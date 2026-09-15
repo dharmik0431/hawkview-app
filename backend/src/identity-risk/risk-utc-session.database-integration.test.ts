@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { PrismaPg } from '@prisma/adapter-pg'
@@ -11,16 +12,16 @@ import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './i
 
 test('real Prisma mailbox writers and evaluator preserve instants across session/Node timezones without changing the pool',
   { skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1', timeout: 60000 }, async () => {
-    const url = new URL(process.env.DATABASE_URL ?? '')
+    const url = assertDisposableTestDatabase()
     assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback PostgreSQL only')
     const originalNodeTimezone = process.env.TZ
     try {
       for (const nodeTimezone of ['UTC', 'America/New_York', 'Asia/Kolkata']) {
         process.env.TZ = nodeTimezone
         for (const databaseTimezone of ['UTC', 'America/New_York', 'Asia/Kolkata']) {
-          const startup = new URL(url)
-          startup.searchParams.set('options', `-c timezone=${databaseTimezone}`)
-          const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: startup.toString(), max: 1 }) })
+          const prisma = new PrismaClient({ adapter: new PrismaPg({
+            connectionString: url.toString(), options: `-c timezone=${databaseTimezone}`, max: 1,
+          }) })
           const rollback = new Error('ROLLBACK_SYNTHETIC_UTC_FIXTURE')
           const scope = { organizationId: randomUUID(), customerTenantId: randomUUID() }
           try {

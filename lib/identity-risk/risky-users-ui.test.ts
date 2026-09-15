@@ -5,6 +5,8 @@ import test from 'node:test'
 import * as adapter from './adapter.ts'
 import * as presentation from './presentation.ts'
 import * as riskyUsersView from './risky-users-view.ts'
+import type { useNativeRiskyUsersRead } from '../api/risky-users-assessment-hooks.ts'
+import type { NativeAssessment } from './native-assessment.ts'
 import {
   assessmentFixture,
   assessmentNow,
@@ -12,6 +14,9 @@ import {
   at,
 } from './assessment-test-fixtures.ts'
 import { syntheticRiskResponses, unavailableMeta } from './test-fixtures.ts'
+import { nativeAssessmentFixture, nativeRiskyUsersFixture } from './risky-users-ui-native-fixtures.ts'
+
+type NativeRiskyUsersRead = ReturnType<typeof useNativeRiskyUsersRead>
 
 const require = createRequire(import.meta.url)
 const React = require('react')
@@ -134,6 +139,7 @@ function render(
   assessmentValue: unknown = assessmentFixture(true),
   options: {
     microsoft?: unknown
+    native?: NativeAssessment | null
     requestFailed?: boolean
     contractFailed?: boolean
     notReported?: boolean
@@ -150,6 +156,9 @@ function render(
     assessmentNow
   )
   if (assessment) options.afterAdapt?.(assessment)
+  const nativeView = options.native === undefined
+    ? nativeAssessmentFixture(assessment)
+    : options.native
   const microsoftView = adapter.adaptMicrosoftRiskyUsersResponse(
     options.microsoft ?? microsoftWithoutP2()
   )
@@ -168,6 +177,19 @@ function render(
       retryMicrosoft: () => undefined,
     }),
   }
+
+  const nativeRiskyUsersRead = {
+    cacheScope: 'synthetic-msp-session',
+    nativeView:
+      options.contractFailed || options.notReported ? null : nativeView,
+    assessmentLoading: options.loading ?? false,
+    assessmentRequestError: options.requestFailed ?? false,
+    assessmentContractError: options.contractFailed ?? false,
+    microsoftView,
+    microsoftLoading: false,
+    retryAssessment: () => undefined,
+    retryMicrosoft: () => undefined,
+  } satisfies NativeRiskyUsersRead
 
   const nativeViewModule = require('./native-view.ts')
   const riskPresentationMapper = require('./risk-presentation-mapper.ts')
@@ -218,12 +240,16 @@ function render(
     ...uiMocks,
     './identity-risk-hooks': identityRiskHooks,
     './risky-users-assessment-hooks': {
-      useNativeRiskyUsersRead: () => identityRiskHooks.useIdentityRiskChannels(),
+      useNativeRiskyUsersRead: () => nativeRiskyUsersRead,
     },
   })
   const drawer = compile(
     '../../components/identity-risk/risk-assessment-drawer.tsx',
     { ...uiMocks, '@/lib/api/identity-risk-hooks': identityRiskHooks }
+  )
+  const fleetDrawer = compile(
+    '../../components/identity-risk/fleet-risk-assessment-drawer.tsx',
+    uiMocks
   )
   const section = compile(
     '../../components/identity-risk/risky-users-section.tsx',
@@ -231,9 +257,7 @@ function render(
       ...uiMocks,
       '@/lib/api/risky-users-hooks': hooks,
       './risk-assessment-drawer': drawer,
-      '@/components/identity-risk/fleet-risk-assessment-drawer': {
-        FleetRiskAssessmentDrawer: () => null,
-      },
+      '@/components/identity-risk/fleet-risk-assessment-drawer': fleetDrawer,
     }
   )
   const card = compile(
@@ -266,402 +290,461 @@ function render(
     cardDocument: cardDom.window.document,
     visibleCardText: visibleTextOf(cardDom.window.document),
     visibleText: visibleTextOf(dom.window.document),
+    openNativeDrawer: (subjectRef?: string) => {
+      function OpenNativeDrawer() {
+        const view = hooks.useRiskyUsers('synthetic-tenant')
+        const rows = [...view.list.rows, ...view.list.context]
+        const row = subjectRef
+          ? rows.find((candidate: any) => candidate.reference === subjectRef)
+          : rows[0]
+        assert.ok(row, 'an opened drawer must have a real row from the native hook')
+        return React.createElement(fleetDrawer.FleetRiskAssessmentDrawer, {
+          row: { ...row, tenantId: 'synthetic-tenant', tenantName: 'Synthetic Tenant', tenantDomain: null },
+          isOpen: true,
+          onClose: () => undefined,
+        })
+      }
+      const opened = new JSDOM(renderToStaticMarkup(React.createElement(OpenNativeDrawer)))
+      assert.ok(opened.window.document.querySelector('[role="dialog"]'))
+      return {
+        document: opened.window.document,
+        text: opened.window.document.body.textContent ?? '',
+      }
+    },
   }
 }
 
 /* -------------------------------------------------------------------------- */
 
-test('the list gives a technician the four things they triage on', () => {
-  const { document, text } = render()
-  const headers = [...document.querySelectorAll('th')].map(
-    (cell) => cell.textContent?.trim() ?? ''
-  )
-  assert.deepEqual(headers.slice(0, 4), [
-    'User',
-    'Detected by',
-    'HawkView priority',
-    'Latest of any reason',
+
+/** QA contract: the compact summary directly precedes the current native table. */
+function compactSummary(document: Document) {
+  const table = document.querySelector('[aria-labelledby="risky-users-table-heading"]')
+  assert.ok(table, 'the current native table must exist')
+  const summary = table.previousElementSibling
+  assert.ok(summary, 'the real compact summary must exist')
+  return summary
+}
+
+function nativeMicrosoftPair() {
+  const native = nativeRiskyUsersFixture()
+  const correlation = {
+    available: true as const,
+    shape: 'DIRECTORY_OBJECT_ID' as const,
+    ref: '00000000-0000-4000-8000-000000000011',
+  }
+  native.findings[0]!.subject.correlation = correlation
+  const base = microsoftLive()
+  return {
+    native,
+    microsoft: {
+      ...base,
+      users: [{
+        ...base.users[0]!,
+        identityLabel: 'Native fixture user',
+        correlation,
+      }],
+    },
+  }
+}
+
+
+type ReadableNative = Extract<NativeAssessment, { available: true }>
+const nativeProjection = require('./native-view.ts') as typeof import('./native-view.ts')
+
+function renderNative(native: NativeAssessment | null = nativeRiskyUsersFixture(), options: Parameters<typeof render>[1] = {}) {
+  return render(undefined, { ...options, native })
+}
+
+function nativeZero() {
+  const native = nativeRiskyUsersFixture()
+  native.count.value = 0
+  native.findings = []
+  return native
+}
+
+function nativeWithheld(because = 'UNRESOLVED_SUBJECT_IDENTITY') {
+  const native = nativeRiskyUsersFixture()
+  native.count.accuracy = 'NOT_AVAILABLE'
+  native.count.value = null
+  native.withheld = [{ stream: null, because }]
+  return native
+}
+
+function nativeSignal(signal = 'PASSWORD_REJECTED', count = 10,
+  kind: 'EVENT_OCCURRED' | 'STATE_OBSERVED' = 'EVENT_OCCURRED',
+  at: string | null = '2026-09-08T21:59:00.000Z') {
+  return { signal, count, capped: false, latest: at === null ? null : { at, kind } }
+}
+
+function nativeMailbox() {
+  const native = nativeWithheld()
+  native.findings[0] = {
+    detectorId: 'external-mailbox-forwarding',
+    subject: {
+      ...native.findings[0]!.subject,
+      kind: 'MAILBOX',
+      ref: '00000000-0000-4000-8000-000000000022',
+      displayName: 'Native mailbox fixture',
+      userPrincipalName: null,
+    },
+    signals: [nativeSignal('EXTERNAL_FORWARDING_CONFIGURED', 3, 'STATE_OBSERVED')],
+  }
+  return native
+}
+
+function nativeTable(document: Document) {
+  const table = document.querySelector('[aria-labelledby="risky-users-table-heading"]')
+  assert.ok(table)
+  return table
+}
+
+function actionableRows(document: Document) {
+  return Array.from(nativeTable(document).querySelectorAll('tbody tr')).filter(row => row.querySelector('button'))
+}
+
+function findingItems(document: Document) {
+  return Array.from(document.querySelectorAll('h4')).map(heading => {
+    let item = heading.parentElement
+    while (item && !item.querySelector('details')) item = item.parentElement
+    assert.ok(item, 'each real drawer finding has its own technical disclosure')
+    return item
+  })
+}
+
+function primaryText(document: Document) {
+  const body = document.body.cloneNode(true) as HTMLElement
+  for (const detail of Array.from(body.querySelectorAll('details'))) detail.remove()
+  return body.textContent ?? ''
+}
+
+function assertNativeCountCopy(native: ReadableNative, result: ReturnType<typeof render>) {
+  const count = nativeProjection.nativeRiskyUserCount(native)
+  for (const text of [result.text, result.cardText]) {
+    assert.ok(text.includes(count.caption), 'the native count scope must reach both surfaces')
+    // Exact-count coverage gaps carry the normalized gap headline, not a
+    // duplicate reason paragraph. Withholding still requires every explanation.
+    if (count.accuracy === 'WITHHELD') {
+      for (const reason of count.reasons) assert.ok(text.includes(reason), reason)
+    }
+    for (const gap of count.gaps) assert.ok(text.includes(gap), gap)
+    assert.doesNotMatch(text, /\d+ identities evaluated|\d+ mailboxes assessed/i)
+  }
+  return count
+}
+
+function assertIndependentPair() {
+  const pair = nativeMicrosoftPair()
+  const result = renderNative(pair.native, { microsoft: pair.microsoft })
+  const rows = actionableRows(result.document)
+  assert.equal(rows.length, 1)
+  const badges = rows[0]!.querySelectorAll('td')[2]!.textContent ?? ''
+  assert.match(badges, /HawkView/)
+  assert.match(badges, /Microsoft/)
+  assert.doesNotMatch(badges, /partial|unavailable|not comparable/i)
+  assert.match(compactSummary(result.document).textContent ?? '', /1 users requiring review/)
+  assert.match(compactSummary(result.document).textContent ?? '', /1 active Microsoft risk/)
+  const drawer = result.openNativeDrawer()
+  assert.match(drawer.text, /Detected by HawkView & Microsoft/)
+  assert.match(drawer.text, /independent signals/)
+  assert.match(result.text, /never combined into a single score/)
+  return result
+}
+
+function assertNoMicrosoftConclusion() {
+  const native = nativeRiskyUsersFixture()
+  const result = renderNative(native, { microsoft: microsoftLive() })
+  assert.equal(actionableRows(result.document).length, 1)
+  const drawer = result.openNativeDrawer()
+  assert.match(drawer.text, /Microsoft risk comparison incomplete/)
+  assert.match(drawer.text, /No conclusion about active Microsoft risk can be drawn/)
+  assert.match(drawer.text, /Partial coverage/)
+  assert.doesNotMatch(drawer.text, /No active Microsoft risk reported|currently has no active risk record/)
+  return result
+}
+
+function assertNoActiveMicrosoftControl() {
+  const pair = nativeMicrosoftPair()
+  pair.microsoft.users = []
+  const view = adapter.adaptMicrosoftRiskyUsersResponse(pair.microsoft)
+  const row = nativeProjection.nativeRiskyUserList(pair.native, riskyUsersView.microsoftChannel(view), view.users).rows[0]!
+  assert.equal(row.detection.microsoft, 'NOT_REPORTED')
+  const result = renderNative(pair.native, { microsoft: pair.microsoft })
+  const drawer = result.openNativeDrawer()
+  assert.match(drawer.text, /No active Microsoft risk reported/)
+  assert.match(drawer.text, /does not confirm that the account is safe/)
+  assert.doesNotMatch(drawer.text, /Microsoft risk comparison incomplete/)
+  return result
+}
+
+function nativeWire(native: ReadableNative) {
+  return {
+    version: 'hawkview-risky-users/v1', available: true, run: native.run,
+    collectors: native.collectors,
+    coverage: native.coverage.map(({ stream, ...coverage }) => ({ stream, coverage })),
+    subjectsNamed: native.subjectsNamed,
+    count: { accuracy: native.count.accuracy, value: native.count.value,
+      scope: { covered: native.count.covered, notCovered: native.count.notCovered, evidenceRequested: native.count.evidenceRequested } },
+    claim: { permitted: true },
+    findings: { complete: native.complete, items: native.findings.map(finding => ({
+      detectorId: finding.detectorId,
+      subject: { kind: finding.subject.kind,
+        ...(finding.subject.kind === 'MAILBOX' ? { mailboxRef: finding.subject.ref } : { userRef: finding.subject.ref }),
+        correlation: { available: false, because: 'NO_SHARED_CORRELATION' } },
+      displayName: finding.subject.displayName, userPrincipalName: finding.subject.userPrincipalName,
+      signals: finding.signals,
+    })) },
+  }
+}
+
+test('native contracts N33: native triage uses factual fields and volume ordering without priority', () => {
+  // N33: Legacy priority columns are not native facts; preserve triage fields and observable volume/recency ordering.
+
+  const native = nativeRiskyUsersFixture()
+  const low = structuredClone(native.findings[0]!)
+  low.subject.ref = '00000000-0000-4000-8000-000000000033'
+  low.subject.displayName = 'Lower volume user'
+  low.signals = [nativeSignal('PASSWORD_REJECTED', 2)]
+  native.findings.unshift(low)
+  native.count.value = 2
+  const result = renderNative(native)
+  assert.deepEqual([...result.document.querySelectorAll('th')].map(cell => cell.textContent?.trim()), [
+    'User', 'Why this user needs review', 'Found by', 'Latest evidence', 'Data state', 'Action',
   ])
-  assert.match(text, /Synthetic identity/)
-  assert.match(text, /Repeated invalid credentials/)
-  assert.match(text, /Low/)
-  // And a way into the evidence for that user.
-  assert.ok(
-    [...document.querySelectorAll('button')].some((button) =>
-      /Investigate/.test(button.textContent ?? '')
-    )
-  )
+  const rows = actionableRows(result.document)
+  assert.equal(rows.length, 2)
+  assert.match(rows[0]!.textContent ?? '', /Native fixture user/)
+  assert.match(rows[1]!.textContent ?? '', /Lower volume user/)
+  assert.doesNotMatch(result.text, /priority|priorities|most important/i)
+  assert.ok([...result.document.querySelectorAll('select')].every(select => !/priority/i.test(select.textContent ?? '')))
+  assert.ok(rows.every(row => /Investigate/.test(row.textContent ?? '')))
 })
+test('native contracts R34: raw native subject references stay private while findings remain reviewable', () => {
+  // R34: Native subject refs are raw IDs, not the legacy displayable opaque handle; conceal full and shortened refs without hiding evidence.
 
-test('the opaque subject reference is shortened but stays available', () => {
-  const { document } = render()
-  const cell = document.querySelector('tbody tr td')
-  assert.ok(cell)
-  // Selected by its title attribute rather than by position, so adding a
-  // line to the cell does not silently retarget the assertion.
-  const reference = cell!.querySelector('p[title]')
-  assert.ok(reference)
-  // Shown short, so it does not crowd out the name and the reasons.
-  assert.match(reference!.textContent ?? '', /^hvr1_subject_[0-9a-f]{10}…$/)
-  // The full value is still there to copy or search on.
-  assert.match(
-    reference!.getAttribute('title') ?? '',
-    /^hvr1_subject_[0-9a-f]{64}$/
-  )
-})
-
-test('the P2 gap is shown once as a first-class state, not as an empty column', () => {
-  const { document, text } = render()
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.ok(panel, 'the Microsoft channel has its own panel')
-  assert.match(panel!.textContent ?? '', /requires Entra ID P2/)
-  assert.match(
-    panel!.textContent ?? '',
-    /does not mean Microsoft would also report zero/
-  )
-  // It also appears once in the count's disclosure, because a number shown
-  // beside an unavailable Microsoft channel has to say so. What it must not do
-  // is repeat down every row of the table.
-  for (const row of document.querySelectorAll('tbody tr')) {
-    assert.doesNotMatch(row.textContent ?? '', /Entra ID P2/)
-  }
-})
-
-test('every row still names which system reported it', () => {
-  const { document } = render()
-  const detectedBy = [...document.querySelectorAll('tbody tr')].map(
-    (row) => row.querySelectorAll('td')[1]?.textContent ?? ''
-  )
-  assert.ok(detectedBy.length > 0)
-  for (const cell of detectedBy) {
-    assert.match(cell, /HawkView/)
-    // Microsoft could not be consulted, and the row says so rather than
-    // implying Microsoft looked and found nothing.
-    assert.match(cell, /Microsoft unavailable/)
-    assert.doesNotMatch(cell, /Microsoft did not report/)
-    // "Cannot report on this tenant" and "looked and found nothing" are
-    // different claims and never share a sentence.
-    assert.doesNotMatch(cell, /Not comparable/)
-  }
-})
-
-test('a zero is never rendered alone', () => {
-  const { text, cardText } = render(assessmentFixture(false))
-  for (const [label, rendered] of [
-    ['section', text],
-    ['overview card', cardText],
-  ] as const) {
-    assert.match(rendered, /No findings in evaluated evidence/, label)
-    assert.match(rendered, /does not establish that an identity is safe/, label)
-    // The disclosure that stops the zero reading as "nothing is wrong".
-    assert.match(rendered, /Not covered by this number/, label)
-    assert.match(rendered, /requires Entra ID P2/, label)
-  }
-})
-
-test('a live Microsoft channel shows its own records in its own vocabulary', () => {
-  const { document, text } = render(assessmentFixture(true), {
-    microsoft: microsoftLive(),
-  })
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.ok(panel)
-  assert.match(panel!.textContent ?? '', /reporting on this tenant/)
-  // Microsoft's records, under Microsoft's heading, using Microsoft's terms.
-  assert.match(panel!.textContent ?? '', /Synthetic finance user/)
-  assert.match(panel!.textContent ?? '', /At risk/)
-  assert.match(panel!.textContent ?? '', /Dismissed/)
-  // Never a licence pitch on a tenant that is already reporting.
-  assert.doesNotMatch(text, /requires Entra ID P2/)
-})
-
-test('Microsoft records are never folded into the HawkView list or its count', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftLive(),
-  })
-  const hawkViewList = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"]'
-  )
-  assert.ok(hawkViewList)
-  // Microsoft's identities do not appear among HawkView's rows.
-  assert.doesNotMatch(hawkViewList!.textContent ?? '', /Synthetic finance user/)
-
-  // And the HawkView total is unchanged by Microsoft having two records.
-  const summary = document.querySelector(
-    '[aria-labelledby="risky-users-total-heading"]'
-  )
-  assert.ok(summary)
-  assert.match(summary!.textContent ?? '', /Risky user/)
-  assert.doesNotMatch(summary!.textContent ?? '', /3/)
-
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.match(
-    panel!.textContent ?? '',
-    /never\s+added to, or subtracted from, the HawkView count/
-  )
-})
-
-test('rows say Microsoft is not comparable rather than that it cleared anyone', () => {
-  // Microsoft is live, but nothing correlates its directory objects to
-  // HawkView's tenant-keyed pseudonyms. "Microsoft did not report this user"
-  // would be a claim no evidence supports.
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftLive(),
-  })
-  // Non-vacuity guard. This assertion is a loop over rows, so zero rows makes
-  // it pass while testing nothing -- and that is exactly what happened when the
-  // harness began mocking useNativeRiskyUsersRead with the OLD hook's return
-  // shape: the component receives no nativeView, renders no rows, and a test
-  // named for the safety property most worth keeping goes green by asserting
-  // nothing at all.
-  //
-  // It stays red until the fixtures are rewritten against the native shape,
-  // which is owed work. Red for a known reason is worth more than green for an
-  // unknown one.
-  const rows = document.querySelectorAll(
-    '[aria-labelledby="risky-users-list-heading"] tbody tr'
-  )
-  assert.ok(
-    rows.length > 0,
-    'no rows rendered, so the per-row assertions below check nothing'
-  )
-  for (const row of rows) {
-    const detectedBy = row.querySelectorAll('td')[1]?.textContent ?? ''
-    assert.match(detectedBy, /HawkView/)
-    assert.match(detectedBy, /Not comparable/)
-    assert.doesNotMatch(detectedBy, /Microsoft did not report/)
-  }
-})
-
-test('a bounded Microsoft page says so instead of implying a full total', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftLive(true),
-  })
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.match(panel!.textContent ?? '', /More Microsoft records exist/)
-  assert.match(panel!.textContent ?? '', /incomplete result set/)
-})
-
-test('a withheld count reads as a decision, not as a blank or a breakage', () => {
-  const value = assessmentFixture(false)
-  value.summary.currentUsers = {
-    value: null,
-    accuracy: 'UNKNOWN',
-    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
-  }
-  const { text, cardText } = render(value)
-
-  for (const [label, rendered] of [
-    ['section', text],
-    ['overview card', cardText],
-  ] as const) {
-    // The slot where the number belongs says what happened, rather than
-    // showing a glyph a technician would read as an empty or broken state.
-    assert.match(rendered, /Not counted/, label)
-    assert.match(rendered, /could not be tied to people/, label)
-    assert.match(rendered, /belongs to a person/, label)
-    // Nothing invites a retry, because no retry would help.
-    assert.doesNotMatch(rendered, /Support code/, label)
-    assert.doesNotMatch(rendered, /try again/i, label)
-  }
-})
-
-test('an empty list never answers the question a withheld count refused', () => {
-  const value = assessmentFixture(true)
-  value.users = ['a', 'b', 'c'].map((character) =>
-    assessmentUser('HV-ID-MBX-001.v1', character)
-  )
-  value.rules[0].matchedIdentities = 0
-  value.rules[2].assessedIdentities = 3
-  value.rules[2].matchedIdentities = 3
-  value.summary.currentUsers = {
-    value: null,
-    accuracy: 'UNKNOWN',
-    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
-  }
-  const { document } = render(value)
-  const list = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"]'
-  )
-  assert.ok(list)
-  // Three mailboxes are forwarding externally and HawkView has just said it
-  // cannot tell how many belong to people. "No user needs attention" would
-  // answer that question anyway.
-  assert.doesNotMatch(
-    list!.textContent ?? '',
-    /No user is listed as needing attention/
-  )
-  assert.match(
-    list!.textContent ?? '',
-    /not the same as no user needing attention/
-  )
-
-  // Where HawkView did count, the plain sentence is still the right one.
-  const counted = render(assessmentFixture(false))
-  assert.match(
-    counted.document.querySelector(
-      '[aria-labelledby="risky-users-list-heading"]'
-    )?.textContent ?? '',
-    /No user is listed as needing attention/
-  )
-})
-
-test('what HawkView did find is rendered beside a withheld count', () => {
-  // Three mailboxes forwarding externally, none attributable to a person.
-  const value = assessmentFixture(true)
-  value.users = ['a', 'b', 'c'].map((character) =>
-    assessmentUser('HV-ID-MBX-001.v1', character)
-  )
-  value.rules[0].matchedIdentities = 0
-  value.rules[2].assessedIdentities = 3
-  value.rules[2].matchedIdentities = 3
-  value.summary.currentUsers = {
-    value: null,
-    accuracy: 'UNKNOWN',
-    reason: 'UNRESOLVED_SUBJECT_IDENTITY',
-  }
-  const { text, cardText } = render(value)
-
-  for (const [label, rendered] of [
-    ['section', text],
-    ['overview card', cardText],
-  ] as const) {
-    assert.match(rendered, /What HawkView did find/, label)
-    assert.match(rendered, /External mailbox forwarding: 3 mailboxes/, label)
-  }
-})
-
-test('a check that cannot run states its scope beside the number, not elsewhere', () => {
-  const value = assessmentFixture(false)
-  value.rules[2].status = 'INAPPLICABLE'
-  value.rules[2].reasonCode = 'CHECK_NOT_APPLICABLE'
-  value.rules[2].assessedIdentities = null
-  value.rules[2].matchedIdentities = null
-  value.rules[2].evaluatedAt = null
-  value.rules[2].window = { start: null, end: null }
-  const { document, cardText } = render(value)
-
-  // The overview card carries the whole claim on its own, because that is
-  // often the only Risky Users surface a technician sees.
-  assert.match(cardText, /2 checks this tenant/)
-  assert.match(cardText, /1 further check cannot run/)
-  assert.match(cardText, /cannot run on this tenant/)
-  assert.match(cardText, /External mailbox forwarding/)
-
-  // In the section, the scope sits inside the same block as the number rather
-  // than in the coverage panel further down the page. A scoped zero whose
-  // scope lives one component away is a bare zero in practice.
-  const summary = document.querySelector(
-    '[aria-labelledby="risky-users-total-heading"]'
-  )
-  assert.ok(summary)
-  assert.match(summary!.textContent ?? '', /2 checks this tenant/)
-  assert.match(summary!.textContent ?? '', /1 further check cannot run/)
-  assert.match(summary!.textContent ?? '', /External mailbox forwarding/)
-
-  // And the check is labelled as unable to run, not as a failure.
-  assert.match(document.body.textContent ?? '', /Cannot run on this tenant/)
-})
-
-test('the four evidence states never share the same words', () => {
-  const partial = assessmentFixture(false)
-  delete partial.summary
-  partial.meta.capability = 'PARTIAL'
-  partial.meta.freshness = 'UNKNOWN'
-  partial.meta.limitation = 'One check did not complete.'
-  partial.rules[1].status = 'PARTIAL'
-  partial.rules[1].reasonCode = 'INCOMPLETE_WINDOW'
-
-  // Every serious bug found on the old surface was two of these four wearing
-  // the same clothes, so each one has to reach the screen saying something the
-  // others do not.
-  const states = {
-    'never collected': {
-      rendered: render(assessmentFixture(false), { notReported: true }).text,
-      sentence: /HawkView has not evaluated this tenant yet/,
-    },
-    'genuinely clean': {
-      rendered: render(assessmentFixture(false)).text,
-      sentence: /No findings in evaluated evidence/,
-    },
-    unreadable: {
-      rendered: render(assessmentFixture(false), { contractFailed: true }).text,
-      sentence: /A response arrived that HawkView could not read/,
-    },
-    'partly evaluated': {
-      rendered: render(partial).text,
-      sentence: /did not complete over current evidence/,
-    },
-  }
-
-  for (const [state, { rendered, sentence }] of Object.entries(states)) {
-    assert.match(rendered, sentence, state)
-    // And no state borrows another's wording.
-    for (const [other, { sentence: otherSentence }] of Object.entries(states)) {
-      if (other === state) continue
-      assert.doesNotMatch(rendered, otherSentence, `${state} vs ${other}`)
+  for (const subjectsNamed of [true, false]) {
+    const native = nativeRiskyUsersFixture()
+    native.subjectsNamed = subjectsNamed
+    native.findings[0]!.subject.displayName = null
+    native.findings[0]!.subject.userPrincipalName = null
+    const ref = native.findings[0]!.subject.ref
+    const result = renderNative(native)
+    assert.equal(actionableRows(result.document).length, 1)
+    for (const text of [result.text, result.openNativeDrawer().text]) {
+      assert.ok(text.includes(subjectsNamed ? 'Identity not resolved' : 'Name not shown for your role'))
+      assert.ok(!text.includes(ref))
+      assert.ok(!text.includes(ref.slice(0, 10)))
+      assert.match(text, /Repeated unsuccessful sign-in activity/)
     }
   }
+})
+test('native contracts P35: the P2 gap is shown once as a first-class state, not as an empty column', () => {
+  // P35: The native compact summary replaces the legacy Microsoft panel; preserve the licensed-unavailable, never-zero boundary.
 
-  // None of the three non-clean states is allowed to print a bare zero.
-  for (const state of ['never collected', 'unreadable', 'partly evaluated']) {
-    assert.doesNotMatch(
-      states[state as keyof typeof states].rendered,
-      /No findings in evaluated evidence/,
-      state
-    )
+  const result = renderNative()
+  const summary = compactSummary(result.document).textContent ?? ''
+  assert.equal((summary.match(/requires Entra ID P2/g) ?? []).length, 1)
+  assert.doesNotMatch(summary, /0 active Microsoft risk/)
+  assert.match(summary, /1 users requiring review/)
+  assert.match(summary, /1 detected by HawkView/)
+  assert.equal(actionableRows(result.document).length, 1)
+  // Tooltip detail may explain licensing; it is not a repeated visible badge.
+  for (const row of actionableRows(result.document)) {
+    const badges = Array.from(row.querySelectorAll('td')[2]!.querySelectorAll('span'))
+    for (const badge of badges) assert.doesNotMatch(badge.textContent ?? '', /Entra ID P2/)
   }
 })
+test('native contracts R36: every row still names which system reported it', () => {
+  // R36: Native source badges and the real drawer replace the legacy detection cell sentence; unavailable is not a negative finding.
 
-test('a failed read keeps prior findings on screen and withdraws only the total', () => {
-  const { text } = render(assessmentFixture(true), { requestFailed: true })
-  assert.match(text, /The latest assessment could not be loaded/)
-  assert.match(text, /has not resolved or dismissed any of them/)
-  // The user is still listed.
-  assert.match(text, /Synthetic identity/)
-  assert.match(text, /The latest assessment could not be loaded/)
+  const result = renderNative()
+  const rows = actionableRows(result.document)
+  assert.equal(rows.length, 1)
+  assert.match(rows[0]!.querySelectorAll('td')[2]!.textContent ?? '', /HawkView.*Microsoft coverage partial/)
+  const drawer = result.openNativeDrawer()
+  assert.match(drawer.text, /Microsoft Entra risk data unavailable/)
+  assert.doesNotMatch(drawer.text, /No active Microsoft risk reported|currently has no active risk record/)
 })
+test('native contracts C37: a zero is never rendered alone', () => {
+  // C37: Native zero is event/detector-scoped, not the legacy assessed-identity population; preserve scope and gaps on both surfaces.
 
-test('mailbox evidence is shown but visibly excluded from the count', () => {
-  const value = assessmentFixture(true)
-  value.users.push(assessmentUser('HV-ID-MBX-001.v1', 'b'))
-  value.rules[2].matchedIdentities = 1
-  const { document, text } = render(value)
-
-  const context = document.querySelector(
-    '[aria-labelledby="risky-users-context-heading"]'
-  )
-  assert.ok(context, 'supporting evidence has its own section')
-  assert.match(
-    context!.textContent ?? '',
-    /deliberately not counted above|would overstate/
-  )
-  assert.match(text, /External mailbox forwarding/)
+  const native = nativeZero()
+  native.count.notCovered = [{ detectorId: 'external-mailbox-forwarding', because: 'NEVER_COLLECTED' }]
+  const result = renderNative(native)
+  const count = assertNativeCountCopy(native, result)
+  assert.equal(count.value, 0)
+  assert.match(result.text, /0 users requiring review/)
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /investigation leads, not confirmed compromise/i)
+    assert.match(text, /Not covered by this number/)
+    assert.match(text, /Every event this run examined/)
+  }
 })
+test('native contracts P38: Microsoft-only risk has a separate count and an explicit table limitation', () => {
+  // P38: The native table does not display Microsoft-only rows; disclose that limitation beside the separate active-risk summary.
 
-test('the surface never claims a user is safe or that HawkView acted', () => {
-  const { text } = render()
-  assert.match(text, /investigation lead/i)
-  assert.match(text, /does not establish that a user is safe/)
-  assert.match(text, /HawkView makes no changes to Microsoft/)
-  assert.doesNotMatch(text, /compromised account confirmed/i)
-  assert.doesNotMatch(text, /remediated by HawkView/i)
+  const result = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftLive() })
+  const summary = compactSummary(result.document).textContent ?? ''
+  assert.match(summary, /1 active Microsoft risk/)
+  assert.match(result.text, /This table lists HawkView findings/)
+  assert.match(result.text, /Microsoft-only identities.*Entra ID Protection/)
+  assert.doesNotMatch(nativeTable(result.document).textContent ?? '', /Synthetic finance user|Synthetic sales user/)
+  assert.doesNotMatch(result.text, /requires Entra ID P2/)
 })
-
-test('the coverage behind the number is available on the same screen', () => {
-  const { text } = render()
-  assert.match(text, /What HawkView checked/)
-  assert.match(text, /identities evaluated by this check/)
-  assert.match(text, /Microsoft 365 audit sign-ins/)
+test('native contracts R39: Microsoft records are never folded into the HawkView list or its count', () => {
+  // R39: Correlated native and Microsoft facts replace legacy separate panels; neither count nor evidence is merged.
+  assertIndependentPair()
 })
+test('native contracts R40: rows say Microsoft is not comparable rather than that it cleared anyone', () => {
+  // R40: Structured NOT_COMPARABLE is incomplete evidence, not the legacy unmatched cell or a Microsoft clearance.
 
+  assertNoMicrosoftConclusion()
+  assertNoActiveMicrosoftControl()
+})
+test('native contracts P41: a bounded Microsoft page says so instead of implying a full total', () => {
+  // P41: A bounded Microsoft page must expose a page-local count, not an exact tenant total or an invented zero lower bound.
+
+  const partial = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftLive(true) })
+  assert.match(compactSummary(partial.document).textContent ?? '', /1 active Microsoft risk records on this page; more results available/)
+  const emptyPage = { ...microsoftLive(true), users: [] }
+  const empty = renderNative(nativeRiskyUsersFixture(), { microsoft: emptyPage })
+  const summary = compactSummary(empty.document).textContent ?? ''
+  assert.match(summary, /Microsoft active-risk count unavailable.*more results available/)
+  assert.doesNotMatch(summary, /0 active Microsoft|at least 0/i)
+  const complete = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftLive() })
+  assert.match(compactSummary(complete.document).textContent ?? '', /1 active Microsoft risk/)
+  assert.doesNotMatch(compactSummary(complete.document).textContent ?? '', /more results available/)
+})
+test('native contracts C42: a withheld count reads as a decision, not as a blank or a breakage', () => {
+  // C42: Native supplied withholding explanations replace the legacy reason literal; withholding is a decision, not a failed request.
+
+  const native = nativeWithheld()
+  const result = renderNative(native)
+  const count = assertNativeCountCopy(native, result)
+  assert.equal(count.accuracy, 'WITHHELD')
+  assert.equal(count.value, null)
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /Not counted/)
+    assert.doesNotMatch(text, /Support code|try again|0 users requiring review/i)
+  }
+  assert.equal(result.document.querySelector('[role="alert"]'), null)
+})
+test('native contracts C43: an empty list never answers the question a withheld count refused', () => {
+  // C43: A native withheld empty list must not borrow the exact-zero empty state; mailbox evidence remains independent.
+
+  const native = nativeMailbox()
+  const result = renderNative(native)
+  assert.equal(actionableRows(result.document).length, 0)
+  const count = nativeProjection.nativeRiskyUserCount(native)
+  const expected = riskyUsersView.riskyUsersEmptyState(count, false)
+  assert.ok(nativeTable(result.document).textContent?.includes(expected.sentence))
+  assert.doesNotMatch(nativeTable(result.document).textContent ?? '', /No users requiring review found/)
+  const zero = renderNative(nativeZero())
+  assert.notEqual(riskyUsersView.riskyUsersEmptyState(nativeProjection.nativeRiskyUserCount(nativeZero()), false).sentence, expected.sentence)
+  assert.match(zero.text, /0 users requiring review/)
+})
+test('native contracts N44: what HawkView did find is rendered beside a withheld count', () => {
+  // N44/C known: Covered checks are not findings. Preserve actual finding titles, deduplicate safely, and never invent mailbox or identity totals.
+
+  const clean = nativeZero()
+  const cleanResult = renderNative(clean)
+  assert.doesNotMatch(cleanResult.cardText, /What HawkView did find/)
+  assert.deepEqual(nativeProjection.nativeRiskyUserCount(clean).known, [])
+  const actual = nativeMailbox()
+  actual.count.covered = ['repeated-credential-failure']
+  const anotherMailbox = structuredClone(actual.findings[0]!)
+  anotherMailbox.subject.ref = '00000000-0000-4000-8000-000000000099'
+  actual.findings.push(anotherMailbox)
+  const result = renderNative(actual)
+  assert.deepEqual(nativeProjection.nativeRiskyUserCount(actual).known, ['External mailbox forwarding'])
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /What HawkView did find/)
+    assert.match(text, /External mailbox forwarding/)
+    assert.doesNotMatch(text, /External mailbox forwarding: 3 mailboxes/)
+  }
+  const unknown = nativeWithheld()
+  unknown.findings[0]!.detectorId = 'UNKNOWN_FUTURE_DETECTOR'
+  assert.deepEqual(nativeProjection.nativeRiskyUserCount(unknown).known, ['A check this build of HawkView does not recognise'])
+})
+test('native contracts N45: a check that cannot run states its scope beside the number, not elsewhere', () => {
+  // N45: Native detector/event coverage replaces legacy per-check identity counts; the number keeps its scope and uncovered checks.
+
+  const native = nativeZero()
+  native.count.notCovered = [{ detectorId: 'external-mailbox-forwarding', because: 'DETECTOR_FAILED' }]
+  const result = renderNative(native)
+  assertNativeCountCopy(native, result)
+  assert.match(result.text, /Not covered by this number/)
+  assert.doesNotMatch(result.text + result.cardText, /identities evaluated|tenant coverage: \d+/i)
+})
+test('native contracts C46: the four evidence states never share the same words', () => {
+  // C46: Native absence, exact zero, unreadable response, and withheld evaluation retain distinct UI claims rather than legacy status copy.
+
+  const missing = renderNative(null)
+  const unreadable = renderNative(nativeRiskyUsersFixture(), { contractFailed: true })
+  const zero = renderNative(nativeZero())
+  const partial = renderNative(nativeWithheld('UNREADABLE_NOW'))
+  assert.equal(missing.document.querySelector('[role="alert"]'), null)
+  assert.match(missing.text, /No current assessment|has no assessment/)
+  assert.match(unreadable.document.querySelector('[role="alert"]')?.textContent ?? '', /response could not be read/)
+  assert.match(zero.text, /0 users requiring review/)
+  assert.match(partial.text, /Not counted/)
+  for (const result of [missing, unreadable, partial]) assert.doesNotMatch(result.text, /0 users requiring review/)
+})
+test('native contracts N47: unavailable native reads withhold rows and totals without a retained-cache claim', () => {
+  // N47: The native hook deliberately discards unavailable reads; do not preserve the legacy retained-cache claim.
+
+  for (const options of [{ requestFailed: true }, { contractFailed: true }]) {
+    const result = renderNative(nativeRiskyUsersFixture(), options)
+    assert.equal(actionableRows(result.document).length, 0)
+    assert.match(result.text, /Not available/)
+    assert.match(result.text, /No current result can be confirmed/)
+    assert.doesNotMatch(result.text, /earlier read|remain open|0 users requiring review/)
+  }
+  assert.equal(actionableRows(renderNative().document).length, 1)
+})
+test('native contracts R48: mailbox evidence is shown but visibly excluded from the count', () => {
+  // R48: Genuine native MAILBOX evidence uses the existing Supporting evidence region, not a counted legacy user row.
+
+  const native = nativeMailbox()
+  const result = renderNative(native)
+  assert.equal(actionableRows(result.document).length, 0)
+  const context = result.document.querySelector('[aria-labelledby="risky-users-context-heading"]')
+  assert.ok(context)
+  assert.match(context.textContent ?? '', /Supporting evidence/)
+  assert.match(context.textContent ?? '', /not.*counted|not.*user count/i)
+  assert.match(context.textContent ?? '', /Native mailbox fixture/)
+  const drawer = result.openNativeDrawer(native.findings[0]!.subject.ref)
+  assert.equal(findingItems(drawer.document).length, 1)
+  assert.match(drawer.text, /3 external destinations/)
+  assert.match(drawer.text, /Configuration read/)
+  assert.doesNotMatch(drawer.text, /3 users/)
+})
+test('native contracts C49: the surface never claims a user is safe or that HawkView acted', () => {
+  // C49: Native count and evidence copy must not assert safety or completed actions, even when its number is zero.
+
+  for (const native of [nativeZero(), nativeRiskyUsersFixture(), nativeWithheld()]) {
+    const result = renderNative(native)
+    assertNativeCountCopy(native, result)
+    for (const text of [result.visibleText, result.visibleCardText]) {
+      assert.doesNotMatch(text, /tenant is safe|user is safe|account is safe|HawkView (?:blocked|disabled|remediated)/i)
+    }
+  }
+})
+test('native contracts N50: the coverage behind the number is available on the same screen', () => {
+  // N50: The native scope is detector/event based; do not recreate the legacy assessed-identity table or a tenant coverage denominator.
+
+  const native = nativeRiskyUsersFixture()
+  native.coverage[0]!.notYetCitedEvents = 7
+  native.coverage[0]!.uninterpretedEvents = 11
+  native.count.notCovered = [{ detectorId: 'external-mailbox-forwarding', because: 'NEVER_COLLECTED' }]
+  const result = renderNative(native)
+  assertNativeCountCopy(native, result)
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /7 events held pending a citation/)
+    assert.match(text, /11 events could not be interpreted/)
+    assert.doesNotMatch(text, /18 events|identities evaluated/)
+  }
+})
 /* -------------------------------------------------------------------------- */
 /* Microsoft verdict polarity, rendered                                        */
 /* -------------------------------------------------------------------------- */
@@ -674,91 +757,70 @@ function microsoftPanel(document: any) {
   return panel
 }
 
-test('a sign-in Microsoft cleared is never rendered among its detections', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
-  const sections = [...panel.querySelectorAll('section')]
-  const risk = sections.find((section: any) =>
-    /currently considers at risk/.test(section.textContent ?? '')
-  )
-  const cleared = sections.find((section: any) =>
-    /currently considers safe/.test(section.textContent ?? '')
-  )
-  assert.ok(risk, 'active risk has its own group')
-  assert.ok(cleared, 'clearances have their own group')
+test('native contracts P51: a sign-in Microsoft cleared is never rendered among its detections', () => {
+  // P51: Polarity helpers and a real matched drawer replace the removed legacy Microsoft record panel; a cleared sign-in is never active.
 
-  // The machine-cleared identity sits under "safe", not under "reports risk",
-  // even though its state still reads atRisk.
-  assert.match(cleared!.textContent ?? '', /Machine cleared user/)
-  assert.doesNotMatch(risk!.textContent ?? '', /Machine cleared user/)
-  assert.match(risk!.textContent ?? '', /Flagged user/)
-  assert.match(cleared!.textContent ?? '', /not Microsoft flagging one/)
-  // Microsoft can carry a risk state and a superseding safe conclusion on the
-  // same record; the row says which governs rather than printing a state that
-  // contradicts the heading above it.
-  assert.match(cleared!.textContent ?? '', /superseded by the conclusion below/)
+  const view = adapter.adaptMicrosoftRiskyUsersResponse(microsoftMixedVerdicts())
+  const groups = riskyUsersView.microsoftRecordsByPolarity(view)
+  assert.equal(groups.ACTIVE_RISK.length, 2)
+  assert.equal(groups.CLEARED.length, 1)
+  assert.equal(groups.CLOSED.length, 1)
+  assert.equal(groups.UNRECOGNISED.length, 1)
+  assert.ok(!groups.ACTIVE_RISK.some(user => user.riskDetail === 'aiConfirmedSigninSafe'))
+  assert.match(riskyUsersView.microsoftVerdictDetail(groups.CLEARED[0]!), /automated assessment concluded this sign-in was safe/)
+  assertIndependentPair()
 })
+test('native contracts P52: an unrecognised verdict renders as unrecognised, not as a risk', () => {
+  // P52: Unknown Microsoft verdicts remain unrecognised in the grouping contract, never promoted to active risk by the native summary.
 
-test('an unrecognised verdict renders as unrecognised, not as a risk', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
-  const sections = [...panel.querySelectorAll('section')]
-  const unrecognised = sections.find((section: any) =>
-    /does not recognise/.test(section.textContent ?? '')
-  )
-  const risk = sections.find((section: any) =>
-    /currently considers at risk/.test(section.textContent ?? '')
-  )
-  assert.ok(unrecognised)
-  assert.match(unrecognised!.textContent ?? '', /Unrecognised verdict user/)
-  assert.doesNotMatch(risk!.textContent ?? '', /Unrecognised verdict user/)
+  const microsoft = microsoftMixedVerdicts()
+  const view = adapter.adaptMicrosoftRiskyUsersResponse(microsoft)
+  const groups = riskyUsersView.microsoftRecordsByPolarity(view)
+  assert.equal(groups.UNRECOGNISED.length, 1)
+  assert.equal(riskyUsersView.microsoftPolarityLabel.UNRECOGNISED, 'Verdict not recognised')
+  assert.ok(!groups.ACTIVE_RISK.includes(groups.UNRECOGNISED[0]!))
+  const result = renderNative(nativeRiskyUsersFixture(), { microsoft })
+  assert.match(compactSummary(result.document).textContent ?? '', /2 active Microsoft risk/)
+  assertIndependentPair()
 })
+test('native contracts P53: Microsoft automatic remediation is not shown as human negligence', () => {
+  // P53: Actor-aware Microsoft details replace old panel text; automatic outcomes must not imply administrator negligence.
 
-test('Microsoft automatic remediation is not shown as human negligence', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
-  assert.match(panel.textContent ?? '', /An administrator dismissed all risk/)
-  assert.match(
-    panel.textContent ?? '',
-    /automatic remediation lands in the dismissed state/
-  )
+  const view = adapter.adaptMicrosoftRiskyUsersResponse(microsoftMixedVerdicts())
+  const groups = riskyUsersView.microsoftRecordsByPolarity(view)
+  const automatic = { ...groups.CLOSED[0]!, riskDetail: 'aiConfirmedSigninSafe' }
+  assert.equal(riskyUsersView.microsoftVerdictPolarity(automatic), 'CLEARED')
+  assert.match(riskyUsersView.microsoftVerdictDetail(automatic), /automated assessment/)
+  assert.doesNotMatch(riskyUsersView.microsoftVerdictDetail(automatic), /administrator/i)
+  assert.match(riskyUsersView.microsoftVerdictDetail(groups.CLOSED[0]!), /administrator dismissed/i)
+  assertIndependentPair()
 })
+test('native contracts P54: a withheld risk level says so instead of reading as no risk', () => {
+  // P54: Withheld Microsoft levels stay active-but-undisclosed in helpers and separate native summary, never read as no risk.
 
-test('a withheld risk level says so instead of reading as no risk', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
-  assert.match(panel.textContent ?? '', /level requires Entra ID P2/)
-  assert.match(panel.textContent ?? '', /not an absence of risk/)
-  // And the level is named as confidence, not severity.
-  assert.match(panel.textContent ?? '', /Microsoft confidence/)
-  assert.match(
-    panel.textContent ?? '',
-    /confidence scale rather than a severity/
-  )
+  const microsoft = microsoftMixedVerdicts()
+  const view = adapter.adaptMicrosoftRiskyUsersResponse(microsoft)
+  const hidden = riskyUsersView.microsoftRecordsByPolarity(view).ACTIVE_RISK.find(user => user.riskLevel === 'hidden')
+  assert.ok(hidden)
+  assert.match(riskyUsersView.microsoftRiskLevelLabel(hidden.riskLevel), /Detected.*level requires Entra ID P2/)
+  assert.equal(riskyUsersView.microsoftLevelsHidden(view), true)
+  assert.match(compactSummary(renderNative(nativeRiskyUsersFixture(), { microsoft }).document).textContent ?? '', /2 active Microsoft risk/)
+  const pair = nativeMicrosoftPair()
+  pair.microsoft.users[0]!.riskLevel = 'hidden'
+  assert.match(renderNative(pair.native, { microsoft: pair.microsoft }).openNativeDrawer().text, /Active risk reported by Microsoft/)
 })
+test('native contracts P55: no raw Microsoft identifier is ever painted on screen', () => {
+  // P55: Raw Microsoft provider IDs remain absent from the native table and real drawer, including an actually correlated active record.
 
-test('no raw Microsoft identifier is ever painted on screen', () => {
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
-  for (const identifier of [
-    'aiConfirmedSigninSafe',
-    'adminDismissedAllRiskForUser',
-    'unknownFutureValue',
-  ]) {
-    assert.doesNotMatch(panel.textContent ?? '', new RegExp(identifier))
+  const pair = nativeMicrosoftPair()
+  pair.microsoft.users[0]!.id = 'SYNTHETIC_PRIVATE_PROVIDER_RECORD'
+  const result = renderNative(pair.native, { microsoft: pair.microsoft })
+  for (const text of [result.text, result.openNativeDrawer().text]) {
+    assert.doesNotMatch(text, /SYNTHETIC_PRIVATE_PROVIDER_RECORD/)
+    assert.ok(!text.includes(pair.native.findings[0]!.subject.ref))
   }
+  assert.match(result.openNativeDrawer().text, /Active risk reported by Microsoft/)
 })
-
 test('a count with no number is words, never a dash or a blank', () => {
   const withheld = assessmentFixture(false)
   withheld.summary.currentUsers = {
@@ -833,273 +895,77 @@ test('the surface never offers to write back to Microsoft', () => {
   }
 })
 
-test('a zero never renders as a clean tenant while findings sit below it', () => {
-  const value = assessmentFixture(true)
-  value.users = ['a', 'b', 'c'].map((character) =>
-    assessmentUser('HV-ID-MBX-001.v1', character)
-  )
-  value.rules[0].matchedIdentities = 0
-  value.rules[2].assessedIdentities = 3
-  value.rules[2].matchedIdentities = 3
-  value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
-  const { document, text, cardText } = render(value)
+test('native contracts C59: a zero never renders as a clean tenant while findings sit below it', () => {
+  // C59: A native person count does not erase mailbox findings; zero people is not an all-clear when supporting evidence exists.
 
-  for (const [label, rendered] of [
-    ['section', text],
-    ['overview card', cardText],
-  ] as const) {
-    assert.match(rendered, /but there are findings/, label)
-    // What was found is beside the number, not only further down the page.
-    assert.match(rendered, /External mailbox forwarding: 3 mailboxes/, label)
+  const native = nativeMailbox()
+  native.count.accuracy = 'EXACT'
+  native.count.value = 0
+  native.withheld = []
+  const result = renderNative(native)
+  assert.equal(actionableRows(result.document).length, 0)
+  assertNativeCountCopy(native, result)
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /What HawkView did find/)
+    assert.match(text, /External mailbox forwarding/)
+    assert.doesNotMatch(text, /all users are safe|no findings anywhere/i)
   }
-
-  // The empty user list must not answer the question the zero did not.
-  const list = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"]'
-  )
-  assert.ok(list)
-  assert.doesNotMatch(
-    list!.textContent ?? '',
-    /No user is listed as needing attention/
-  )
-  assert.match(list!.textContent ?? '', /it is not an all-clear/)
-
-  // A genuinely clean tenant still gets the plain sentence.
-  const clean = render(assessmentFixture(false))
-  assert.match(
-    clean.document.querySelector('[aria-labelledby="risky-users-list-heading"]')
-      ?.textContent ?? '',
-    /No user is listed as needing attention/
-  )
-  assert.doesNotMatch(clean.text, /but there are findings/)
+  assert.ok(result.document.querySelector('[aria-labelledby="risky-users-context-heading"]'))
 })
-
-test('a user both systems reported shows both, and neither is folded in', () => {
-  // The strongest signal this product can produce, and the reason the join was
-  // worth waiting for rather than faking.
-  const key = {
-    available: true,
-    shape: 'DIRECTORY_OBJECT_ID',
-    ref: '11111111-2222-3333-4444-555555555555',
-  }
-  const value = assessmentFixture(true)
-  value.users[0].correlation = key
-  value.users[0].displayName = 'Alice Chen'
-  value.users[0].userPrincipalName = 'alice.chen@synthetic.invalid'
-
-  const envelope = syntheticRiskResponses().microsoftRiskyUsers
-  const microsoft = {
-    ...envelope,
-    users: [
-      {
-        id: 'ms-1',
-        identityLabel: 'Alice Chen',
-        correlation: key,
-        riskLevel: 'high',
-        riskState: 'atRisk',
-        riskDetail: null,
-        observedAt: envelope.observedAt,
-      },
-    ],
-    pageInfo: { hasMore: false, nextCursor: null },
-  }
-
-  const { document } = render(value, { microsoft })
-  const row = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"] tbody tr'
-  )
-  assert.ok(row)
-  const detectedBy = row!.querySelectorAll('td')[1]?.textContent ?? ''
-  assert.match(detectedBy, /HawkView/)
-  assert.match(detectedBy, /Microsoft/)
-  assert.match(detectedBy, /HawkView and Microsoft/)
-  assert.doesNotMatch(detectedBy, /Not comparable|did not report|unavailable/)
-
-  // The resolved identity is shown rather than the opaque reference.
-  const identity = row!.querySelectorAll('td')[0]?.textContent ?? ''
-  assert.match(identity, /Alice Chen/)
-  assert.match(identity, /alice.chen@synthetic.invalid/)
-  assert.doesNotMatch(identity, /hvr1_subject_/)
-
-  // Microsoft's record still lives in Microsoft's own panel, and the HawkView
-  // count is unchanged by it.
-  const summary = document.querySelector(
-    '[aria-labelledby="risky-users-total-heading"]'
-  )
-  assert.match(summary?.textContent ?? '', /Risky user/)
+test('native contracts R60: a user both systems reported shows both, and neither is folded in', () => {
+  // R60: A correlated native user has independent source badges and a real drawer, not a legacy merged assessment row.
+  assertIndependentPair()
 })
+test('native contracts R61: Microsoft looked and did not report this user is a distinct sentence', () => {
+  // R61: NOT_REPORTED requires comparable Microsoft evidence; unlike NOT_COMPARABLE it may state no active record but never safety.
 
-test('Microsoft looked and did not report this user is a distinct sentence', () => {
-  const value = assessmentFixture(true)
-  value.users[0].correlation = {
-    available: true,
-    shape: 'DIRECTORY_OBJECT_ID',
-    ref: 'aaaa-user',
-  }
-  const envelope = syntheticRiskResponses().microsoftRiskyUsers
-  const microsoft = {
-    ...envelope,
-    users: [
-      {
-        id: 'ms-other',
-        identityLabel: 'Someone else',
-        correlation: {
-          available: true,
-          shape: 'DIRECTORY_OBJECT_ID',
-          ref: 'bbbb-other',
-        },
-        riskLevel: 'high',
-        riskState: 'atRisk',
-        riskDetail: null,
-        observedAt: envelope.observedAt,
-      },
-    ],
-    pageInfo: { hasMore: false, nextCursor: null },
-  }
-  const { document } = render(value, { microsoft })
-  const detectedBy =
-    document
-      .querySelector('[aria-labelledby="risky-users-list-heading"] tbody tr')
-      ?.querySelectorAll('td')[1]?.textContent ?? ''
-  assert.match(detectedBy, /Microsoft did not report this user/)
-  assert.doesNotMatch(detectedBy, /Not comparable/)
+  assertNoActiveMicrosoftControl()
+  assertNoMicrosoftConclusion()
 })
+test('native contracts N62: per-check identity counts cannot be read as tenant coverage', () => {
+  // N62: Native detector/event scope cannot become a per-check identity population or tenant-wide denominator.
 
-test('per-check identity counts cannot be read as tenant coverage', () => {
-  const { text } = render(assessmentFixture(false))
-  // Labelled as what the check evaluated, never as a share of the tenant.
-  assert.match(text, /identities evaluated by this check/)
-  assert.match(text, /does not report how many identities exist in this tenant/)
-  assert.match(text, /two checks may have evaluated different populations/)
-  // And the zero carries the same admission beside the number itself.
-  assert.match(text, /not a proportion of your people/)
-})
-
-test('a corroborated row never reads as a combined judgement', () => {
-  // Microsoft calls this person at risk with high confidence in its own panel.
-  // HawkView rates its own finding Low. Both are true; a row labelled
-  // "HawkView and Microsoft" carrying a bare "Low" reads as the verdict of
-  // both, and a technician triaging by that column works the one row where two
-  // systems agree last.
-  const key = {
-    available: true,
-    shape: 'DIRECTORY_OBJECT_ID',
-    ref: 'shared-guid',
-  }
-  const value = assessmentFixture(true)
-  value.users[0].correlation = key
-  value.users[0].displayName = 'Alice Chen'
-  // A second, uncorroborated user that HawkView rates higher.
-  const louder = assessmentUser('HV-ID-AUTH-005.v2', 'b')
-  louder.label = 'Higher priority, one source'
-  value.users.push(louder)
-  value.rules[1].matchedIdentities = 1
-  value.summary.currentUsers = { value: 2, accuracy: 'EXACT' }
-
-  const envelope = syntheticRiskResponses().microsoftRiskyUsers
-  const microsoft = {
-    ...envelope,
-    users: [
-      {
-        id: 'ms-1',
-        identityLabel: 'Alice Chen',
-        correlation: key,
-        riskLevel: 'high',
-        riskState: 'atRisk',
-        riskDetail: null,
-        observedAt: envelope.observedAt,
-      },
-    ],
-    pageInfo: { hasMore: false, nextCursor: null },
-  }
-
-  const { document } = render(value, { microsoft })
-  const rows = [
-    ...document.querySelectorAll(
-      '[aria-labelledby="risky-users-list-heading"] tbody tr'
-    ),
-  ]
-  assert.equal(rows.length, 2)
-
-  // The column names whose rating it is.
-  const headers = [...document.querySelectorAll('th')].map((cell: any) =>
-    cell.textContent?.trim()
-  )
-  assert.ok(headers.includes('HawkView priority'))
-
-  // Microsoft's own verdict travels with the row rather than living only in
-  // the panel above, so the two are read together.
-  const alice = rows.find((row: any) =>
-    /Alice Chen/.test(row.textContent ?? '')
-  )
-  assert.ok(alice)
-  assert.match(alice!.textContent ?? '', /Microsoft says/)
-  assert.match(alice!.textContent ?? '', /At risk/)
-  assert.match(alice!.textContent ?? '', /High confidence/)
-  // And the cell says the rating is HawkView's alone.
-  assert.match(alice!.textContent ?? '', /rating of its own finding/)
-
-  // HawkView's own priority still orders HawkView's list: the Medium leads the
-  // corroborated Low. Ordering on corroboration would have made the position
-  // of a HawkView finding depend on the customer's Microsoft licensing, which
-  // is a rule that changes per tenant without saying so.
-  assert.match(rows[0].textContent ?? '', /Higher priority, one source/)
-  assert.match(rows[1].textContent ?? '', /Alice Chen/)
-  // The ordering is stated rather than left to be inferred.
-  const list = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"]'
-  )
-  assert.match(list!.textContent ?? '', /whatever its Microsoft licensing/)
-  assert.match(list!.textContent ?? '', /never combined into one score/)
-})
-
-test('a person and a mailbox sharing a name are visibly different subjects', () => {
-  // A shared mailbox named after its owner is ordinary in Microsoft 365. Two
-  // rows reading "Alice Chen" with different priorities look like the page
-  // contradicting itself unless each says what it is a row about.
-  const value = assessmentFixture(true)
-  value.users[0].displayName = 'Alice Chen'
-  const mailbox = assessmentUser('HV-ID-MBX-001.v1', 'd')
-  mailbox.label = 'Alice Chen'
-  value.users.push(mailbox)
-  value.rules[2].assessedIdentities = 2
-  value.rules[2].matchedIdentities = 1
-
-  const { document } = render(value)
-  const counted = document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"] tbody tr'
-  )
-  const supporting = document.querySelector(
-    '[aria-labelledby="risky-users-context-heading"] tbody tr'
-  )
-  assert.ok(counted)
-  assert.ok(supporting)
-  assert.match(counted!.textContent ?? '', /Alice Chen/)
-  assert.match(supporting!.textContent ?? '', /Alice Chen/)
-  // Each row says which kind of subject it is, so the two are not read as one
-  // person the page cannot make its mind up about.
-  assert.match(counted!.textContent ?? '', /User account/)
-  assert.match(supporting!.textContent ?? '', /Mailbox/)
-})
-
-test('several withholding reasons all reach the screen', () => {
-  const value = assessmentFixture(false)
-  value.summary.currentUsers = {
-    value: null,
-    accuracy: 'UNKNOWN',
-    reasons: ['UNRESOLVED_SUBJECT_IDENTITY', 'UNINTERPRETABLE_EVIDENCE'],
-  }
-  const { text, cardText } = render(value)
-  for (const [label, rendered] of [
-    ['section', text],
-    ['overview card', cardText],
-  ] as const) {
-    assert.match(rendered, /2 reasons/, label)
-    assert.match(rendered, /belongs to a person/, label)
-    assert.match(rendered, /does not recognise/, label)
+  const native = nativeZero()
+  const result = renderNative(native)
+  assertNativeCountCopy(native, result)
+  for (const text of [result.text, result.cardText]) {
+    assert.match(text, /Every event this run examined/)
+    assert.doesNotMatch(text, /\d+ identities evaluated|of \d+ identities|all identities examined/i)
+    assert.match(text, /investigation leads, not confirmed compromise/i)
   }
 })
+test('native contracts N63: a corroborated row never reads as a combined judgement', () => {
+  // N63: Independent native/Microsoft signals replace a corroborated legacy judgement; no combined score is introduced.
+  assertIndependentPair()
+})
+test('native contracts R64: a person and a mailbox sharing a name are visibly different subjects', () => {
+  // R64: Native USER and MAILBOX subjects with one display name remain distinct regions and drawer evidence, never merged by label.
 
+  const native = nativeRiskyUsersFixture()
+  const mailbox = nativeMailbox().findings[0]!
+  mailbox.subject.displayName = native.findings[0]!.subject.displayName
+  native.findings.push(mailbox)
+  const result = renderNative(native)
+  assert.equal(actionableRows(result.document).length, 1)
+  const context = result.document.querySelector('[aria-labelledby="risky-users-context-heading"]')
+  assert.ok(context)
+  assert.match(context.textContent ?? '', /Native fixture user/)
+  assert.match(compactSummary(result.document).textContent ?? '', /1 users requiring review/)
+  assert.match(result.openNativeDrawer(native.findings[0]!.subject.ref).text, /10 rejected sign-ins/)
+  assert.match(result.openNativeDrawer(mailbox.subject.ref).text, /3 external destinations/)
+})
+test('native contracts C65: several withholding reasons all reach the screen', () => {
+  // C65: Every supplied native withholding reason reaches both count surfaces, instead of selecting one legacy reason.
+
+  const native = nativeWithheld()
+  native.withheld.push({ stream: 'synthetic.sign-ins', because: 'UNINTERPRETED_EVENTS' })
+  const result = renderNative(native)
+  const count = assertNativeCountCopy(native, result)
+  assert.equal(count.reasons.length, 2)
+  for (const text of [result.text, result.cardText]) assert.ok(count.reasons.every(reason => text.includes(reason)))
+  const healthy = renderNative()
+  for (const reason of count.reasons) assert.ok(!healthy.text.includes(reason))
+})
 test('the no-safe-verdict boundary is on screen, not only announced', () => {
   // It is the product's central claim about what these numbers are. On the
   // overview card it lived in a visually-hidden label, so a sighted technician
@@ -1146,31 +1012,14 @@ test('a hidden label does not repeat what its visible partner already says', () 
   assert.ok(labels.includes('1'))
 })
 
-test('the Microsoft panel names the question it answers, not just its source', () => {
-  // Microsoft answers two different questions by two different roads: this
-  // API gives its current assessment of a person, and sign-in verdicts give
-  // its reading of one event as logged. They can disagree without either being
-  // wrong. A heading that says only "Microsoft" invites that disagreement to
-  // read as Microsoft contradicting itself, and makes it possible to drop
-  // event-level rows into a user-level group without anyone noticing.
-  const { document } = render(assessmentFixture(true), {
-    microsoft: microsoftMixedVerdicts(),
-  })
-  const panel = microsoftPanel(document)
+test('native contracts P68: the compact summary names active Microsoft risk without a combined score', () => {
+  // P68: The compact summary answers active Microsoft risk with attribution, not the removed panel heading or a merged score.
 
-  // Every group names its subject as a user.
-  for (const heading of [...panel.querySelectorAll('h5')]) {
-    assert.match(
-      heading.textContent ?? '',
-      /^Users /,
-      heading.textContent ?? ''
-    )
-  }
-  // And the panel names the tense and the evidence base.
-  assert.match(panel.textContent ?? '', /considers at risk now/)
-  assert.match(panel.textContent ?? '', /telemetry HawkView cannot see/)
+  const result = assertIndependentPair()
+  assert.match(compactSummary(result.document).textContent ?? '', /active Microsoft risk/)
+  assert.match(result.openNativeDrawer().text, /Microsoft Entra ID Protection/)
+  assert.match(result.text, /never combined into a single score/)
 })
-
 /* -------------------------------------------------------------------------- */
 /* Tenant and session scoping                                                 */
 /* -------------------------------------------------------------------------- */
@@ -1239,249 +1088,107 @@ test('every read is keyed to the exact tenant and the authorised session', () =>
   assert.notDeepEqual(keys[0], keys[1])
 })
 
-test('a reporting Microsoft channel with no records says so, rather than showing nothing', () => {
-  // "Microsoft is looking and currently lists nobody at risk" is a result and
-  // is worth having. Rendering nothing made it indistinguishable from having
-  // failed to fetch Microsoft's records, and hid the one statement that
-  // separates an authoritative empty snapshot from an unconfirmed one.
-  const { document } = render(assessmentFixture(true), {
-    microsoft: syntheticRiskResponses().microsoftRiskyUsers,
-  })
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.ok(panel)
-  assert.match(panel!.textContent ?? '', /reporting on this tenant/)
-  assert.match(panel!.textContent ?? '', /Microsoft records reported/)
-  assert.match(
-    panel!.textContent ?? '',
-    /latest complete, current Microsoft snapshot is empty/
-  )
-  // And it does not become a HawkView safety verdict on the way.
-  assert.match(panel!.textContent ?? '', /not a HawkView safety verdict/)
-})
+test('native contracts P70: a reporting Microsoft channel with no records says so, rather than showing nothing', () => {
+  // P70: A complete available empty Microsoft snapshot can report zero active risk, independently of HawkView and without a safety verdict.
 
-test('an unavailable Microsoft channel adds no empty-count line', () => {
-  // There the panel already explains itself, and a second "no records" line
-  // would be noise that competes with the licence statement.
-  const { document } = render(assessmentFixture(true))
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.match(panel!.textContent ?? '', /requires Entra ID P2/)
-  assert.doesNotMatch(panel!.textContent ?? '', /Microsoft records reported/)
+  const pair = nativeMicrosoftPair()
+  pair.microsoft.users = []
+  const result = renderNative(pair.native, { microsoft: pair.microsoft })
+  const summary = compactSummary(result.document).textContent ?? ''
+  assert.match(summary, /0 active Microsoft risk/)
+  assert.match(summary, /1 users requiring review/)
+  assert.doesNotMatch(summary, /tenant is safe|all-clear/i)
+  assertNoActiveMicrosoftControl()
 })
+test('native contracts P71: an unavailable Microsoft channel adds no empty-count line', () => {
+  // P71: An unavailable Microsoft channel cannot earn a numeric empty count from an empty array.
 
-test('an unconfirmed empty Microsoft result never becomes an authoritative zero', () => {
-  // The distinction microsoftHasConfirmedEmptySnapshot exists to make. An
-  // empty page while Microsoft reports further pages is not a clean tenant,
-  // and it must not borrow the wording of one.
-  const envelope = syntheticRiskResponses().microsoftRiskyUsers
-  const { document } = render(assessmentFixture(true), {
-    microsoft: {
-      ...envelope,
-      users: [],
-      pageInfo: { hasMore: true, nextCursor: 'cursor.abc' },
-    },
-  })
-  const panel = document.querySelector(
-    '[aria-labelledby="microsoft-channel-heading"]'
-  )
-  assert.ok(panel)
-  assert.match(panel!.textContent ?? '', /Microsoft count unavailable/)
-  assert.match(panel!.textContent ?? '', /It is not zero/)
-  // Never the confirmed-empty wording, and never a zero lower bound.
-  assert.doesNotMatch(panel!.textContent ?? '', /snapshot is empty/)
-  assert.doesNotMatch(panel!.textContent ?? '', /At least 0/)
-  assert.doesNotMatch(panel!.textContent ?? '', /≥0/)
+  const result = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftWithoutP2() })
+  const summary = compactSummary(result.document).textContent ?? ''
+  assert.match(summary, /requires Entra ID P2/)
+  assert.doesNotMatch(summary, /0 active Microsoft risk/)
+  assert.equal(actionableRows(result.document).length, 1)
 })
+test('native contracts P72: an unconfirmed empty Microsoft result never becomes an authoritative zero', () => {
+  // P72: Unconfirmed empty Microsoft pages and unavailable reads never become authoritative zero, unlike a complete reporting control.
 
-test('two reasons with different dates never share one', () => {
-  // Real shape from the fleet: an account with 467 lockouts that stopped six
-  // days before its last password rejection. A row listing both titles beside
-  // a single "last seen" describes the quieter signal and makes the louder one
-  // look current — two true facts implying a false third.
-  const value = assessmentFixture(true)
-  const older = JSON.parse(JSON.stringify(value.users[0].findings[0]))
-  older.id = older.id.replace(/a{4}$/, 'bbbb')
-  older.ruleId = 'HV-ID-AUTH-005.v2'
-  older.ruleVersion = 'v2'
-  older.priority = 'MEDIUM'
-  older.title = 'Failures followed by successful sign-in'
-  older.firstSeen = at(-14)
-  older.lastSeen = at(-12)
-  older.activityWindowEndsAt = at(-11)
-  older.window = { start: at(-15), end: at() }
-  older.evidenceCount = 467
-  older.clientSource = {
-    reference: 'hvr1_context_' + 'a'.repeat(64),
-    qualification: 'QUALIFIED',
+  for (const microsoft of [{ ...microsoftLive(true), users: [] }, microsoftWithoutP2()]) {
+    const result = renderNative(nativeRiskyUsersFixture(), { microsoft })
+    assert.doesNotMatch(compactSummary(result.document).textContent ?? '', /0 active Microsoft risk/)
   }
-  value.users[0].findings.push(older)
-  value.users[0].priority = 'MEDIUM'
-  value.rules[1].matchedIdentities = 1
-
-  const { document } = render(value)
-  const cell =
-    document.querySelector(
-      '[aria-labelledby="risky-users-list-heading"] tbody tr td'
-    )?.textContent ?? ''
-
-  // Each reason states its own volume and its own recency.
-  assert.match(cell, /Repeated invalid credentials/)
-  assert.match(cell, /Failures followed by successful sign-in/)
-  assert.match(cell, /467 records/)
-  assert.match(cell, /10 records/)
-  // Two different dates are present, so neither number sits beside the
-  // other's. Split on the label rather than pattern-matching a locale date.
-  const afterLast = cell
-    .split('last ')
-    .slice(1)
-    .map((part: string) => part.trim())
-  assert.equal(afterLast.length, 2, cell)
-  assert.notEqual(afterLast[0], afterLast[1], cell)
-
-  // And the column that aggregates says that is what it does.
-  const headers = [...document.querySelectorAll('th')].map((h: any) =>
-    h.textContent?.trim()
-  )
-  assert.ok(headers.includes('Latest of any reason'))
-  assert.ok(!headers.includes('Last seen'))
+  const complete = renderNative(nativeRiskyUsersFixture(), { microsoft: { ...microsoftLive(), users: [] } })
+  assert.match(compactSummary(complete.document).textContent ?? '', /0 active Microsoft risk/)
 })
+test('native contracts S73: two reasons with different dates never share one', () => {
+  // S73: Real native drawer items replace collapsed legacy row text; each signal retains its own count and instant.
 
-test('a setting is never counted as though it were a sequence of events', () => {
-  // The mailbox check counts the external destinations a mailbox is currently
-  // configured to forward to, and its timestamp is when HawkView read that
-  // configuration. Every other check counts events that happened, and its
-  // timestamp is when the last one happened. Both arrive in the same two
-  // fields, so one phrase for both is false for one of them.
-  //
-  // "10 records, last 4:12 p.m." says ten things happened and the newest was
-  // minutes ago. The truth is that one setting names ten destinations and
-  // 4:12 p.m. is when we looked. The read time is always recent, which makes
-  // every forwarding finding read as though it were unfolding right now --
-  // backwards, since a rule set six months ago is the worse case.
-  const value = assessmentFixture(true)
-  value.users = [assessmentUser('HV-ID-MBX-001.v1', 'a')]
-  value.rules[0].matchedIdentities = 0
-  value.rules[2].assessedIdentities = 1
-  value.rules[2].matchedIdentities = 1
-  const { document } = render(value)
-  // Mailbox evidence is never counted as a person, so the row lives in the
-  // context region rather than the user list.
-  const list =
-    document.querySelector('[aria-labelledby="risky-users-context-heading"]')
-      ?.textContent ?? ''
-
-  assert.match(list, /10 external destinations/)
-  assert.match(list, /configuration read/)
-  // The row must not describe the setting in the vocabulary of events.
-  assert.ok(!/10 records/.test(list), 'destinations rendered as event records')
-  assert.ok(
-    !/configured to forward[^.]*, last /.test(list),
-    'a read time rendered as an occurrence time'
-  )
-
-  // The aggregate beside the reason is the half that survives a per-reason fix.
-  // "Latest of any reason" is a maximum over timestamps that do not all mean
-  // the same thing, and a read time is always the most recent thing on the
-  // page, so an unlabelled column puts every forwarding row at the top and
-  // tells the reader it just happened.
-  assert.match(list, /when HawkView read a setting, not when anything happened/)
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [
+    nativeSignal('PASSWORD_REJECTED', 12, 'EVENT_OCCURRED', '2026-09-08T21:01:00.000Z'),
+    nativeSignal('LOCKED_OUT_AFTER_REPEATED_FAILURES', 462, 'EVENT_OCCURRED', '2026-09-08T21:58:00.000Z'),
+  ]
+  const drawer = renderNative(native).openNativeDrawer()
+  const items = findingItems(drawer.document)
+  assert.equal(items.length, 2)
+  assert.match(items[0]!.textContent ?? '', /12 rejected sign-ins/)
+  assert.match(items[1]!.textContent ?? '', /462 matching events/)
+  const dates = native.findings[0]!.signals.map(signal => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(signal.latest!.at)))
+  assert.notEqual(dates[0], dates[1])
+  assert.ok(items[0]!.textContent?.includes(dates[0]!))
+  assert.ok(!items[0]!.textContent?.includes(dates[1]!))
+  assert.ok(items[1]!.textContent?.includes(dates[1]!))
+  assert.ok(!items[1]!.textContent?.includes(dates[0]!))
+  assert.doesNotMatch(drawer.text, /474/)
 })
+test('native contracts S74: a setting is never counted as though it were a sequence of events', () => {
+  // S74: Native latest.kind determines configuration-read timing; the old rule-name heuristic is not carried forward.
 
-test('an event check keeps the event vocabulary', () => {
-  // The guard above must not have been bought by flattening every check into
-  // the cautious wording. A check that really does count events still says so.
-  const { document } = render(assessmentFixture(true))
-  const list =
-    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
-      ?.textContent ?? ''
-  assert.match(list, /10 records, last /)
-  assert.ok(
-    !/external destinations/.test(list),
-    'an event check borrowed the state vocabulary'
-  )
-  assert.ok(
-    !/read a setting/.test(list),
-    'an event row was told its own timestamp was a read time'
-  )
+  const native = nativeMailbox()
+  const item = findingItems(renderNative(native).openNativeDrawer().document)[0]!
+  assert.match(item.textContent ?? '', /3 external destinations/)
+  assert.match(item.textContent ?? '', /Configuration read/)
+  assert.doesNotMatch(item.textContent ?? '', /Last observed/)
 })
+test('native contracts N75: an event check keeps the event vocabulary', () => {
+  // N75: Native event timing replaces the legacy collapsed event sentence, using the signal's own kind and volume.
 
-test('an unrecognised rule never lets its identifier become the description', () => {
-  // Backend rule catalogues move on their own schedule, so a check this build
-  // has never seen will appear in a row eventually. The row has to say
-  // something, and the two tempting options are both wrong: "10 records"
-  // guesses a unit the mailbox check has already proved can be wrong, and the
-  // identifier is not a sentence a technician can act on.
-  const value = assessmentFixture(true)
-  const subject = assessmentUser('HV-ID-AUTH-005.v2', 'a')
-  subject.findings[0].ruleId = 'HV-ID-NEW-777.v1'
-  value.users = [subject]
-  // The server publishes the new check in its readiness list; only this build's
-  // own catalogue is behind. That is the case worth covering, because it is the
-  // one that happens on every backend release.
-  value.rules.push({
-    ...value.rules[1],
-    ruleId: 'HV-ID-NEW-777.v1',
-    ruleVersion: 'v1',
-    title: 'A check released after this build',
-    matchedIdentities: 1,
-  })
-  value.rules[0].matchedIdentities = 0
-  const { document } = render(value)
-  const list =
-    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
-      ?.textContent ?? ''
-
-  assert.match(list, /does not know this check/)
-  assert.ok(!/10 records/.test(list), 'a unit was guessed for an unknown rule')
-  assert.ok(
-    !/HV-ID-NEW-777/.test(list),
-    'an identifier was rendered where a description belongs'
-  )
+  const drawer = renderNative().openNativeDrawer()
+  const item = findingItems(drawer.document)[0]!
+  assert.match(item.textContent ?? '', /10 rejected sign-ins/)
+  assert.match(item.textContent ?? '', /Last observed/)
+  assert.doesNotMatch(item.textContent ?? '', /Configuration read/)
 })
+test('native contracts N76: an unrecognised rule never lets its identifier become the description', () => {
+  // N76: Unknown native detector codes are technical metadata only, not descriptions, guidance, or invented evidence units.
 
-test('a check that ran without a time says so, and is not called unreported', () => {
-  // No detector emits a dateless finding today, and that is a fact about the
-  // two detectors that exist rather than about the contract. The alternative to
-  // handling it is a default — now, the epoch, the empty string — which would
-  // place the row somewhere specific in the one column that means recency, on
-  // the strength of a value nobody supplied.
-  //
-  // The words matter as much as the handling. "Not reported" describes a gap in
-  // collection. A check that ran and produced evidence carrying no time is a
-  // gap in the evidence, and sending a technician to look at collection for it
-  // is this surface's standing mistake in miniature.
-  const { document } = render(assessmentFixture(true), {
-    afterAdapt: (value) => {
-      for (const finding of value.users[0].findings) finding.lastSeen = null
-    },
-  })
-  const rows = Array.from(
-    document.querySelectorAll(
-      '[aria-labelledby="risky-users-list-heading"] tbody tr'
-    )
-  ) as Element[]
-  const dateless = rows.find((row) =>
-    row.textContent?.includes('No time recorded')
-  )
-  assert.ok(dateless, 'the dateless row rendered no distinct state')
-  assert.match(
-    dateless!.textContent ?? '',
-    /the checks ran; their evidence carries no time/
-  )
-  assert.ok(
-    !/Not reported/.test(dateless!.textContent ?? ''),
-    'an evidence gap was reported as a collection gap'
-  )
-  // The reason line beside it must not invent one either.
-  assert.ok(
-    !/, last /.test(dateless!.textContent ?? ''),
-    'a reason without a time was given one'
-  )
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.detectorId = 'FUTURE_DETECTOR_<b>UNKNOWN</b>'
+  native.findings[0]!.signals = [nativeSignal('FUTURE_SIGNAL', 9)]
+  const result = renderNative(native)
+  const drawer = result.openNativeDrawer()
+  assert.match(primaryText(drawer.document), /Security activity needs review/)
+  assert.doesNotMatch(primaryText(drawer.document), /FUTURE_DETECTOR|FUTURE_SIGNAL|9 records/)
+  const technical = [...drawer.document.querySelectorAll('details')].find(detail => detail.querySelector('summary')?.textContent === 'Technical details')
+  assert.ok(technical)
+  assert.ok(technical.textContent?.includes(native.findings[0]!.detectorId))
+  assert.equal(technical.querySelector('b'), null)
+  assert.doesNotMatch(nativeTable(result.document).textContent ?? '', /FUTURE_DETECTOR|FUTURE_SIGNAL/)
 })
+test('native contracts S77: a check that ran without a time says so, and is not called unreported', () => {
+  // S77: A genuine native dateless finding is evidence without a timestamp, not failed collection or an unreported finding.
 
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals[0]!.latest = null
+  const result = renderNative(native)
+  assert.match(nativeTable(result.document).textContent ?? '', /No time recorded/)
+  const drawer = result.openNativeDrawer()
+  assert.match(drawer.text, /No evidence time recorded/)
+  assert.match(drawer.text, /Dateless evidence/)
+  assert.doesNotMatch(drawer.text, /Last observed.*Not reported|Latest evidence.*Not reported|Evaluated.*Not reported/)
+  const dated = renderNative().openNativeDrawer()
+  assert.match(dated.text, /Current evidence/)
+  assert.doesNotMatch(dated.text, /No evidence time recorded/)
+})
 test('a row with no time sorts after dated rows rather than being coerced to one', () => {
   // Scope of this guard, stated because mutation testing narrowed it: the
   // empty-string fallback it replaced already produced this order, so reverting
@@ -1507,7 +1214,7 @@ test('a row with no time sorts after dated rows rather than being coerced to one
   const names = (
     Array.from(
       document.querySelectorAll(
-        '[aria-labelledby="risky-users-list-heading"] tbody tr'
+        '[aria-labelledby="risky-users-table-heading"] tbody tr'
       )
     ) as Element[]
   ).map((row) => row.textContent ?? '')
@@ -1519,106 +1226,37 @@ test('a row with no time sorts after dated rows rather than being coerced to one
   assert.ok(names[1].includes('No time recorded'))
 })
 
-test('an exact zero over a population never examined is not a clean tenant', () => {
-  // This is the live engine's output on all five tenants right now: an exact
-  // zero, with zero eligible subjects, on three tenants that are under attack.
-  // It is the state this surface is most likely to be asked to render today,
-  // and until the wire exists it is also the state it has never met.
-  //
-  // Both cohorts are asserted together on purpose. A gate that fires on the
-  // unexamined tenant proves nothing on its own — it has to be shown not to
-  // fire on the tenant that really was checked and really was clean, or it is
-  // a warning that is always on, which a technician learns to skim past.
-  const tenant = (assessedIdentities: number) => {
-    const value = assessmentFixture(false)
-    value.users = []
-    value.summary.currentUsers = { value: 0, accuracy: 'EXACT' }
-    for (const rule of value.rules) {
-      rule.assessedIdentities = assessedIdentities
-      rule.matchedIdentities = 0
-    }
-    return render(value)
-  }
+test('native contracts N79: an exact zero over a population never examined is not a clean tenant', () => {
+  // N79: NOTHING_APPLICABLE or absent scope cannot become a clean tenant; native scope does not invent assessed-identity populations.
 
-  const neverExamined = tenant(0)
-  assert.match(neverExamined.cardText, /No findings can be confirmed yet/)
-  assert.match(neverExamined.cardText, /lack a complete evaluated scope/)
-  assert.ok(
-    !/reported no matches/.test(neverExamined.cardText),
-    'a tenant nothing was examined on was described as having been checked'
-  )
-
-  // The coverage panel must not describe the check as having run over a
-  // population either. "0 identities evaluated" reads as a check that examined
-  // people and found none; the truth is that it had nobody to examine, and one
-  // of those is a quiet tenant while the other is a broken pipeline.
-  assert.match(neverExamined.text, /no identities were in scope for this check/)
-  assert.ok(
-    !/0 identities evaluated/.test(neverExamined.text),
-    'an empty population was rendered as an evaluated one'
-  )
-
-  // The control: a tenant that really was checked keeps its clean-sweep
-  // sentence, so the gate above is discriminating rather than always on.
-  const clean = tenant(5)
-  assert.match(clean.cardText, /No findings in evaluated evidence/)
-  assert.match(clean.cardText, /reported no matches/)
-  assert.match(clean.text, /5 identities evaluated by this check/)
-  assert.ok(
-    !/No findings can be confirmed yet/.test(clean.cardText),
-    'the unexamined-tenant gate fired on a tenant that was examined'
-  )
+  const noApplicable = nativeWithheld('NOTHING_APPLICABLE')
+  noApplicable.findings = []
+  noApplicable.coverage = []
+  const result = renderNative(noApplicable)
+  assertNativeCountCopy(noApplicable, result)
+  assert.match(result.text, /Not counted/)
+  assert.doesNotMatch(result.text, /0 users requiring review|identities evaluated/)
+  const emptyScope = nativeZero()
+  emptyScope.coverage = []
+  const missingScope = renderNative(emptyScope)
+  assert.match(missingScope.text, /did not report what it examined/)
+  assert.match(missingScope.cardText, /cannot be read as covering any particular scope/)
 })
+test('native contracts C80: a count with no findings behind it is a gap, never an all-clear', () => {
+  // C80: A native positive count with no delivered findings remains a delivery gap, distinct from both an empty count and a partial list.
 
-test('a count with no findings behind it is a gap, never an all-clear', () => {
-  // The first shape a real assessment will take. The read path can serve
-  // coverage, count and claim while findings have nowhere to persist, so a
-  // response that states four users and carries no finding is not a defensive
-  // branch — it is the state the wire produces on its first day.
-  //
-  // Each component on its own sees something coherent: the tile a number, the
-  // list an emptiness. The contradiction lives only in the pair, and the
-  // sentence the list used to fall through to made it worse by pointing the
-  // reader up at the summary — which confidently says four.
-  const value = assessmentFixture(false)
-  value.users = []
-  value.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
-  value.rules[0].assessedIdentities = 12
-  value.rules[0].matchedIdentities = 4
-  const { document, cardText } = render(value)
-  const list =
-    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
-      ?.textContent ?? ''
-
-  assert.match(list, /reports 4 users with current findings/)
-  assert.match(list, /gap in what this response delivered/)
-  assert.ok(
-    !/No user is listed as needing attention/.test(list),
-    'a number of users was rendered beside a sentence saying none need attention'
-  )
-
-  // The card carries the whole claim on its own, because it is often the only
-  // Risky Users surface a technician sees.
-  assert.match(cardText, /did not come back with it/)
-  assert.ok(
-    !/No user is listed as needing attention/.test(cardText),
-    'the standalone card left the contradiction to the section'
-  )
-
-  // Control: a count with its findings behind it says none of this. Without
-  // this half the guard would pass just as well if the disclosure were always
-  // on, which is a warning a technician learns to skim.
-  const delivered = render(assessmentFixture(true))
-  assert.ok(
-    !/did not come back with it/.test(delivered.cardText),
-    'the disclosure fired on a response that delivered its findings'
-  )
-  assert.ok(
-    !/gap in what this response delivered/.test(delivered.text),
-    'the disclosure fired on a response that delivered its findings'
-  )
+  const native = nativeZero()
+  native.count.value = 4
+  const result = renderNative(native)
+  const count = nativeProjection.nativeRiskyUserCount(native)
+  assert.equal(count.listCoverage, 'NONE_DELIVERED')
+  assert.equal(actionableRows(result.document).length, 0)
+  assert.ok(nativeTable(result.document).textContent?.includes(riskyUsersView.riskyUsersEmptyState(count, false).sentence))
+  assert.match(result.cardText, /did not come back with it/)
+  assert.doesNotMatch(result.text, /0 users requiring review|Showing 0 of 0/)
+  const delivered = renderNative()
+  assert.doesNotMatch(delivered.cardText, /did not come back with it/)
 })
-
 const withSignals = (signals: unknown) => {
   const value = assessmentFixture(true)
   value.users[0].findings[0].title = 'Repeated invalid credentials'
@@ -1629,278 +1267,178 @@ const withSignals = (signals: unknown) => {
 
 const rowText = (document: Document) =>
   document.querySelector(
-    '[aria-labelledby="risky-users-list-heading"] tbody tr'
+    '[aria-labelledby="risky-users-table-heading"] tbody tr'
   )?.textContent ?? ''
 
-test('one finding resting on two signals renders two reasons, not one', () => {
-  // Raymonds, as the contract now delivers it: a single credential-failure
-  // finding carrying 462 lockouts that stopped on the 3rd and 12 password
-  // rejections from the 9th. Mapping a finding to a reason would show one
-  // count and one date for both -- the collapse the contract was changed to
-  // remove, re-created one level up in the layer that renders it.
-  const { document } = render(
-    withSignals([
-      {
-        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
-        count: 462,
-        capped: false,
-        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
-      },
-      {
-        signal: 'PASSWORD_REJECTED',
-        count: 12,
-        capped: false,
-        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
-      },
-    ])
-  )
-  const row = rowText(document)
+test('native contracts S81: one finding resting on two signals renders two reasons, not one', () => {
+  // S81: One native finding with two signals yields exactly two real drawer reasons, never a fabricated aggregate third reason.
 
-  // Each signal keeps its own volume, in its own unit, with its own date.
-  assert.match(row, /Locked out after repeated failures/)
-  assert.match(row, /462 lockouts, last /)
-  assert.match(row, /Password rejected/)
-  assert.match(row, /12 rejected sign-ins, last /)
-
-  // And the two dates are different, so neither count sits beside the other's.
-  const dates = row
-    .split('last ')
-    .slice(1)
-    .map((part: string) => part.slice(0, 24))
-  assert.equal(dates.length, 2, row)
-  assert.notEqual(dates[0], dates[1], row)
-
-  // The finding's own aggregate count is never printed beside the signals it
-  // was summed from; 474 would read as a third reason.
-  assert.ok(!/474/.test(row), 'the finding total was rendered beside its parts')
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [nativeSignal('LOCKED_OUT_AFTER_REPEATED_FAILURES', 462), nativeSignal('PASSWORD_REJECTED', 12, 'EVENT_OCCURRED', '2026-09-08T21:01:00.000Z')]
+  const drawer = renderNative(native).openNativeDrawer()
+  const items = findingItems(drawer.document)
+  assert.equal(items.length, 2)
+  assert.match(items[0]!.textContent ?? '', /462 matching events/)
+  assert.match(items[1]!.textContent ?? '', /12 rejected sign-ins/)
+  assert.doesNotMatch(drawer.text, /474/)
+  assert.equal(drawer.document.querySelectorAll('h4').length, 2)
 })
+test('native contracts S82: a state signal is not described in the vocabulary of events', () => {
+  // S82: Native state signals retain configured-state units and read timing in the opened drawer, not legacy event prose.
 
-test('a state signal is not described in the vocabulary of events', () => {
-  // The kind comes off the value. Nothing here consults the signal's name to
-  // decide it, which is the point of the contract change: a name is a proxy
-  // for the kind in exactly the way a rule id is.
-  const { document } = render(
-    withSignals([
-      {
-        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
-        count: 3,
-        capped: false,
-        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
-      },
-    ])
-  )
-  const row = rowText(document)
-  assert.match(row, /3 external destinations/)
-  assert.match(row, /configuration read /)
-  assert.ok(!/, last /.test(row), 'a read time was rendered as an occurrence')
+  const native = nativeMailbox()
+  const drawer = renderNative(native).openNativeDrawer()
+  const item = findingItems(drawer.document)[0]!
+  assert.match(item.textContent ?? '', /3 external destinations/)
+  assert.match(item.textContent ?? '', /Configuration read/)
+  assert.doesNotMatch(item.textContent ?? '', /Last observed|3 events/)
 })
+test('native contracts S83: unknown signal codes stay in escaped technical details without invented units', () => {
+  // S83: An unknown signal's bounded code may appear as escaped technical metadata, never as primary copy or an invented count unit.
 
-test('an unrecognised signal says so and never shows its identifier', () => {
-  // The closed set lives in the wiring layer and the core's type is a plain
-  // string, so a fourth signal can appear without anything failing to compile.
-  const { document } = render(
-    withSignals([
-      {
-        signal: 'SOMETHING_SHIPPED_AFTER_THIS_BUILD',
-        count: 9,
-        capped: false,
-        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
-      },
-    ])
-  )
-  const row = rowText(document)
-  assert.match(row, /does not recognise/)
-  assert.match(row, /does not know this check/)
-  assert.ok(!/9 records/.test(row), 'a unit was guessed for an unknown signal')
-  assert.ok(
-    !/SOMETHING_SHIPPED_AFTER_THIS_BUILD/.test(row),
-    'an identifier was rendered where a description belongs'
-  )
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [nativeSignal('UNKNOWN_SIGNAL_<b>FUTURE</b>', 9)]
+  const drawer = renderNative(native).openNativeDrawer()
+  assert.doesNotMatch(primaryText(drawer.document), /UNKNOWN_SIGNAL|9 records|9 rejected sign-ins/)
+  const technical = [...drawer.document.querySelectorAll('details')].find(detail => detail.querySelector('summary')?.textContent === 'Technical details')
+  assert.ok(technical)
+  assert.ok(technical.textContent?.includes(native.findings[0]!.signals[0]!.signal))
+  assert.equal(technical.querySelector('b'), null)
 })
+test('native contracts N84: missing empty duplicate or malformed native signals fail closed', () => {
+  // N84: Unlike the legacy optional-signals fallback, native findings require nonempty, unique, valid signals and malformed input fails closed.
 
-test('a response without signals still renders, and one with an empty array does not', () => {
-  // Frontend and backend ship through separate systems, so every release has a
-  // window where one side is old. Absence has to be survivable; the key simply
-  // missing is what an old server sends.
-  const older = render(withSignals(undefined))
-  assert.match(rowText(older.document), /Repeated invalid credentials/)
-  assert.match(rowText(older.document), /474 records, last /)
-
-  // An empty array is not the same thing and must not be tolerated as though
-  // it were. Under the contract a signal missing from the array was never
-  // evaluated, so an empty one says every signal was never evaluated -- a
-  // finding resting on nothing. Accepting it as an old-server sentinel would
-  // drop every finding in the tenant for the length of a deploy, which fails
-  // silently and reads exactly like a clean tenant.
-  const empty = adapter.adaptRiskAssessmentResponse(
-    withSignals([]),
-    assessmentNow
-  )
-  assert.equal(empty, null)
-
-  // Two entries for one signal make every count ambiguous.
-  const duplicated = adapter.adaptRiskAssessmentResponse(
-    withSignals([
-      {
-        signal: 'PASSWORD_REJECTED',
-        count: 1,
-        capped: false,
-        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
-      },
-      {
-        signal: 'PASSWORD_REJECTED',
-        count: 2,
-        capped: false,
-        latest: { at: at(-2), kind: 'EVENT_OCCURRED' },
-      },
-    ]),
-    assessmentNow
-  )
-  assert.equal(duplicated, null)
-})
-
-test('a signal evaluated and empty is distinguishable from one never evaluated', () => {
-  // Two of the nine findings on the fleet carry a zero lockout count beside a
-  // real rejection count. The zero is a result and reads as one; the signal
-  // that is simply absent renders nothing at all.
-  const { document } = render(
-    withSignals([
-      {
-        signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES',
-        count: 0,
-        capped: false,
-        latest: null,
-      },
-      {
-        signal: 'PASSWORD_REJECTED',
-        count: 7,
-        capped: false,
-        latest: { at: at(-1), kind: 'EVENT_OCCURRED' },
-      },
-    ])
-  )
-  const row = rowText(document)
-  assert.match(row, /Locked out after repeated failures/)
-  assert.match(row, /none recorded/)
-  assert.match(row, /7 rejected sign-ins, last /)
-  assert.ok(
-    !/0 lockouts/.test(row),
-    'an evaluated zero was rendered as a count'
-  )
-  // Nothing invents a forwarding line for a signal that was never sent.
-  assert.ok(!/external destination/.test(row))
-})
-
-test('the kind comes off the value even when the name suggests otherwise', () => {
-  // The guard the contract change exists for, and it was not guarded until a
-  // mutation said so: replacing "read the kind" with "infer it from the signal
-  // name" broke none of the tests above, because in every fixture the name and
-  // the kind agree. A test that cannot tell the two apart is not testing the
-  // thing the field was added for.
-  //
-  // So both are inverted here. A forwarding signal whose instant marks an
-  // event is a legitimate payload -- a future detector could watch forwarding
-  // being changed rather than read its current state -- and the client must
-  // not overrule it from the name. That is the whole reason the kind travels
-  // on the value: a name is a proxy for it in exactly the way a rule id is.
-  const { document } = render(
-    withSignals([
-      {
-        signal: 'EXTERNAL_FORWARDING_CONFIGURED',
-        count: 3,
-        capped: false,
-        latest: { at: at(-14), kind: 'EVENT_OCCURRED' },
-      },
-      {
-        signal: 'PASSWORD_REJECTED',
-        count: 5,
-        capped: false,
-        latest: { at: at(-1), kind: 'STATE_OBSERVED' },
-      },
-    ])
-  )
-  const row = rowText(document)
-
-  // The forwarding signal keeps its own unit and takes the event wording.
-  assert.match(row, /3 external destinations, last /)
-  // The rejection signal keeps its own unit and takes the observation wording.
-  assert.match(row, /5 rejected sign-ins, configuration read /)
-
-  // Neither borrowed the reading its name would have implied.
-  assert.ok(
-    !/3 external destinations, configuration read /.test(row),
-    'the kind was inferred from the signal name rather than read from the value'
-  )
-  assert.ok(
-    !/5 rejected sign-ins, last /.test(row),
-    'the kind was inferred from the signal name rather than read from the value'
-  )
-})
-
-test('a page of a list is never presented as the list', () => {
-  // The count counts the tenant; the rows are what this response returned.
-  // Both true, and a reader who counts the rows and compares gets a different
-  // answer with nothing on screen to reconcile them. Eight people go missing
-  // and the page reads as though they were cleared.
-  //
-  // Reachable at scale rather than in principle: a tenant with nine findings
-  // returns a first page, and the collector fix means tenants that reported
-  // none now report nine.
-  const paged = () => {
-    const value = assessmentFixture(true)
-    value.summary.currentUsers = { value: 9, accuracy: 'EXACT' }
-    value.rules[0].assessedIdentities = 12
-    value.rules[0].matchedIdentities = 9
-    value.page = { hasMore: true, nextCursor: 'abc123.def456' }
-    return value
+  const adapt = require('./native-assessment.ts').adaptNativeAssessment as typeof import('./native-assessment.ts').adaptNativeAssessment
+  const native = nativeRiskyUsersFixture()
+  assert.ok(adapt(nativeWire(native)), 'valid native wire is the non-vacuous control')
+  for (const signals of [undefined, [], [nativeSignal(), nativeSignal()], [{ ...nativeSignal(), count: -1 }]]) {
+    const wire = nativeWire(native)
+    const item = wire.findings.items[0]! as Record<string, unknown>
+    if (signals === undefined) delete item.signals
+    else item.signals = signals
+    const adapted = adapt(wire)
+    assert.equal(adapted, null)
+    const result = renderNative(adapted, { contractFailed: true })
+    assert.equal(actionableRows(result.document).length, 0)
+    assert.match(result.text, /Not available/)
+    assert.doesNotMatch(result.text, /0 users requiring review/)
   }
-  const { document, cardText } = render(paged())
-  const list =
-    document.querySelector('[aria-labelledby="risky-users-list-heading"]')
-      ?.textContent ?? ''
+})
+test('native contracts S85: a signal evaluated and empty is distinguishable from one never evaluated', () => {
+  // S85: Evaluated-zero native signals are not absent signals; render none recorded without fabricating an occurrence time or a third signal.
 
-  assert.match(list, /part of the list, not all of it/)
-  assert.match(list, /have not been checked and cleared/)
-  // The card travels alone, so it carries the fact too.
-  assert.match(cardText, /longer than what came back with it/)
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [
+    nativeSignal('LOCKED_OUT_AFTER_REPEATED_FAILURES', 0, 'EVENT_OCCURRED', null),
+    nativeSignal('PASSWORD_REJECTED', 7),
+  ]
+  const drawer = renderNative(native).openNativeDrawer()
+  const items = findingItems(drawer.document)
+  assert.equal(items.length, 2)
+  assert.match(items[0]!.textContent ?? '', /none recorded/)
+  assert.doesNotMatch(items[0]!.textContent ?? '', /0 lockouts|Sep|2026/)
+  assert.match(items[1]!.textContent ?? '', /7 rejected sign-ins/)
+  assert.doesNotMatch(drawer.text, /external destinations/)
+})
+test('native contracts S86: the kind comes off the value even when the name suggests otherwise', () => {
+  // S86: Inverted signal names cannot override latest.kind; each real drawer reason keeps its own timing semantics.
 
-  // Arithmetic alone is enough, without the server saying so. A response that
-  // sets one signal and not the other is still a list that does not account
-  // for its own number.
-  const noFlag = paged()
-  noFlag.page = { hasMore: false, nextCursor: null }
-  const arithmetic = render(noFlag)
-  assert.match(
-    arithmetic.document.querySelector(
-      '[aria-labelledby="risky-users-list-heading"]'
-    )?.textContent ?? '',
-    /part of the list, not all of it/
-  )
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [
+    nativeSignal('EXTERNAL_FORWARDING_CONFIGURED', 3, 'EVENT_OCCURRED'),
+    nativeSignal('PASSWORD_REJECTED', 5, 'STATE_OBSERVED'),
+  ]
+  const items = findingItems(renderNative(native).openNativeDrawer().document)
+  assert.equal(items.length, 2)
+  assert.match(items[0]!.textContent ?? '', /3 external destinations/)
+  assert.match(items[0]!.textContent ?? '', /Last observed/)
+  assert.doesNotMatch(items[0]!.textContent ?? '', /Configuration read/)
+  assert.match(items[1]!.textContent ?? '', /5 rejected sign-ins/)
+  assert.match(items[1]!.textContent ?? '', /Configuration read/)
+  assert.doesNotMatch(items[1]!.textContent ?? '', /Last observed/)
+})
+test('native contracts C87: a page of a list is never presented as the list', () => {
+  // C87: The native structured total and list coverage replace a row-length denominator; exact, lower-bound, withheld and missing lists remain distinct.
 
-  // Control: a complete list says none of this. Without this half the guard
-  // passes just as well if the notice is always on, which is a warning a
-  // technician learns to skim past.
-  const complete = render(assessmentFixture(true))
-  assert.ok(
-    !/part of the list, not all of it/.test(complete.text),
-    'the partial notice fired on a list that was complete'
-  )
-  assert.ok(
-    !/longer than what came back with it/.test(complete.cardText),
-    'the partial notice fired on a list that was complete'
-  )
+  for (const flag of [true, false]) {
+    const native = nativeRiskyUsersFixture()
+    native.count.value = 9
+    native.complete = !flag
+    const result = renderNative(native)
+    assert.match(nativeTable(result.document).textContent ?? '', /Showing 1 of 9 reported users/)
+    assert.match(compactSummary(result.document).textContent ?? '', /1 detected by HawkView shown; 9 reported users/)
+    assert.doesNotMatch(compactSummary(result.document).textContent ?? '', /total that is not available/)
+    assert.match(result.cardText, /longer than what came back with it/)
+  }
+  const lower = nativeRiskyUsersFixture()
+  lower.count.accuracy = 'AT_LEAST'
+  lower.count.value = 9
+  lower.complete = false
+  assert.match(nativeTable(renderNative(lower).document).textContent ?? '', /Showing 1; at least 9 reported users/)
+  assert.match(nativeTable(renderNative(nativeWithheld()).document).textContent ?? '', /1 shown; complete total unavailable/)
+  const complete = renderNative()
+  assert.match(nativeTable(complete.document).textContent ?? '', /Showing 1 of 1 reported users/)
+  assert.doesNotMatch(complete.cardText, /longer than what came back with it/)
+})
+test('native truthfulness: unavailable reads never claim retained rows', () => {
+  for (const options of [{ requestFailed: true }, { contractFailed: true }]) {
+    const result = render(assessmentFixture(true), options)
+    const alert = result.document.querySelector('[role="alert"]')
+    assert.ok(alert, 'a failed read must disclose its unavailable state')
+    assert.match(alert.textContent ?? '', /No current result can be confirmed/)
+    assert.doesNotMatch(alert.textContent ?? '', /Users below are from an earlier read/)
+    const table = result.document.querySelector('[aria-labelledby="risky-users-table-heading"]')
+    assert.ok(table)
+    assert.equal(table.querySelectorAll('tbody tr button').length, 0,
+      'the existing hook withholds rows; the banner must not promise cached rows')
+    assert.match(result.text, /Not available/)
+    assert.doesNotMatch(result.text, /\b0 (?:users requiring review|detected by HawkView)\b/)
+  }
 
-  // And the two gaps stay distinct: nothing delivered is not the same as some
-  // delivered, and each has its own sentence.
-  const none = assessmentFixture(false)
-  none.users = []
-  none.summary.currentUsers = { value: 4, accuracy: 'EXACT' }
-  none.rules[0].assessedIdentities = 12
-  none.rules[0].matchedIdentities = 4
-  const undelivered = render(none)
-  assert.match(undelivered.text, /gap in what this response delivered/)
-  assert.ok(
-    !/part of the list, not all of it/.test(undelivered.text),
-    'an empty list borrowed the partial-list wording'
+  const missing = render(assessmentFixture(true), { notReported: true })
+  assert.match(missing.text, /Not available/)
+  assert.doesNotMatch(missing.text, /\b0 (?:users requiring review|detected by HawkView)\b/)
+
+  const healthy = render(assessmentFixture(true))
+  assert.equal(healthy.document.querySelector('[role="alert"]'), null)
+  assert.equal(healthy.document.querySelectorAll(
+    '[aria-labelledby="risky-users-table-heading"] tbody tr button'
+  ).length, 1, 'the healthy control must still render its actionable row')
+  assert.match(healthy.text, /1 detected by HawkView/)
+})
+
+test('native truthfulness: compact summary shows supplied withholding explanations', () => {
+  const value = assessmentFixture(false)
+  value.summary.currentUsers = {
+    value: null,
+    accuracy: 'UNKNOWN',
+    reasons: ['UNRESOLVED_SUBJECT_IDENTITY', 'UNINTERPRETABLE_EVIDENCE'],
+  }
+  const native = nativeAssessmentFixture(
+    adapter.adaptRiskAssessmentResponse(value, assessmentNow)
   )
+  const expected: riskyUsersView.RiskyUserCount =
+    require('./native-view.ts').nativeRiskyUserCount(native)
+  assert.equal(expected.value, null)
+  assert.equal(expected.reasons.length, 2, 'two distinct supplied reasons are required')
+  const result = render(value)
+  for (const [label, text] of [['section', result.text], ['card', result.cardText]]) {
+    assert.ok(text.includes(expected.caption), `${label}: supplied caption must be visible`)
+    for (const reason of expected.reasons) {
+      assert.ok(text.includes(reason), `${label}: every supplied reason must be visible`)
+    }
+    assert.doesNotMatch(text, /\b0 (?:users requiring review|detected by HawkView)\b/)
+  }
+
+  const healthyValue = assessmentFixture(true)
+  const healthyCount: riskyUsersView.RiskyUserCount = require('./native-view.ts')
+    .nativeRiskyUserCount(nativeAssessmentFixture(
+      adapter.adaptRiskAssessmentResponse(healthyValue, assessmentNow)
+    ))
+  const healthy = render(healthyValue)
+  assert.ok(healthy.text.includes(healthyCount.caption))
+  assert.match(healthy.text, /1 detected by HawkView/)
+  for (const reason of expected.reasons) {
+    assert.ok(!healthy.text.includes(reason), 'a healthy control must not inherit a withheld reason')
+  }
 })

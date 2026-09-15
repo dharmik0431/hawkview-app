@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
@@ -23,10 +24,15 @@ import { mailboxRule } from './mailbox-risk.test-fixtures.js'
 import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './identity-risk.contract.js'
 import { ASSESSMENT_COPY } from './risk-assessment-projection.js'
 
+/** The newest event actually seeded, so the window records what the fixture
+ *  observed rather than a number chosen to make it pass. */
+const newest = (list: ReadonlyArray<{ eventDateTime: Date }>): string | null =>
+  list.reduce<Date | null>((max, row) => max === null || row.eventDateTime > max ? row.eventDateTime : max, null)?.toISOString() ?? null
+
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const deadline = () => Date.now()+6000
 async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true, activity:'POSITIVE'|'ZERO'='POSITIVE') {
-  const url=new URL(process.env.DATABASE_URL??'')
+  const url=assertDisposableTestDatabase()
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname),'Disposable loopback DB only')
   assert.match(url.pathname,/test|qa|^\/hawkview_ci$/i,'Explicit test/QA or repository CI database only')
   const prisma=new PrismaService(),client=new pg.Client({connectionString:url.toString()})
@@ -73,7 +79,8 @@ async function fixture(work:(f:any)=>Promise<void>, audit=false, complete=true, 
     // thresholds, not an empty DTO or a forced READY rule outcome.
     const records=activity==='ZERO'?[record('below-threshold',9)]:Array.from({length:10},(_,i)=>record(`failure-${i}`,i));records.push(record('success',0,true))
     await persistAuthenticationRecords(prisma,scope,records)
-    if(complete)await persistCompletedAuthenticationWindow(prisma,scope,audit?'M365_AUDIT_STS':'GRAPH_SIGN_INS',new Date(base.getTime()-86_400_000),base,true)
+    if(complete)await persistCompletedAuthenticationWindow(prisma,scope,audit?'M365_AUDIT_STS':'GRAPH_SIGN_INS',new Date(base.getTime()-86_400_000),base,true,
+      {events:records.length,latestEventAt:newest(records)})
     const collectedAt=new Date()
     await prisma.syncState.create({data:{organizationId:scope.organizationId,customerTenantId:scope.customerTenantId,resourceType:'SIGN_INS',
       status:audit?'RUNNING':'SUCCEEDED',lastErrorCode:audit?'sign-ins-non-premium-fallback-active':null,lastAttemptAt:base,lastSuccessfulAt:collectedAt}})
@@ -170,8 +177,8 @@ for(const change of ['row-insert','row-conflict','source-swap','directory-genera
 test('actual window writer refuses older generations and incomplete chains without overwriting latest proof',{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   const where={customerTenantId_resourceType:{customerTenantId:f.scope.customerTenantId,resourceType:'SIGN_INS' as const}}
   const before=await f.prisma.tenantEntraSnapshot.findUnique({where})
-  await assert.rejects(()=>persistCompletedAuthenticationWindow(f.prisma,f.scope,'GRAPH_SIGN_INS',new Date(f.base.getTime()-3600_000),new Date(f.base.getTime()-1),true),/SUPERSEDED/)
-  await assert.rejects(()=>persistCompletedAuthenticationWindow(f.prisma,f.scope,'GRAPH_SIGN_INS',f.base,new Date(),false),/INCOMPLETE/)
+  await assert.rejects(()=>persistCompletedAuthenticationWindow(f.prisma,f.scope,'GRAPH_SIGN_INS',new Date(f.base.getTime()-3600_000),new Date(f.base.getTime()-1),true,{events:0,latestEventAt:null}),/SUPERSEDED/)
+  await assert.rejects(()=>persistCompletedAuthenticationWindow(f.prisma,f.scope,'GRAPH_SIGN_INS',f.base,new Date(),false,{events:0,latestEventAt:null}),/INCOMPLETE/)
   assert.deepEqual(await f.prisma.tenantEntraSnapshot.findUnique({where}),before)
 }))
 
@@ -333,13 +340,15 @@ for(const change of ['snapshot-generation','attestation-digest','attestation-sta
   assert.equal(dto.meta.capability,'PARTIAL')
 }))
 
-for(const complete of [true,false])test(`zero findings retain exact ${complete?'complete':'partial'} assessed scope without claiming safety`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+for(const complete of [true,false])test(`empty ${complete?'complete':'partial'} source cannot fabricate an assessed zero`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   await f.prisma.signInLog.deleteMany({where:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId}})
   await f.evaluate()
   const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
   assert.equal(dto.users.length,0)
-  assert.equal(dto.rules[0].status,complete?'READY':'PARTIAL')
-  assert.equal(dto.rules[0].matchedIdentities,complete?0:null)
+  assert.equal(dto.rules[0].status,complete?'WAITING':'PARTIAL')
+  assert.equal(dto.rules[0].matchedIdentities,null)
+  assert.equal(dto.rules[0].assessedIdentities,null)
+  if(complete) assert.equal(dto.rules[0].reasonCode,'NO_EVIDENCE_IN_WINDOW')
   assert.notEqual(dto.meta.capability,'FULL','Mailbox remains unavailable')
 },false,complete))
 
@@ -451,7 +460,7 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
       assert.ok(dto.rules.every((rule:any)=>rule.matchedIdentities===0))
       const empty=riskAssessmentEmptyPresentation(view)
       assert.equal(empty?.label,'No findings in evaluated evidence')
-      assert.match(empty!.detail,/All three supported checks/)
+      assert.match(empty!.detail,/All 3 checks this tenant’s evidence supports/)
       assert.match(empty!.detail,/does not establish that an identity is safe/)
     }
   }

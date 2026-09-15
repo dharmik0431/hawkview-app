@@ -64,9 +64,14 @@ const ENGINE_VERSION_COMPATIBILITY: typeof IDENTITY_RISK_ENGINE_VERSION =
   APPROVED_ENGINE_VERSION
 const CATALOG_VERSION_COMPATIBILITY: typeof IDENTITY_RISK_CATALOG_VERSION =
   APPROVED_CATALOG_VERSION
+// Reviewed platform-only rules; no implementation is invented in the pinned evaluator.
+export const PLATFORM_ONLY_IDENTITY_RISK_RULE_IDS = [
+  'HV-ID-AUTH-010.v1', 'HV-ID-AUTH-005.v2', 'HV-ID-AUTH-011.v1',
+] as const
+type PlatformOnlyRuleId = typeof PLATFORM_ONLY_IDENTITY_RISK_RULE_IDS[number]
 type RuleIdCompatibility =
   Exclude<ApprovedIdentitySignalRuleId, IdentityRiskRuleId> extends never
-    ? Exclude<IdentityRiskRuleId, ApprovedIdentitySignalRuleId | 'HV-ID-AUTH-010.v1' | 'HV-ID-AUTH-005.v2'> extends never
+    ? Exclude<IdentityRiskRuleId, ApprovedIdentitySignalRuleId | PlatformOnlyRuleId> extends never
       ? true
       : never
     : never
@@ -75,10 +80,15 @@ void ENGINE_VERSION_COMPATIBILITY
 void CATALOG_VERSION_COMPATIBILITY
 void RULE_ID_COMPATIBILITY
 
-const platformRuleIds = Object.keys(IDENTITY_RISK_RULE_CATALOG)
-  .filter(id => id !== 'HV-ID-AUTH-010.v1' && id !== 'HV-ID-AUTH-005.v2').sort()
 const approvedRuleIds = [...IDENTITY_SIGNAL_RULE_IDS].sort()
-if (platformRuleIds.join('\u0000') !== approvedRuleIds.join('\u0000')) {
+
+export function isApprovedRuleCatalogCompatible(ruleIds: readonly string[]): boolean {
+  const exemptions: readonly string[] = PLATFORM_ONLY_IDENTITY_RISK_RULE_IDS
+  const platformRuleIds = ruleIds.filter(id => !exemptions.includes(id)).sort()
+  return new Set(ruleIds).size === ruleIds.length &&
+    platformRuleIds.join('\u0000') === approvedRuleIds.join('\u0000')
+}
+if (!isApprovedRuleCatalogCompatible(Object.keys(IDENTITY_RISK_RULE_CATALOG))) {
   throw new Error('Approved identity evaluator rule catalog is incompatible.')
 }
 

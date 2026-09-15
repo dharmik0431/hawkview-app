@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import net from 'node:net'
@@ -11,7 +12,7 @@ import { withRiskKeyTransaction, withRiskRetentionTransaction } from './mailbox-
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 type Scope = { organizationId: string; customerTenantId: string }
 async function fixture(work: (f: { c: pg.Client; prisma: PrismaService; scopes: Scope[]; worker: RiskHistoryRetention; config: NonNullable<ReturnType<typeof riskHistoryRetentionConfig>>; lease: { key: string; id: string } }) => Promise<void>) {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local database only')
   const c = new pg.Client({ connectionString: url.toString() }); const prisma = new PrismaService()
   await c.connect(); await prisma.$connect()

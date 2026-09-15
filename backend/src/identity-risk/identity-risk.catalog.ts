@@ -73,6 +73,10 @@ export const IDENTITY_RISK_RULE_CATALOG = Object.freeze({
     'Invalid credentials followed by successful sign-in',
     'At least 5 distinct invalid-credential failures preceded verified success within 10 minutes for the same resolved account, application and qualified client address; the last failure was within 2 minutes.',
   ),
+  'HV-ID-AUTH-011.v1': activity(
+    'Repeated credential failure observed',
+    'Five or more invalid-credential attempts, or any lockout after repeated failures, were observed for one resolved account within the evaluation window. This states what was observed; it does not assert that access was obtained or that the account is compromised.',
+  ),
   'HV-ID-EXP-001.v1': access(
     'Privileged identity has an MFA enforcement gap',
     'Current evidence did not verify effective MFA enforcement for a privileged identity. This is an exposure finding, not proof of compromise.',

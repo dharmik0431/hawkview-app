@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -10,7 +11,7 @@ import { runRiskKeyOperator } from './risk-key-operator.js'
 test('operator real DB preflight is read-only; scoped concurrent ensure is create-only; failed writes roll back', {
   skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1', timeout: 45000,
 }, async () => {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1','localhost','[::1]'].includes(url.hostname), 'Disposable loopback DB only')
   const client = new pg.Client({ connectionString: url.toString() }); await client.connect()
   const prisma = new PrismaService(); await prisma.$connect()

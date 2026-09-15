@@ -143,6 +143,28 @@ model Notification {
   expiresAt         DateTime?               @map("expires_at") @db.Timestamptz(6)
   createdAt         DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime                @updatedAt @map("updated_at") @db.Timestamptz(6)
+  /// The incident this row belongs to. NULL until step 03 keys it, and NULL again after a
+  /// revert. Many rows share one key: the unique constraint below forbids them sharing a
+  /// dedupe key, so consolidation is a column rather than fewer rows.
+  ///
+  /// IN THE SCHEMA RATHER THAN ONLY IN THE MIGRATION, which was a ruling. A column absent
+  /// from the schema is invisible to every consumer except a raw query — so routing, and
+  /// anything that reads incidents, could not see the key at all, and the point of the
+  /// migration is that many rows share one.
+  /// WHICH ALERT TYPE THIS IS, AND IT IS THE FACT. The urgency tier is DERIVED from it through
+  /// `ALERT_CATALOG`, never stored a second time — two columns describing how urgent something
+  /// is disagree the first time anybody edits one. `severity` below is still set, derived from
+  /// this at write time, because the reader's visibility filter matches on it: it is a
+  /// RENDERING, and this column wins if they ever disagree.
+  ///
+  /// NULL FOR EVERY NOTIFICATION THAT IS NOT AN ALERT, and absence is not a tier. A row that did
+  /// not say is not RECORD_ONLY — that is a decision somebody made to stop being told.
+  alertTypeId       String?                 @map("alert_type_id") @db.VarChar(64)
+  incidentKey       String?                 @map("incident_key") @db.VarChar(400)
+  /// Which burst within the incident. NULL where the count could not be recovered, which is
+  /// a VALUE and not an absence: it means the incident holds a row whose event time is gone.
+  /// Distinguishable from episode 1, deliberately.
+  episode           Int?
   organization      Organization            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant    CustomerTenant?         @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
   states            NotificationUserState[]
@@ -150,6 +172,11 @@ model Notification {
   @@unique([organizationId, dedupeKey])
   @@index([organizationId, lastOccurredAt(sort: Desc)])
   @@index([customerTenantId, resolvedAt])
+  /// Organisation first: the column exists to be grouped by, every read here is org-scoped,
+  /// and an incident key never spans two organisations. See the migration for why this is
+  /// not a partial index.
+  @@index([organizationId, incidentKey])
+  @@index([organizationId, alertTypeId])
   @@map("notifications")
 }
 
@@ -190,12 +217,326 @@ model NotificationPreference {
   @@map("notification_preferences")
 }
 
+/// THE LIFECYCLE OF AN INCIDENT, once per incident.
+///
+/// A PROJECTION OVER `notifications`, NOT A PARENT OF THEM. An incident is the set of rows
+/// sharing an `incident_key`; this holds the state of that set. There is deliberately no
+/// relation to `Notification`: nothing cascades either way, and an incident row missing for a
+/// keyed notification is a REPORTABLE GAP rather than a broken foreign key.
+///
+/// WHY NOT COLUMNS ON `notifications`: an incident spans many rows, so the state would be
+/// stored once per row with nothing making the copies agree. Acknowledging would be N writes,
+/// and a partial failure leaves an incident half-acknowledged with no way to tell.
+///
+/// WHY NOT ON `IdentityRiskFinding`: half the incidents have no finding. Step 03 migrates rows
+/// produced by tenant sync and directory audit, which never had one.
+model AlertIncident {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  /// Matches `notifications.incident_key`. Same width, for the same reason.
+  incidentKey     String   @map("incident_key") @db.VarChar(400)
+  /// Which catalogue type this incident is, so the lifecycle rules that depend on category
+  /// (an OPERATIONAL investigation may be closed by the system; a SECURITY one may not) can be
+  /// applied without re-deriving the type from the key.
+  alertTypeId     String   @map("alert_type_id") @db.VarChar(80)
+  /// UNACKNOWLEDGED | ACKNOWLEDGED
+  ownership       String   @db.VarChar(20)
+  /// ACTIVE | CLEARED | UNKNOWN
+  condition       String   @db.VarChar(20)
+  /// OPEN | RESOLVED | NONE
+  investigation   String   @db.VarChar(20)
+  /// THREE TIMESTAMPS, ONE PER AXIS, and that is the point of three axes.
+  ///
+  /// A single `updatedAt` would collapse "when did the condition last change" and "when was
+  /// this acknowledged" into one fact, and those move independently — a cleared condition on an
+  /// unacknowledged incident is a normal state. Collapsing them is the failure this feature has
+  /// found in four other places.
+  ownershipAt     DateTime @map("ownership_at") @db.Timestamptz(6)
+  conditionAt     DateTime @map("condition_at") @db.Timestamptz(6)
+  investigationAt DateTime @map("investigation_at") @db.Timestamptz(6)
+  /// Who acknowledged it. Constrained in SQL to be present exactly when ownership is
+  /// ACKNOWLEDGED — see the migration. Two fields that can disagree need one owner, and here
+  /// the database is it.
+  acknowledgedBy  String?  @map("acknowledged_by") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, incidentKey])
+  /// The queue read: this MSP’s incidents that still need somebody.
+  @@index([organizationId, ownership, conditionAt(sort: Desc)])
+  @@map("alert_incidents")
+}
+
+/// WHAT AN MSP CONSIDERS URGENT, per rule. ORGANISATION GRAIN, deliberately.
+///
+/// TWO GRAINS, TWO QUESTIONS, AND THEY HOLD DIFFERENT FACTS. This answers *what counts as
+/// urgent here*, which is an MSP policy — two people in one MSP must not disagree about whether
+/// a privileged role grant is urgent. How and when a given person hears about it is a separate
+/// fact and lives on `NotificationPreference`, at the user grain.
+///
+/// Two places holding the SAME fact is the defect this feature has fixed three times. Two
+/// places holding DIFFERENT facts is just a system: the organisation says a role grant is
+/// urgent, a user says do not email me, and both are honoured.
+///
+/// A ROW EXISTS ONLY WHERE AN MSP HAS OVERRIDDEN THE DEFAULT. Nothing is seeded, and that is
+/// forced rather than lazy: `defaultPreferenceFor` derives the default FROM THE DECLARED
+/// SEVERITY, precisely "so the default cannot drift from the tiering the catalogue already
+/// states". Seeding twenty rows per organisation would copy a derived value into storage, and
+/// the copies would disagree with the catalogue the first time a severity changed.
+model AlertRuleDisposition {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  /// **AN ALERT TYPE ID, because that is what the pipeline looks it up by.** This was called
+  /// `ruleId` and the name lied: a disposition stored as a rule id was silently ignored and the
+  /// email went anyway — the row existed, the write succeeded, the MSP saw their choice saved.
+  /// The key is now built by `dispositionKey()`, which only accepts an `AlertTypeId`, so the
+  /// confusion is a compile error rather than a naming convention.
+  ///
+  /// A FINER GRAIN THAN THE ALERT TYPE WOULD NEED ITS OWN COLUMN AND A DISCRIMINATOR, not this
+  /// one holding two kinds of id. Five of the seven types use the type as their own grain today.
+  alertTypeId    String   @map("alert_type_id") @db.VarChar(120)
+  /// ACT_NOW | ACT_TODAY | RECORD_ONLY — the catalogue's `Severity`, constrained in SQL.
+  /// **THE TIER, NOT THE CHANNEL**: the organisation answers what counts as urgent here, and the
+  /// product decides how to reach them about something that urgent. There is still no OFF — an
+  /// MSP may choose not to be DELIVERED to, never to have the thing not recorded.
+  disposition    String   @db.VarChar(20)
+  /// Who set it and when, because a preference nobody can attribute is one nobody will change.
+  setByUserId    String?  @map("set_by_user_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, alertTypeId])
+  @@map("alert_rule_dispositions")
+}
+
+/// One send, with its own budget. See `send-queue.ts`.
+///
+/// THE BUDGET IS A FACT ON THE ROW. `attemptsMade`/`maxAttempts` are columns because a
+/// runner-scoped counter restarts at zero on a redeploy or a second worker, and the job then
+/// retries forever while every test of the runner shows it stopping.
+///
+/// NO TENANT AND NO ORGANISATION COLUMN: a per-tenant queue is unwriteable rather than
+/// discouraged, because there is no field to partition on.
+model AlertSendJob {
+  id             String    @id @default(uuid()) @db.Uuid
+  messageId      String    @unique @map("message_id") @db.VarChar(400)
+  idempotencyKey String    @map("idempotency_key") @db.VarChar(400)
+  /// READY | CLAIMED | SENT | EXHAUSTED | GAVE_UP | CANCELLED | WITHDRAWN — constrained in SQL,
+  /// see the migration. CANCELLED is the operator stop; WITHDRAWN is the send ceasing to be
+  /// appropriate with nobody deciding it. Both are terminal and cannot be claimed again.
+  state          String    @db.VarChar(20)
+  attemptsMade   Int       @map("attempts_made")
+  maxAttempts    Int       @map("max_attempts")
+  /// The backoff, as a fact rather than a sleeping worker.
+  notBeforeAt    DateTime  @map("not_before_at") @db.Timestamptz(6)
+  claimedBy      String?   @map("claimed_by") @db.VarChar(100)
+  claimedAt      DateTime? @map("claimed_at") @db.Timestamptz(6)
+  claimExpiresAt DateTime? @map("claim_expires_at") @db.Timestamptz(6)
+  providerId     String?   @map("provider_id") @db.VarChar(200)
+  /// WHO STOPPED IT, WHEN AND WHY. Six months from now "why was this MSP never told" has to be
+  /// answerable from the record; the state alone says somebody stopped it and nothing says who.
+  /// All three or none, enforced by a CHECK — see the migration.
+  cancelledAt      DateTime? @map("cancelled_at") @db.Timestamptz(6)
+  cancelledBy      String?   @map("cancelled_by") @db.VarChar(200)
+  cancelledBecause String?   @map("cancelled_because") @db.VarChar(500)
+  /// WHEN THE SEND STOPPED BEING APPROPRIATE, AND WHICH OF FOUR REASONS. Both or neither,
+  /// enforced by a biconditional CHECK — see the migration.
+  ///
+  /// THERE IS NO `withdrawnBy` AND THAT IS THE POINT. Unlike a cancellation, nobody decided this:
+  /// a preference changed, a recipient went away, or the incident stopped being actionable. A
+  /// nullable column for a person would get filled in eventually by somebody being helpful, and a
+  /// system decision would acquire an author.
+  ///
+  /// Closed vocabulary, unlike `cancelledBecause` three lines up, because these four are produced
+  /// by the resolver rather than typed by an operator — the CHECK lists them and
+  /// `send-queue.test.ts` holds it to `WithdrawnReason`.
+  withdrawnAt      DateTime? @map("withdrawn_at") @db.Timestamptz(6)
+  withdrawnBecause String?   @map("withdrawn_because") @db.VarChar(40)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([state, notBeforeAt])
+  @@index([cancelledAt])
+  /// "What did we not send this week, and why", asked over a window.
+  @@index([withdrawnAt])
+  @@map("alert_send_jobs")
+}
+
+/// One attempt. WRITTEN BEFORE THE SEND, which is why the settlement is nullable: an attempt
+/// recorded on return leaves no trace when a process dies mid-send, and the retry then sends a
+/// second email believing it is the first.
+///
+/// No foreign key to the job: an attempt is evidence and must survive the job being removed.
+model AlertSendAttempt {
+  id          String    @id @default(uuid()) @db.Uuid
+  messageId   String    @map("message_id") @db.VarChar(400)
+  attemptNo   Int       @map("attempt_no")
+  startedAt   DateTime  @map("started_at") @db.Timestamptz(6)
+  /// ACCEPTED | REFUSED_RETRYABLE | REFUSED_PERMANENT, or null while in flight.
+  settledKind String?   @map("settled_kind") @db.VarChar(30)
+  settledAt   DateTime? @map("settled_at") @db.Timestamptz(6)
+  providerId  String?   @map("provider_id") @db.VarChar(200)
+  because     String?   @db.VarChar(500)
+
+  @@unique([messageId, attemptNo])
+  @@index([settledKind, startedAt])
+  @@map("alert_send_attempts")
+}
+
+/// AN ADDRESS THAT MUST NOT BE WRITTEN TO AGAIN. A hard bounce is a fact about an address, not
+/// an error in a log — the mail server has said the mailbox does not exist, and continuing to
+/// attempt it is what earns a sending domain a reputation problem. The damage lands on every
+/// other message HawkView sends, not on the one that bounced.
+///
+/// THE ADDRESS IS THE PRIMARY KEY, not a surrogate id. A uuid key permits two rows disagreeing
+/// about one address, and then "is this suppressed" has two answers and no owner.
+///
+/// NO ORGANISATION COLUMN, deliberately, and it is the uncomfortable direction: a mailbox proven
+/// dead by one MSP's send is dead for all of them, because the fact is about the mailbox. Scoping
+/// it per organisation would let a second organisation re-prove the same dead address and take
+/// the same reputation hit to learn what was already known.
+///
+/// NO EXPIRY, AND NO UNSUPPRESS PATH YET. A hard bounce does not heal on a timer, so a TTL would
+/// be a guess that resumes sending to a dead mailbox on a schedule. Removing one is a deliberate
+/// act; that it currently requires SQL is flagged in the handoff rather than hidden.
+/// PER-FINDING SUPPRESSION HISTORY. See the migration header for why nothing existing could
+/// carry it: incident state is true forever once open, and a disposition timestamp moves on
+/// unrelated edits while `observed_at` is the event time rather than the ingestion time.
+///
+/// **KEYED LIKE `notifications`** on (organization_id, dedupe_key), the same grain, so both are
+/// read at one key: a finding is notified, or withheld, or neither — and neither is what "new,
+/// tell somebody" means. NOT a partition: two unique indexes say nothing about the pair, and
+/// overlapping ticks can write one of each. The gate unions them, so that cannot change its
+/// answer. See `noticeKeyFor`.
+model AlertWithheldNotice {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  /// The NOTIFICATION dedupe key, so it compares directly with `notifications.dedupe_key`.
+  dedupeKey      String   @map("dedupe_key") @db.VarChar(300)
+  alertTypeId    String   @map("alert_type_id") @db.VarChar(80)
+  /// Provenance: which finding produced the decision, so "why is this silent" reaches evidence.
+  findingId      String   @map("finding_id") @db.Uuid
+  /// A REASON, NOT A BOOLEAN — CHECK-constrained. Withheld because something went wrong and
+  /// withheld because the MSP silenced this type must never be the same row.
+  because        String   @db.VarChar(40)
+  withheldAt     DateTime @default(now()) @map("withheld_at") @db.Timestamptz(6)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, dedupeKey], map: "alert_withheld_notices_scope_key")
+  @@map("alert_withheld_notices")
+}
+
+model AlertSuppressedAddress {
+  address           String   @id @db.VarChar(320)
+  /// HARD_BOUNCE | COMPLAINT | MANUAL — constrained in SQL, see the migration.
+  reason            String   @db.VarChar(30)
+  /// What the provider said, kept verbatim so a wrong suppression can be argued with.
+  because           String?  @db.VarChar(500)
+  /// The message that proved it. Null for MANUAL, which has no send behind it.
+  messageId         String?  @map("message_id") @db.VarChar(400)
+  firstSuppressedAt DateTime @map("first_suppressed_at") @db.Timestamptz(6)
+  lastSeenAt        DateTime @map("last_seen_at") @db.Timestamptz(6)
+
+  @@index([reason, firstSuppressedAt])
+  @@map("alert_suppressed_addresses")
+}
+
+/// WHAT HAPPENED TO A MESSAGE, as against what the provider said when asked. Two vocabularies
+/// that never merge: acceptance is a fact about a handoff and lives on the attempt; this is the
+/// fact that arrives later, by webhook, about a send that already returned.
+///
+/// WITHOUT THIS TABLE THE CONSEQUENCE OUTLIVES ITS CAUSE. A hard bounce already suppresses the
+/// address durably, so after a restart the system knows a mailbox is dead and cannot say which
+/// message proved it — the remedy survives and the evidence does not.
+///
+/// EVERY VERIFIED EVENT LANDS HERE, INCLUDING THE ONES THAT MATCHED NOTHING, and that is the
+/// half worth having. An event carrying a provider id we hold no job for is a fact about this
+/// system — a job we lost, an id never recorded, or somebody posting forged or replayed events
+/// at the endpoint — and all three look like nothing happening if unmatched events are dropped.
+/// `messageId` is therefore NULLABLE and `providerId` is not: the provider id is what arrived,
+/// the message id is what we managed to tie it to.
+///
+/// NO FOREIGN KEY TO THE JOB, for the reason the attempt has none: this is evidence, and
+/// evidence must survive the job being pruned.
+model AlertDeliveryOutcome {
+  id         String    @id @default(uuid()) @db.Uuid
+  /// What the provider called the message. Always present — it is the only thing an unmatched
+  /// event carries that can later be reconciled.
+  providerId String    @map("provider_id") @db.VarChar(200)
+  /// Null when the event matched no job. See the note above.
+  messageId  String?   @map("message_id") @db.VarChar(400)
+  /// DELIVERED | BOUNCED | COMPLAINED | UNMATCHED — constrained in SQL, see the migration.
+  kind       String    @db.VarChar(20)
+  /// HARD | SOFT, and only for BOUNCED. Different facts about the future rather than two
+  /// severities: hard means the address never works, soft means try later, and collapsing them
+  /// produces either a suppressed address that was fine or a retry loop against one that was not.
+  bounce     String?   @db.VarChar(10)
+  /// Why an event did not become an outcome: NO_SUCH_JOB | ALREADY_RESOLVED. Null for the three
+  /// real outcomes. A closed vocabulary because a free-text reason here is how "we never recorded
+  /// that" becomes unanswerable.
+  ///
+  /// THE UNVERIFIABLE VERDICTS ARE NOT IN THIS LIST AND CANNOT BE WRITTEN HERE — see the CHECK in
+  /// 20260913180000. Anyone can cause a SIGNATURE_MISSING or SIGNATURE_INVALID, so storing one
+  /// row each made this table an unbounded unauthenticated write; they are counted per hour in
+  /// `AlertWebhookRejection` instead. The two that remain require the signing secret, so their
+  /// volume is bounded by Resend's traffic, which is bounded by our own sending.
+  because    String?   @db.VarChar(30)
+  /// When the provider says it happened, which is not when we heard about it.
+  occurredAt DateTime  @map("occurred_at") @db.Timestamptz(6)
+  recordedAt DateTime  @default(now()) @map("recorded_at") @db.Timestamptz(6)
+
+  /// ONE ROW PER PROVIDER EVENT. Resend retries a webhook it thinks failed, so the same event
+  /// arrives more than once — and a second DELIVERED row for one send would make any count of
+  /// delivered messages depend on how often the provider retried us.
+  @@unique([providerId, kind, occurredAt])
+  @@index([messageId])
+  @@index([kind, occurredAt])
+  @@map("alert_delivery_outcomes")
+}
+
+/// REQUESTS AT THE WEBHOOK THAT COULD NOT BE AUTHENTICATED, AS A COUNT RATHER THAN AS ROWS.
+///
+/// The endpoint returns 200 to a forged request on purpose — a 401 tells a forger their signature
+/// was checked and records nothing, and a non-2xx makes the provider retry a body we will never
+/// accept. But a row per request made that an unbounded unauthenticated write, and the row's
+/// content is worthless anyway: a forger picks whatever provider id they like.
+///
+/// WHAT THE SIGNAL ACTUALLY NEEDS is that it happened, how many, and when — all three of which
+/// survive aggregation, while the row count becomes a function of TIME rather than of how hard
+/// somebody pushes. Twenty-four hours times two verdicts is the daily ceiling.
+///
+/// RETENTION IS NOT THE SAFETY PROPERTY HERE, the bucket is. Retention bounds the long run and
+/// not the burst, and the burst is what an attacker controls; `expiresAt` is present for hygiene
+/// and to match `IdentityRiskOperationalEvent`.
+model AlertWebhookRejection {
+  id           String   @id @default(uuid()) @db.Uuid
+  /// The hour the requests arrived in, truncated.
+  bucketStart  DateTime @map("bucket_start") @db.Timestamptz(6)
+  /// SIGNATURE_MISSING | SIGNATURE_INVALID — constrained in SQL. The verified-but-unmatched
+  /// verdicts are NOT here: those mean a job we lost or an id never recorded, which is a fact
+  /// about this system that a count cannot answer, so they are kept in full.
+  verdict      String   @db.VarChar(30)
+  attempts     BigInt   @default(1)
+  firstSeenAt  DateTime @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt   DateTime @map("last_seen_at") @db.Timestamptz(6)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(6)
+
+  @@unique([bucketStart, verdict])
+  @@index([expiresAt], map: "alert_webhook_rejections_expiry")
+  @@map("alert_webhook_rejections")
+}
+
 model Organization {
   id                 String                     @id @default(uuid()) @db.Uuid
   name               String                     @db.VarChar(200)
   slug               String                     @unique @db.VarChar(100)
   businessDomain     String?                    @map("business_domain") @db.VarChar(253)
   timeZone           String?                    @map("time_zone") @db.VarChar(100)
+  alertIncidents     AlertIncident[]
+  alertRuleDispositions AlertRuleDisposition[]
+  alertWithheldNotices AlertWithheldNotice[]
   onboardingCompletedAt DateTime?               @map("onboarding_completed_at") @db.Timestamptz(6)
   createdByUserId    String?                    @map("created_by_user_id") @db.Uuid
   status             OrganizationStatus         @default(ACTIVE)

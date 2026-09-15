@@ -1,4 +1,46 @@
+import { readTier, type ReadTier } from './tier.ts'
+
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
+
+/**
+ * The severity a notification row actually arrives with.
+ *
+ * THIS IS THE WIRE'S VOCABULARY, NOT THE CATALOGUE'S. An earlier version of this
+ * type was `ACT_NOW | ACT_TODAY | RECORD_ONLY` -- the alerting catalogue's
+ * tiers -- written while the backend notification write was assumed not to be
+ * landed. It was landed. `finding-pipeline.ts` translates the tier into this
+ * vocabulary on the way in (`ACT_NOW -> critical`, `ACT_TODAY -> high`,
+ * `RECORD_ONLY -> info`) and `notifications.service.ts` passes
+ * `row.severity` straight through. So every alert-backed row arrived as
+ * `critical`, `high` or `info`, matched none of the three tiers, and was
+ * dropped here -- visible in no badge, which is indistinguishable from alerting
+ * not working. The backend's own comment warns against exactly this, about a
+ * second producer; it arrived from the reader instead.
+ *
+ * THE TIER NOW TRAVELS AS ITS OWN FIELD, AND IS STILL NOT REBUILT HERE. When
+ * this comment was written the list response sent no tier and no alert type id;
+ * b5e2c79 added both, deriving the tier server-side through the catalogue. It is
+ * read by `./tier.ts` and never reconstructed, because `severity` cannot be
+ * inverted into a tier: `tenant-sync.service.ts` publishes collector rows at
+ * `critical` too (a lost Microsoft connection), so `critical -> ACT_NOW` would
+ * label a disconnected tenant an ACT_NOW alert. That is a correctness argument,
+ * not a preference about deriving twice.
+ *
+ * `severity` is still sent and still read, because a row that is not an alert has
+ * no tier and its severity IS its urgency.
+ *
+ * Optional because most notifications say nothing about urgency, and absent
+ * means "this row did not say" rather than "nothing is urgent".
+ */
+export const NOTIFICATION_SEVERITIES = [
+  'info',
+  'low',
+  'medium',
+  'high',
+  'critical',
+] as const
+
+export type NotificationSeverity = (typeof NOTIFICATION_SEVERITIES)[number]
 
 export interface NotificationItem {
   id: string
@@ -11,6 +53,19 @@ export interface NotificationItem {
   actionLabel?: string
   occurrenceCount?: number
   resolved?: boolean
+  /** Present only on alert-backed rows. Absent is "not said", not "not urgent". */
+  severity?: NotificationSeverity
+  /** Which alert type raised this, when one did. */
+  alertTypeId?: string
+  /**
+   * The urgency tier, as the API sends it.
+   *
+   * ALWAYS PRESENT, unlike `severity`, because its NOT_STATED arm already
+   * carries "the API did not say". A conditional key here would give absence
+   * two spellings -- a missing key and a NOT_STATED value -- and a reader
+   * checking one of them would miss the other.
+   */
+  tier: ReadTier
 }
 
 export interface NotificationRefreshResult {
@@ -64,6 +119,23 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
       : undefined
   const resolved =
     typeof value.resolved === 'boolean' ? value.resolved : undefined
+  // A severity this build does not recognise is dropped rather than guessed.
+  // Rendering an unknown severity as the mildest one would be the reassuring
+  // direction of the same error the inbox already made. Checked against the list
+  // the backend declares, so a value added there fails a test here rather than
+  // disappearing from the screen.
+  const alertTypeId = optionalString(value.alertTypeId)
+  // NOT DERIVED FROM `severity` OR FROM `alertTypeId`. The API computes the tier
+  // from the row's alert type through the catalogue and sends it; rebuilding it
+  // here would need a copy of the catalogue on the client, and inverting
+  // `severity` is not merely redundant but wrong -- `critical` is also what a
+  // lost Microsoft connection is published at.
+  const tier = readTier(value.tier)
+  const severity = (NOTIFICATION_SEVERITIES as readonly string[]).includes(
+    value.severity as string
+  )
+    ? (value.severity as NotificationSeverity)
+    : undefined
 
   return {
     id,
@@ -76,6 +148,13 @@ function parseNotificationItem(value: unknown): NotificationItem | null {
     actionLabel: optionalString(value.actionLabel),
     occurrenceCount,
     resolved,
+    // Spread conditionally so an absent severity is an ABSENT KEY rather than a
+    // key holding undefined. The two are equal to a reader and not to a deep
+    // comparison, and "this row said nothing about urgency" is better carried
+    // by the field not being there.
+    tier,
+    ...(severity ? { severity } : {}),
+    ...(alertTypeId ? { alertTypeId } : {}),
   }
 }
 

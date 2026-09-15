@@ -1002,6 +1002,11 @@ export function nativeWithheldReasonCopy(reason: string) {
 const withheldReasonCopy: Readonly<
   Record<RiskAssessmentCountReason, { headline: string; caption: string }>
 > = {
+  NO_EVIDENCE_IN_WINDOW: {
+    headline: 'Not counted — this tenant produced no sign-in evidence',
+    caption:
+      'Collection succeeded, and the window it covered contained no authentication activity at all, so no check ran over anything. This is not a clean result: HawkView has not assessed this tenant, it has found nothing to assess. A tenant that has genuinely gone quiet and one whose evidence has stopped reaching HawkView look identical from here, and both are worth confirming.',
+  },
   UNRESOLVED_SUBJECT_IDENTITY: {
     headline: 'Not counted — findings could not be tied to people',
     caption:
@@ -1316,4 +1321,192 @@ function riskyUserCountFrom({
     gaps,
     asOf: reported.asOf,
   }
+}
+
+// ---------------------------------------------------------------------------------------
+// WHAT THE LIST SAYS WHEN IT HAS NO ROWS
+// ---------------------------------------------------------------------------------------
+
+/**
+ * **THE SENTENCE UNDER AN EMPTY TABLE, DERIVED FROM THE COUNT RATHER THAN FROM THE ROWS.**
+ *
+ * `risky-users-section.tsx` chose it from `filteredRows.length === 0` and the filters alone, in
+ * both the desktop and mobile branches. So a tenant whose assessment could not be read rendered
+ * **"Users requiring review: Not available"** immediately above **"No users requiring review
+ * found."** One sentence says we do not know; the next says we know and it is none. An MSP reads
+ * the second and stops looking.
+ *
+ * The requirement was already written down — see `listCoverage` above: *"the list must not fall
+ * through to 'no user is listed as needing attention', which points the reader up at a summary
+ * confidently stating a number and so deepens the contradiction rather than resolving it."* The
+ * type said it; nothing enforced it; the component did the forbidden thing.
+ *
+ * **ZERO IS CLAIMED ONLY ON AN EXPLICIT CONJUNCTION, and everything else falls through to a
+ * non-claim.** That inversion is the whole fix. The old form asserted "none found" by default and
+ * narrowed it with one filter check, so every state nobody had thought about — unread, withheld,
+ * truncated — landed on the reassuring sentence. Here the reassuring sentence is the one arm that
+ * has to be earned, and an unanticipated state lands on "cannot confirm" instead.
+ */
+export type RiskyUsersEmptyState = {
+  /** For tests and for a caller that wants to style them differently. */
+  readonly kind:
+    | 'NO_ASSESSMENT'
+    | 'COUNT_WITHHELD'
+    | 'ROWS_MISSING'
+    | 'FILTERED'
+    | 'CONFIRMED_ZERO'
+  readonly sentence: string
+  /** True only for `CONFIRMED_ZERO`. A caller may use it to choose a calmer treatment, and it is
+   * the single place that decides whether "none" is being asserted at all. */
+  readonly assertsNone: boolean
+}
+
+export function riskyUsersEmptyState(
+  count: RiskyUserCount,
+  filtersActive: boolean
+): RiskyUsersEmptyState {
+  // FIRST, BEFORE THE FILTERS. "No users match the active search or filters" implies the set
+  // being filtered was known — so when it is not, that sentence is a quieter version of the same
+  // false claim.
+  if (count.accuracy === 'UNAVAILABLE') {
+    return {
+      kind: 'NO_ASSESSMENT',
+      sentence:
+        'No current assessment for this tenant, so nothing can be listed. This is not a zero and it is not an all-clear.',
+      assertsNone: false,
+    }
+  }
+
+  // NOT AN ERROR AND NOT AN EMPTY STATE — the type is explicit that a technician who reads a
+  // withheld count as breakage opens a support ticket, which is worse than the dishonest number
+  // would have been. So this names coverage and points at the reasons already on screen.
+  if (count.accuracy === 'WITHHELD') {
+    return {
+      kind: 'COUNT_WITHHELD',
+      sentence:
+        'HawkView will not give a total for this tenant, so this list is not a complete account. The reasons are shown above; nothing here says no user needs review.',
+      assertsNone: false,
+    }
+  }
+
+  // The count asserts users the list did not deliver, or the server said there are more pages.
+  if (count.listCoverage !== 'COMPLETE') {
+    return {
+      kind: 'ROWS_MISSING',
+      sentence:
+        'The findings behind this total did not all arrive, so none can be listed. This is a gap in what was delivered, not a statement about this tenant.',
+      assertsNone: false,
+    }
+  }
+
+  if (filtersActive) {
+    return {
+      kind: 'FILTERED',
+      sentence: 'No users match the active search or filters.',
+      assertsNone: false,
+    }
+  }
+
+  // THE ONLY ARM THAT ASSERTS NONE, and it takes every condition at once: a number HawkView was
+  // willing to state exactly, that number being zero, and a list that accounts for it.
+  if (count.accuracy === 'EXACT' && count.value === 0) {
+    // A ZERO IS NEVER RENDERED WITHOUT ITS GAPS — the type says a caller that drops them is
+    // dropping the disclosure that makes the zero truthful.
+    const gaps = count.gaps.length > 0 ? ` Not covered: ${count.gaps.join('; ')}.` : ''
+    return {
+      kind: 'CONFIRMED_ZERO',
+      sentence: `No users requiring review were found in the evidence assessed.${gaps}`,
+      assertsNone: true,
+    }
+  }
+
+  // EVERYTHING ELSE, AND THE DEFAULT IS THE CAUTIOUS ONE. `AT_LEAST` with no rows, or an exact
+  // non-zero total with an empty list, are both states where the screen knows less than the
+  // reassuring sentence would claim.
+  return {
+    kind: 'ROWS_MISSING',
+    sentence:
+      'This list does not account for the total above, so nothing can be listed here. It is not a statement that no user needs review.',
+    assertsNone: false,
+  }
+}
+
+/**
+ * **"N DETECTED BY HAWKVIEW", WHERE N MAY NOT BE A NUMBER.**
+ *
+ * The summary line counted `rows.filter(r => r.reasons.length > 0).length` and printed it
+ * unconditionally. `nativeRiskyUserCount` and `nativeRiskyUserList` branch on the **identical**
+ * condition — `!native || !native.available` — so an unavailable assessment yields a count of
+ * `Not available` and a row list of `[]` **together, always**. The two lines could not come apart:
+ * every tenant with no collection configured read
+ *
+ *     Users requiring review: Not available
+ *     0 detected by HawkView
+ *
+ * and the second line is the one a technician believes, because it has a number in it. Measured
+ * live on two organisations.
+ *
+ * **A COUNT DERIVED FROM A LIST IS ONLY A COUNT WHEN THE LIST IS KNOWN TO BE WHOLE.** That is the
+ * same rule as `riskyUsersEmptyState` and it is deliberately the same vocabulary: `accuracy` says
+ * whether a total may be stated at all, `listCoverage` says whether the rows account for it.
+ * Neither is something this line may skip because it did its own arithmetic.
+ */
+export function hawkViewDetectionSummary(
+  count: RiskyUserCount,
+  hawkViewRowCount: number
+): string {
+  // No assessment at all. The rows are empty because nothing was read, not because nobody was
+  // found, and a "0" here is the sentence that stops somebody looking.
+  if (count.accuracy === 'UNAVAILABLE') return 'Detected by HawkView: not available'
+
+  // A withheld total is a statement about coverage. The rows that did arrive are real and are
+  // worth showing — the type is explicit that what HawkView does know beats a blank — but they
+  // are a floor, never a total.
+  if (count.listCoverage === 'NONE_DELIVERED' &&
+      (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST')) {
+    return `HawkView findings not delivered; ${count.display} reported users`
+  }
+  if (count.accuracy === 'EXACT' && count.listCoverage !== 'COMPLETE') {
+    return `${hawkViewRowCount} detected by HawkView shown; ${count.display} reported users`
+  }
+  if (count.accuracy === 'AT_LEAST') {
+    return `${hawkViewRowCount} detected by HawkView shown; at least ${count.value?.toLocaleString()} reported users`
+  }
+  if (count.accuracy === 'WITHHELD' || count.listCoverage !== 'COMPLETE') {
+    return hawkViewRowCount > 0
+      ? `${hawkViewRowCount} detected by HawkView so far, out of a total that is not available`
+      : 'Detected by HawkView: not a complete count'
+  }
+
+  return `${hawkViewRowCount} detected by HawkView`
+}
+
+/**
+ * **THE SECOND DERIVED ZERO: "0 active Microsoft risk".**
+ *
+ * The summary line asked `microsoftView?.users !== null` and counted the array. That distinguishes
+ * "no array" from "an array" — it does not distinguish **an empty array because Microsoft reported
+ * nothing** from **an empty array because Microsoft could not report at all**, which are opposite
+ * facts with opposite remedies. `MicrosoftChannelState` has said so all along, and `headline` is
+ * documented as "one line, safe to show beside a HawkView count": written for this call site and
+ * never read by it.
+ *
+ * ONLY `REPORTING` EARNS A NUMBER. The other states each have their own sentence, including the
+ * addressable ones where the gap is a licence the MSP controls — worth telling them plainly rather
+ * than burying under a zero that reads as good news.
+ */
+export function microsoftRiskSummary(
+  channel: MicrosoftChannel,
+  activeCount: number | null,
+  hasMore = false
+): string {
+  if (channel.state === 'REPORTING' && activeCount !== null) {
+    if (hasMore) {
+      return activeCount > 0
+        ? `${activeCount} active Microsoft risk records on this page; more results available`
+        : 'Microsoft active-risk count unavailable: this page is empty; more results available'
+    }
+    return `${activeCount} active Microsoft risk`
+  }
+  return channel.headline
 }

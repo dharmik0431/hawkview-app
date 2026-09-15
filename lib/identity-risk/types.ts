@@ -211,7 +211,15 @@ export type RiskAssessmentReadiness =
   | 'DISABLED'
 export type RiskAssessmentReason =
   | 'READY'
+  | 'OUT_OF_SCOPE_EVENTS'
   | 'WAITING_FOR_COLLECTION'
+  /** Collection succeeded and the window held nothing to evaluate.
+   *
+   * Distinct from WAITING_FOR_COLLECTION, which means we have not looked yet,
+   * and from INCOMPLETE_WINDOW, which means we looked at part of it. Here we
+   * looked at all of it and it was empty -- so the rule did not run, and any
+   * screen reporting it as assessed is stating a result nobody measured. */
+  | 'NO_EVIDENCE_IN_WINDOW'
   | 'MISSING_PERMISSION'
   | 'LICENSE_REQUIRED'
   | 'COLLECTION_FAILED'
@@ -466,6 +474,9 @@ export type NativeWithheldReason =
   | 'UNRESOLVED_SUBJECT_IDENTITY'
 
 export type RiskAssessmentCountReason =
+  /** The count is withheld because the window held nothing to count, not
+   *  because counting was interrupted. See [RiskAssessmentReason]. */
+  | 'NO_EVIDENCE_IN_WINDOW'
   | 'UNRESOLVED_SUBJECT_IDENTITY'
   | 'UNINTERPRETABLE_EVIDENCE'
   | 'CAPACITY_LIMIT'

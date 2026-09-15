@@ -273,9 +273,9 @@ export function nativeRiskyUserCount(
         : 'Distinct users with at least one current HawkView finding. A user with several findings is counted once. These are investigation leads, not confirmed compromise. ' +
           scopeSentence(native),
     reasons: captions,
-    // The detectors that did run, so a number is never read as covering checks
-    // that never executed.
-    known: native.count.covered.map(detectorTitle),
+    // "What HawkView did find" describes findings, not checks that merely ran.
+    // Distinct safe titles disclose evidence without inventing subject totals.
+    known: Array.from(new Set(native.findings.map((finding) => detectorTitle(finding.detectorId)))),
     gaps: native.count.notCovered.map(
       (entry) =>
         `${detectorTitle(entry.detectorId)}: ${nativeWithheldReasonCopy(entry.because).headline}`

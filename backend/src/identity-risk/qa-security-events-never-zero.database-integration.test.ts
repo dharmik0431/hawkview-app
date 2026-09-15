@@ -13,6 +13,7 @@
 // This test PASSES today and must keep passing. If it starts failing, (b) has
 // bought a reportable count by discarding evidence.
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
@@ -33,6 +34,11 @@ import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION } fro
 import { mailboxRule } from './mailbox-risk.test-fixtures.js'
 import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './identity-risk.contract.js'
 
+/** The newest event actually seeded, so the window records what the fixture
+ *  observed rather than a number chosen to make it pass. */
+const newest = (list: ReadonlyArray<{ eventDateTime: Date }>): string | null =>
+  list.reduce<Date | null>((max, row) => max === null || row.eventDateTime > max ? row.eventDateTime : max, null)?.toISOString() ?? null
+
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 const deadline = () => Date.now() + 6000
 
@@ -46,7 +52,7 @@ const UNRECOGNIZED = [50053, 53003]
 const NON_QUALIFYING = [50076, 50140]
 
 async function securityEventTenant<T>(codes: readonly number[], work: (context: any) => Promise<T>): Promise<T> {
-  const url = new URL(process.env.DATABASE_URL ?? '')
+  const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable loopback DB only')
   assert.match(url.pathname, /test|qa|^\/hawkview_ci$/i, 'Explicit test/QA database only')
   const prisma = new PrismaService(), client = new pg.Client({ connectionString: url.toString() })
@@ -104,7 +110,8 @@ async function securityEventTenant<T>(codes: readonly number[], work: (context: 
         riskLevel: 'high', ingestedAt: base, expiresAt: new Date(base.getTime() + 90 * 86_400_000) }
     })
     await persistAuthenticationRecords(prisma, scope, rows)
-    await persistCompletedAuthenticationWindow(prisma, scope, 'GRAPH_SIGN_INS', new Date(base.getTime() - 86_400_000), base, true)
+    await persistCompletedAuthenticationWindow(prisma, scope, 'GRAPH_SIGN_INS', new Date(base.getTime() - 86_400_000), base, true,
+      { events: rows.length, latestEventAt: newest(rows) })
     await prisma.syncState.create({ data: { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId, resourceType: 'SIGN_INS',
       status: 'SUCCEEDED', lastAttemptAt: base, lastSuccessfulAt: new Date() } })
 

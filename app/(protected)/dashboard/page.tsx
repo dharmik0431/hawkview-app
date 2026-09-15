@@ -33,6 +33,7 @@ import {
 import type { Tenant } from '@/types/api'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
+import { queueSummary } from '@/lib/dashboard/queue-summary'
 import { EmptyState } from '@/components/common/empty-state'
 
 export type Severity = 'critical' | 'high' | 'medium'
@@ -530,6 +531,31 @@ export default function DashboardPage() {
     return items
   }, [queueItems, sortField, sortDir])
 
+  // WHAT THE COUNT IS OVER, NOT JUST THE COUNT. A tenant whose attention
+  // list could not be read has `attentionReported: false` and contributes
+  // zero items above, so the bare length treats "we could not read this
+  // tenant" as "this tenant has nothing". The page already knows the
+  // difference per tenant; the queue heading did not carry it.
+  const queueCoverage = React.useMemo(
+    () => ({
+      inScope: filteredTenants.length,
+      read: filteredTenants.filter((t) => t.attentionReported).length,
+    }),
+    [filteredTenants]
+  )
+
+  // Only a filter that is actually narrowing something may be blamed for an
+  // empty queue. The same three controls reset() clears, which is this
+  // page's own definition of what counts as a filter.
+  const queueFiltersActive =
+    tenantId !== 'all' || severity !== 'all' || search.trim() !== ''
+
+  const queue = queueSummary(
+    sortedQueueItems.length,
+    queueCoverage,
+    queueFiltersActive
+  )
+
   const kpis = React.useMemo(() => {
     const reportedRiskCounts = tenants
       .map((tenant) => tenant.identityDetected)
@@ -921,15 +947,25 @@ export default function DashboardPage() {
               Priority Action Queue
             </h2>
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
-              {sortedQueueItems.length} matching {sortedQueueItems.length === 1 ? 'alert' : 'alerts'}
+              {queue.headline}
             </span>
           </div>
 
           {/* Unified Alert Queue Surface */}
           <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-sm">
-            {sortedQueueItems.length === 0 ? (
-              <div className="p-8 text-center text-sm font-medium text-slate-500 dark:text-slate-400">
-                No matching alerts found. Try adjusting filters or search query.
+            {queue.empty ? (
+              /* "Try adjusting filters or search query" was said for every
+                 empty queue. It makes two claims: that HawkView looked, and that
+                 the filters are why nothing came back. With tenants unread both
+                 are wrong, and the second sends somebody to adjust filters
+                 that have nothing to do with it. */
+              <div className="p-8 text-center">
+                <p className="text-sm font-semibold text-slate-700 dark:text-slate-200">
+                  {queue.empty.title}
+                </p>
+                <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-slate-500 dark:text-slate-400">
+                  {queue.empty.detail}
+                </p>
               </div>
             ) : (
               <div>

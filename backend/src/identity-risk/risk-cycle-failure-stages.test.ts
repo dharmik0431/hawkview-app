@@ -76,7 +76,7 @@ test('actual controller generic catch cannot erase a specific cycle stage', () =
         runScheduledGlobalRiskCycle: async (_deadline: number, observe: (reason: CycleReason) => void) =>
           runGlobalRiskCycle({ ...f.deps, [boundary]: async () => { throw hostile }, observe }, 100_000),
         syncDueTenants: async () => ({ status: 'unchanged' }),
-      } as any, { runAuthorizedScheduledMaintenance: async () => ({ hasMore: false }) } as any)
+      } as any, { runAuthorizedScheduledMaintenance: async () => ({ hasMore: false }) } as any, { runOnce: async () => null } as any)
       ;(controller as any).logger = { log() {}, warn() {} }
       assert.deepEqual(await controller.syncDueTenants({ headers: {} } as any), { status: 'unchanged' })
       assertRecord(lines, reason)

@@ -1,7 +1,7 @@
 import type { AuthScope } from '../risky-users-auth/contract.js'
 import type { IdentityRiskSourceBatch } from './identity-risk.contract.js'
 import { withMailboxReadTransaction } from './mailbox-read-transaction.js'
-import { AUTH_WINDOW_SCHEMA, authenticationWindow, prepareAuthenticationEvaluation, selectedAuthenticationSource, unavailableAuthenticationSource, type AuthenticationWindow, type AuthenticationDirectoryUser,
+import { AUTH_WINDOW_SCHEMA_V1, authenticationWindow, prepareAuthenticationEvaluation, selectedAuthenticationSource, unavailableAuthenticationSource, type AuthenticationWindow, type AuthenticationDirectoryUser,
   type AuthenticationProof, type AuthenticationReference, type AuthenticationRow } from './authentication-source-readiness.js'
 import { AUTHENTICATION_GENERATION_SQL, authenticationGenerationParameters, authenticationGenerationValid, type AuthenticationGeneration } from './authentication-generation-proof.js'
 
@@ -34,7 +34,11 @@ export async function loadAuthenticationRiskEvidence(scope: AuthScope, evaluatio
     // Unattested legacy collections can still supply exact supported positive
     // witnesses. This is a bounded read window, NEVER a pagination assertion.
     const window: AuthenticationWindow | null = snapshotValid ? reportedWindow : selected && proof?.lastSuccessfulAt instanceof Date && Number.isFinite(proof.lastSuccessfulAt.getTime())
-      ? { schemaVersion: AUTH_WINDOW_SCHEMA, source: selected, start: new Date(proof.lastSuccessfulAt.getTime() - 24 * 60 * 60_000).toISOString(),
+      // V1 DELIBERATELY. This is the unattested legacy fallback: a bounded read
+      // window built from a proof timestamp, with nothing observed recorded. v2
+      // promises an observation and this has none, so labelling it v2 would be a
+      // version claiming a fact that is not in the object.
+      ? { schemaVersion: AUTH_WINDOW_SCHEMA_V1, source: selected, start: new Date(proof.lastSuccessfulAt.getTime() - 24 * 60 * 60_000).toISOString(),
         end: proof.lastSuccessfulAt.toISOString(), paginationComplete: false } : null
     const directoryReady = !!userProof && userProof.status === 'SUCCEEDED' && userProof.lastErrorCode === null &&
       userProof.lastSuccessfulAt instanceof Date && userProof.lastSuccessfulAt <= evaluationAt &&

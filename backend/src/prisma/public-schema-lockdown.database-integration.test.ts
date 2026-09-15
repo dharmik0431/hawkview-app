@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { assertDisposableTestDatabase } from './native-alert-test-database.js'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import pg from 'pg'
@@ -41,7 +42,7 @@ test(
   'public schema stays denied to anon and authenticated',
   { skip: !databaseIntegrationEnabled },
   async () => {
-    const client = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    const client = new pg.Client({ connectionString: assertDisposableTestDatabase().toString() })
     await client.connect()
 
     try {

@@ -33,7 +33,7 @@ test('one entry clock charges auth/maintenance/risk and preserves the fixed coll
         now += 5_000
         if (scenario === 'maintenance-failure') throw new Error('Synthetic failure')
         return { hasMore: false }
-      } } as any)
+      } } as any, { runOnce: async () => null } as any)
       ;(controller as any).logger = { log() {}, warn() {} }
       assert.deepEqual(await controller.syncDueTenants({ headers: {} } as any), { status: 'ok' })
       assert.deepEqual(calls, scenario === 'auth-expired' || scenario === 'auth-slow' ? ['auth','collect'] :
