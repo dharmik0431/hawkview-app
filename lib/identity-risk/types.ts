@@ -211,6 +211,7 @@ export type RiskAssessmentReadiness =
   | 'DISABLED'
 export type RiskAssessmentReason =
   | 'READY'
+  | 'OUT_OF_SCOPE_EVENTS'
   | 'WAITING_FOR_COLLECTION'
   /** Collection succeeded and the window held nothing to evaluate.
    *

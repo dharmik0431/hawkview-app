@@ -339,13 +339,15 @@ for(const change of ['snapshot-generation','attestation-digest','attestation-sta
   assert.equal(dto.meta.capability,'PARTIAL')
 }))
 
-for(const complete of [true,false])test(`zero findings retain exact ${complete?'complete':'partial'} assessed scope without claiming safety`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
+for(const complete of [true,false])test(`empty ${complete?'complete':'partial'} source cannot fabricate an assessed zero`,{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   await f.prisma.signInLog.deleteMany({where:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId}})
   await f.evaluate()
   const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
   assert.equal(dto.users.length,0)
-  assert.equal(dto.rules[0].status,complete?'READY':'PARTIAL')
-  assert.equal(dto.rules[0].matchedIdentities,complete?0:null)
+  assert.equal(dto.rules[0].status,complete?'WAITING':'PARTIAL')
+  assert.equal(dto.rules[0].matchedIdentities,null)
+  assert.equal(dto.rules[0].assessedIdentities,null)
+  if(complete) assert.equal(dto.rules[0].reasonCode,'NO_EVIDENCE_IN_WINDOW')
   assert.notEqual(dto.meta.capability,'FULL','Mailbox remains unavailable')
 },false,complete))
 
@@ -457,7 +459,7 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
       assert.ok(dto.rules.every((rule:any)=>rule.matchedIdentities===0))
       const empty=riskAssessmentEmptyPresentation(view)
       assert.equal(empty?.label,'No findings in evaluated evidence')
-      assert.match(empty!.detail,/All three supported checks/)
+      assert.match(empty!.detail,/All 3 checks this tenant’s evidence supports/)
       assert.match(empty!.detail,/does not establish that an identity is safe/)
     }
   }

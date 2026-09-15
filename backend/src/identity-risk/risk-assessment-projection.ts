@@ -50,6 +50,7 @@ export function assessmentReason(reason: RiskAssessmentReason): string {
     // the rule did not look at anything, so it cannot report that nothing was
     // found. Collection is fine; there was simply nothing in the window.
     case 'NO_EVIDENCE_IN_WINDOW': return 'Collection succeeded and the window contained no authentication activity, so this check could not be evaluated. This is not a finding that nothing is wrong.'
+    case 'OUT_OF_SCOPE_EVENTS': return 'Collected authentication events include non-qualifying events outside the assessed scope of this check. Those events are not assessed by this check; an exact total cannot be confirmed. This does not establish that an identity is safe.'
     case 'MISSING_PERMISSION': return 'The selected source requires a Microsoft read permission that is not available.'
     case 'LICENSE_REQUIRED': return 'Microsoft reported a licensing restriction for this source.'
     case 'COLLECTION_FAILED': return 'The latest source collection failed. Earlier evidence does not establish current coverage.'
@@ -77,10 +78,11 @@ export type StoredRiskAssessment = Readonly<{
 }>
 const STATES = new Set(['READY', 'PARTIAL', 'WAITING', 'MISSING_PERMISSION', 'LICENSE_REQUIRED', 'STALE', 'FAILED', 'INSUFFICIENT_FIELDS', 'UNSUPPORTED', 'DISABLED'])
 const REASONS = new Set(['READY', 'WAITING_FOR_COLLECTION', 'MISSING_PERMISSION', 'LICENSE_REQUIRED', 'COLLECTION_FAILED', 'COLLECTION_STALE', 'INCOMPLETE_WINDOW', 'SOURCE_UNAVAILABLE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED', 'CLIENT_SOURCE_UNQUALIFIED', 'UNSUPPORTED_RECORD', 'CONFLICTING_EVIDENCE', 'CAPACITY_LIMIT', 'EVALUATION_FAILED', 'EVALUATION_DISABLED', 'KEY_UNAVAILABLE', 'DIRECTORY_SYNC_MISSING', 'DIRECTORY_SYNC_NOT_SUCCEEDED', 'DIRECTORY_SYNC_UNDATED', 'DIRECTORY_SYNC_STALE', 'DIRECTORY_SYNC_NEWER_ATTEMPT', 'RULE_ENDPOINT_NOT_FOUND', 'RULE_VALIDATION_UNATTESTABLE', 'SOURCE_NOT_ATTESTED', 'ATTESTED_COMPLETE', 'NO_EVIDENCE_IN_WINDOW'])
+REASONS.add('OUT_OF_SCOPE_EVENTS')
 const SOURCES = new Set(['M365_AUDIT_STS', 'GRAPH_SIGN_INS', 'MAILBOX_RULES'])
 const STATUS_REASONS: Readonly<Record<string, readonly string[]>> = {
   READY: ['READY', 'ATTESTED_COMPLETE'],
-  PARTIAL: ['INCOMPLETE_WINDOW', 'CAPACITY_LIMIT', 'CONFLICTING_EVIDENCE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED'],
+  PARTIAL: ['INCOMPLETE_WINDOW', 'CAPACITY_LIMIT', 'CONFLICTING_EVIDENCE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED', 'APPLICATION_BINDING_UNRESOLVED', 'OUT_OF_SCOPE_EVENTS'],
   // NO_EVIDENCE_IN_WINDOW sits with WAITING rather than PARTIAL: a partial
   // result implies some evidence was assessed, and there was none. It is the
   // same family as WAITING_FOR_COLLECTION — we do not have what we need — and

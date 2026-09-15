@@ -14,6 +14,37 @@ const managed = async (kind: string, identifiers: readonly string[]): Promise<st
 const scoped = (rows: readonly AuthNormalizedEvent[], subject = 'subject', app = 'app'): AuthNormalizedEvent[] => rows.map(row => ({ ...row, subjectRef: opaque('subject', subject), applicationRef: opaque('application', app) }));
 const project = async (rows: readonly AuthNormalizedEvent[]) => { const input = evaluation(rows); return projectAuthenticationAssessment(input, evaluateAuthenticationRules(input), managed); };
 
+test('non-qualifying admitted events withhold an exact assessed zero without fabricating findings', async () => {
+  const outside = { ...success(), eventId: 'outside', outcome: 'NON_QUALIFYING' as const, errorCode: 50076 };
+  for (const rows of [[outside], [outside, success(-2)]]) {
+    const output = await project(scoped(rows));
+    assert.deepEqual(output.subjects, []);
+    for (const rule of output.rules) {
+      assert.equal(rule.status, 'PARTIAL');
+      assert.equal(rule.reasonCode, 'OUT_OF_SCOPE_EVENTS');
+      assert.equal(rule.assessedIdentities, null);
+      assert.equal(rule.matchedIdentities, null);
+      assert.equal(rule.countsCapped, false);
+      assert.match(rule.explanation, /outside the assessed scope/);
+    }
+  }
+  const control = await project(scoped([success()]));
+  assert.ok(control.rules.every(rule => rule.status === 'READY' && rule.assessedIdentities === 1 && rule.matchedIdentities === 0));
+});
+
+test('scope disclosure preserves genuine findings and never overrides stronger evidence gaps', async () => {
+  const outside = { ...success(), eventId: 'outside', outcome: 'NON_QUALIFYING' as const, errorCode: 50076 };
+  const qualified = scoped([...failures(10), success()]);
+  const positive = await project(qualified);
+  const mixed = await project([...qualified, ...scoped([outside])]);
+  assert.deepEqual(mixed.subjects, positive.subjects);
+  assert.ok(mixed.rules.every(rule => rule.reasonCode === 'OUT_OF_SCOPE_EVENTS'));
+  const unknown = await project(scoped([outside, { ...success(-2), eventId: 'unknown', outcome: 'UNKNOWN', errorCode: 50053 }]));
+  assert.ok(unknown.rules.every(rule => rule.status === 'PARTIAL' && rule.reasonCode === 'INCOMPLETE_WINDOW'));
+  const older = await project(scoped([{ ...outside, eventAt: at(-1441), ingestedAt: at(-1441) }, success()]));
+  assert.ok(older.rules.every(rule => rule.status === 'READY' && rule.matchedIdentities === 0));
+});
+
 test('projects fixed tuples and only opaque evidence/context; code-owned copy and no labels', async () => {
   const rows = scoped([...failures(10), success()]);
   const output = await project(rows);
@@ -112,4 +143,12 @@ test('helper output is accepted by the canonical stored-assessment validator', a
     status: 'WAITING', reasonCode: 'SOURCE_UNAVAILABLE', explanation: assessmentReason('SOURCE_UNAVAILABLE'), selectedSource: 'MAILBOX_RULES',
     window: { start: null, end: null }, evaluatedAt: null, assessedIdentities: null, matchedIdentities: null, countsCapped: false };
   assert.notEqual(projectStoredRiskAssessment({ schemaVersion: RISK_ASSESSMENT_SCHEMA, sources, rules: [...output.rules, mailboxRule], subjects: output.subjects }, new Date(at(0))), null);
+  const limited = await project(scoped([{ ...success(), outcome: 'NON_QUALIFYING', errorCode: 50076 }]));
+  const stored = { schemaVersion: RISK_ASSESSMENT_SCHEMA, sources, rules: [...limited.rules, mailboxRule], subjects: limited.subjects };
+  const safe = projectStoredRiskAssessment(stored, new Date(at(0)));
+  assert.ok(safe);
+  assert.match(safe.rules[0]!.explanation, /outside the assessed scope/);
+  for (const reasonCode of ['OUT_OF_SCOPE_EVENTS_INVENTED', 'password=synthetic-secret']) {
+    assert.equal(projectStoredRiskAssessment({ ...stored, rules: stored.rules.map(rule => ({ ...rule, reasonCode })) }, new Date(at(0))), null);
+  }
 });

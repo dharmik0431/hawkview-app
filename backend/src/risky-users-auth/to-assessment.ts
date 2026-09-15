@@ -78,12 +78,16 @@ export async function projectAuthenticationAssessment(
   const needed = new Set(selected.flatMap(incident => incident.evidenceEventIds.slice(0, ASSESSMENT_MAX_REFERENCES)));
   const captured = new Map<string, AuthNormalizedEvent>();
   const assessed = { [AUTH_RULE_A]: new Set<string>(), [AUTH_RULE_B]: new Set<string>() };
+  let hasOutOfScopeEvents = false;
   const disputed = new Set(canonical.conflictingEventIds);
   if (input.events.length <= MAX_AUTH_EVENTS) for (const event of input.events) {
     // Use the engine's exact admission gate, not an unfiltered ID-to-last-record map.
     // This is bounded by MAX_AUTH_EVENTS and does not query or retain additional history.
     if (!event || disputed.has(event.eventId) || evaluateAuthenticationRules({ ...input, events: [event] }).admittedEventCount !== 1) continue;
     if (!opaque(event.subjectRef, 'subject') || !opaque(event.applicationRef, 'application')) throw new TypeError('MANAGED_SUBJECT_OR_APPLICATION_REQUIRED');
+    // Admission establishes provenance, not that an event qualifies for these
+    // checks. Preserve that distinction without changing detector semantics.
+    if (event.outcome === 'NON_QUALIFYING') { hasOutOfScopeEvents = true; continue; }
     assessed[AUTH_RULE_A].add(event.subjectRef);
     if (event.clientSource.qualification === 'QUALIFIED') assessed[AUTH_RULE_B].add(event.subjectRef);
     if (!needed.has(event.eventId)) continue;
@@ -134,6 +138,10 @@ export async function projectAuthenticationAssessment(
   const rules = ([AUTH_RULE_A, AUTH_RULE_B] as const).map(ruleId => {
     const evaluation = canonical.rules.find(rule => rule.ruleId === ruleId)!;
     const state = readiness(evaluation.reasonCodes, ruleId, capacity);
+    if (state.status === 'READY' && hasOutOfScopeEvents) {
+      state.status = 'PARTIAL';
+      state.reasonCode = 'OUT_OF_SCOPE_EVENTS';
+    }
     const complete = state.status === 'READY' && evaluation.status !== 'NOT_EVALUATED';
     const matched = new Set(incidents.filter(incident => incident.ruleId === ruleId).map(incident => incident.subjectRef));
     return {

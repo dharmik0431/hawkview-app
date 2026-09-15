@@ -34,6 +34,7 @@ export type RiskAssessmentReason =
    * incomplete, it was empty. Those are different facts with different
    * remedies, and before this they were the same sentence. */
   | 'NO_EVIDENCE_IN_WINDOW'
+  | 'OUT_OF_SCOPE_EVENTS'
 export type RiskEvidenceWindow = Readonly<{ start: string | null; end: string | null }>
 export type RiskProtectionEvidence<State extends string> = Readonly<{
   state: State | 'UNKNOWN'

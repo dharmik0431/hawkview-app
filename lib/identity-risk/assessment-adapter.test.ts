@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { adaptRiskAssessmentResponse } from './adapter.ts'
-import { riskAssessmentEmptyPresentation } from './presentation.ts'
+import { hawkViewRiskyUserCountPresentation, riskAssessmentEmptyPresentation } from './presentation.ts'
 import {
   assessmentFixture,
   assessmentUser,
@@ -9,6 +9,27 @@ import {
   at,
   opaque,
 } from './assessment-test-fixtures.ts'
+
+test('out-of-scope authentication evidence remains readable and cannot display a confident zero', () => {
+  const value = assessmentFixture()
+  value.meta.capability = 'PARTIAL'
+  value.summary.currentUsers = { value: null, accuracy: 'UNKNOWN' }
+  for (const rule of value.rules.filter((rule: { ruleId: string }) => rule.ruleId !== 'HV-ID-MBX-001.v1')) {
+    Object.assign(rule, { status: 'PARTIAL', reasonCode: 'OUT_OF_SCOPE_EVENTS',
+      assessedIdentities: null, matchedIdentities: null,
+      explanation: 'Non-qualifying events outside the assessed scope are not assessed by this check.' })
+  }
+  const view = adaptRiskAssessmentResponse(value, assessmentNow)
+  assert.ok(view)
+  assert.match(view.rules[0].explanation, /outside the assessed scope/)
+  assert.equal(hawkViewRiskyUserCountPresentation(view).exact, false)
+  assert.notEqual(hawkViewRiskyUserCountPresentation(view).value, '0')
+  assert.notEqual(riskAssessmentEmptyPresentation(view)?.label, 'No findings in evaluated evidence')
+  for (const reason of ['OUT_OF_SCOPE_EVENTS_INVENTED', 'password=synthetic-secret']) {
+    value.rules[0].reasonCode = reason
+    assert.equal(adaptRiskAssessmentResponse(value, assessmentNow), null)
+  }
+})
 
 test('accepts current authoritative assessment metadata and exact three release tuples', () => {
   for (const rule of [

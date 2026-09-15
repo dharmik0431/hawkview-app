@@ -195,6 +195,7 @@ const assessmentReadiness = [
 ] as const
 const assessmentReasons = [
   'READY',
+  'OUT_OF_SCOPE_EVENTS',
   'WAITING_FOR_COLLECTION',
   'MISSING_PERMISSION',
   'LICENSE_REQUIRED',
