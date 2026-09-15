@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import childProcess from 'node:child_process'
-import { syncBuiltinESMExports } from 'node:module'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { createRequire, syncBuiltinESMExports } from 'node:module'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { Socket } from 'node:net'
-import { join, sep } from 'node:path'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { inspect } from 'node:util'
 import {
   assertE2DisposableUrl, backendRoot, createMigrationPlan, manifest,
-  materializePlan, validateStageDirectory, type Migration,
+  materializePlan, resolvePrismaCli, validateStageDirectory, type Migration,
 } from './e2-migration-upgrade.js'
 
 const sha = 'a'.repeat(40)
@@ -29,6 +30,40 @@ const environment = {
   TZ: 'UTC',
   HAWKVIEW_E2_DISPOSABLE_DATABASE_URL: 'postgresql://postgres@127.0.0.1:55432/hv_e2_m66_upgrade_20260915',
 }
+
+test('installed Prisma CLI resolution follows package bin metadata without executing the CLI', () => {
+  const metadataPath = createRequire(import.meta.url).resolve('prisma/package.json')
+  const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { bin: string | { prisma: string } }
+  const bin = typeof metadata.bin === 'string' ? metadata.bin : metadata.bin.prisma
+  assert.equal(resolvePrismaCli(), realpathSync(resolve(dirname(metadataPath), bin)))
+})
+
+test('Prisma CLI resolution refuses missing, malformed, wrong-package and escaping bins', () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'hv-prisma-bin-'))
+  let serial = 0
+  const fixture = (metadata: unknown): string => {
+    const root = join(scratch, String(serial++), 'prisma')
+    mkdirSync(join(root, 'build'), { recursive: true })
+    writeFileSync(join(root, 'build/index.js'), '// synthetic CLI, never executed\n')
+    const file = join(root, 'package.json')
+    writeFileSync(file, JSON.stringify(metadata))
+    return file
+  }
+  const valid = fixture({ name: 'prisma', bin: { prisma: 'build/index.js' } })
+  assert.equal(resolvePrismaCli(valid), realpathSync(join(dirname(valid), 'build/index.js')))
+  for (const metadata of [
+    { name: 'other', bin: 'build/index.js' },
+    { name: 'prisma' },
+    { name: 'prisma', bin: { other: 'build/index.js' } },
+    { name: 'prisma', bin: 'build/missing.js' },
+    { name: 'prisma', bin: 'build' },
+    { name: 'prisma', bin: '../outside.js' },
+    { name: 'prisma', bin: resolve(scratch, 'outside.js') },
+  ]) assert.throws(() => resolvePrismaCli(fixture(metadata)), /could not be resolved safely/)
+  const malformed = fixture({ name: 'prisma', bin: 'build/index.js' })
+  writeFileSync(malformed, '{')
+  assert.throws(() => resolvePrismaCli(malformed), /could not be resolved safely/)
+})
 
 test('ambient Node preload options fail before any child or socket can be created', (t) => {
   let children = 0

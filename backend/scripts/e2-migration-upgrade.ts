@@ -4,7 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import pg from 'pg'
 import { parseDisposablePostgresUrl } from '../src/prisma/native-alert-test-database.js'
@@ -183,6 +183,30 @@ export function disposableConnectionOptions(url: URL) {
   }
 }
 
+export function resolvePrismaCli(packageJson = createRequire(import.meta.url).resolve('prisma/package.json')): string {
+  try {
+    const metadataPath = realpathSync(packageJson)
+    requireSafe(basename(metadataPath) === 'package.json', 'Prisma package metadata required')
+    const packageRoot = dirname(metadataPath)
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { name?: unknown; bin?: unknown }
+    requireSafe(metadata.name === 'prisma', 'Expected installed Prisma package')
+    const declared = typeof metadata.bin === 'string' ? metadata.bin
+      : metadata.bin && typeof metadata.bin === 'object'
+        ? (metadata.bin as Record<string, unknown>).prisma : undefined
+    requireSafe(typeof declared === 'string' && declared.length > 0, 'Declared Prisma CLI bin required')
+    const bin = declared as string
+    requireSafe(!isAbsolute(bin) && !bin.split(/[\\/]/).includes('..'), 'Relative package-local CLI bin required')
+    const target = resolve(packageRoot, bin)
+    requireSafe(target.startsWith(packageRoot + sep), 'CLI bin must remain within its package')
+    const real = realpathSync(target)
+    requireSafe(real.startsWith(packageRoot + sep) && lstatSync(real).isFile(),
+      'Existing package-local CLI file required')
+    return real
+  } catch {
+    throw new Error('Installed Prisma CLI bin could not be resolved safely')
+  }
+}
+
 function childEnvironment(environment: Environment, mode: Mode, root: string): NodeJS.ProcessEnv {
   const profile = join(root, 'empty-profile')
   mkdirSync(profile)
@@ -227,7 +251,7 @@ async function main(mode: string | undefined) {
   const child = childEnvironment(process.env, mode as Mode, root)
   const require = createRequire(import.meta.url)
   const loader = pathToFileURL(require.resolve('tsx')).href
-  const prisma = require.resolve('prisma')
+  const prisma = resolvePrismaCli()
   const run = (args: string[], stage: Stage, legacyDigest?: string): string => {
     validateStageDirectory(plan, root, stage)
     const result = spawnSync(process.execPath, ['--import', loader, ...args], {
