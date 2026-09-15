@@ -55,6 +55,19 @@ const MICROSOFT_RISK_DETAILS = new Set([
   'adminConfirmedAccountSafe',
   'unknownFutureValue',
 ])
+const MICROSOFT_SUMMARY_MAX_ROWS = 50_000
+const MICROSOFT_SUMMARY_UNAVAILABLE_REASONS = new Set([
+  'SOURCE_UNAVAILABLE',
+  'COLLECTION_NOT_SUCCEEDED',
+  'INVALID_CLOCK',
+  'STALE_EVIDENCE',
+  'INVALID_SNAPSHOT',
+])
+const MICROSOFT_SUMMARY_EARLY_REASONS = new Set([
+  'SOURCE_UNAVAILABLE',
+  'COLLECTION_NOT_SUCCEEDED',
+  'INVALID_CLOCK',
+])
 const HAWKVIEW_RULE_SOURCE_LABELS = new Map([
   ...[
     'HV-ID-EXP-001.v1',
@@ -306,7 +319,63 @@ function assertStringList(value, label, { maxItems = 10, requireItem = false } =
   assert(new Set(value).size === value.length, `${label} contained duplicates`)
 }
 
-function assertIdentityRiskEnvelope(body, route, requestWindow) {
+function assertMicrosoftRiskSummary(value, label, trustedNowMs) {
+  const summary = record(value)
+  assert(
+    summary && exactKeys(summary, [
+      'source', 'availability', 'completeness', 'rawRecordCount',
+      'observedActiveDistinctUserCount', 'activeDistinctUserCount',
+      'snapshotObservedAt', 'collectionSucceededAt', 'reasonCode',
+    ]),
+    `${label} summary keys were invalid`,
+  )
+  assert(
+    summary.source === 'MICROSOFT_IDENTITY_PROTECTION',
+    `${label} summary source was invalid`,
+  )
+  const observation = assertNullableTimestamp(summary.snapshotObservedAt, `${label} summary observation`, trustedNowMs)
+  const collection = assertNullableTimestamp(summary.collectionSucceededAt, `${label} summary collection`, trustedNowMs)
+  const ordered = observation !== null && collection !== null &&
+    Date.parse(collection) >= Date.parse(observation)
+  if (summary.availability === 'UNAVAILABLE') {
+    assert(
+      summary.completeness === 'UNKNOWN' &&
+        summary.rawRecordCount === null &&
+        summary.observedActiveDistinctUserCount === null &&
+        summary.activeDistinctUserCount === null &&
+        MICROSOFT_SUMMARY_UNAVAILABLE_REASONS.has(summary.reasonCode),
+      `${label} unavailable summary was contradictory`,
+    )
+    // Source/collection gates precede clock validation in the emitter. Their
+    // independently valid clocks are diagnostics, never current evidence.
+    assert(
+      MICROSOFT_SUMMARY_EARLY_REASONS.has(summary.reasonCode) || ordered,
+      `${label} unavailable summary clocks were contradictory`,
+    )
+    return summary
+  }
+  assert(ordered, `${label} summary clocks were contradictory`)
+  assert(
+    Number.isInteger(summary.rawRecordCount) &&
+      summary.rawRecordCount >= 0 && summary.rawRecordCount <= MICROSOFT_SUMMARY_MAX_ROWS &&
+      Number.isInteger(summary.observedActiveDistinctUserCount) &&
+      summary.observedActiveDistinctUserCount >= 0 &&
+      summary.observedActiveDistinctUserCount <= summary.rawRecordCount,
+    `${label} summary counts were invalid`,
+  )
+  const exact = summary.availability === 'AVAILABLE' &&
+    summary.completeness === 'COMPLETE' && summary.reasonCode === null &&
+    summary.activeDistinctUserCount === summary.observedActiveDistinctUserCount
+  const partial = summary.availability === 'PARTIAL' &&
+    summary.activeDistinctUserCount === null &&
+    ((summary.completeness === 'CONFLICTING' && summary.reasonCode === 'CONFLICTING_RECORDS') ||
+      ((summary.completeness === 'PARTIAL' || summary.completeness === 'UNKNOWN') &&
+        summary.reasonCode === 'PARTIAL_RECORDS'))
+  assert(exact || partial, `${label} summary state was contradictory`)
+  return summary
+}
+
+function assertIdentityRiskEnvelope(body, route, requestWindow, microsoftSummary) {
   const trustedNowMs = requestWindow.completedAt
   const envelope = record(body)
   assert(envelope?.version === IDENTITY_RISK_API_VERSION, `${route.label} version was invalid`)
@@ -379,18 +448,21 @@ function assertIdentityRiskEnvelope(body, route, requestWindow) {
       envelope.limitation !== null)
   const microsoftCoherent =
     (envelope.status === 'AVAILABLE' &&
-      envelope.capability === 'FULL' &&
+      ((envelope.capability === 'FULL' && microsoftSummary?.availability === 'AVAILABLE' && envelope.limitation === null) ||
+        (envelope.capability === 'PARTIAL' && microsoftSummary?.availability === 'PARTIAL' && envelope.limitation !== null)) &&
       envelope.freshness === 'CURRENT' &&
       evaluatedAt !== null &&
       observedAt !== null &&
       observedAgeAtStartMs <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
-      envelope.limitation === null) ||
+      microsoftSummary.snapshotObservedAt === observedAt &&
+      microsoftSummary.collectionSucceededAt === evaluatedAt) ||
     (envelope.status === 'UNAVAILABLE' &&
       envelope.capability === 'UNAVAILABLE' &&
       envelope.freshness === 'UNKNOWN' &&
       evaluatedAt === null &&
       observedAt === null &&
-      envelope.limitation !== null)
+      envelope.limitation !== null &&
+      microsoftSummary?.availability === 'UNAVAILABLE')
   const coherent = route.channel === 'HAWKVIEW_IDENTITY_SIGNALS'
     ? hawkViewCoherent
     : microsoftCoherent
@@ -536,11 +608,16 @@ function assertIdentityRiskResponse(body, route, requestWindow) {
       candidate,
       route.collection === 'counts'
         ? [...commonKeys, 'counts']
-        : [...commonKeys, route.collection, 'pageInfo'],
+        : route.channel === 'MICROSOFT_ENTRA_RISKY_USERS'
+          ? [...commonKeys, route.collection, 'pageInfo', 'microsoftRiskSummary']
+          : [...commonKeys, route.collection, 'pageInfo'],
     ),
     `${route.label} envelope keys were invalid`,
   )
-  const envelope = assertIdentityRiskEnvelope(body, route, requestWindow)
+  const microsoftSummary = route.channel === 'MICROSOFT_ENTRA_RISKY_USERS'
+    ? assertMicrosoftRiskSummary(candidate.microsoftRiskSummary, route.label, trustedNowMs)
+    : null
+  const envelope = assertIdentityRiskEnvelope(body, route, requestWindow, microsoftSummary)
   if (route.collection === 'counts') {
     const counts = record(envelope.counts)
     assert(
@@ -585,6 +662,9 @@ function assertIdentityRiskResponse(body, route, requestWindow) {
   })
   const rowIds = collection.map(value => record(value)?.id)
   assert(new Set(rowIds).size === rowIds.length, `${route.label} row IDs were duplicated`)
+  if (microsoftSummary && microsoftSummary.availability !== 'UNAVAILABLE') {
+    assert(collection.length <= microsoftSummary.rawRecordCount, `${route.label} page exceeded its source summary`)
+  }
   assertPageInfo(envelope.pageInfo, route.label, collection.length)
 }
 
