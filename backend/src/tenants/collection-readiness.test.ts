@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { summarizeMicrosoftRisk } from '../identity-risk/microsoft-risk-summary.js'
 import test from 'node:test'
 import { deriveCollectionReadiness, M365_ACTIVITY_CONTENT_TYPES } from './collection-readiness.js'
 
@@ -162,6 +163,36 @@ test('keeps Microsoft Identity Protection risk explicitly P2-only', () => {
   assert.equal(row(entitlementUnknown, 'entra_identity_protection').state, 'UNVERIFIED')
 })
 
+test('risk summary is shared across readiness and canonical helper without raw-count or clock drift', () => {
+  const payload = [{ id: 'active', riskLevel: 'high', riskState: 'atRisk' }, { id: 'active', riskLevel: 'high', riskState: 'confirmedSafe' }, { id: 'other', riskLevel: 'high', riskState: 'atRisk' }, {}]
+  const args = input({ licenseServicePlans: [...input().licenseServicePlans, { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }], evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload, observedAt: current }] })
+  const result = deriveCollectionReadiness(args).evidence.riskyIdentities
+  assert.deepEqual(result.microsoftRiskSummary, summarizeMicrosoftRisk({ payload, snapshotObservedAt: current, collectionSucceededAt: current, collectionStatus: 'SUCCEEDED', sourceAllowed: true, now }))
+  assert.equal(result.availability, 'PARTIAL')
+  assert.equal(result.count, null)
+  assert.equal(result.microsoftRiskSummary.observedActiveDistinctUserCount, 2)
+  assert.equal(result.observedAt, current.toISOString())
+
+  for (const hours of [27, 37]) {
+    const past = new Date(now.getTime() - hours * 3600000)
+    const aged = deriveCollectionReadiness({ ...args, syncStates: args.syncStates.map((state) => state.resourceType === 'RISKY_USERS' ? { ...state, lastSuccessfulAt: past } : state), evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload, observedAt: past }] }).evidence.riskyIdentities
+    assert.equal(aged.microsoftRiskSummary.availability, 'UNAVAILABLE')
+    assert.equal(aged.count, null)
+    const canonical = summarizeMicrosoftRisk({ payload, snapshotObservedAt: past, collectionSucceededAt: past, collectionStatus: 'SUCCEEDED', now })
+    assert.equal(canonical.availability, hours === 27 ? 'PARTIAL' : 'UNAVAILABLE')
+    assert.equal(aged.microsoftRiskSummary.snapshotObservedAt, canonical.snapshotObservedAt)
+    assert.equal(aged.microsoftRiskSummary.collectionSucceededAt, canonical.collectionSucceededAt)
+  }
+  const staleSnapshot = deriveCollectionReadiness({ ...args, evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload, observedAt: new Date(now.getTime() - 37 * 3600000) }] }).evidence.riskyIdentities
+  assert.equal(staleSnapshot.microsoftRiskSummary.reasonCode, 'STALE_EVIDENCE')
+  assert.equal(staleSnapshot.count, null)
+  for (const status of ['FAILED', 'RUNNING']) {
+    const blocked = deriveCollectionReadiness({ ...args, syncStates: args.syncStates.map((state) => state.resourceType === 'RISKY_USERS' ? { ...state, status } : state) }).evidence.riskyIdentities
+    assert.equal(blocked.microsoftRiskSummary.availability, 'UNAVAILABLE')
+    assert.equal(blocked.microsoftRiskSummary.observedActiveDistinctUserCount, null)
+  }
+})
+
 test('projects Identity Protection counts only from fresh P2 snapshot evidence', () => {
   const p1Only = deriveCollectionReadiness(input({
     evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'must-not-count' }], observedAt: current }],
@@ -185,7 +216,7 @@ test('projects Identity Protection counts only from fresh P2 snapshot evidence',
 
   const freshRisk = deriveCollectionReadiness(input({
     licenseServicePlans: p2Plans,
-    evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'risk-1' }, { id: 'risk-2' }], observedAt: current }],
+    evidenceSnapshots: [{ resourceType: 'RISKY_USERS', payload: [{ id: 'risk-1', riskState: 'atRisk', riskLevel: 'high' }, { id: 'risk-2', riskState: 'confirmedCompromised', riskLevel: 'high' }], observedAt: current }],
   }))
   assert.equal(freshRisk.evidence.riskyIdentities.count, 2)
 

@@ -1,4 +1,5 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
   capabilitiesForWorkload,
@@ -151,6 +152,7 @@ export type PilotEvidenceProjection = {
     reason: string | null
   }
   riskyIdentities: {
+    microsoftRiskSummary: MicrosoftRiskSummary
     availability: CollectionReadinessState
     count: number | null
     selectedSource: 'MICROSOFT_IDENTITY_PROTECTION'
@@ -824,11 +826,18 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const riskySnapshot = snapshotByResource.get('RISKY_USERS')
   const conditionalAccessSnapshot = snapshotByResource.get('CONDITIONAL_ACCESS')
   const securityDefaultsSnapshot = snapshotByResource.get('SECURITY_DEFAULTS')
-  const riskyRows = Array.isArray(riskySnapshot?.payload) ? riskySnapshot.payload : null
+  const microsoftRiskSummary = summarizeMicrosoftRisk({
+    payload: riskySnapshot?.payload,
+    snapshotObservedAt: riskySnapshot?.observedAt,
+    collectionSucceededAt: states.get('RISKY_USERS')?.lastSuccessfulAt,
+    collectionStatus: states.get('RISKY_USERS')?.status,
+    sourceAllowed: riskyDataset?.state === 'READY',
+    now,
+  })
   const conditionalAccessRows = Array.isArray(conditionalAccessSnapshot?.payload) ? conditionalAccessSnapshot.payload : null
   const securityDefaultsRows = Array.isArray(securityDefaultsSnapshot?.payload) ? securityDefaultsSnapshot.payload : null
   const securityDefaultsValue = securityDefaultsRows?.[0]
-  const riskyEvidenceReady = riskyDataset?.state === 'READY' && riskyRows !== null && Boolean(riskySnapshot?.observedAt)
+  const riskyEvidenceReady = microsoftRiskSummary.availability === 'AVAILABLE'
   const conditionalAccessEvidenceReady = conditionalAccessDataset?.state === 'READY' && conditionalAccessRows !== null && Boolean(conditionalAccessSnapshot?.observedAt)
   const securityDefaultsEnabled = securityDefaultsValue && typeof securityDefaultsValue === 'object' && typeof (securityDefaultsValue as { isEnabled?: unknown }).isEnabled === 'boolean'
     ? (securityDefaultsValue as { isEnabled: boolean }).isEnabled
@@ -847,12 +856,13 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
       reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
     },
     riskyIdentities: {
-      availability: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'UNVERIFIED' : riskyDataset?.state ?? 'UNVERIFIED',
-      count: riskyEvidenceReady ? riskyRows.length : null,
+      microsoftRiskSummary,
+      availability: microsoftRiskSummary.availability === 'PARTIAL' ? 'PARTIAL' : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'UNVERIFIED' : riskyDataset?.state ?? 'UNVERIFIED',
+      count: microsoftRiskSummary.activeDistinctUserCount,
       selectedSource: 'MICROSOFT_IDENTITY_PROTECTION',
-      observedAt: riskyEvidenceReady ? iso(riskySnapshot?.observedAt) : null,
-      reasonCode: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : riskyDataset?.reasonCode ?? null,
-      reason: evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'Current Microsoft Identity Protection evidence is unavailable.' : riskyDataset?.reason ?? null,
+      observedAt: microsoftRiskSummary.snapshotObservedAt,
+      reasonCode: microsoftRiskSummary.availability === 'PARTIAL' ? microsoftRiskSummary.reasonCode : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'EVIDENCE_SNAPSHOT_UNAVAILABLE' : riskyDataset?.reasonCode ?? null,
+      reason: microsoftRiskSummary.availability === 'PARTIAL' ? 'Microsoft Identity Protection evidence is incomplete or conflicting; the exact active total is unknown.' : evidenceUnavailable(riskyDataset?.state, riskyEvidenceReady) ? 'Current Microsoft Identity Protection evidence is unavailable.' : riskyDataset?.reason ?? null,
     },
     conditionalAccess: {
       availability: evidenceUnavailable(conditionalAccessDataset?.state, conditionalAccessEvidenceReady) ? 'UNVERIFIED' : conditionalAccessDataset?.state ?? 'UNVERIFIED',

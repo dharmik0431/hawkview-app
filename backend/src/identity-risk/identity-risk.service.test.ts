@@ -4,6 +4,7 @@ import test, { beforeEach, afterEach } from 'node:test'
 import { ForbiddenException } from '@nestjs/common'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
+import { summarizeMicrosoftRisk } from './microsoft-risk-summary.js'
 
 const identity = { subject: 'auth-user', email: 'owner@example.com' }
 const organizationId = '11111111-1111-4111-8111-111111111111'
@@ -607,6 +608,41 @@ test('a corrupt capped-zero coverage row fails closed instead of rendering at le
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('Microsoft summary is snapshot-wide before pagination and preserves uncertain active observations', async () => {
+  const previousDisplay = process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+  const previousSecret = process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+  process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = 'true'
+  process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = 'unit-test-only-cursor-secret-at-least-32-bytes'
+  const now = new Date()
+  try {
+    const payload: unknown[] = Array.from({ length: 55 }, (_, i) => ({ id: `source-${i}`, riskLevel: 'high', riskState: i < 2 ? 'atRisk' : 'dismissed' }))
+    payload.push({ id: 'source-0', riskLevel: 'high', riskState: 'confirmedSafe' }, {})
+    const prisma = scoped({
+      syncState: { findFirst: async (args: { where: unknown }) => { assert.deepEqual(args.where, { organizationId, customerTenantId: tenantId, resourceType: 'RISKY_USERS' }); return { status: 'SUCCEEDED', lastSuccessfulAt: now } } },
+      tenantEntraSnapshot: { findFirst: async (args: { where: unknown; orderBy: unknown }) => { assert.deepEqual(args.where, { organizationId, customerTenantId: tenantId, resourceType: 'RISKY_USERS' }); assert.deepEqual(args.orderBy, { observedAt: 'desc' }); return { payload, observedAt: now } } },
+    })
+    const service = new IdentityRiskService(prisma)
+    const first = await service.microsoftRiskyUsers(identity, tenantId, { limit: '1' })
+    const larger = await service.microsoftRiskyUsers(identity, tenantId, { limit: '100' })
+    assert.equal(first.users.length, 1)
+    assert.equal(larger.users.length, 56)
+    assert.deepEqual(first.microsoftRiskSummary, larger.microsoftRiskSummary)
+    assert.deepEqual(first.microsoftRiskSummary, summarizeMicrosoftRisk({ payload, snapshotObservedAt: now, collectionSucceededAt: now, collectionStatus: 'SUCCEEDED', now }))
+    assert.equal(first.microsoftRiskSummary.observedActiveDistinctUserCount, 2)
+    assert.equal(first.microsoftRiskSummary.activeDistinctUserCount, null)
+    assert.equal(first.capability, 'PARTIAL')
+    assert.equal(first.microsoftRiskSummary.completeness, 'CONFLICTING')
+    assert.doesNotMatch(JSON.stringify(first.microsoftRiskSummary), /source-\d/)
+    assert.equal(first.observedAt, first.microsoftRiskSummary.snapshotObservedAt)
+    assert.equal(first.evaluatedAt, first.microsoftRiskSummary.collectionSucceededAt)
+  } finally {
+    if (previousDisplay === undefined) delete process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED
+    else process.env.HAWKVIEW_MICROSOFT_RISK_DISPLAY_ENABLED = previousDisplay
+    if (previousSecret === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET
+    else process.env.HAWKVIEW_IDENTITY_RISK_CURSOR_SECRET = previousSecret
   }
 })
 

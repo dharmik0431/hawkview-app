@@ -405,6 +405,7 @@ export class TenantsService {
       syncStates: tenant.syncStates,
       authSnapshot: tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.AUTH_REGISTRATIONS) ?? null,
       riskyIdentityCount: collectionReadiness.evidence.riskyIdentities.count,
+      microsoftRiskSummary: collectionReadiness.evidence.riskyIdentities.microsoftRiskSummary,
       signInEvidence: collectionReadiness.evidence.signIns,
       auditEvents,
       notApplicableResourceTypes,
