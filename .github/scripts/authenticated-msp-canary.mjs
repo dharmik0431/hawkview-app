@@ -66,7 +66,6 @@ const MICROSOFT_SUMMARY_UNAVAILABLE_REASONS = new Set([
 const MICROSOFT_SUMMARY_EARLY_REASONS = new Set([
   'SOURCE_UNAVAILABLE',
   'COLLECTION_NOT_SUCCEEDED',
-  'INVALID_CLOCK',
 ])
 const HAWKVIEW_RULE_SOURCE_LABELS = new Map([
   ...[
@@ -319,7 +318,8 @@ function assertStringList(value, label, { maxItems = 10, requireItem = false } =
   assert(new Set(value).size === value.length, `${label} contained duplicates`)
 }
 
-function assertMicrosoftRiskSummary(value, label, trustedNowMs) {
+function assertMicrosoftRiskSummary(value, label, requestWindow) {
+  const trustedNowMs = requestWindow.completedAt
   const summary = record(value)
   assert(
     summary && exactKeys(summary, [
@@ -348,10 +348,17 @@ function assertMicrosoftRiskSummary(value, label, trustedNowMs) {
     )
     // Source/collection gates precede clock validation in the emitter. Their
     // independently valid clocks are diagnostics, never current evidence.
-    assert(
-      MICROSOFT_SUMMARY_EARLY_REASONS.has(summary.reasonCode) || ordered,
-      `${label} unavailable summary clocks were contradictory`,
-    )
+    const staleAtEnd = ordered &&
+      (trustedNowMs - Date.parse(observation) > IDENTITY_RISK_CURRENT_MAX_AGE_MS ||
+        trustedNowMs - Date.parse(collection) > IDENTITY_RISK_CURRENT_MAX_AGE_MS)
+    const currentAtStart = ordered &&
+      requestWindow.startedAt - Date.parse(observation) <= IDENTITY_RISK_CURRENT_MAX_AGE_MS &&
+      requestWindow.startedAt - Date.parse(collection) <= IDENTITY_RISK_CURRENT_MAX_AGE_MS
+    const coherentReason = MICROSOFT_SUMMARY_EARLY_REASONS.has(summary.reasonCode) ||
+      (summary.reasonCode === 'INVALID_CLOCK' && !ordered) ||
+      (summary.reasonCode === 'STALE_EVIDENCE' && staleAtEnd) ||
+      (summary.reasonCode === 'INVALID_SNAPSHOT' && currentAtStart)
+    assert(coherentReason, `${label} unavailable summary clocks were contradictory`)
     return summary
   }
   assert(ordered, `${label} summary clocks were contradictory`)
@@ -615,7 +622,7 @@ function assertIdentityRiskResponse(body, route, requestWindow) {
     `${route.label} envelope keys were invalid`,
   )
   const microsoftSummary = route.channel === 'MICROSOFT_ENTRA_RISKY_USERS'
-    ? assertMicrosoftRiskSummary(candidate.microsoftRiskSummary, route.label, trustedNowMs)
+    ? assertMicrosoftRiskSummary(candidate.microsoftRiskSummary, route.label, requestWindow)
     : null
   const envelope = assertIdentityRiskEnvelope(body, route, requestWindow, microsoftSummary)
   if (route.collection === 'counts') {

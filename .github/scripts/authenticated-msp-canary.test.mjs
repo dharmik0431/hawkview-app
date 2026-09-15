@@ -943,14 +943,19 @@ test('fails before authentication when the live revision differs', async () => {
   )
 })
 
-async function checkMicrosoftResponse(response) {
+async function checkMicrosoftResponse(response, { responseDelayMs = 0 } = {}) {
+  let clock = freshnessNow
   const { calls, fetchImpl } = successfulFetch({
-    riskResponseOverride: ({ relationship, route }) =>
-      relationship === 'own' && route === 'microsoft' ? jsonResponse(response) : null,
+    riskResponseOverride: ({ relationship, route }) => {
+      if (relationship !== 'own' || route !== 'microsoft') return null
+      const body = typeof response === 'function' ? response(clock) : response
+      clock += responseDelayMs
+      return jsonResponse(body)
+    },
   })
   await runAuthenticatedCanary({
     fetchImpl,
-    now: () => freshnessNow,
+    now: () => clock,
     environment: {
       EXPECTED_REVISION: revision,
       ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
@@ -1017,10 +1022,11 @@ test('preserves unavailable diagnostic clock precedence without creating current
   }
   for (const reasonCode of ['STALE_EVIDENCE', 'INVALID_SNAPSHOT']) {
     const response = riskFixture('microsoft')
+    const ageHours = reasonCode === 'STALE_EVIDENCE' ? 38 : 1
     response.microsoftRiskSummary = microsoftSummaryFixture({
       reasonCode,
-      snapshotObservedAt: new Date(freshnessNow - 38 * 60 * 60 * 1_000).toISOString(),
-      collectionSucceededAt: new Date(freshnessNow - 37 * 60 * 60 * 1_000).toISOString(),
+      snapshotObservedAt: new Date(freshnessNow - ageHours * 60 * 60 * 1_000).toISOString(),
+      collectionSucceededAt: new Date(freshnessNow - (ageHours - 0.5) * 60 * 60 * 1_000).toISOString(),
     })
     await checkMicrosoftResponse(response)
   }
@@ -1049,6 +1055,47 @@ test('rejects missing and extra Microsoft summary fields without relaxing other 
   }
   for (const response of fixtures) {
     await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users .*keys were invalid/)
+  }
+})
+
+test('rejects unavailable reasons that contradict clock-validation precedence', async () => {
+  for (const [reasonCode, ageMs] of [
+    ['INVALID_CLOCK', 60 * 60 * 1_000],
+    ['INVALID_CLOCK', 37 * 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 36 * 60 * 60 * 1_000],
+    ['INVALID_SNAPSHOT', 36 * 60 * 60 * 1_000 + 1],
+  ]) {
+    const time = new Date(freshnessNow - ageMs).toISOString()
+    const response = riskFixture('microsoft')
+    response.microsoftRiskSummary = microsoftSummaryFixture({
+      reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+    })
+    await assert.rejects(checkMicrosoftResponse(response), /unavailable summary clocks were contradictory/)
+  }
+})
+
+test('accepts unavailable freshness only within the actual request timing window', async () => {
+  for (const reasonCode of ['STALE_EVIDENCE', 'INVALID_SNAPSHOT']) {
+    await checkMicrosoftResponse((startedAt) => {
+      const time = new Date(startedAt - 36 * 60 * 60 * 1_000 + 1_000).toISOString()
+      const response = riskFixture('microsoft')
+      response.microsoftRiskSummary = microsoftSummaryFixture({
+        reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+      })
+      return response
+    }, { responseDelayMs: 2_000 })
+  }
+  for (const [reasonCode, ageMs] of [
+    ['INVALID_SNAPSHOT', 36 * 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 36 * 60 * 60 * 1_000 + 1],
+  ]) {
+    const time = new Date(freshnessNow - ageMs).toISOString()
+    const response = riskFixture('microsoft')
+    response.microsoftRiskSummary = microsoftSummaryFixture({
+      reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+    })
+    await checkMicrosoftResponse(response)
   }
 })
 
