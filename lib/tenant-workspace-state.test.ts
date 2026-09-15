@@ -173,6 +173,32 @@ test('uses an authoritative core permission finding instead of a healthy-looking
   assert.equal(display.issues[0]?.id, 'authorization-required')
 })
 
+test('keeps Microsoft risk attention pointed at the canonical tenant evidence page', () => {
+  const data = bundle()
+  data.tenant.initialSync = undefined
+  const health = tenantActionableHealthProjection({
+    tenantHealth: {
+      attention: [{
+        key: 'risky-identities',
+        label: '2 identities have active Microsoft-risk evidence requiring review',
+        severity: 'high',
+        why: 'Microsoft Identity Protection evidence is incomplete.',
+        detectedAt: '2026-09-15T11:00:00.000Z',
+        actionLabel: 'Review Microsoft risk',
+        actionUrl: '/tenants/123e4567-e89b-42d3-a456-426614174000/risky-users',
+      }],
+    },
+  })
+
+  const display = deriveTenantWorkspaceDisplay(data, false, null, health)
+  assert.equal(display.issues[0]?.targetModule, 'risky-users')
+  assert.equal(display.issues[0]?.action, 'Review Microsoft risk')
+  assert.equal(
+    display.issues[0]?.actionUrl,
+    '/tenants/123e4567-e89b-42d3-a456-426614174000/risky-users',
+  )
+})
+
 test('preserves an authoritative healthy zero and multiple tenant-wide findings exactly', () => {
   const data = bundle()
   data.tenant.initialSync = undefined

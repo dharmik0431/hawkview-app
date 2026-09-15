@@ -54,6 +54,7 @@ const microsoftView = adapter.adaptMicrosoftRiskyUsersResponse({
 const uiMocks: Record<string, unknown> = {
   '@/lib/identity-risk/presentation': presentation,
   '@/lib/identity-risk/risky-users-view': riskyUsersView,
+  '@/lib/identity-risk/microsoft-risk-summary': require('./microsoft-risk-summary.ts'),
   '@/lib/identity-risk/native-view': require('./native-view.ts'),
   '@/lib/identity-risk/risk-presentation-mapper': require('./risk-presentation-mapper.ts'),
   '@/lib/api/hooks': {

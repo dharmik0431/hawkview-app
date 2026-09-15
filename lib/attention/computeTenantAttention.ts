@@ -64,12 +64,16 @@ function authoritativeAttention(value: unknown): AttentionItem[] | null {
     // actions. Accept the row without inflating actionable counts.
     if (!ATTENTION_SEVERITIES.has(severity)) continue
     const detectedAt = safeAttentionText(row.detectedAt, 80) ?? undefined
+    const actionLabel = safeAttentionText(row.actionLabel, 120) ?? undefined
+    const actionUrl = safeAttentionText(row.actionUrl, 500) ?? undefined
     items.push({
       key,
       label,
       why,
       severity: severity as AttentionItem['severity'],
       ...(detectedAt ? { detectedAt } : {}),
+      ...(actionLabel ? { actionLabel } : {}),
+      ...(actionUrl ? { actionUrl } : {}),
     })
   }
   return items

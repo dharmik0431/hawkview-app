@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { MicrosoftRiskSummarySchema } from '../lib/identity-risk/microsoft-risk-summary.ts'
 
 export const TenantSchema = z.object({
   id: z.string(),
@@ -21,6 +22,7 @@ export const TenantSchema = z.object({
   healthScore: z.number().min(0).max(100).nullish(),
   mfaCoverage: z.number().min(0).max(100).nullish(),
   riskyIdentityCount: z.number().int().nonnegative().nullish(),
+  microsoftRiskSummary: MicrosoftRiskSummarySchema.optional().catch(undefined),
   attention: z.array(z.object({
     key: z.string(),
     label: z.string(),

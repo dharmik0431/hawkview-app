@@ -6,4 +6,6 @@ export type AttentionItem = {
   severity: AttentionSeverity
   why: string
   detectedAt?: string
+  actionLabel?: string
+  actionUrl?: string
 }

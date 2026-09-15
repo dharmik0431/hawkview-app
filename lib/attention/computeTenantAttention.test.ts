@@ -54,6 +54,27 @@ test('uses backend tenant-list attention instead of recomputing health from conn
   }])
 })
 
+test('preserves bounded backend investigation actions for guarded navigation', () => {
+  const projection = tenantActionableHealthProjection({
+    attention: [{
+      key: 'risky-identities',
+      label: '2 identities have active Microsoft-risk evidence requiring review',
+      severity: 'high',
+      why: 'Microsoft Identity Protection evidence is incomplete.',
+      detectedAt: '2026-09-15T11:00:00.000Z',
+      actionLabel: 'Review Microsoft risk',
+      actionUrl: '/tenants/123e4567-e89b-42d3-a456-426614174000/risky-users',
+    }],
+  })
+
+  assert.equal(projection.status, 'VERIFIED')
+  assert.equal(projection.items[0]?.actionLabel, 'Review Microsoft risk')
+  assert.equal(
+    projection.items[0]?.actionUrl,
+    '/tenants/123e4567-e89b-42d3-a456-426614174000/risky-users',
+  )
+})
+
 test('an authoritative empty attention list stays empty', () => {
   const findings = computeTenantAttention({
     attention: [],

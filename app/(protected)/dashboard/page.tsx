@@ -28,6 +28,7 @@ import {
   getTenantMatrixOverallState,
   getTenantConnectionDataInfo,
   getTenantIdentityInfo,
+  getTenantRiskyUsersInfo,
   getTenantThreatsInfo,
 } from '@/components/dashboard/tenant-risk-matrix-helpers'
 import type { Tenant } from '@/types/api'
@@ -35,6 +36,10 @@ import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { queueSummary } from '@/lib/dashboard/queue-summary'
 import { EmptyState } from '@/components/common/empty-state'
+import {
+  normalizeMicrosoftRiskSummary,
+  presentMicrosoftRiskSummary,
+} from '@/lib/identity-risk/microsoft-risk-summary'
 
 export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
@@ -110,7 +115,7 @@ function numericEvidence(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER)
 
 function evidenceCount(value: number | null, partial: boolean, unavailableLabel = 'Not reported') {
   if (value === null || (partial && value === 0)) return unavailableLabel
-  return partial ? `≥${value}` : String(value)
+  return partial ? `${value} observed` : String(value)
 }
 
 function severityStripe(sev: Severity) {
@@ -278,6 +283,7 @@ type TenantRow = Tenant & {
   topSeverity?: Severity
   lastCriticalAt?: string
   identityDetected: number | null
+  identityExact: boolean
 }
 
 function buildTenants(source: any[]): TenantRow[] {
@@ -299,7 +305,13 @@ function buildTenants(source: any[]): TenantRow[] {
 
     const healthScore = numericEvidence(t.healthScore, 0, 100)
     const mfaCoverage = numericEvidence(t.mfaCoverage, 0, 100)
-    const identityDetected = numericEvidence(t.riskyIdentityCount, 0)
+    const normalizedRiskSummary = normalizeMicrosoftRiskSummary(t.microsoftRiskSummary)
+    const riskPresentation = normalizedRiskSummary
+      ? presentMicrosoftRiskSummary(normalizedRiskSummary)
+      : null
+    const legacyIdentityCount = numericEvidence(t.riskyIdentityCount, 0)
+    const identityDetected = riskPresentation?.count ?? legacyIdentityCount
+    const identityExact = riskPresentation?.exact ?? legacyIdentityCount !== null
 
     return {
       ...t,
@@ -310,8 +322,9 @@ function buildTenants(source: any[]): TenantRow[] {
       lastCriticalAt,
       healthScore,
       mfaCoverage,
-      riskyIdentityCount: identityDetected,
+      riskyIdentityCount: legacyIdentityCount,
       identityDetected,
+      identityExact,
     }
   })
 }
@@ -339,12 +352,22 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
   }
 
   if (label.includes('risky') || label.includes('risk')) {
+    const normalizedSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
+    const presentation = normalizedSummary
+      ? presentMicrosoftRiskSummary(normalizedSummary)
+      : null
     return {
       metricLabel: 'RISK EVIDENCE',
       metricValue:
-        tenant.identityDetected === null
-          ? 'Not reported'
-          : `${tenant.identityDetected} user${tenant.identityDetected === 1 ? '' : 's'}`,
+        presentation
+          ? presentation.count === null
+            ? 'Not reported'
+            : presentation.exact
+            ? `${presentation.count} active ${presentation.count === 1 ? 'identity' : 'identities'}`
+            : `${presentation.count} observed`
+          : tenant.identityDetected === null
+            ? 'Not reported'
+            : `${tenant.identityDetected} active ${tenant.identityDetected === 1 ? 'identity' : 'identities'}`,
     }
   }
 
@@ -435,9 +458,10 @@ export default function DashboardPage() {
 
       // 2. Has Risky Users
       if (matrixHasRiskyUsers === 'yes') {
-        if (typeof t.riskyIdentityCount !== 'number' || t.riskyIdentityCount <= 0) return false
+        if ((getTenantRiskyUsersInfo(t).count ?? 0) <= 0) return false
       } else if (matrixHasRiskyUsers === 'no') {
-        if (t.riskyIdentityCount !== 0) return false
+        const risk = getTenantRiskyUsersInfo(t)
+        if (!risk.isExact || risk.count !== 0) return false
       }
 
       // 3. Has Active Threats
@@ -593,7 +617,9 @@ export default function DashboardPage() {
       criticalTenants,
       mfaGaps,
       avgScore,
-      riskPartial: reportedRiskCounts.length < tenants.length,
+      riskPartial:
+        reportedRiskCounts.length < tenants.length ||
+        tenants.some((tenant) => !tenant.identityExact),
       attentionPartial,
       mfaPartial: reportedMfa.length < tenants.length,
       healthPartial: reportedHealthScores.length < tenants.length,
@@ -607,7 +633,7 @@ export default function DashboardPage() {
         (tenant) =>
           tenant.healthScore == null ||
           tenant.mfaCoverage == null ||
-          tenant.identityDetected == null ||
+          !tenant.identityExact ||
           !tenant.attentionReported ||
           !tenant.lastSync,
       ),
@@ -1025,6 +1051,7 @@ export default function DashboardPage() {
                     const destinationUrl = investigateDestination(
                       q.item.actionUrl,
                       `/tenants/${encodeURIComponent(q.tenantId)}/settings`,
+                      q.tenantId,
                     )
                     const buttonLabel = q.item.actionLabel ?? actionLabel(q.item.severity)
 

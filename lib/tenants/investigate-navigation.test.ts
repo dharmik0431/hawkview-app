@@ -33,3 +33,26 @@ test('canonicalizes only approved internal tenant and investigation routes', () 
   assert.equal(investigateDestination('/what-changed?tenantId=tenant-1', '/fallback'), '/what-changed?tenantId=tenant-1')
   assert.equal(investigateDestination('/dashboard', '/fallback'), '/fallback')
 })
+
+test('accepts only the authorized same-tenant risky-users evidence route', () => {
+  const route = `/tenants/${tenantId}/risky-users`
+  assert.equal(investigateDestination(route, '/fallback', tenantId), route)
+  assert.equal(
+    investigateDestination(
+      '/tenants/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/risky-users',
+      '/fallback',
+      tenantId,
+    ),
+    '/fallback',
+  )
+})
+
+test('keeps traversal and arbitrary risky-user routes outside the allowlist', () => {
+  for (const value of [
+    `/tenants/${tenantId}/risky-users/anything`,
+    `/tenants/${tenantId}/risky-users%2F..%2Fsettings`,
+    `/tenants/${tenantId}/risky-users\\settings`,
+  ]) {
+    assert.equal(investigateDestination(value, '/fallback', tenantId), '/fallback')
+  }
+})

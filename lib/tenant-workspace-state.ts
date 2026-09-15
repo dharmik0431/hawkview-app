@@ -34,6 +34,7 @@ export type TenantIssue = {
   technicalDetails?: string
   recommendedSteps?: string[]
   action?: string
+  actionUrl?: string
   lastDetectedAt?: string | null
   targetModule?: string
 }
@@ -76,6 +77,7 @@ function attentionService(item: AttentionItem) {
 
 function attentionTargetModule(item: AttentionItem) {
   const key = item.key.toLowerCase()
+  if (key.includes('risky')) return 'risky-users'
   if (
     key.includes('authorization') ||
     key.includes('permission') ||
@@ -84,7 +86,6 @@ function attentionTargetModule(item: AttentionItem) {
   ) return 'settings'
   if (
     key.includes('identity') ||
-    key.includes('risky') ||
     key.includes('mfa') ||
     key.includes('auth') ||
     key.includes('conditional')
@@ -105,7 +106,8 @@ function workspaceIssueFromAttention(item: AttentionItem): TenantIssue {
     title: item.label,
     detail: item.why,
     explanation: item.why,
-    action: 'Review issue',
+    action: item.actionLabel ?? 'Review issue',
+    actionUrl: item.actionUrl,
     lastDetectedAt: item.detectedAt ?? null,
     targetModule: attentionTargetModule(item),
   }

@@ -5,6 +5,7 @@ import test from 'node:test'
 import * as adapter from './adapter.ts'
 import * as presentation from './presentation.ts'
 import * as riskyUsersView from './risky-users-view.ts'
+import * as microsoftRiskSummary from './microsoft-risk-summary.ts'
 import type { useNativeRiskyUsersRead } from '../api/risky-users-assessment-hooks.ts'
 import type { NativeAssessment } from './native-assessment.ts'
 import {
@@ -197,6 +198,7 @@ function render(
   const uiMocks = {
     '@/lib/identity-risk/presentation': presentation,
     '@/lib/identity-risk/risky-users-view': riskyUsersView,
+    '@/lib/identity-risk/microsoft-risk-summary': microsoftRiskSummary,
     '@/lib/identity-risk/native-view': nativeViewModule,
     '@/lib/identity-risk/risk-presentation-mapper': riskPresentationMapper,
     '@/lib/api/hooks': {

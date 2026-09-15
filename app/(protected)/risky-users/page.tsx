@@ -347,7 +347,7 @@ export default function FleetRiskyUsersPage() {
             <div className="space-y-2 pt-2 border-t border-slate-100 dark:border-slate-800/60">
               <div className="flex items-center justify-between text-2xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
                 <span>Detection Sources</span>
-                <span>{totalDistributionSum} total instances</span>
+                <span>{totalDistributionSum} users by detection source</span>
               </div>
               <div className="h-1.5 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden flex">
                 {hawkViewOnlyCount > 0 && (
