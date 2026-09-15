@@ -173,9 +173,17 @@ test('A REAL NATIVE FINDING PRODUCES THE INTENDED IN-APP ALERT',
       // THE RULE ID MAPPED, rather than being read and discarded. An unmapped rule is reported
       // by intake rather than thrown, so without this a new id that reaches nothing would look
       // identical to one that works — until no alert appeared in production.
-      assert.deepEqual(outcome.report.unmappedRules, [], 'the native rule id reached no alert type')
-      assert.equal(outcome.report.findingsRead, 1)
-      assert.equal(outcome.report.notificationsWritten, 1)
+      // Global intake totals include other organizations in the shared test database.
+      // The exact notification cardinality and mapping above belong to this fixture.
+      assert.equal(outcome.report.unmappedRules.includes(NATIVE_RULE_ID), false,
+        'the native rule id reached no alert type')
+
+      // Replaying intake must preserve the same single notification, not create a duplicate.
+      await runIntakeOnce(prisma, at)
+      const replayedNotifications = await prisma.notification.findMany({
+        where: { organizationId: scope.organizationId },
+      })
+      assert.deepEqual(replayedNotifications.map(row => row.id), notifications.map(row => row.id))
     } finally {
       await cleanUp(prisma, scope)
       await prisma.$disconnect()
@@ -206,6 +214,16 @@ test('CONTROL: the same finding under a RECORD_ONLY disposition produces no aler
       assert.equal(production.findingsPublished, 1,
         'the control must publish the same finding as the positive case')
 
+      const stored = await prisma.identityRiskFinding.findFirst({
+        where: {
+          organizationId: scope.organizationId,
+          customerTenantId: scope.customerTenantId,
+          matchedResult: { evaluationRunId: production.runId },
+        },
+      })
+      assert.ok(stored)
+      assert.equal(stored.ruleId, NATIVE_RULE_ID)
+
       const outcome = await runIntakeOnce(prisma, at)
 
       const notifications = await prisma.notification.findMany({
@@ -217,8 +235,15 @@ test('CONTROL: the same finding under a RECORD_ONLY disposition produces no aler
       // AND IT WAS A DECISION, NOT AN ABSENCE. Intake read the same finding and chose not to
       // notify. Without this the control would also pass if the finding were never read at all —
       // which is exactly how it passed before, when intake was NOT_CONFIGURED.
-      assert.equal(outcome.report.findingsRead, 1, 'the control never even read the finding')
-      assert.equal(outcome.report.notificationsWritten, 0)
+      assert.equal(outcome.report.unmappedRules.includes(NATIVE_RULE_ID), false,
+        'the control native rule id reached no alert type')
+      const withheld = await prisma.alertWithheldNotice.findMany({
+        where: { organizationId: scope.organizationId },
+      })
+      assert.equal(withheld.length, 1, 'the control did not persist exactly one withheld decision')
+      assert.equal(withheld[0]!.findingId, stored.id)
+      assert.equal(withheld[0]!.alertTypeId, 'security.suspected_credential_attack')
+      assert.equal(withheld[0]!.because, 'RECORD_ONLY')
     } finally {
       await cleanUp(prisma, scope)
       await prisma.$disconnect()
