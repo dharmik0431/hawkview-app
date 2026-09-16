@@ -114,7 +114,7 @@ export class DeliveryWebhookController {
       // recorded, which is a fact about this system that a count could not answer, and it needs
       // the signing secret to produce so its volume is bounded by the provider.
       const matched = await this.store.messageForProvider(received.event.providerId)
-      await this.store.record(outcomeRow(received.event, matched))
+      await this.store.record(outcomeRow(received.event, matched), { eventId: svixId ?? '', event: received.event })
     } catch (error) {
       // A TRANSIENT FAILURE ON AN AUTHENTIC EVENT MUST NOT BECOME A SUCCESSFUL ACKNOWLEDGEMENT.
       // Swallowing it would tell Resend the event was handled and lose the outcome permanently —

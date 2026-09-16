@@ -496,6 +496,40 @@ model AlertDeliveryOutcome {
   @@map("alert_delivery_outcomes")
 }
 
+/// Private immutable provenance for the controlled email release.
+model AlertEmailEnvelope {
+  messageId        String    @id @map("message_id") @db.VarChar(400)
+  activationId     String    @unique @map("activation_id") @db.Uuid
+  organizationId   String    @map("organization_id") @db.Uuid
+  ownerUserId      String    @map("owner_user_id") @db.Uuid
+  recipientHash    String    @map("recipient_hash") @db.VarChar(64)
+  startsAt         DateTime  @map("starts_at") @db.Timestamptz(6)
+  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(6)
+  fromAddress      String    @map("from_address") @db.VarChar(320)
+  appOrigin        String    @map("app_origin") @db.VarChar(300)
+  recipientAddress String?   @map("recipient_address") @db.VarChar(320)
+  verifiedAt       DateTime? @map("verified_at") @db.Timestamptz(6)
+  payload          String?   @db.Text
+  idempotencyKey   String    @unique @map("idempotency_key") @db.VarChar(80)
+  providerId       String?   @unique @map("provider_id") @db.VarChar(200)
+  stopCode         String?   @map("stop_code") @db.VarChar(50)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  @@index([organizationId, expiresAt])
+  @@map("alert_email_envelopes")
+}
+
+/// Authenticated fields only; unmatched events cannot suppress an address.
+model AlertEmailEvent {
+  eventId    String   @id @map("event_id") @db.VarChar(200)
+  providerId String   @map("provider_id") @db.VarChar(200)
+  kind       String   @db.VarChar(20)
+  bounce     String?  @db.VarChar(10)
+  occurredAt DateTime @map("occurred_at") @db.Timestamptz(6)
+  recordedAt DateTime @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  @@index([providerId])
+  @@map("alert_email_events")
+}
+
 /// REQUESTS AT THE WEBHOOK THAT COULD NOT BE AUTHENTICATED, AS A COUNT RATHER THAN AS ROWS.
 ///
 /// The endpoint returns 200 to a forged request on purpose — a 401 tells a forger their signature

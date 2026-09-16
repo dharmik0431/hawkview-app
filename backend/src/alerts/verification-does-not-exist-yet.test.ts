@@ -51,7 +51,7 @@ test('POSITIVE CONTROL: the scan can actually see a construction', () => {
     'contain them — the pattern has drifted and this whole file is now vacuous')
 })
 
-test('no production code constructs a VerifiedRecipient — and when that changes, read this', () => {
+test('production VerifiedRecipient construction is restricted to the authoritative adapter', () => {
     const declaring = sources.find((file) => file.name === DECLARES_THE_TYPE)
   assert.ok(declaring && declaring.text.includes('export type VerifiedRecipient ='),
     DECLARES_THE_TYPE + ' no longer declares VerifiedRecipient, so excluding it is wrong')
@@ -60,7 +60,7 @@ test('no production code constructs a VerifiedRecipient — and when that change
     (file) => !file.isTest && file.name !== DECLARES_THE_TYPE && constructs(file.text))
 
   assert.deepEqual(
-    inProduction.map((file) => file.name), [],
+    inProduction.map((file) => file.name), ['verified-email-recipient.ts'],
     'Operator email verification now exists in production code, which is good — and three ' +
     'things need re-examining before it ships:\n' +
     '  1. current-state.ts takes `recipients` as an argument precisely because there was no ' +
