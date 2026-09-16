@@ -42,6 +42,21 @@ const microsoftUnavailable = {
   limitation: 'Microsoft Entra risky-user display is not enabled.',
 }
 
+function microsoftSummaryFixture(overrides = {}) {
+  return {
+    source: 'MICROSOFT_IDENTITY_PROTECTION',
+    availability: 'UNAVAILABLE',
+    completeness: 'UNKNOWN',
+    rawRecordCount: null,
+    observedActiveDistinctUserCount: null,
+    activeDistinctUserCount: null,
+    snapshotObservedAt: null,
+    collectionSucceededAt: null,
+    reasonCode: 'SOURCE_UNAVAILABLE',
+    ...overrides,
+  }
+}
+
 function riskFixture(route) {
   if (route === 'summary') {
     return {
@@ -66,6 +81,7 @@ function riskFixture(route) {
   }
   return {
     ...microsoftUnavailable,
+    microsoftRiskSummary: microsoftSummaryFixture(),
     users: [],
     pageInfo: { hasMore: false, nextCursor: null },
   }
@@ -143,6 +159,16 @@ function availableFixture(route, nowMs = freshnessNow) {
     observedAt: currentObservedAt,
     freshness: 'CURRENT',
     limitation: null,
+    microsoftRiskSummary: microsoftSummaryFixture({
+      availability: 'AVAILABLE',
+      completeness: 'COMPLETE',
+      rawRecordCount: 0,
+      observedActiveDistinctUserCount: 0,
+      activeDistinctUserCount: 0,
+      snapshotObservedAt: currentObservedAt,
+      collectionSucceededAt: evaluatedAt,
+      reasonCode: null,
+    }),
     users: [],
     pageInfo: { hasMore: false, nextCursor: null },
   }
@@ -354,7 +380,14 @@ test('accepts valid projected nonempty HawkView and Microsoft rows', async () =>
       if (relationship !== 'own') return null
       const response = availableFixture(route, freshnessNow)
       if (route === 'findings') response.findings = [findingFixture(freshnessNow)]
-      if (route === 'microsoft') response.users = [microsoftUserFixture(freshnessNow)]
+      if (route === 'microsoft') {
+        response.users = [microsoftUserFixture(freshnessNow)]
+        Object.assign(response.microsoftRiskSummary, {
+          rawRecordCount: 1,
+          observedActiveDistinctUserCount: 1,
+          activeDistinctUserCount: 1,
+        })
+      }
       return jsonResponse(response)
     },
   })
@@ -908,4 +941,331 @@ test('fails before authentication when the live revision differs', async () => {
     }),
     /expected API revision is not live/i,
   )
+})
+
+async function checkMicrosoftResponse(response, { responseDelayMs = 0 } = {}) {
+  let clock = freshnessNow
+  const { calls, fetchImpl } = successfulFetch({
+    riskResponseOverride: ({ relationship, route }) => {
+      if (relationship !== 'own' || route !== 'microsoft') return null
+      const body = typeof response === 'function' ? response(clock) : response
+      clock += responseDelayMs
+      return jsonResponse(body)
+    },
+  })
+  await runAuthenticatedCanary({
+    fetchImpl,
+    now: () => clock,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  })
+  return calls
+}
+
+test('accepts explicit exact Microsoft snapshot totals independently of page size', async () => {
+  for (const [raw, active] of [[0, 0], [10, 0], [10, 4], [50_000, 50_000]]) {
+    const response = availableFixture('microsoft')
+    Object.assign(response.microsoftRiskSummary, {
+      rawRecordCount: raw,
+      observedActiveDistinctUserCount: active,
+      activeDistinctUserCount: active,
+    })
+    if (active > 0) {
+      response.users = [microsoftUserFixture()]
+      response.pageInfo = { hasMore: true, nextCursor: 'opaque.cursor' }
+    }
+    const calls = await checkMicrosoftResponse(response)
+    const microsoftCalls = calls.filter(call => call.url.pathname.endsWith('/microsoft-entra-risky-users'))
+    assert.equal(microsoftCalls.length, 5)
+    assert.equal(microsoftCalls.filter(call => !call.init.headers?.Authorization).length, 1)
+  }
+})
+
+test('accepts only matching partial Microsoft envelopes with observed evidence and null exact totals', async () => {
+  for (const [completeness, reasonCode, observed] of [
+    ['PARTIAL', 'PARTIAL_RECORDS', 2],
+    ['PARTIAL', 'PARTIAL_RECORDS', 0],
+    ['CONFLICTING', 'CONFLICTING_RECORDS', 2],
+    ['UNKNOWN', 'PARTIAL_RECORDS', 0],
+  ]) {
+    const response = availableFixture('microsoft')
+    response.capability = 'PARTIAL'
+    response.limitation = 'Observed Microsoft evidence is incomplete and requires review.'
+    Object.assign(response.microsoftRiskSummary, {
+      availability: 'PARTIAL', completeness, reasonCode,
+      rawRecordCount: 3,
+      observedActiveDistinctUserCount: observed,
+      activeDistinctUserCount: null,
+    })
+    response.users = [{ ...microsoftUserFixture(), riskState: observed ? 'atRisk' : 'none' }]
+    await checkMicrosoftResponse(response)
+  }
+})
+
+test('preserves unavailable diagnostic clock precedence without creating current evidence', async () => {
+  const observation = new Date(freshnessNow - 60 * 60 * 1_000).toISOString()
+  const earlierCollection = new Date(Date.parse(observation) - 1).toISOString()
+  for (const reasonCode of ['SOURCE_UNAVAILABLE', 'COLLECTION_NOT_SUCCEEDED', 'INVALID_CLOCK']) {
+    for (const clocks of [
+      { snapshotObservedAt: null, collectionSucceededAt: null },
+      { snapshotObservedAt: observation, collectionSucceededAt: null },
+      { snapshotObservedAt: null, collectionSucceededAt: earlierCollection },
+      { snapshotObservedAt: observation, collectionSucceededAt: earlierCollection },
+    ]) {
+      const response = riskFixture('microsoft')
+      response.microsoftRiskSummary = microsoftSummaryFixture({ reasonCode, ...clocks })
+      await checkMicrosoftResponse(response)
+    }
+  }
+  for (const reasonCode of ['STALE_EVIDENCE', 'INVALID_SNAPSHOT']) {
+    const response = riskFixture('microsoft')
+    const ageHours = reasonCode === 'STALE_EVIDENCE' ? 38 : 1
+    response.microsoftRiskSummary = microsoftSummaryFixture({
+      reasonCode,
+      snapshotObservedAt: new Date(freshnessNow - ageHours * 60 * 60 * 1_000).toISOString(),
+      collectionSucceededAt: new Date(freshnessNow - (ageHours - 0.5) * 60 * 60 * 1_000).toISOString(),
+    })
+    await checkMicrosoftResponse(response)
+  }
+})
+
+test('rejects missing and extra Microsoft summary fields without relaxing other envelope keys', async () => {
+  const fixtures = []
+  const missingSummary = availableFixture('microsoft')
+  delete missingSummary.microsoftRiskSummary
+  fixtures.push(missingSummary)
+  for (const field of Object.keys(availableFixture('microsoft').microsoftRiskSummary)) {
+    const response = availableFixture('microsoft')
+    delete response.microsoftRiskSummary[field]
+    fixtures.push(response)
+  }
+  for (const field of ['version', 'channel', 'sourceLabel', 'users', 'pageInfo']) {
+    const response = availableFixture('microsoft')
+    delete response[field]
+    fixtures.push(response)
+  }
+  fixtures.push({ ...availableFixture('microsoft'), arbitrary: true })
+  for (const field of ['arbitrary', '__proto__', 'constructor']) {
+    const response = availableFixture('microsoft')
+    response.microsoftRiskSummary = { ...response.microsoftRiskSummary, [field]: 'not allowed' }
+    fixtures.push(response)
+  }
+  for (const response of fixtures) {
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users .*keys were invalid/)
+  }
+})
+
+test('rejects unavailable reasons that contradict clock-validation precedence', async () => {
+  for (const [reasonCode, ageMs] of [
+    ['INVALID_CLOCK', 60 * 60 * 1_000],
+    ['INVALID_CLOCK', 37 * 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 36 * 60 * 60 * 1_000],
+    ['INVALID_SNAPSHOT', 36 * 60 * 60 * 1_000 + 1],
+  ]) {
+    const time = new Date(freshnessNow - ageMs).toISOString()
+    const response = riskFixture('microsoft')
+    response.microsoftRiskSummary = microsoftSummaryFixture({
+      reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+    })
+    await assert.rejects(checkMicrosoftResponse(response), /unavailable summary clocks were contradictory/)
+  }
+})
+
+test('accepts unavailable freshness only within the actual request timing window', async () => {
+  for (const reasonCode of ['STALE_EVIDENCE', 'INVALID_SNAPSHOT']) {
+    await checkMicrosoftResponse((startedAt) => {
+      const time = new Date(startedAt - 36 * 60 * 60 * 1_000 + 1_000).toISOString()
+      const response = riskFixture('microsoft')
+      response.microsoftRiskSummary = microsoftSummaryFixture({
+        reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+      })
+      return response
+    }, { responseDelayMs: 2_000 })
+  }
+  for (const [reasonCode, ageMs] of [
+    ['INVALID_SNAPSHOT', 36 * 60 * 60 * 1_000],
+    ['STALE_EVIDENCE', 36 * 60 * 60 * 1_000 + 1],
+  ]) {
+    const time = new Date(freshnessNow - ageMs).toISOString()
+    const response = riskFixture('microsoft')
+    response.microsoftRiskSummary = microsoftSummaryFixture({
+      reasonCode, snapshotObservedAt: time, collectionSucceededAt: time,
+    })
+    await checkMicrosoftResponse(response)
+  }
+})
+
+test('rejects incoherent Microsoft summary counts, reasons, sources and discriminants', async () => {
+  const changes = [
+    { source: 'HAWKVIEW_IDENTITY_SIGNALS' },
+    { availability: 'UNKNOWN' },
+    { completeness: 'UNKNOWN' },
+    { reasonCode: 'SOURCE_UNAVAILABLE' },
+    { rawRecordCount: null },
+    ...[-1, 0.5, NaN, Infinity, 50_001, '10'].map(rawRecordCount => ({ rawRecordCount })),
+    ...[-1, 0.5, NaN, Infinity, 50_001, '1'].map(observedActiveDistinctUserCount => ({ observedActiveDistinctUserCount })),
+    { rawRecordCount: 1, observedActiveDistinctUserCount: 9, activeDistinctUserCount: 9 },
+    { rawRecordCount: 2, observedActiveDistinctUserCount: 1, activeDistinctUserCount: 0 },
+    { activeDistinctUserCount: null },
+    { activeDistinctUserCount: '0' },
+    { activeDistinctUserCount: 0.5 },
+    { activeDistinctUserCount: NaN },
+  ]
+  for (const change of changes) {
+    const response = availableFixture('microsoft')
+    Object.assign(response.microsoftRiskSummary, change)
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users summary/)
+  }
+  for (const change of [
+    { completeness: 'UNKNOWN', reasonCode: 'SOURCE_UNAVAILABLE', rawRecordCount: null },
+    { completeness: 'CONFLICTING', reasonCode: 'PARTIAL_RECORDS' },
+    { completeness: 'PARTIAL', reasonCode: 'CONFLICTING_RECORDS' },
+    { completeness: 'COMPLETE', reasonCode: 'PARTIAL_RECORDS' },
+    { activeDistinctUserCount: 1 },
+  ]) {
+    const response = availableFixture('microsoft')
+    response.capability = 'PARTIAL'
+    response.limitation = 'Incomplete evidence.'
+    Object.assign(response.microsoftRiskSummary, {
+      availability: 'PARTIAL', completeness: 'PARTIAL', reasonCode: 'PARTIAL_RECORDS',
+      rawRecordCount: 2, observedActiveDistinctUserCount: 1, activeDistinctUserCount: null,
+    }, change)
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users summary/)
+  }
+  for (const change of [
+    { rawRecordCount: 0 }, { observedActiveDistinctUserCount: 0 },
+    { activeDistinctUserCount: 0 }, { completeness: 'COMPLETE' },
+    { reasonCode: null }, { reasonCode: 'PARTIAL_RECORDS' },
+    { reasonCode: 'CONFLICTING_RECORDS' }, { reasonCode: 'PROVIDER_ERROR_TEXT' },
+  ]) {
+    const response = riskFixture('microsoft')
+    Object.assign(response.microsoftRiskSummary, change)
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users unavailable summary/)
+  }
+})
+
+test('enforces Microsoft evidence clock ordering and exact envelope clock parity', async () => {
+  for (const offset of [0, 1]) {
+    const response = availableFixture('microsoft')
+    response.evaluatedAt = new Date(Date.parse(response.observedAt) + offset).toISOString()
+    response.microsoftRiskSummary.collectionSucceededAt = response.evaluatedAt
+    await checkMicrosoftResponse(response)
+  }
+  for (const change of [
+    { snapshotObservedAt: null }, { collectionSucceededAt: null },
+    { snapshotObservedAt: '2026-02-30T00:00:00.000Z' },
+    { collectionSucceededAt: '2026-09-08T11:30:00Z' },
+    { snapshotObservedAt: new Date(freshnessNow + 5 * 60 * 1_000 + 1).toISOString() },
+    { collectionSucceededAt: new Date(freshnessNow + 5 * 60 * 1_000 + 1).toISOString() },
+    { collectionSucceededAt: new Date(freshnessNow - 60 * 60 * 1_000 - 1).toISOString() },
+  ]) {
+    const response = availableFixture('microsoft')
+    Object.assign(response.microsoftRiskSummary, change)
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users summary/)
+  }
+  for (const field of ['snapshotObservedAt', 'collectionSucceededAt']) {
+    const response = availableFixture('microsoft')
+    response.microsoftRiskSummary[field] = new Date(Date.parse(response.microsoftRiskSummary[field]) + 1).toISOString()
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users state was contradictory/)
+  }
+  for (const reasonCode of ['STALE_EVIDENCE', 'INVALID_SNAPSHOT']) {
+    for (const collectionSucceededAt of [null, new Date(freshnessNow - 60 * 60 * 1_000 - 1).toISOString()]) {
+      const response = riskFixture('microsoft')
+      response.microsoftRiskSummary = microsoftSummaryFixture({
+        reasonCode,
+        snapshotObservedAt: new Date(freshnessNow - 60 * 60 * 1_000).toISOString(),
+        collectionSucceededAt,
+      })
+      await assert.rejects(checkMicrosoftResponse(response), /unavailable summary clocks were contradictory/)
+    }
+  }
+  const response = riskFixture('microsoft')
+  response.microsoftRiskSummary = microsoftSummaryFixture({
+    reasonCode: 'INVALID_CLOCK',
+    snapshotObservedAt: new Date(freshnessNow + 5 * 60 * 1_000 + 1).toISOString(),
+  })
+  await assert.rejects(checkMicrosoftResponse(response), /summary observation timestamp was in the future/)
+})
+
+test('rejects mismatched Microsoft envelope/summary availability and page bounds', async () => {
+  const responses = []
+  const partial = availableFixture('microsoft')
+  Object.assign(partial.microsoftRiskSummary, {
+    availability: 'PARTIAL', completeness: 'PARTIAL', reasonCode: 'PARTIAL_RECORDS',
+    rawRecordCount: 1, activeDistinctUserCount: null,
+  })
+  responses.push(partial)
+  const unavailable = availableFixture('microsoft')
+  unavailable.microsoftRiskSummary = microsoftSummaryFixture()
+  responses.push(unavailable)
+  const active = riskFixture('microsoft')
+  active.microsoftRiskSummary = availableFixture('microsoft').microsoftRiskSummary
+  responses.push(active)
+  for (const response of responses) {
+    await assert.rejects(checkMicrosoftResponse(response), /Microsoft Entra risky users state was contradictory/)
+  }
+  const oversizedPage = availableFixture('microsoft')
+  oversizedPage.users = [microsoftUserFixture()]
+  await assert.rejects(checkMicrosoftResponse(oversizedPage), /page exceeded its source summary/)
+})
+
+test('does not permit the Microsoft summary field on HawkView responses', async () => {
+  for (const target of ['summary', 'findings']) {
+    const { fetchImpl } = successfulFetch({
+      riskResponseOverride: ({ relationship, route }) =>
+        relationship === 'own' && route === target
+          ? jsonResponse({ ...riskFixture(route), microsoftRiskSummary: microsoftSummaryFixture() })
+          : null,
+    })
+    await assert.rejects(runAuthenticatedCanary({
+      fetchImpl,
+      now: () => freshnessNow,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }), /identity risk .* envelope keys were invalid/)
+  }
+})
+
+test('still rejects foreign Microsoft risk access for either authenticated fixture', async () => {
+  for (const token of [tokenA, tokenB]) {
+    const { fetchImpl } = successfulFetch({
+      riskResponseOverride: ({ authorization, relationship, route }) =>
+        authorization === `Bearer ${token}` && relationship === 'foreign' && route === 'microsoft'
+          ? jsonResponse(riskFixture('microsoft'))
+          : null,
+    })
+    await assert.rejects(runAuthenticatedCanary({
+      fetchImpl,
+      now: () => freshnessNow,
+      environment: {
+        EXPECTED_REVISION: revision,
+        ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+      },
+    }), /Microsoft Entra risky users foreign tenant denial returned an unexpected status/)
+  }
+})
+
+test('still rejects unauthenticated Microsoft risk access with a valid new summary', async () => {
+  const { fetchImpl: baseFetch } = successfulFetch()
+  const fetchImpl = (input, init) =>
+    new URL(String(input)).pathname.endsWith('/microsoft-entra-risky-users') && !init?.headers?.Authorization
+      ? jsonResponse(riskFixture('microsoft'))
+      : baseFetch(input, init)
+  await assert.rejects(runAuthenticatedCanary({
+    fetchImpl,
+    now: () => freshnessNow,
+    environment: {
+      EXPECTED_REVISION: revision,
+      ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+    },
+  }), /Microsoft Entra risky users unauthenticated denial returned an unexpected status/)
 })
