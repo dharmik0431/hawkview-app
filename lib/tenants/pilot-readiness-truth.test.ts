@@ -37,7 +37,15 @@ test('permission and risk presentation retain bounded evidence instead of invent
   assert.match(settings, /Verified tenant permission and readiness evidence remains visible below/)
   assert.doesNotMatch(tenants, /riskyUsersByTenant/)
   assert.match(tenants, /collectionReadiness\.evidence\.riskyIdentities\.count/)
-  assert.match(dashboard, /evidenceCount\(kpis\.riskyIdentities, kpis\.riskPartial, 'Unavailable'\)/)
+  // Native KPI evidence must come from its server summary, not the separate Microsoft channel.
+  assert.match(dashboard, /summarizeHawkViewPortfolioRisk\(\s*nativeRiskQuery\.data\?\.fleet,\s*nativeRiskRequestState,/)
+  const nativePanel = dashboard.match(/const nativeRiskPanel = <NativeRiskSummaryCard[\s\S]*?\/>/)?.[0]
+  assert.ok(nativePanel)
+  assert.match(nativePanel, /risk=\{hawkViewPortfolioRisk\}/)
+  assert.match(nativePanel, /requestState=\{nativeRiskRequestState\}/)
+  assert.doesNotMatch(nativePanel, /kpis\.riskyIdentities|kpis\.riskPartial|microsoftLabel/)
+  const matrix = source('components/dashboard/tenant-risk-matrix.tsx')
+  assert.match(matrix, /Microsoft Entra: \{microsoftRiskInfo\.label\}/)
 })
 
 test('limited sign-in fallback is modeled as current partial evidence, not a failed collector', () => {
