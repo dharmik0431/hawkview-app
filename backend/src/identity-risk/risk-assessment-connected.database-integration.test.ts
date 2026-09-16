@@ -539,7 +539,7 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
     assert.notEqual(headline.value,'0');assert.match(headline.detail,/not zero/i)
     assert.equal(riskAssessmentEmptyPresentation(view)?.label,'No findings can be confirmed yet')
   } else {
-    assert.equal(dto.meta.capability,'FULL',dto.meta.capability==='FULL'?undefined:
+    assert.equal(dto.meta.capability,'FULL',dto.meta.capability==='FULL'?'FULL capability is required':
       JSON.stringify(connectedFailureDiagnostic(batch,run.aggregate.assessment,dto,evaluateElapsedMs,readElapsedMs)))
     assert.equal(dto.meta.status,'AVAILABLE');assert.equal(dto.meta.freshness,'CURRENT')
     assert.equal(dto.rules.length,3)
