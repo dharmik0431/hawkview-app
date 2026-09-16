@@ -1,42 +1,38 @@
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
+import { relative } from 'node:path'
 import { test } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { authenticatedIdentityFromSupabasePayload } from './identity-token-verifier.service.js'
+import { emailHash, type EmailReleaseConfig } from '../alerts/email-release-config.js'
+import { type EmailFetch } from '../alerts/email-http.js'
+import { type SqlRunner } from '../alerts/pipeline-store.js'
+import { verifiedEmailRecipient } from '../alerts/verified-email-recipient.js'
 
 /**
- * THE ASSUMPTION OPERATOR EMAIL VERIFICATION WOULD REST ON, AND WHAT THIS CAN AND CANNOT CHECK.
+ * AUTHENTICATION IS NOT EMAIL-RECIPIENT VERIFICATION.
  *
- * HawkView already knows an operator's address is confirmed — `protected-route.tsx` refuses to
- * render without `email_confirmed_at`. But the evidence is NOT a claim in the token.
- * `identity-token-verifier.service.ts` records why: Supabase has no authoritative
- * `email_confirmed` claim, Confirm Email prevents a session being ISSUED before confirmation,
- * and WITH THE SETTING DISABLED Supabase treats the address as implicitly confirmed.
+ * A session or JWT confirmation claim is not authoritative evidence for delivery. The
+ * controlled-email adapter instead reads current Auth settings, requires mailer_autoconfirm
+ * to be exactly false, then checks the exact Auth Admin user and current confirmed address.
+ * Keep that capability confined to this reviewed adapter, not the authentication identity.
  *
- * So the evidence is the EXISTENCE of a session, and it holds only while that project setting
- * does. Turn it off and every session silently becomes evidence of nothing: no code change,
- * nothing failing, nothing visible in a review.
- *
- * WHAT THIS FILE CANNOT DO, said plainly so nobody mistakes its green for coverage: it cannot
- * detect the setting changing. That is remote configuration, and reading it means a live call to
- * `/auth/v1/settings` at runtime — a dependency on auth configuration, which is an owner
- * decision and a different piece of work. NOT BUILT HERE, deliberately.
- *
- * WHAT IT DOES DO is cover the half that is local: it fires the moment code starts TREATING a
- * session as proof of a verified address, which is the moment the assumption acquires teeth.
- * A signpost at the point of use, not a prohibition — building this is wanted, building it
- * without confronting where the authority comes from is not.
+ * These source contracts and mocked adapter tests do not attest any live project setting,
+ * recipient, provider, or delivery. No network or database is used by the runtime fixtures.
  */
 
 const AUTH = new URL('.', import.meta.url)
+const SOURCES = new URL('../', AUTH)
+const VERIFIED_RECIPIENT = 'alerts/verified-email-recipient.ts'
 const backendSources = () => {
   const walk = (dir: URL): { name: string; text: string }[] =>
     readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
       const child = new URL(entry.name + (entry.isDirectory() ? '/' : ''), dir)
       if (entry.isDirectory()) return walk(child)
       if (!entry.name.endsWith('.ts')) return []
-      return [{ name: entry.name, text: readFileSync(child, 'utf8') }]
+      return [{ name: relative(fileURLToPath(SOURCES), fileURLToPath(child)).replaceAll('\\', '/'), text: readFileSync(child, 'utf8') }]
     })
-  return walk(new URL('../', AUTH)).filter((f) => !f.name.includes('.test.'))
+  return walk(SOURCES).filter((f) => !f.name.includes('.test.'))
 }
 
 const VALID = {
@@ -53,26 +49,18 @@ test('POSITIVE CONTROL: the scan can see the backend sources at all', () => {
   // does when its traversal has quietly stopped working.
   const files = backendSources()
   assert.ok(files.length > 100, 'the source scan found ' + files.length + ' files; it is broken')
-  assert.ok(files.some((f) => f.name === 'identity-token-verifier.service.ts'),
+  assert.ok(files.some((f) => f.name === 'auth/identity-token-verifier.service.ts'),
     'the scan cannot see the file this assumption is written in')
 })
 
-test('the backend does NOT read a confirmation claim, and must not start', () => {
-  // The frontend reads `email_confirmed_at` from the client session in several places -- that is
-  // the render gate and it is fine. The BACKEND deliberately does not, because the claim is not
-  // authoritative. If this fails, somebody has started trusting it server-side, and the question
-  // they need to answer first is where the authority comes from.
-  const offenders = backendSources()
+test('confirmation reads are confined to the settings-gated Auth Admin recipient adapter', () => {
+  const readers = backendSources()
     .filter((f) => f.text.includes('email_confirmed_at') || f.text.includes("'email_confirmed'"))
     .map((f) => f.name)
-
-  assert.deepEqual(offenders, [],
-    'Backend code is now reading a Supabase confirmation claim. That claim is NOT authoritative ' +
-    '-- identity-token-verifier.service.ts explains why. Confirm Email prevents a session being ' +
-    'ISSUED; with the setting DISABLED Supabase marks the address confirmed anyway. So this ' +
-    'value is only as good as a project setting nothing in this repository can see. Before ' +
-    'relying on it: read /auth/v1/settings and check mailer_autoconfirm is false, and decide ' +
-    'whether that is asserted at runtime -- which is an owner decision, not a code one.')
+    .sort()
+  assert.deepEqual(readers, [VERIFIED_RECIPIENT],
+    'Only the reviewed settings-gated Auth Admin adapter may consume confirmation evidence; ' +
+    'authentication/session claims must not become delivery verification.')
 })
 
 test('the verified identity carries NO confirmation flag, so nothing can read one by accident', () => {
@@ -87,18 +75,90 @@ test('the verified identity carries NO confirmation flag, so nothing can read on
   assert.equal(identity.email, 'ops@example.invalid', 'the fixture stopped producing an identity')
 })
 
-test('NOT BUILT: the setting itself is unchecked, and that is the open half', () => {
-  // Recorded as a test so it is not lost in a commit message. The failure mode this file is
-  // named for -- Confirm Email being turned off -- is NOT detected by anything here or
-  // anywhere else in the repository. Detecting it needs a live /auth/v1/settings read at
-  // runtime, which is a dependency on auth configuration and an owner decision.
-  //
-  // This assertion is deliberately trivial. Its job is to carry the sentence, and to be
-  // deleted by whoever closes the gap.
-  const settingIsCheckedSomewhere = backendSources().some((f) =>
-    f.text.includes('/auth/v1/settings') || f.text.includes('mailer_autoconfirm'))
-  assert.equal(settingIsCheckedSomewhere, false,
-    'Something now reads the Supabase auth settings. If that is a runtime check for ' +
-    'mailer_autoconfirm, the gap this file documents is closed -- delete this test and update ' +
-    'the header. If it is something else, the header is now misleading and needs correcting.')
+test('Auth confirmation-settings reads stay confined to the reviewed recipient adapter', () => {
+  const readers = backendSources()
+    .filter((f) => f.text.includes('/auth/v1/settings') || f.text.includes('mailer_autoconfirm'))
+    .map((f) => f.name)
+    .sort()
+  assert.deepEqual(readers, [VERIFIED_RECIPIENT])
+})
+
+const NOW = Date.parse('2026-09-16T12:10:00.000Z')
+const CONFIG: EmailReleaseConfig = {
+  activationId: '00000000-0000-4000-8000-000000000001',
+  organizationId: '00000000-0000-4000-8000-000000000002',
+  ownerUserId: '00000000-0000-4000-8000-000000000003',
+  recipientHash: emailHash(VALID.email),
+  startsAt: '2026-09-16T12:00:00.000Z', expiresAt: '2026-09-16T13:00:00.000Z',
+  from: 'alerts@example.invalid', appOrigin: 'https://console.hawkviewapp.com',
+  resendKey: 're_synthetic_not_a_real_key', authOrigin: 'https://auth.example.invalid',
+  authKey: 'synthetic-not-a-real-service-key',
+}
+const CONFIRMED_USER = {
+  id: VALID.sub, email: VALID.email, is_anonymous: false,
+  email_confirmed_at: '2026-09-15T12:00:00.000Z',
+}
+
+function recipientHarness(options: {
+  settings?: Record<string, unknown>; settingsStatus?: number; user?: Record<string, unknown>
+} = {}) {
+  const settings = options.settings ?? { mailer_autoconfirm: false }
+  const paths: string[] = []
+  const runner = { query: async () => [{
+    id: CONFIG.ownerUserId, auth_provider_user_id: VALID.sub, email: VALID.email,
+  }] } as unknown as SqlRunner
+  const fetchImpl = (async (input: string | URL | Request) => {
+    const path = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url).pathname
+    paths.push(path)
+    if (path === '/auth/v1/settings') {
+      return new Response(JSON.stringify(settings), { status: options.settingsStatus ?? 200 })
+    }
+    assert.equal(path, `/auth/v1/admin/users/${VALID.sub}`, 'unexpected mocked Auth request')
+    return new Response(JSON.stringify(options.user ?? CONFIRMED_USER), { status: 200 })
+  }) as EmailFetch
+  return {
+    paths,
+    resolve: verifiedEmailRecipient(runner, CONFIG, fetchImpl, new AbortController().signal, () => NOW),
+  }
+}
+
+test('only explicit Confirm Email enforcement permits the subsequent Auth Admin lookup', async () => {
+  for (const value of [true, undefined, null, 'false', 0]) {
+    const h = recipientHarness({ settings: { mailer_autoconfirm: value } })
+    assert.equal(await h.resolve(CONFIG.organizationId), null)
+    assert.deepEqual(h.paths, ['/auth/v1/settings'], 'unsupported settings must stop before user lookup')
+  }
+})
+
+test('unavailable Auth settings fail closed before the Auth Admin lookup', async () => {
+  const h = recipientHarness({ settingsStatus: 503 })
+  await assert.rejects(h.resolve(CONFIG.organizationId), /EMAIL_VERIFICATION_UNAVAILABLE/)
+  assert.deepEqual(h.paths, ['/auth/v1/settings'])
+})
+
+test('enforced confirmation and an exact confirmed Auth Admin user produce the recipient', async () => {
+  const h = recipientHarness()
+  const recipient = await h.resolve(CONFIG.organizationId)
+  assert.equal(recipient?.kind, 'DESIGNATED_OWNER')
+  assert.equal(recipient?.address, VALID.email)
+  assert.equal(recipient?.verifiedAt.toISOString(), CONFIRMED_USER.email_confirmed_at)
+  assert.deepEqual(h.paths, ['/auth/v1/settings', `/auth/v1/admin/users/${VALID.sub}`])
+})
+
+test('user metadata or invalid confirmation timestamps cannot substitute for Auth confirmation', async () => {
+  for (const email_confirmed_at of [null, undefined, 'invalid', '2099-01-01T00:00:00.000Z']) {
+    const h = recipientHarness({ user: {
+      ...CONFIRMED_USER, email_confirmed_at, user_metadata: { email_verified: true },
+    } })
+    assert.equal(await h.resolve(CONFIG.organizationId), null)
+  }
+})
+
+test('a later autoconfirm change revokes recipient verification without caching the earlier setting', async () => {
+  const settings = { mailer_autoconfirm: false }
+  const h = recipientHarness({ settings })
+  assert.ok(await h.resolve(CONFIG.organizationId))
+  settings.mailer_autoconfirm = true
+  assert.equal(await h.resolve(CONFIG.organizationId), null)
+  assert.deepEqual(h.paths, ['/auth/v1/settings', `/auth/v1/admin/users/${VALID.sub}`, '/auth/v1/settings'])
 })
