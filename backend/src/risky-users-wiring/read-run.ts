@@ -51,7 +51,7 @@ export type ReadRunResult =
       | 'FINDINGS_NOT_RECORDED' | 'FINDINGS_VERSION_AHEAD' | 'FINDINGS_UNREADABLE'
   }>
 
-type RunRow = Readonly<{
+export type RunRow = Readonly<{
   evaluationCoverage: unknown
   evaluationFindings: unknown
   completedAt: Date | null
@@ -90,6 +90,11 @@ export async function readLatestRun(
       completedAt: true, windowStart: true, windowEnd: true,
     },
   })
+  return decodeNativeRunRow(row)
+}
+
+/** Shared by the tenant detail and bounded fleet summary; neither invents a count. */
+export function decodeNativeRunRow(row: RunRow | null): ReadRunResult {
   if (row === null || row.completedAt === null) return { present: false, because: 'NO_RUN' }
 
   const coverage = decodeRunCoverage(row.evaluationCoverage)

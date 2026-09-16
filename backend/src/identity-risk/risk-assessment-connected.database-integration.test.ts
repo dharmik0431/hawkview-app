@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { performance } from 'node:perf_hooks'
 import test from 'node:test'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -23,6 +24,110 @@ import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION } fro
 import { mailboxRule } from './mailbox-risk.test-fixtures.js'
 import { IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_CATALOG_VERSION } from './identity-risk.contract.js'
 import { ASSESSMENT_COPY } from './risk-assessment-projection.js'
+
+// BEGIN CONNECTED FAILURE DIAGNOSTICS
+// Pure, bounded formatting of values the test already has. Never query or serialize a DTO.
+const connectedDiagnosticEnums = {
+  capability: ['FULL', 'PARTIAL', 'UNAVAILABLE'],
+  status: ['READY', 'WAITING', 'COLLECTING', 'PARTIAL', 'FAILED', 'STALE', 'INSUFFICIENT_FIELDS', 'UNAVAILABLE', 'NOT_APPLICABLE'],
+  rule: ['HV-ID-AUTH-005.v2', 'HV-ID-AUTH-010.v1', 'HV-ID-MBX-001.v1'],
+  source: ['GRAPH_SIGN_INS', 'M365_AUDIT_STS', 'MAILBOX_RULES'],
+  reason: [
+    'READY', 'OUT_OF_SCOPE_EVENTS', 'WAITING_FOR_COLLECTION', 'NO_EVIDENCE_IN_WINDOW',
+    'MISSING_PERMISSION', 'LICENSE_REQUIRED', 'COLLECTION_FAILED', 'COLLECTION_STALE',
+    'INCOMPLETE_WINDOW', 'SOURCE_UNAVAILABLE', 'INSUFFICIENT_FIELDS', 'USER_BINDING_UNRESOLVED',
+    'APPLICATION_BINDING_UNRESOLVED', 'CLIENT_SOURCE_UNQUALIFIED', 'UNSUPPORTED_RECORD',
+    'CONFLICTING_EVIDENCE', 'CAPACITY_LIMIT', 'EVALUATION_FAILED', 'EVALUATION_DISABLED',
+    'KEY_UNAVAILABLE', 'DIRECTORY_SYNC_MISSING', 'DIRECTORY_SYNC_NOT_SUCCEEDED',
+    'DIRECTORY_SYNC_UNDATED', 'DIRECTORY_SYNC_STALE', 'DIRECTORY_SYNC_NEWER_ATTEMPT',
+    'RULE_ENDPOINT_NOT_FOUND', 'RULE_VALIDATION_UNATTESTABLE', 'SOURCE_NOT_ATTESTED',
+    'ATTESTED_COMPLETE', 'CHECK_NOT_APPLICABLE', 'UNRESOLVED_SUBJECT_IDENTITY', 'UNINTERPRETABLE_EVIDENCE',
+  ],
+} as const
+
+function diagnosticField(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined
+  // Ignore inherited values and accessors, including arbitrary toJSON implementations.
+  return Object.getOwnPropertyDescriptor(value, key)?.value
+}
+
+function diagnosticEnum(value: unknown, allowed: readonly string[]): string | null {
+  if (value === null || value === undefined) return null
+  return typeof value === 'string' && allowed.includes(value) ? value : 'UNRECOGNIZED'
+}
+
+function diagnosticStage(value: unknown, capability?: unknown) {
+  const rows = (key: string): unknown[] => {
+    const list = diagnosticField(value, key)
+    return Array.isArray(list) ? list.slice(0, 3) : []
+  }
+  return {
+    capability: diagnosticEnum(capability, connectedDiagnosticEnums.capability),
+    rules: rows('rules').map(rule => ({
+      ruleId: diagnosticEnum(diagnosticField(rule, 'ruleId'), connectedDiagnosticEnums.rule),
+      status: diagnosticEnum(diagnosticField(rule, 'status'), connectedDiagnosticEnums.status),
+      reasonCode: diagnosticEnum(diagnosticField(rule, 'reasonCode'), connectedDiagnosticEnums.reason),
+      countsCapped: typeof diagnosticField(rule, 'countsCapped') === 'boolean' ? diagnosticField(rule, 'countsCapped') : null,
+    })),
+    sources: rows('sources').map(source => ({
+      source: diagnosticEnum(diagnosticField(source, 'source'), connectedDiagnosticEnums.source),
+      status: diagnosticEnum(diagnosticField(source, 'status'), connectedDiagnosticEnums.status),
+      reasonCode: diagnosticEnum(diagnosticField(source, 'reasonCode'), connectedDiagnosticEnums.reason),
+    })),
+  }
+}
+
+function connectedFailureDiagnostic(batch: unknown, stored: unknown, dto: unknown, evaluateMs: unknown, readMs: unknown) {
+  const duration = (value: unknown) => typeof value === 'number' && Number.isFinite(value)
+    && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? Math.round(value) : null
+  return {
+    diagnostic: 'CONNECTED_FULL_CAPABILITY_V1',
+    projected: diagnosticStage(diagnosticField(batch, 'assessment'), diagnosticField(batch, 'capability')),
+    persisted: diagnosticStage(stored),
+    controller: diagnosticStage(dto, diagnosticField(diagnosticField(dto, 'meta'), 'capability')),
+    elapsedMs: { evaluate: duration(evaluateMs), read: duration(readMs) },
+  }
+}
+
+test('connected failure diagnostics preserve only allowlisted stage differences and finite durations', () => {
+  const rule = { ruleId: 'HV-ID-AUTH-010.v1', status: 'READY', reasonCode: 'READY', countsCapped: false }
+  const source = { source: 'GRAPH_SIGN_INS', status: 'READY', reasonCode: 'ATTESTED_COMPLETE' }
+  const stored = { rules: [rule], sources: [source] }
+  const dto = { meta: { capability: 'PARTIAL' }, rules: [{ ...rule, status: 'FAILED', reasonCode: 'EVALUATION_FAILED' }],
+    sources: [{ ...source, status: 'FAILED', reasonCode: 'EVALUATION_FAILED' }] }
+  const result = connectedFailureDiagnostic({ capability: 'FULL', assessment: stored }, stored, dto, 12.6, 7.2)
+  assert.equal(result.projected.capability, 'FULL')
+  assert.equal(result.persisted.capability, null, 'Stored assessment has no fabricated capability')
+  assert.equal(result.persisted.rules[0].reasonCode, 'READY')
+  assert.equal(result.controller.capability, 'PARTIAL')
+  assert.equal(result.controller.rules[0].reasonCode, 'EVALUATION_FAILED')
+  assert.equal(result.controller.sources[0].reasonCode, 'EVALUATION_FAILED')
+  assert.equal(result.controller.rules[0].countsCapped, false)
+  assert.deepEqual(result.elapsedMs, { evaluate: 13, read: 7 })
+  assert.deepEqual(Object.keys(result.controller).sort(), ['capability', 'rules', 'sources'])
+  assert.deepEqual(Object.keys(result.controller.rules[0]).sort(), ['countsCapped', 'reasonCode', 'ruleId', 'status'])
+  assert.deepEqual(Object.keys(result.controller.sources[0]).sort(), ['reasonCode', 'source', 'status'])
+})
+
+test('connected failure diagnostics redact arbitrary fields, accessors, oversized lists and invalid durations', () => {
+  const privateValue = 'PRIVATE_DIAGNOSTIC_SENTINEL'
+  const row = { ruleId: privateValue, source: privateValue, status: privateValue, reasonCode: privateValue,
+    countsCapped: privateValue, identity: privateValue, payload: privateValue }
+  const stored = { rules: Array(8).fill(row), sources: Array(8).fill(row), secret: privateValue,
+    toJSON() { throw new Error('Raw fixture must never be serialized') } }
+  const dto = { ...stored, meta: { get capability() { throw new Error('Accessor must not execute') } } }
+  for (const invalid of [NaN, Infinity, -1, Number.MAX_VALUE, privateValue, {}]) {
+    const result = connectedFailureDiagnostic({ capability: privateValue, assessment: stored }, stored, dto, invalid, invalid)
+    assert.equal(result.projected.capability, 'UNRECOGNIZED')
+    assert.equal(result.controller.capability, null)
+    assert.equal(result.controller.rules.length, 3)
+    assert.equal(result.controller.sources.length, 3)
+    assert.ok(result.controller.rules.every(rule => rule.reasonCode === 'UNRECOGNIZED' && rule.countsCapped === null))
+    assert.deepEqual(result.elapsedMs, { evaluate: null, read: null })
+    assert.ok(!JSON.stringify(result).includes(privateValue))
+  }
+})
+// END CONNECTED FAILURE DIAGNOSTICS
 
 /** The newest event actually seeded, so the window records what the fixture
  *  observed rather than a number chosen to make it pass. */
@@ -389,7 +494,9 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
     await f.prisma.signInLog.updateMany({where:{organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId,microsoftSignInId:'failure-0'},
       data:{raw:{...f.records[0].raw,oversized:'x'.repeat(17000)}}})
   }
+  const evaluateStarted=performance.now()
   const {result,batch}=await f.evaluate()
+  const evaluateElapsedMs=performance.now()-evaluateStarted
   assert.equal(result.status,'COMPLETED','The actual durable evaluator transaction must complete')
   const scope={organizationId:f.scope.organizationId,customerTenantId:f.scope.customerTenantId}
   const run=await f.prisma.identityRiskEvaluationRun.findFirst({where:{...scope,status:'COMPLETED'},orderBy:{completedAt:'desc'}})
@@ -402,7 +509,9 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
 
   const controller=new IdentityRiskController(f.service)
   const request={auth:f.scope.identity} as any
+  const readStarted=performance.now()
   const dto=await controller.assessment(request,f.scope.customerTenantId,'true')
+  const readElapsedMs=performance.now()-readStarted
   assert.ok('summary' in dto)
   assert.equal(dto.summary.scope,'TENANT')
   assert.equal(dto.summary.asOf,dto.meta.evaluatedAt)
@@ -430,7 +539,9 @@ test(`connected count acceptance ${scenario}: PostgreSQL -> controller -> produc
     assert.notEqual(headline.value,'0');assert.match(headline.detail,/not zero/i)
     assert.equal(riskAssessmentEmptyPresentation(view)?.label,'No findings can be confirmed yet')
   } else {
-    assert.equal(dto.meta.capability,'FULL');assert.equal(dto.meta.status,'AVAILABLE');assert.equal(dto.meta.freshness,'CURRENT')
+    assert.equal(dto.meta.capability,'FULL',dto.meta.capability==='FULL'?'FULL capability is required':
+      JSON.stringify(connectedFailureDiagnostic(batch,run.aggregate.assessment,dto,evaluateElapsedMs,readElapsedMs)))
+    assert.equal(dto.meta.status,'AVAILABLE');assert.equal(dto.meta.freshness,'CURRENT')
     assert.equal(dto.rules.length,3)
     for(const rule of dto.rules) {
       assert.equal(rule.status,'READY');assert.equal(rule.countsCapped,false)

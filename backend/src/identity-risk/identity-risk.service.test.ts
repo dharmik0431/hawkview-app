@@ -14,6 +14,95 @@ const organizationId = '11111111-1111-4111-8111-111111111111'
 const tenantId = '22222222-2222-4222-8222-222222222222'
 const runId = '33333333-3333-4333-8333-333333333333'
 
+function fleetClient(options: { tenants?: Array<{ id: string; organizationId: string }>; total?: number; controls?: unknown[]; user?: unknown } = {}) {
+  const calls: Array<{ model: string; args: unknown }> = []
+  const tenants = options.tenants ?? [{ id: tenantId, organizationId }]
+  const capture = (model: string, result: unknown) => async (args: unknown) => { calls.push({ model, args }); return result }
+  return { calls, client: {
+    user: { findUnique: capture('user', Object.hasOwn(options, 'user') ? options.user : { id: 'actor', disabledAt: null, memberships: [{ organizationId, role: 'MSP_VIEWER' }] }) },
+    customerTenant: { count: capture('count', options.total ?? tenants.length), findMany: capture('tenants', tenants) },
+    identityRiskOperationalControl: { findMany: capture('controls', options.controls ?? []) },
+  } }
+}
+
+test('native fleet shares active-user authorization, scoped queries, stable cap and control predicate', async () => {
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    const { client, calls } = fleetClient()
+    const result = await new IdentityRiskService({} as never).authorizeRiskyUsersFleetRead(identity, client as never)
+    assert.deepEqual(result, { totalTenants: 1, tenants: [{ id: tenantId, organizationId, gate: null }] })
+    assert.equal(calls.length, 4)
+    assert.deepEqual(calls[0].args, { where: { authProviderUserId: identity.subject }, select: { id: true, disabledAt: true,
+      memberships: { where: { status: 'ACTIVE', organization: { status: 'ACTIVE' } }, select: { organizationId: true, role: true } } } })
+    assert.deepEqual(calls[1].args, { where: { organizationId: { in: [organizationId] } } })
+    assert.deepEqual(calls[2].args, { where: { organizationId: { in: [organizationId] } }, select: { id: true, organizationId: true }, orderBy: [{ organizationId: 'asc' }, { id: 'asc' }], take: 101 })
+    const controls = calls[3].args as { where: unknown; take: number }
+    assert.equal(controls.take, 102)
+    assert.deepEqual(controls.where, { state: 'ACTIVE', controlType: 'EVALUATION_HARD_DISABLED', OR: [
+      { scopeType: 'GLOBAL', scopeKey: 'GLOBAL' }, { scopeType: 'TENANT', scopeKey: `${organizationId}:${tenantId}`, organizationId, customerTenantId: tenantId },
+    ] })
+  } finally { delete process.env.HAWKVIEW_IDENTITY_RISK_MODE }
+})
+
+test('native fleet rejects missing/disabled users before tenant/evidence reads and handles empty organizations', async () => {
+  for (const user of [null, { id: 'actor', disabledAt: new Date(), memberships: [] }]) {
+    const { client, calls } = fleetClient({ user })
+    await assert.rejects(new IdentityRiskService({} as never).authorizeRiskyUsersFleetRead(identity, client as never), ForbiddenException)
+    assert.equal(calls.length, 1)
+  }
+  const { client, calls } = fleetClient({ user: { id: 'actor', disabledAt: null, memberships: [] } })
+  assert.deepEqual(await new IdentityRiskService({} as never).authorizeRiskyUsersFleetRead(identity, client as never), { totalTenants: 0, tenants: [] })
+  assert.equal(calls.length, 1)
+})
+
+test('native fleet batch read rejects foreign tenant rows and count/enumeration mismatch', async () => {
+  for (const options of [{ tenants: [{ id: tenantId, organizationId: 'foreign' }] }, { total: 2 }]) {
+    const { client } = fleetClient(options)
+    await assert.rejects(new IdentityRiskService({} as never).authorizeRiskyUsersFleetRead(identity, client as never), /Invalid summary scope/)
+  }
+})
+
+test('native fleet discloses only first 100 candidates and honors tenant/global stops', async () => {
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    const service = new IdentityRiskService({} as never)
+    for (const control of [
+      { scopeType: 'GLOBAL', scopeKey: 'GLOBAL', organizationId: null, customerTenantId: null },
+      { scopeType: 'TENANT', scopeKey: `${organizationId}:${tenantId}`, organizationId, customerTenantId: tenantId },
+    ]) {
+      const { client } = fleetClient({ controls: [control] })
+      assert.equal((await service.authorizeRiskyUsersFleetRead(identity, client as never)).tenants[0].gate, 'EVALUATION_DISABLED')
+    }
+    const { client } = fleetClient({ tenants: Array.from({ length: 101 }, (_, index) => ({ id: `synthetic-${index}`, organizationId })), total: 102 })
+    const result = await service.authorizeRiskyUsersFleetRead(identity, client as never)
+    assert.equal(result.totalTenants, 102)
+    assert.equal(result.tenants.length, 100)
+    assert.equal(result.tenants[99].id, 'synthetic-99')
+    assert.ok(result.tenants.every((tenant) => tenant.gate === 'NOT_ENABLED_FOR_TENANT'))
+    const overLimit = fleetClient({ controls: [{}, {}, {}] })
+    await assert.rejects(service.authorizeRiskyUsersFleetRead(identity, overLimit.client as never), /Invalid summary controls/)
+  } finally { delete process.env.HAWKVIEW_IDENTITY_RISK_MODE }
+})
+
+test('native fleet global rollout remains organization-scoped for read-only roles', async () => {
+  const keys = ['HAWKVIEW_IDENTITY_RISK_ROLLOUT', 'HAWKVIEW_IDENTITY_RISK_MODE', 'HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER', 'HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE'] as const
+  const previous = keys.map((key) => process.env[key])
+  try {
+    process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT = 'global'
+    process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+    process.env.HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER = 'wrapped-v1'
+    delete process.env.HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE
+    const foreignOrganization = '44444444-4444-4444-8444-444444444444'
+    const { client, calls } = fleetClient({ controls: [{ scopeType: 'TENANT', scopeKey: `${foreignOrganization}:${tenantId}`, organizationId: foreignOrganization, customerTenantId: tenantId }] })
+    const result = await new IdentityRiskService({} as never).authorizeRiskyUsersFleetRead(identity, client as never)
+    assert.equal(result.tenants[0].gate, null)
+    assert.equal(calls.length, 4)
+    assert.doesNotMatch(JSON.stringify(result), /MSP_VIEWER|actor|auth-user|owner@example/)
+  } finally {
+    keys.forEach((key, index) => { if (previous[index] === undefined) delete process.env[key]; else process.env[key] = previous[index] })
+  }
+})
+
 const pilotKeys = ['HAWKVIEW_IDENTITY_RISK_KEY_PROVIDER', 'HAWKVIEW_IDENTITY_RISK_ENVIRONMENT', 'HAWKVIEW_IDENTITY_RISK_PILOT_SCOPE'] as const
 let previousPilot: Array<string | undefined> = []
 beforeEach(() => {
