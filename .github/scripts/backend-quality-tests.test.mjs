@@ -188,7 +188,7 @@ after(async () => {
   const runnerEnvironment = { ...process.env };
   // Explicit undefined also masks this key when a safety wrapper merges parent env first.
   runnerEnvironment.NODE_TEST_CONTEXT = undefined;
-  const negative = spawnSync(process.execPath, ['--test', '--test-concurrency=2', ...files], {
+  const negative = spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=2', ...files], {
     env: { ...runnerEnvironment, HV_HARNESS_NEGATIVE_CONTROL: '1' }, encoding: 'utf8', timeout: 10000,
   });
   assert.equal(negative.error, undefined);
@@ -199,7 +199,7 @@ after(async () => {
   assert.match(negative.stdout, /# fail 1\b/);
   assert.doesNotMatch(negative.stdout, /fixture barrier timed out/);
   assert.equal(existsSync(join(directory, 'fixture.lock')), false);
-  const serial = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], {
+  const serial = spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1', ...files], {
     env: { ...runnerEnvironment, HV_HARNESS_NEGATIVE_CONTROL: '0' }, encoding: 'utf8', timeout: 10000,
   });
   assert.equal(serial.error, undefined);
