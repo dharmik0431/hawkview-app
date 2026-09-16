@@ -1,4 +1,4 @@
-import { Controller, Inject, Logger, Post, Req } from '@nestjs/common'
+import { Controller, Inject, Logger, Optional, Post, Req } from '@nestjs/common'
 import type { Request } from 'express'
 import { Public } from '../auth/public.decorator.js'
 import { SchedulerTokenVerifier } from './scheduler-token-verifier.service.js'
@@ -10,6 +10,8 @@ import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-run
 import { riskHistoryRetentionConfig } from '../identity-risk/risk-history-retention.js'
 import { RiskCycleDiagnostic } from '../identity-risk/risk-operational-diagnostics.js'
 import { AlertIntakeService } from '../alerts/alert-intake.service.js'
+import { EmailAlertReleaseService } from '../alerts/email-alert-release.service.js'
+import { emailAfterCollection } from '../alerts/email-after-collection.js'
 
 @Controller('api/internal/sync')
 export class ScheduledSyncController {
@@ -23,6 +25,8 @@ export class ScheduledSyncController {
     private readonly identityRiskMaintenance: IdentityRiskMaintenanceService,
     @Inject(AlertIntakeService)
     private readonly alertIntake: AlertIntakeService,
+    @Optional() @Inject(EmailAlertReleaseService)
+    private readonly emailAlerts?: EmailAlertReleaseService,
   ) {}
 
   @Public()
@@ -96,6 +100,8 @@ export class ScheduledSyncController {
       }
 
       const result = await this.tenantSyncService.syncDueTenants(admissionDeadlineAt)
+      await emailAfterCollection(result, admissionDeadlineAt,
+        this.emailAlerts ? deadline => this.emailAlerts!.runOnce(deadline) : undefined)
       logProcessMemoryPhase(this.logger, 'scheduled_sync', 'COMPLETED', startedAt)
       return result
     } catch (error) {

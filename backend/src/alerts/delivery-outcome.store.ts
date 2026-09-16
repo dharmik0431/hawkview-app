@@ -2,6 +2,9 @@ import { Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { messageId, type MessageId, type ProviderMessageId } from './email-delivery.js'
 import { type OutcomeRow } from './delivery-events.js'
+import { type AuthenticEvent } from './email-delivery.js'
+import { emailSqlRunner } from './email-sql-runner.js'
+import { recordEmailProviderEvent } from './email-delivery-reconciliation.js'
 
 /**
  * WHERE A DELIVERY OUTCOME BECOMES DURABLE.
@@ -25,7 +28,7 @@ export interface SqlRunner {
 export class DeliveryOutcomeStore {
   private readonly runner: SqlRunner
 
-  constructor(@Inject(PrismaService) prisma: PrismaService) {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {
     this.runner = {
       query: (sql, params) => prisma.$queryRawUnsafe(sql, ...params),
       execute: (sql, params) => prisma.$executeRawUnsafe(sql, ...params),
@@ -55,7 +58,8 @@ export class DeliveryOutcomeStore {
    * on (provider_id, kind, occurred_at) — not provider_id alone, because one message legitimately
    * produces DELIVERED and later COMPLAINED and a key collapsing those would discard the
    * complaint, which is the event that changes behaviour. */
-  async record(row: OutcomeRow): Promise<void> {
+  async record(row: OutcomeRow, authentic?: { eventId: string; event: AuthenticEvent }): Promise<void> {
+    if (authentic) await recordEmailProviderEvent(emailSqlRunner(this.prisma), authentic.eventId, authentic.event)
     await this.runner.execute(
       [
         'INSERT INTO alert_delivery_outcomes',
