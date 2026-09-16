@@ -25,6 +25,7 @@ import { useNativeRiskSummary } from '@/lib/api/native-risk-summary-hooks'
 import { investigateDestination } from '@/lib/tenants/investigate-navigation'
 import { AlertDetailsModal } from '@/components/dashboard/alert-details-modal'
 import { TenantRiskMatrix } from '@/components/dashboard/tenant-risk-matrix'
+import { NativeRiskSummaryCard } from '@/components/dashboard/native-risk-summary-card'
 import {
   getTenantMatrixOverallState,
   getTenantConnectionDataInfo,
@@ -421,7 +422,7 @@ export default function DashboardPage() {
     [nativeRiskQuery.data?.tenants],
   )
 
-  const nativeRiskRequestState = nativeRiskQuery.isLoading
+  const nativeRiskRequestState = nativeRiskQuery.isLoading || nativeRiskQuery.isFetching
     ? 'LOADING' as const
     : nativeRiskQuery.isError
       ? 'ERROR' as const
@@ -668,28 +669,36 @@ export default function DashboardPage() {
     [data?.error, tenants],
   )
 
+  const nativeRiskPanel = <NativeRiskSummaryCard
+    risk={hawkViewPortfolioRisk}
+    requestState={nativeRiskRequestState}
+    generatedAt={nativeRiskQuery.data?.generatedAt}
+    microsoftLabel={evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
+    onRetry={() => void nativeRiskQuery.refetch()}
+  />
+
   if (isLoading) {
-    return <LoadingState message="Loading dashboard evidence…" />
+    return <div className="space-y-5">{nativeRiskPanel}<LoadingState message="Loading dashboard evidence…" /></div>
   }
 
   if (isError && !data?.tenants) {
     return (
-      <ErrorState
+      <div className="space-y-5">{nativeRiskPanel}<ErrorState
         message="HawkView could not load dashboard evidence. No health or risk state is being inferred."
         onRetry={() => void refetch()}
-      />
+      /></div>
     )
   }
 
   if (tenants.length === 0) {
     return (
-      <EmptyState
+      <div className="space-y-5">{nativeRiskPanel}<EmptyState
         icon={Building2}
-        title="No managed tenants"
-        description="Onboard a Microsoft 365 tenant to begin collecting security and configuration evidence."
+        title={nativeRiskRequestState === 'SUCCESS' && nativeRiskQuery.data?.fleet.totalTenants === 0 ? 'No managed tenants' : 'No tenant rows to display'}
+        description="Open the tenant directory to review or resume tenant setup."
         actionLabel="Open tenant directory"
         href="/tenants"
-      />
+      /></div>
     )
   }
 
@@ -750,38 +759,7 @@ export default function DashboardPage() {
       ) : null}
       {/* KPI Cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <button
-          type="button"
-          onClick={() => router.push('/risky-users')}
-          className="rounded-2xl text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
-          aria-label={`Open Risky Users. ${hawkViewPortfolioRisk.accessibleValue} HawkView risky users.`}
-        >
-          <Card className="h-full rounded-2xl transition-colors hover:border-blue-300 dark:hover:border-blue-700">
-          <CardContent className="p-5">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  HawkView Risky Users
-                </div>
-                <div className="mt-1 text-3xl font-bold">
-                  {hawkViewPortfolioRisk.display}
-                </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  {hawkViewPortfolioRisk.totalTenants === null
-                    ? hawkViewPortfolioRisk.detail
-                    : `${hawkViewPortfolioRisk.assessedTenants} of ${hawkViewPortfolioRisk.totalTenants} tenants assessed`}
-                </div>
-                <div className="mt-2 text-[11px] text-slate-400">
-                  Microsoft Entra risk: {evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
-                </div>
-              </div>
-              <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center">
-                <AlertTriangle className="h-5 w-5 text-red-600" />
-              </div>
-            </div>
-          </CardContent>
-          </Card>
-        </button>
+        {nativeRiskPanel}
 
         <Card className="rounded-2xl">
           <CardContent className="p-5">
@@ -949,6 +927,7 @@ export default function DashboardPage() {
             <div className="relative">
               <label className="sr-only">HawkView risky-user status</label>
               <select
+                aria-label="HawkView risky-user status"
                 value={matrixHasRiskyUsers}
                 onChange={(e) => setMatrixHasRiskyUsers(e.target.value)}
                 className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"

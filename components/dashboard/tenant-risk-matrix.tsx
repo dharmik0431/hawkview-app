@@ -32,6 +32,7 @@ import type { Tenant } from '@/types/api'
 import { cn } from '@/lib/utils'
 import {
   presentHawkViewTenantRisk,
+  formatNativeRiskClock,
   type NativeTenantRiskSummary,
 } from '@/lib/dashboard/hawkview-risk-summary'
 import { tenantRiskyUsersPath } from '@/lib/tenants/navigation'
@@ -58,6 +59,20 @@ interface TenantRiskMatrixProps {
   sortColumn?: MatrixSortColumn
   sortDirection?: 'asc' | 'desc'
   onSortChange?: (column: MatrixSortColumn, direction: 'asc' | 'desc') => void
+}
+
+function NativeRiskEvidence({ status, summary }: {
+  status: ReturnType<typeof presentHawkViewTenantRisk>
+  summary?: NativeTenantRiskSummary
+}) {
+  return <div className="mt-1 max-w-[210px] break-words text-[10px] text-slate-500">
+    {summary?.evaluatedAt ? <div>Evaluated <time dateTime={summary.evaluatedAt}>{formatNativeRiskClock(summary.evaluatedAt)}</time></div> : null}
+    <details onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+      <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">Assessment details</summary>
+      <p className="mt-1">{status.detail}</p>
+      <p className="mt-1">Evidence window: {formatNativeRiskClock(summary?.windowStart)} to {formatNativeRiskClock(summary?.windowEnd)}.</p>
+    </details>
+  </div>
 }
 
 /** Sort the same server-owned evidence that the cell renders. Unknown stays last. */
@@ -456,12 +471,11 @@ export function TenantRiskMatrix({
                               {riskyInfo.count > 0 ? (
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-bold bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900/50">
                                   <Users className="h-3 w-3 text-amber-600 dark:text-amber-400" />
-                                  <span>{riskyInfo.display}</span>
+                                  <span aria-label={riskyInfo.accessibleValue}>{riskyInfo.display}</span>
                                 </span>
                               ) : (
-                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
-                                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
-                                  <span>0 users at risk</span>
+                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                  <span aria-label="0 HawkView users with findings in the assessed scope">0 in assessed scope</span>
                                 </span>
                               )}
                             </div>
@@ -487,6 +501,7 @@ export function TenantRiskMatrix({
                             </div>
                           </div>
                         )}
+                        <NativeRiskEvidence status={riskyInfo} summary={nativeRiskRequestState === 'SUCCESS' ? nativeRiskByTenant.get(t.id) : undefined} />
                         <div className="mt-1 text-[10px] text-slate-400">
                           Microsoft Entra: {microsoftRiskInfo.label}
                         </div>
@@ -674,14 +689,15 @@ export function TenantRiskMatrix({
                         HawkView Risky Users
                       </span>
                       {riskyInfo.count !== null ? (
-                        <span className={cn('font-bold block', riskyInfo.count! > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-emerald-700 dark:text-emerald-400')}>
-                          {riskyInfo.display}
+                        <span aria-label={riskyInfo.count === 0 ? '0 HawkView users with findings in the assessed scope' : riskyInfo.accessibleValue} className={cn('font-bold block', riskyInfo.count! > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-slate-700 dark:text-slate-300')}>
+                          {riskyInfo.count === 0 ? '0 in assessed scope' : riskyInfo.display}
                         </span>
                       ) : (
                         <span className="font-semibold text-slate-600 dark:text-slate-300 block text-[11px]">
                           {riskyInfo.display}
                         </span>
                       )}
+                      <NativeRiskEvidence status={riskyInfo} summary={nativeRiskRequestState === 'SUCCESS' ? nativeRiskByTenant.get(t.id) : undefined} />
                       <span className="text-[10px] text-slate-400 block">
                         Microsoft Entra: {microsoftRiskInfo.label}
                       </span>

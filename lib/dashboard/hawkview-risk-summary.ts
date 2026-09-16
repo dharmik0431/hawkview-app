@@ -42,11 +42,25 @@ export type HawkViewRiskStatus = {
   detail: string
 }
 
+export function formatNativeRiskClock(value: string | null | undefined): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return 'Not reported'
+  return new Date(value).toLocaleString('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC', timeZoneName: 'short' })
+}
+
+function tenantLimitation(status: NativeTenantRiskSummary): string {
+  if (status.limitations.includes('NOT_ENABLED_FOR_TENANT')) return 'HawkView assessment is not enabled for this tenant.'
+  if (status.limitations.includes('EVALUATION_DISABLED')) return 'HawkView assessment is currently disabled.'
+  if (status.limitations.includes('COUNT_WITHHELD')) return 'The saved assessment does not support a user count.'
+  if (status.limitations.includes('INVALID_RUN')) return 'The saved assessment could not be validated; its count is withheld.'
+  if (status.limitations.includes('READ_LIMIT_EXCEEDED')) return 'The saved assessment exceeds this summary’s read limit; its count is withheld.'
+  return 'No current HawkView assessment is available for this tenant.'
+}
+
 export function presentHawkViewTenantRisk(
   status: NativeTenantRiskSummary | undefined,
   requestState: 'LOADING' | 'ERROR' | 'SUCCESS' = 'SUCCESS',
 ): HawkViewRiskStatus {
-  if (!status) {
+  if (requestState !== 'SUCCESS' || !status) {
     if (requestState === 'ERROR') {
       return {
         count: null,
@@ -80,7 +94,7 @@ export function presentHawkViewTenantRisk(
       display: 'Not available',
       accessibleValue: 'HawkView assessment not available',
       state: 'unavailable',
-      detail: 'This tenant returned no HawkView assessment',
+      detail: tenantLimitation(status),
     }
   }
 
@@ -150,7 +164,7 @@ export function summarizeHawkViewPortfolioRisk(
       display: 'Unavailable',
       accessibleValue: 'HawkView fleet assessment unavailable',
       state: 'failed',
-      detail: 'The tenant directory could not be loaded, so fleet risk coverage is unknown.',
+      detail: 'The HawkView risk summary could not be loaded. Counts are withheld until a retry succeeds.',
       assessedTenants: 0,
       totalTenants: null,
     }
@@ -186,9 +200,10 @@ export function summarizeHawkViewPortfolioRisk(
       ? fleet.distinctUserCount.toLocaleString()
       : `At least ${fleet.distinctUserCount.toLocaleString()}`,
     state: exact ? 'available' : 'partial',
-    detail: exact
-      ? `Distinct users with current HawkView findings across all ${fleet.totalTenants.toLocaleString()} assessed tenants.`
-      : `At least ${fleet.distinctUserCount.toLocaleString()} distinct users were found across ${fleet.assessedTenants.toLocaleString()} of ${fleet.totalTenants.toLocaleString()} tenant assessments.`,
+    detail: (exact
+      ? `Users with HawkView findings across all ${fleet.totalTenants.toLocaleString()} assessed tenants.`
+      : `At least ${fleet.distinctUserCount.toLocaleString()} users were found across ${fleet.assessedTenants.toLocaleString()} of ${fleet.totalTenants.toLocaleString()} tenant assessments.`) +
+      (!fleet.scopeComplete ? ` Summary limited to ${fleet.enumeratedTenants.toLocaleString()} tenants.` : '') + ' Users are counted separately in each tenant.',
     assessedTenants: fleet.assessedTenants,
     totalTenants: fleet.totalTenants,
   }

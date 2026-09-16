@@ -23,5 +23,6 @@ export function useNativeRiskSummary() {
     },
     retry: false,
     staleTime: 60_000,
+    refetchInterval: 60_000,
   })
 }
