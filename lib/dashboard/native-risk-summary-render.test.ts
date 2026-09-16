@@ -60,19 +60,21 @@ function documentFor(component: unknown, props: Record<string, unknown>) {
   return new JSDOM(renderToStaticMarkup(h(component, props))).window.document
 }
 function cardProps(value: native.NativeRiskSummaryResponse, state: 'SUCCESS' | 'ERROR' | 'LOADING' = 'SUCCESS') {
-  return { risk: native.summarizeHawkViewPortfolioRisk(value.fleet, state), requestState: state, generatedAt: value.generatedAt, microsoftLabel: 'Unavailable', onRetry: () => undefined }
+  return { risk: native.summarizeHawkViewPortfolioRisk(value.fleet, state), requestState: state, onRetry: () => undefined }
 }
 const tenant = { id: 'synthetic-a', name: 'Synthetic tenant', status: 'active', connectionStatus: 'connected', provider: 'microsoft', riskyUsersCount: 987, riskyIdentityCount: 987, missingPermissions: [], attention: [] }
 
-test('rendered primary card uses changing server counts, fixed navigation and qualified scope independent of Microsoft', () => {
+test('compact primary card shows only title, truthful count and one subtitle with native navigation', () => {
   for (const count of [7, 12, 0]) {
     const document = documentFor(NativeRiskSummaryCard, cardProps(fixture(count)))
     assert.equal(document.querySelector('a')?.getAttribute('href'), '/risky-users')
     assert.equal(document.querySelector('[aria-live]')?.textContent, String(count))
     assert.match(document.body.textContent, /1 of 1 tenants assessed/)
-    assert.match(document.body.textContent, /Microsoft Entra risk: Unavailable/)
-    assert.match(document.body.textContent, /Users are counted separately in each tenant/)
-    assert.equal(document.querySelector('time')?.getAttribute('datetime'), fixture().generatedAt)
+    assert.equal(document.body.textContent, `HawkView Risky Users${count}1 of 1 tenants assessed`)
+    assert.doesNotMatch(document.body.textContent, /Microsoft|Users are counted|Summary checked/)
+    assert.equal(document.querySelector('time'), null)
+    assert.match(document.querySelector('a')?.className, /focus-visible:ring-2/)
+    assert.equal(document.querySelector('a')?.getAttribute('tabindex'), null)
     assert.doesNotMatch(document.body.textContent, /987|all safe|all clear/i)
   }
 })
@@ -83,6 +85,7 @@ test('partial rendered count and accessible label say at least; failed/loading c
   const document = documentFor(NativeRiskSummaryCard, cardProps(value))
   assert.equal(document.querySelector('[aria-live]')?.textContent, '≥7')
   assert.match(document.querySelector('a')?.getAttribute('aria-label'), /At least 7/)
+  assert.equal(document.body.textContent, 'HawkView Risky Users≥71 of 1 tenants assessed')
   for (const state of ['ERROR', 'LOADING'] as const) {
     const document = documentFor(NativeRiskSummaryCard, cardProps(fixture(), state))
     assert.equal(document.querySelector('[aria-live]')?.textContent, state === 'ERROR' ? 'Unavailable' : 'Loading')
@@ -90,7 +93,30 @@ test('partial rendered count and accessible label say at least; failed/loading c
     assert.equal(document.querySelector('a button'), null)
     assert.equal(document.querySelector('a')?.getAttribute('aria-busy'), String(state === 'LOADING'))
     assert.equal(Boolean(document.querySelector('[role=alert]')), state === 'ERROR')
+    assert.doesNotMatch(document.body.textContent, /1 of 1|Summary checked|Microsoft|≥7/)
+    assert.match(document.body.textContent, state === 'ERROR' ? /Counts unavailable/ : /Checking assessment/)
   }
+})
+
+test('unavailable and withheld zero stay unavailable in the compact card without extra detail', () => {
+  for (const availability of ['UNAVAILABLE', 'PARTIAL'] as const) {
+    const value = fixture(0)
+    Object.assign(value.fleet, { availability, accuracy: 'NOT_AVAILABLE', distinctUserCount: null })
+    const document = documentFor(NativeRiskSummaryCard, cardProps(value))
+    assert.equal(document.querySelector('[aria-live]')?.textContent, 'Not available')
+    assert.equal(document.body.textContent, 'HawkView Risky UsersNot available1 of 1 tenants assessed')
+    assert.doesNotMatch(document.body.textContent, /all clear|all safe|Summary checked|Microsoft/i)
+  }
+})
+
+test('compact card uses adjacent KPI padding and natural height without clipping or fixed height', () => {
+  const source = readFileSync(new URL('../../components/dashboard/native-risk-summary-card.tsx', import.meta.url), 'utf8')
+  const dashboard = readFileSync(new URL('../../app/(protected)/dashboard/page.tsx', import.meta.url), 'utf8')
+  assert.match(source, /CardContent className="p-5"/)
+  assert.match(source, /flex min-w-0 flex-col gap-2/)
+  assert.match(source, /block flex-1 rounded-2xl/)
+  assert.match(dashboard, /grid gap-4 md:grid-cols-2 lg:grid-cols-4/)
+  assert.doesNotMatch(source, /overflow-hidden|line-clamp|truncate|(?:min-|max-)?h-\[/)
 })
 
 test('matrix desktop and mobile render native counts with assessment clocks; never borrow Microsoft/legacy counts', () => {
@@ -133,6 +159,10 @@ test('retry is a separate keyboard-focusable button and invokes only the supplie
   try {
     await React.act(async () => root.render(h(NativeRiskSummaryCard, { ...cardProps(fixture(), 'ERROR'), onRetry: () => calls++ })))
     const retry = dom.window.document.querySelector('button')
+    const link = dom.window.document.querySelector('a')
+    link.focus()
+    assert.equal(dom.window.document.activeElement, link)
+    assert.equal(link.getAttribute('href'), '/risky-users')
     retry.focus()
     assert.equal(dom.window.document.activeElement, retry)
     await React.act(async () => retry.click())

@@ -672,8 +672,6 @@ export default function DashboardPage() {
   const nativeRiskPanel = <NativeRiskSummaryCard
     risk={hawkViewPortfolioRisk}
     requestState={nativeRiskRequestState}
-    generatedAt={nativeRiskQuery.data?.generatedAt}
-    microsoftLabel={evidenceCount(kpis.riskyIdentities, kpis.riskPartial, 'Unavailable')}
     onRetry={() => void nativeRiskQuery.refetch()}
   />
 
