@@ -30,6 +30,12 @@ import {
 } from '@/components/ui/tooltip'
 import type { Tenant } from '@/types/api'
 import { cn } from '@/lib/utils'
+import {
+  presentHawkViewTenantRisk,
+  formatNativeRiskClock,
+  type NativeTenantRiskSummary,
+} from '@/lib/dashboard/hawkview-risk-summary'
+import { tenantRiskyUsersPath } from '@/lib/tenants/navigation'
 
 import {
   getTenantSecureScoreInfo,
@@ -48,9 +54,25 @@ export type MatrixSortColumn =
 
 interface TenantRiskMatrixProps {
   tenants: Tenant[]
+  nativeRiskByTenant?: ReadonlyMap<string, NativeTenantRiskSummary>
+  nativeRiskRequestState?: 'LOADING' | 'ERROR' | 'SUCCESS'
   sortColumn?: MatrixSortColumn
   sortDirection?: 'asc' | 'desc'
   onSortChange?: (column: MatrixSortColumn, direction: 'asc' | 'desc') => void
+}
+
+function NativeRiskEvidence({ status, summary }: {
+  status: ReturnType<typeof presentHawkViewTenantRisk>
+  summary?: NativeTenantRiskSummary
+}) {
+  return <div className="mt-1 max-w-[210px] break-words text-[10px] text-slate-500">
+    {summary?.evaluatedAt ? <div>Evaluated <time dateTime={summary.evaluatedAt}>{formatNativeRiskClock(summary.evaluatedAt)}</time></div> : null}
+    <details onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
+      <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">Assessment details</summary>
+      <p className="mt-1">{status.detail}</p>
+      <p className="mt-1">Evidence window: {formatNativeRiskClock(summary?.windowStart)} to {formatNativeRiskClock(summary?.windowEnd)}.</p>
+    </details>
+  </div>
 }
 
 /** Sort the same server-owned evidence that the cell renders. Unknown stays last. */
@@ -58,9 +80,11 @@ export function compareTenantRiskSummaries(
   a: Tenant,
   b: Tenant,
   direction: 'asc' | 'desc',
+  nativeRiskByTenant: ReadonlyMap<string, NativeTenantRiskSummary> = new Map(),
+  nativeRiskRequestState: 'LOADING' | 'ERROR' | 'SUCCESS' = 'SUCCESS',
 ) {
-  const riskA = getTenantRiskyUsersInfo(a)
-  const riskB = getTenantRiskyUsersInfo(b)
+  const riskA = presentHawkViewTenantRisk(nativeRiskByTenant.get(a.id), nativeRiskRequestState)
+  const riskB = presentHawkViewTenantRisk(nativeRiskByTenant.get(b.id), nativeRiskRequestState)
   const countA = riskA.count
   const countB = riskB.count
 
@@ -71,7 +95,7 @@ export function compareTenantRiskSummaries(
     return direction === 'asc' ? countA - countB : countB - countA
   }
 
-  if (riskA.isExact !== riskB.isExact) return riskA.isExact ? -1 : 1
+  if (riskA.exact !== riskB.exact) return riskA.exact ? -1 : 1
   return a.name.localeCompare(b.name)
 }
 
@@ -79,6 +103,8 @@ export function sortTenantRiskMatrixTenants(
   tenants: Tenant[],
   sortColumn: MatrixSortColumn,
   sortDir: 'asc' | 'desc',
+  nativeRiskByTenant: ReadonlyMap<string, NativeTenantRiskSummary> = new Map(),
+  nativeRiskRequestState: 'LOADING' | 'ERROR' | 'SUCCESS' = 'SUCCESS',
 ) {
   const list = [...tenants]
   list.sort((a, b) => {
@@ -91,7 +117,13 @@ export function sortTenantRiskMatrixTenants(
       const scoreB = b.secureScore ?? -1
       cmp = scoreA - scoreB
     } else if (sortColumn === 'users_at_risk') {
-      return compareTenantRiskSummaries(a, b, sortDir)
+      return compareTenantRiskSummaries(
+        a,
+        b,
+        sortDir,
+        nativeRiskByTenant,
+        nativeRiskRequestState,
+      )
     } else if (sortColumn === 'active_threats') {
       const threatsA = getTenantThreatsInfo(a).count ?? -1
       const threatsB = getTenantThreatsInfo(b).count ?? -1
@@ -130,6 +162,8 @@ function clamp(val: number, min: number, max: number) {
 
 export function TenantRiskMatrix({
   tenants,
+  nativeRiskByTenant = new Map(),
+  nativeRiskRequestState = 'SUCCESS',
   sortColumn: externalSortColumn,
   sortDirection: externalSortDirection,
   onSortChange,
@@ -162,8 +196,14 @@ export function TenantRiskMatrix({
   }
 
   const sortedTenants = React.useMemo(
-    () => sortTenantRiskMatrixTenants(tenants, sortColumn, sortDir),
-    [tenants, sortColumn, sortDir],
+    () => sortTenantRiskMatrixTenants(
+      tenants,
+      sortColumn,
+      sortDir,
+      nativeRiskByTenant,
+      nativeRiskRequestState,
+    ),
+    [tenants, sortColumn, sortDir, nativeRiskByTenant, nativeRiskRequestState],
   )
 
   if (tenants.length === 0) {
@@ -242,9 +282,9 @@ export function TenantRiskMatrix({
                       type="button"
                       onClick={() => handleHeaderSort('users_at_risk')}
                       className="group flex items-center gap-1.5 hover:text-slate-900 dark:hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -ml-1"
-                      title="Sort by Users at Risk"
+                      title="Sort by HawkView risky users"
                     >
-                      <span>Users at Risk</span>
+                      <span>HawkView Risky Users</span>
                       {renderSortIcon('users_at_risk')}
                     </button>
                   </th>
@@ -272,9 +312,18 @@ export function TenantRiskMatrix({
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
                 {sortedTenants.map((t) => {
                   const scoreInfo = getTenantSecureScoreInfo(t)
-                  const riskyInfo = getTenantRiskyUsersInfo(t)
+                  const riskyInfo = presentHawkViewTenantRisk(
+                    nativeRiskByTenant.get(t.id),
+                    nativeRiskRequestState,
+                  )
+                  const microsoftRiskInfo = getTenantRiskyUsersInfo(t)
                   const threatsInfo = getTenantThreatsInfo(t)
-                  const recAction = getTenantRecommendedAction(t)
+                  const recAction = riskyInfo.count !== null && riskyInfo.count > 0
+                    ? {
+                        label: 'Review risky users',
+                        destinationUrl: tenantRiskyUsersPath(t.id),
+                      }
+                    : getTenantRecommendedAction(t)
                   const overallState = getTenantMatrixOverallState(t)
 
                   return (
@@ -416,23 +465,22 @@ export function TenantRiskMatrix({
 
                       {/* 4. Users at Risk */}
                       <td className="py-3.5 px-4 align-middle">
-                        {riskyInfo.statusType === 'available' && riskyInfo.count !== null ? (
+                        {riskyInfo.count !== null ? (
                           <div className="space-y-0.5">
                             <div className="flex items-center gap-1.5 font-bold">
                               {riskyInfo.count > 0 ? (
                                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-bold bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900/50">
                                   <Users className="h-3 w-3 text-amber-600 dark:text-amber-400" />
-                                  <span>{riskyInfo.label}</span>
+                                  <span aria-label={riskyInfo.accessibleValue}>{riskyInfo.display}</span>
                                 </span>
                               ) : (
-                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
-                                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
-                                  <span>0 users at risk</span>
+                                <span className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                                  <span aria-label="0 HawkView users with findings in the assessed scope">0 in assessed scope</span>
                                 </span>
                               )}
                             </div>
                             <div className="text-[10px] text-slate-400">
-                              {riskyInfo.breakdownNote}
+                              HawkView native assessment
                             </div>
                           </div>
                         ) : (
@@ -441,20 +489,22 @@ export function TenantRiskMatrix({
                               variant="outline"
                               className={cn(
                                 'px-2 py-0.5 text-[11px] font-semibold border rounded-md',
-                                riskyInfo.statusType === 'permission_required'
-                                  ? 'border-amber-200 bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300'
-                                  : riskyInfo.statusType === 'disconnected'
+                                riskyInfo.state === 'failed'
                                   ? 'border-red-200 bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
                                   : 'border-slate-200 bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300'
                               )}
                             >
-                              {riskyInfo.label}
+                              {riskyInfo.display}
                             </Badge>
                             <div className="text-[10px] text-slate-400">
-                              {riskyInfo.breakdownNote}
+                              HawkView native assessment
                             </div>
                           </div>
                         )}
+                        <NativeRiskEvidence status={riskyInfo} summary={nativeRiskRequestState === 'SUCCESS' ? nativeRiskByTenant.get(t.id) : undefined} />
+                        <div className="mt-1 text-[10px] text-slate-400">
+                          Microsoft Entra: {microsoftRiskInfo.label}
+                        </div>
                       </td>
 
                       {/* 5. Threats */}
@@ -524,9 +574,18 @@ export function TenantRiskMatrix({
           <div className="lg:hidden divide-y divide-slate-100 dark:divide-slate-800">
             {sortedTenants.map((t) => {
               const scoreInfo = getTenantSecureScoreInfo(t)
-              const riskyInfo = getTenantRiskyUsersInfo(t)
+              const riskyInfo = presentHawkViewTenantRisk(
+                nativeRiskByTenant.get(t.id),
+                nativeRiskRequestState,
+              )
+              const microsoftRiskInfo = getTenantRiskyUsersInfo(t)
               const threatsInfo = getTenantThreatsInfo(t)
-              const recAction = getTenantRecommendedAction(t)
+              const recAction = riskyInfo.count !== null && riskyInfo.count > 0
+                ? {
+                    label: 'Review risky users',
+                    destinationUrl: tenantRiskyUsersPath(t.id),
+                  }
+                : getTenantRecommendedAction(t)
               const overallState = getTenantMatrixOverallState(t)
 
               return (
@@ -627,17 +686,21 @@ export function TenantRiskMatrix({
                     {/* Users at Risk */}
                     <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 space-y-1">
                       <span className="text-[10px] uppercase font-bold text-slate-400 block">
-                        Users at Risk
+                        HawkView Risky Users
                       </span>
-                      {riskyInfo.statusType === 'available' ? (
-                        <span className={cn('font-bold block', riskyInfo.count! > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-emerald-700 dark:text-emerald-400')}>
-                          {riskyInfo.label}
+                      {riskyInfo.count !== null ? (
+                        <span aria-label={riskyInfo.count === 0 ? '0 HawkView users with findings in the assessed scope' : riskyInfo.accessibleValue} className={cn('font-bold block', riskyInfo.count! > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-slate-700 dark:text-slate-300')}>
+                          {riskyInfo.count === 0 ? '0 in assessed scope' : riskyInfo.display}
                         </span>
                       ) : (
                         <span className="font-semibold text-slate-600 dark:text-slate-300 block text-[11px]">
-                          {riskyInfo.label}
+                          {riskyInfo.display}
                         </span>
                       )}
+                      <NativeRiskEvidence status={riskyInfo} summary={nativeRiskRequestState === 'SUCCESS' ? nativeRiskByTenant.get(t.id) : undefined} />
+                      <span className="text-[10px] text-slate-400 block">
+                        Microsoft Entra: {microsoftRiskInfo.label}
+                      </span>
                     </div>
 
                     {/* Threats */}

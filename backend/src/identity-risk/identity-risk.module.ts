@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common'
 import { IdentityRiskController } from './identity-risk.controller.js'
 import { RiskyUsersController } from '../risky-users-wiring/risky-users.controller.js'
+import { NativeRiskSummaryController } from '../risky-users-wiring/native-risk-summary.controller.js'
 import { IdentityRiskService } from './identity-risk.service.js'
 import {
   IdentityRiskEvaluationScheduler,
@@ -20,7 +21,7 @@ import { RiskAssessmentReader } from './risk-assessment-reader.service.js'
   // The rebuilt engine's endpoint is registered BESIDE the existing one rather
   // than replacing it. Nothing calls it yet, so it cannot affect a customer;
   // the old route serves the deployed frontend unchanged.
-  controllers: [IdentityRiskController, RiskyUsersController],
+  controllers: [IdentityRiskController, RiskyUsersController, NativeRiskSummaryController],
   providers: [
     { provide: IDENTITY_RISK_MANAGED_MAC_TRANSPORT, useValue: null },
     { provide: IdentityRiskPseudonymProvider, useFactory: createPilotPseudonymProvider, inject: [IDENTITY_RISK_MANAGED_MAC_TRANSPORT] },

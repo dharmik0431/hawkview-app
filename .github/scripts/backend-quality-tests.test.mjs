@@ -20,8 +20,9 @@ const paths = entries => entries.map(entry => entry.path);
 test('partition is the complete disjoint discovery, including the nonstandard real-PG file', () => {
   const entries = fixtureEntries();
   const plan = planTests(entries, paths(entries).reverse());
-  assert.equal(plan.database.length, 26);
+  assert.equal(plan.database.length, 27);
   assert.ok(plan.database.includes('src/tenants/sign-in-provisioning.test.ts'));
+  assert.ok(plan.database.includes('src/risky-users-wiring/native-risk-summary.database-integration.test.ts'));
   assert.deepEqual([...plan.ordinary, ...plan.database].sort(), paths(entries).sort());
   assert.equal(new Set([...plan.ordinary, ...plan.database]).size, entries.length);
 });

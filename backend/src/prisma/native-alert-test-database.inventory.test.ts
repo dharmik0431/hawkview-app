@@ -27,6 +27,7 @@ const expected = [
   "identity-risk/wrapped-risk-key.database-integration.test.ts",
   "prisma/alert-table-rls.database-integration.test.ts",
   "prisma/public-schema-lockdown.database-integration.test.ts",
+  "risky-users-wiring/native-risk-summary.database-integration.test.ts",
   "risky-users-wiring/expired-native-finding-alert.database-integration.test.ts",
   "risky-users-wiring/native-alert-publication-lifecycle.database-integration.test.ts",
   "risky-users-wiring/native-finding-to-alert.database-integration.test.ts",
@@ -120,7 +121,7 @@ function hasImportedGuardCall(source: string): boolean {
   return bindings.size > 0 && calls > 0
 }
 
-test('all 25 database integration suites structurally import and invoke the shared boundary', () => {
+test('all database integration suites structurally import and invoke the shared boundary', () => {
   const files = integrationFiles(root).sort()
   assert.deepEqual(files.map(path => relative(root, path).replaceAll('\\', '/')).sort(), [...expected].sort())
   for (const path of files) {

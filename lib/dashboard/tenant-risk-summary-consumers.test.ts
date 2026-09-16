@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import test from 'node:test'
 import * as microsoftRiskSummary from '../identity-risk/microsoft-risk-summary.ts'
 import * as tenantNavigation from '../tenants/navigation.ts'
+import * as hawkViewRiskSummary from './hawkview-risk-summary.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -78,6 +79,8 @@ function compileMatrix(helpers: ReturnType<typeof compileHelpers>) {
         TooltipTrigger: () => null,
       },
       '@/lib/utils': { cn: (...values: unknown[]) => values.filter(Boolean).join(' ') },
+      '@/lib/dashboard/hawkview-risk-summary': hawkViewRiskSummary,
+      '@/lib/tenants/navigation': tenantNavigation,
       './tenant-risk-matrix-helpers': helpers,
       './tenant-risk-matrix-drawer': { TenantRiskMatrixDrawer: () => null },
     }[name] ?? require(name)),
@@ -93,6 +96,7 @@ function compileMatrix(helpers: ReturnType<typeof compileHelpers>) {
       tenants: Record<string, unknown>[],
       sortColumn: 'users_at_risk',
       direction: 'asc' | 'desc',
+      nativeRiskByTenant?: ReadonlyMap<string, hawkViewRiskSummary.NativeTenantRiskSummary>,
     ) => Record<string, unknown>[]
   }
 }
@@ -198,7 +202,7 @@ test('valid summaries win over the legacy scalar without treating partial eviden
   )
 })
 
-test('Users at Risk sorting follows visible summary counts and never the legacy scalar', () => {
+test('Users at Risk sorting follows visible HawkView-native counts and never Microsoft or legacy scalars', () => {
   const exactZero = {
     ...baseTenant,
     name: 'Exact zero',
@@ -247,10 +251,43 @@ test('Users at Risk sorting follows visible summary counts and never the legacy 
     },
   }
 
+  const nativeRiskByTenant = new Map([
+    [exactZero.id, {
+      tenantId: exactZero.id,
+      availability: 'AVAILABLE' as const,
+      accuracy: 'EXACT' as const,
+      distinctUserCount: 0,
+      evaluatedAt: clocks.collectionSucceededAt,
+      windowStart: null,
+      windowEnd: null,
+      complete: true,
+      limitations: [],
+    }],
+    [observedTwo.id + '-observed', {
+      tenantId: observedTwo.id + '-observed',
+      availability: 'PARTIAL' as const,
+      accuracy: 'AT_LEAST' as const,
+      distinctUserCount: 2,
+      evaluatedAt: clocks.collectionSucceededAt,
+      windowStart: null,
+      windowEnd: null,
+      complete: false,
+      limitations: ['PARTIAL_ASSESSMENT'],
+    }],
+  ])
+  const nativeTenants = [
+    exactZero,
+    { ...observedTwo, id: observedTwo.id + '-observed' },
+    { ...partialZero, id: partialZero.id + '-partial' },
+    { ...missing, id: missing.id + '-missing' },
+    { ...invalid, id: invalid.id + '-invalid' },
+  ]
+
   const descending = matrix.sortTenantRiskMatrixTenants(
-    [exactZero, missing, invalid, partialZero, observedTwo],
+    nativeTenants,
     'users_at_risk',
     'desc',
+    nativeRiskByTenant,
   )
   assert.deepEqual(
     descending.map((tenant) => tenant.name),
@@ -258,9 +295,10 @@ test('Users at Risk sorting follows visible summary counts and never the legacy 
   )
 
   const ascending = matrix.sortTenantRiskMatrixTenants(
-    [observedTwo, partialZero, invalid, missing, exactZero],
+    nativeTenants,
     'users_at_risk',
     'asc',
+    nativeRiskByTenant,
   )
   assert.deepEqual(
     ascending.map((tenant) => tenant.name),

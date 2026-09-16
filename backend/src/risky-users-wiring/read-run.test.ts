@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { readLatestRun } from './read-run.js'
+import { decodeNativeRunRow, readLatestRun } from './read-run.js'
 import { RUN_ENGINE_VERSION, RUN_STATUS, persistRun } from './persist-run.js'
 import { assessTenant } from './assess-tenant.js'
 import { normalizeSignInBatch } from '../risky-users-normalization/index.js'
@@ -8,6 +8,13 @@ import type { Finding } from '../evaluation-core/contract.js'
 
 const now = new Date('2026-09-10T21:00:00.000Z')
 const scope = { organizationId: 'org', customerTenantId: 'tenant' }
+
+test('batch and single-tenant readers share exactly the same persisted decoder', async () => {
+  const row = await writtenRow()
+  const { client } = reader(row)
+  assert.deepEqual(await readLatestRun(client, scope, now), decodeNativeRunRow(row as never))
+  assert.deepEqual(decodeNativeRunRow(null), { present: false, because: 'NO_RUN' })
+})
 
 const raymonds: Finding = {
   detectorId: 'repeated-credential-failure',

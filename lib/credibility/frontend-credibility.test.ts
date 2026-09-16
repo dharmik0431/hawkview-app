@@ -23,7 +23,7 @@ test('dashboard renders explicit evidence states and has no healthy or risky fab
   assert.match(helpers, /Risk data not reported/)
 })
 
-test('Microsoft risk consumers use the additive summary and canonical evidence route', () => {
+test('HawkView native and Microsoft risk consumers remain source-separated', () => {
   const dashboard = source('app/(protected)/dashboard/page.tsx')
   const helpers = source('components/dashboard/tenant-risk-matrix-helpers.ts')
   const matrix = source('components/dashboard/tenant-risk-matrix.tsx')
@@ -31,12 +31,16 @@ test('Microsoft risk consumers use the additive summary and canonical evidence r
   const section = source('components/identity-risk/risky-users-section.tsx')
 
   assert.match(dashboard, /normalizeMicrosoftRiskSummary/)
+  assert.match(dashboard, /useNativeRiskSummary/)
+  assert.match(dashboard, /<NativeRiskSummaryCard/)
+  assert.match(source('components/dashboard/native-risk-summary-card.tsx'), /HawkView Risky Users/)
   assert.match(dashboard, /identityExact/)
   assert.doesNotMatch(dashboard, /riskyIdentityCount/)
   assert.doesNotMatch(dashboard, /partial \? `≥\$\{value\}`/)
   assert.match(helpers, /tenantRiskyUsersPath\(tenant\.id\)/)
   assert.doesNotMatch(helpers, /riskyIdentityCount/)
-  assert.match(matrix, /sortTenantRiskMatrixTenants\(tenants, sortColumn, sortDir\)/)
+  assert.match(matrix, /sortTenantRiskMatrixTenants\([\s\S]*?nativeRiskByTenant/)
+  assert.match(matrix, /Microsoft Entra:/)
   assert.doesNotMatch(matrix, /riskyIdentityCount/)
   assert.doesNotMatch(helpers, /'0 users at risk'|'No risky users'/)
   assert.match(workspace, /if \(key\.includes\('risky'\)\) return 'risky-users'/)
