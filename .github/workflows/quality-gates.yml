@@ -86,7 +86,8 @@ jobs:
         run: |
           mapfile -t tests < <(find src -type f -name '*.test.ts' -print | sort)
           test "${#tests[@]}" -gt 0
-          ./node_modules/.bin/tsx --test "${tests[@]}"
+          node --test ../.github/scripts/backend-quality-tests.test.mjs
+          node ../.github/scripts/backend-quality-tests.mjs "${tests[@]}"
       - run: npm run build
       - name: Backend standalone script tests
         run: node --test scripts/*.test.mjs
