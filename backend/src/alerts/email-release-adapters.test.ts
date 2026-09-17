@@ -84,9 +84,10 @@ test('autoconfirm, absent/duplicate eligible rows fail closed', async () => {
   assert.equal(await recipientHarness(verified, undefined, 0).resolve(id), null)
   assert.equal(await recipientHarness(verified, undefined, 2).resolve(id), null)
 })
-test('template contains only aggregate counts and fixed authenticated app link', () => {
+test('template contains only aggregate facts, code-owned guidance and fixed authenticated app link', () => {
   const payload = JSON.parse(emailPayload(config, 'owner@example.test', body))
-  assert.deepEqual(Object.keys(payload), ['from', 'to', 'subject', 'text'])
+  assert.deepEqual(Object.keys(payload), ['from', 'to', 'subject', 'text', 'html'])
+  assert.match(payload.html, /<!doctype html>/)
   assert.match(payload.text, /https:\/\/console\.hawkviewapp\.com\/risky-users/)
   assert.ok(!payload.text.includes(body[0].alertTypeId))
   assert.throws(() => emailPayload(config, 'owner@example.test', [{ ...body[0], tenantsAffected: NaN }]))

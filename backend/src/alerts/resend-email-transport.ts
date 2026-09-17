@@ -1,6 +1,8 @@
 import { type Body } from './email-delivery.js'
 import { type EmailReleaseConfig, UUID } from './email-release-config.js'
 import { emailHttp, type EmailFetch } from './email-http.js'
+import { allowlistedAlertEmailUrl } from './email-alert-content.js'
+import { renderAlertEmail } from './email-alert-template.js'
 
 export interface FrozenEmail {
   readonly key: string
@@ -14,20 +16,12 @@ export type EmailProviderResult =
   | { kind: 'PERMANENT'; code: 'PROVIDER_REQUEST_REJECTED' }
 
 export function emailPayload(config: EmailReleaseConfig, address: string, body: Body): string {
-  const counts = body.filter(line => line.kind === 'TYPE_COUNT')
-  if (counts.length !== 1 || !Number.isSafeInteger(counts[0].tenantsAffected)
-    || !Number.isSafeInteger(counts[0].incidentsAffected)
-    || counts[0].tenantsAffected < 0 || counts[0].incidentsAffected < 1) {
-    throw new Error('EMAIL_CONTENT_UNAVAILABLE')
-  }
-  // No finding titles, identities, tenant names, incident IDs, HTML, tracking or bearer links.
+  allowlistedAlertEmailUrl(config.appOrigin)
+  // Only NEW envelopes reach this renderer. The store reuses existing serialized payloads,
+  // including legacy plaintext-only messages, byte-for-byte with their original provider key.
+  // No finding titles, identities, tenant names, incident IDs, tracking or bearer links.
   return JSON.stringify({
-    from: config.from, to: [address], subject: 'HawkView security alert',
-    text: `A security alert needs attention in your HawkView workspace.\n\n`
-      + `Affected tenants: ${counts[0].tenantsAffected}\n`
-      + `Incidents of this type: ${counts[0].incidentsAffected}\n\n`
-      + `Open HawkView and select your workspace: ${config.appOrigin}/risky-users\n`
-      + 'Sign-in and current workspace authorization are required.\n',
+    from: config.from, to: [address], ...renderAlertEmail(body),
   })
 }
 
