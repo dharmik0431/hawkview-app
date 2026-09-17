@@ -8,6 +8,8 @@ import { type VerifiedRecipient } from './routing-policy.js'
 import { emailPayload, type FrozenEmail, type EmailProviderResult } from './resend-email-transport.js'
 import { lockEmailProvider, reconcileEmailProvider } from './email-delivery-reconciliation.js'
 import { notificationSeveritySql } from '../notifications/notification-severity.js'
+import { claimRegularEmail, closeRegularEpoch, lockEmailReleaseScope, regularReservationGate,
+  REGULAR_FINAL_GATE_SQL, type RegularEmailStatus } from './email-regular-release.js'
 import { loadEmailIncidentContext, parseEmailIncidentScope } from './email-incident-context.js'
 
 type JobRow = {
@@ -24,12 +26,25 @@ const iso = (value: Date | string): string => value instanceof Date ? value.toIS
 export interface EmailClaim { job: SendJob; by: WorkerId; config: EmailReleaseConfig }
 
 export class EmailReleaseStore {
+  regularStatus: RegularEmailStatus | null = null
   constructor(readonly runner: SqlRunner) {}
 
+  closeRegularEpoch(activationId: string, organizationId: string, ownerUserId: string) {
+    return closeRegularEpoch(this.runner, activationId, organizationId, ownerUserId)
+  }
+
   async claim(config: EmailReleaseConfig, now: number): Promise<EmailClaim | null> {
+    this.regularStatus = null
     return this.runner.transaction(async tx => {
-      await tx.query('SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended($1, 0))',
-        [`hawkview-email-activation/${config.organizationId}`])
+      await lockEmailReleaseScope(tx, config.activationId, config.organizationId)
+      if (config.mode === 'regular') {
+        const result = await claimRegularEmail(tx, config)
+        this.regularStatus = result.status
+        return result.claim
+      }
+      if ((await tx.query(`SELECT 1 FROM alert_email_regular_epochs
+        WHERE activation_id = $1::uuid OR (organization_id = $2::uuid AND closed_at IS NULL) LIMIT 1`,
+      [config.activationId, config.organizationId])).length) return null
       const existing = await tx.query<EnvelopeRow>(
         'SELECT * FROM alert_email_envelopes WHERE activation_id = $1::uuid', [config.activationId])
       const envelope = existing[0]
@@ -96,7 +111,14 @@ export class EmailReleaseStore {
   }
 
   async open(claim: EmailClaim, recipient: VerifiedRecipient, body: Body, now: number): Promise<FrozenEmail | null> {
+    this.regularStatus = null
     return this.runner.transaction(async tx => {
+      if (claim.config.mode === 'regular') {
+        this.regularStatus = await regularReservationGate(tx, claim)
+        if (this.regularStatus) return null
+        const clock = await tx.query<{ at: Date | string }>('SELECT clock_timestamp() AS at', [])
+        now = Date.parse(iso(clock[0].at))
+      }
       const live = await tx.query(`SELECT 1 FROM alert_send_jobs
         WHERE message_id = $1 AND state = 'CLAIMED' AND claimed_by = $2
           AND attempts_made = $3 AND attempts_made < LEAST(max_attempts, 3)
@@ -158,6 +180,7 @@ export class EmailReleaseStore {
           AND n.customer_tenant_id = t.id AND (n.recipient_user_id IS NULL OR n.recipient_user_id = u.id)
           AND ${notificationSeveritySql('n.severity')}
             >= ${notificationSeveritySql('p.minimum_severity')})
+        ${claim.config.mode === 'regular' ? REGULAR_FINAL_GATE_SQL : "AND v.release_mode = 'controlled'"}
         AND NOT EXISTS (SELECT 1 FROM alert_suppressed_addresses WHERE address = $4)`,
     [claim.job.messageId, claim.by, claim.job.attemptsMade + 1, envelope.recipient, envelope.key, alertTypeId, defaultDisposition,
       scope.customerTenantId, scope.organizationId, claim.config.ownerUserId])

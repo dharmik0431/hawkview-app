@@ -10,6 +10,7 @@ import { sendResendEmail } from './resend-email-transport.js'
 import { emailDeadline } from './email-deadline.js'
 import { notificationSeveritySql } from '../notifications/notification-severity.js'
 import type { SqlRunner } from './pipeline-store.js'
+import type { RegularEmailStatus } from './email-regular-release.js'
 
 /** The initial visibility gate, also exercised directly against disposable PostgreSQL. */
 export async function emailNotificationVisible(
@@ -29,6 +30,7 @@ export async function emailNotificationVisible(
 export interface EmailRunReport {
   status: 'DISABLED' | 'INVALID_CONFIGURATION' | 'OUTSIDE_ACTIVATION_WINDOW' | 'NO_BUDGET'
     | 'NO_WORK' | 'WITHDRAWN' | 'SUPPRESSED' | 'ACCEPTED' | 'UNKNOWN' | 'RETRYABLE' | 'PERMANENT' | 'FAILED_SAFE'
+    | 'DISABLED_EPOCH_CLOSED' | RegularEmailStatus
   attempted: number
 }
 function configurationStillMatches(
@@ -46,7 +48,18 @@ export async function runEmailRelease(options: {
 }): Promise<EmailRunReport> {
   const now = options.now ?? Date.now
   const configuration = emailReleaseConfiguration(options.env, now())
-  if (!configuration.enabled) return { status: configuration.reason, attempted: 0 }
+  if (!configuration.enabled) {
+    if (configuration.reason === 'DISABLED' && typeof options.store.closeRegularEpoch === 'function') {
+      try {
+        const closed = await options.store.closeRegularEpoch(
+          options.env.HAWKVIEW_ALERT_EMAIL_ACTIVATION_ID ?? '',
+          options.env.HAWKVIEW_ALERT_EMAIL_ORGANIZATION_ID ?? '',
+          options.env.HAWKVIEW_ALERT_EMAIL_OWNER_USER_ID ?? '')
+        if (closed) return { status: 'DISABLED_EPOCH_CLOSED', attempted: 0 }
+      } catch { return { status: 'FAILED_SAFE', attempted: 0 } }
+    }
+    return { status: configuration.reason, attempted: 0 }
+  }
   if (!Number.isFinite(options.deadlineAt) || options.deadlineAt - now() < 10_000) {
     return { status: 'NO_BUDGET', attempted: 0 }
   }
@@ -61,7 +74,7 @@ export async function runEmailRelease(options: {
   try {
     const signal = AbortSignal.timeout(budget.remaining())
     const claim = await options.store.claim(config, now())
-    if (!claim) return { status: 'NO_WORK', attempted: 0 }
+    if (!claim) return { status: options.store.regularStatus ?? 'NO_WORK', attempted: 0 }
     let recipient: VerifiedRecipient | null = null
     const recipients = verifiedEmailRecipient(options.store.runner, config, boundedFetch, signal, now)
     const state = currentStateFrom(options.store.runner, async organizationId => {
@@ -96,6 +109,7 @@ export async function runEmailRelease(options: {
     if (budget.remaining() < 15_000) return { status: 'NO_BUDGET', attempted: 0 }
     const envelope = await options.store.open(claim, recipient, resolution.body, now())
     if (!envelope) {
+      if (options.store.regularStatus) return { status: options.store.regularStatus, attempted: 0 }
       await options.store.withdraw(claim, 'NO_VERIFIED_RECIPIENT', 'ADDRESS_SUPPRESSED')
       return { status: 'SUPPRESSED', attempted: 0 }
     }

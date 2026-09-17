@@ -98,7 +98,9 @@ export function deliveryDescription(
 
   const email = capabilities.channels.email
   const limitation =
-    email.availability === 'DISABLED'
+    email.regular?.availability === 'AVAILABLE'
+      ? 'Regular email is available only to the designated owner with explicit personal opt-in and eligible new alerts. This policy does not enable anyone.'
+      : email.availability === 'DISABLED'
       ? 'Email sending is currently off. A saved personal email opt-in does not activate it.'
       : email.availability === 'CONTROLLED'
         ? 'Email delivery is controlled separately by recipient eligibility and release status.'
