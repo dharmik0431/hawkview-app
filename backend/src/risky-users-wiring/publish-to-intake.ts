@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Finding } from '../evaluation-core/contract.js'
+import { readSourceEventReference } from './incident-source-reference.js'
 
 /**
  * **THE ONE BRIDGE FROM A NATIVE FINDING TO THE TABLE ALERT INTAKE READS.**
@@ -117,6 +118,15 @@ export function intakeRowsFor(input: IntakeRowInput): readonly IntakePair[] {
     const dedupeKey = sha256(
       input.organizationId, input.customerTenantId, NATIVE_RULE_ID, subjectType, subjectId,
     )
+    const signals = finding.signals.map(signal => {
+      const reference = readSourceEventReference(signal.sourceEvent)
+      const valid = reference && reference.organizationId === input.organizationId
+        && reference.customerTenantId === input.customerTenantId && reference.subjectRef === subjectId
+        && signal.count > 0 && signal.latest?.kind === 'EVENT_OCCURRED'
+        && signal.latest.at === reference.eventAt
+      const { sourceEvent: _unused, ...existing } = signal
+      return { ...existing, ...(valid ? { sourceEvent: reference } : {}) }
+    })
     return {
       matched: {
         // The run IS in the result key: a matched result is this run's record of the match,
@@ -129,7 +139,9 @@ export function intakeRowsFor(input: IntakeRowInput): readonly IntakePair[] {
         confidence: NOT_ASSESSED,
         coverage: NOT_ASSESSED,
         // The detector's own signals, unchanged. Counts and recency — no verdict added here.
-        evidence: { detectorId: finding.detectorId, signals: finding.signals },
+        evidence: { ...(signals.some(signal => signal.sourceEvent)
+          ? { schemaVersion: 'hawkview-native-email-evidence/v1' } : {}),
+        detectorId: finding.detectorId, signals },
       },
       finding: {
         dedupeKey,

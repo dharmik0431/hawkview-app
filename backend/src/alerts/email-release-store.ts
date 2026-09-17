@@ -8,6 +8,7 @@ import { type VerifiedRecipient } from './routing-policy.js'
 import { emailPayload, type FrozenEmail, type EmailProviderResult } from './resend-email-transport.js'
 import { lockEmailProvider, reconcileEmailProvider } from './email-delivery-reconciliation.js'
 import { notificationSeveritySql } from '../notifications/notification-severity.js'
+import { loadEmailIncidentContext, parseEmailIncidentScope } from './email-incident-context.js'
 
 type JobRow = {
   message_id: string; idempotency_key: string; state: SendJob['state']; attempts_made: number
@@ -108,7 +109,9 @@ export class EmailReleaseStore {
       const row = envelopes[0]
       if (!row || Date.parse(iso(row.expires_at)) <= now) throw new Error('EMAIL_WINDOW_EXPIRED')
       if (row.recipient_address !== null && row.recipient_address !== recipient.address) throw new Error('EMAIL_RECIPIENT_CHANGED')
-      const payload = row.payload ?? emailPayload(claim.config, recipient.address, body)
+      // Existing accepted/uncertain/legacy payloads are retry authority: never load or upgrade their context.
+      const payload = row.payload ?? emailPayload(claim.config, recipient.address, body,
+        await loadEmailIncidentContext(tx, claim.job.messageId, claim.config.ownerUserId))
       if (row.payload === null) {
         await tx.execute(`UPDATE alert_email_envelopes SET recipient_address = $2,
           verified_at = $3::timestamptz, payload = $4 WHERE message_id = $1 AND payload IS NULL`,
@@ -127,11 +130,14 @@ export class EmailReleaseStore {
   }
 
   async maySend(claim: EmailClaim, envelope: FrozenEmail, alertTypeId: string, defaultDisposition: string): Promise<boolean> {
+    const scope = parseEmailIncidentScope(claim.job.messageId)
+    if (!scope || scope.organizationId !== claim.config.organizationId || scope.alertTypeId !== alertTypeId) return false
     const rows = await this.runner.query(`SELECT 1 FROM alert_send_jobs j
       JOIN alert_email_envelopes v ON v.message_id = j.message_id
       JOIN users u ON u.id = v.owner_user_id
       JOIN memberships m ON m.user_id = u.id AND m.organization_id = v.organization_id
       JOIN organizations o ON o.id = m.organization_id
+      JOIN customer_tenants t ON t.id = $8::uuid AND t.organization_id = o.id
       JOIN notification_preferences p ON p.user_id = u.id AND p.organization_id = o.id
       JOIN alert_incidents i ON i.organization_id = o.id
         AND i.incident_key = substring(j.message_id FROM position('|' IN j.message_id) + 1)
@@ -140,6 +146,7 @@ export class EmailReleaseStore {
         AND j.attempts_made = $3 AND j.claim_expires_at > clock_timestamp() + interval '6 seconds'
         AND v.expires_at > clock_timestamp() + interval '6 seconds'
         AND v.recipient_address = $4 AND v.idempotency_key = $5
+        AND v.organization_id = $9::uuid AND v.owner_user_id = $10::uuid
         AND u.disabled_at IS NULL AND lower(btrim(u.email)) = v.recipient_address
         AND m.status = 'ACTIVE' AND m.role = 'MSP_OWNER' AND o.status = 'ACTIVE'
         AND p.email_enabled = true AND p.security_enabled = true AND p.digest_mode = 'off'
@@ -148,10 +155,12 @@ export class EmailReleaseStore {
         AND i.ownership IN ('ACKNOWLEDGED', 'UNACKNOWLEDGED')
         AND (i.condition <> 'CLEARED' OR i.ownership = 'UNACKNOWLEDGED')
         AND EXISTS (SELECT 1 FROM notifications n WHERE n.organization_id = o.id AND n.incident_key = i.incident_key
+          AND n.customer_tenant_id = t.id AND (n.recipient_user_id IS NULL OR n.recipient_user_id = u.id)
           AND ${notificationSeveritySql('n.severity')}
             >= ${notificationSeveritySql('p.minimum_severity')})
         AND NOT EXISTS (SELECT 1 FROM alert_suppressed_addresses WHERE address = $4)`,
-    [claim.job.messageId, claim.by, claim.job.attemptsMade + 1, envelope.recipient, envelope.key, alertTypeId, defaultDisposition])
+    [claim.job.messageId, claim.by, claim.job.attemptsMade + 1, envelope.recipient, envelope.key, alertTypeId, defaultDisposition,
+      scope.customerTenantId, scope.organizationId, claim.config.ownerUserId])
     return rows.length === 1
   }
 
