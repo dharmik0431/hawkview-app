@@ -26,7 +26,7 @@ test('HTML and plaintext share every fact, action, qualifier and live/TEST disti
     const content = buildAlertEmailContent(body, { mode })
     const rendered = renderAlertEmail(body, mode)
     assert.equal(rendered.subject, content.subject)
-    for (const value of [content.eyebrow, content.headline, content.intro, content.notice, content.priorityNote,
+    for (const value of [content.eyebrow, content.headline, content.intro, content.summary, content.notice, content.priorityNote,
       content.why, ...content.steps, content.source, content.actionLabel, content.actionUrl,
       content.authorizationNote, content.previewNote, ...content.facts.flatMap(fact => [fact.label, fact.value])]
       .filter((value): value is string => value !== null)) {
@@ -43,6 +43,11 @@ test('HTML and plaintext share every fact, action, qualifier and live/TEST disti
     assert.match(rendered.html, /<table lang="en" dir="ltr"/)
     assert.match(rendered.html, /max-width:600px/)
     assert.match(rendered.html, /word-break:break-word/)
+    assert.doesNotMatch(rendered.html, /<table\b[^>]*\bwidth="600"|min-width:|Observed range[^<]*\d{4}-\d{2}-\d{2}T/)
+    assert.match(rendered.html, /box-sizing:border-box;table-layout:fixed/)
+    assert.ok(rendered.html.indexOf('<a href=') < rendered.html.indexOf('Investigation next steps'))
+    assert.ok(rendered.text.indexOf(content.actionUrl) < rendered.text.indexOf('Investigation next steps'))
+    assert.ok(!content.facts.some(fact => fact.label === 'Alert type'))
   }
 })
 

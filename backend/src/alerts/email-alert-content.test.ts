@@ -13,12 +13,10 @@ const castBody = (value: unknown): Body => value as Body
 test('supported aggregate facts and catalog priority do not invent incident severity, names or time', () => {
   const content = buildAlertEmailContent(body)
   assert.deepEqual(content.facts, [
-    { label: 'Alert type', value: 'Suspected credential attack' },
-    { label: 'Catalog priority', value: 'Act now' },
-    { label: 'Affected tenants', value: '1' },
-    { label: 'Incidents of this type', value: '2' },
+    { label: 'Rule priority', value: 'Act now' },
   ])
-  assert.match(content.priorityNote, /not recorded incident severity/)
+  assert.equal(content.summary, '2 incidents across 1 tenant')
+  assert.match(content.priorityNote, /not recorded severity/)
   assert.equal(content.steps.length, 3)
   assert.match(content.why, /do not, by themselves, establish/)
   assert.equal(content.actionUrl, ALERT_EMAIL_CONSOLE_URL)
@@ -27,7 +25,7 @@ test('supported aggregate facts and catalog priority do not invent incident seve
 
 test('explicit valid observation window is preserved and labelled as observed, not sent', () => {
   const content = buildAlertEmailContent([count, { kind: 'WINDOW', fromIso: '2026-09-16T23:00:00Z', toIso: '2026-09-16T23:49:59.000Z' }])
-  assert.deepEqual(content.facts.at(-1), { label: 'Observed range (UTC)', value: '2026-09-16T23:00:00.000Z to 2026-09-16T23:49:59.000Z' })
+  assert.deepEqual(content.facts.at(-1), { label: 'Observed range', value: 'Sep 16, 2026, 23:00 to 23:49:59 UTC' })
   assert.doesNotMatch(alertEmailPlaintext(content), /sent at|detected now/i)
 })
 
@@ -94,13 +92,19 @@ test('plaintext contains every shared semantic field, including all historical c
   for (const mode of ['live', 'historical-test'] as const) {
     const content = buildAlertEmailContent(body, { mode })
     const text = alertEmailPlaintext(content)
-    for (const value of [content.brand, content.eyebrow, content.headline, content.intro, content.notice,
+    for (const value of [content.brand, content.eyebrow, content.headline, content.intro, content.summary, content.notice,
       content.priorityNote, content.why, ...content.steps, content.source, content.actionLabel,
       content.actionUrl, content.authorizationNote, content.previewNote].filter((value): value is string => value !== null)) {
       assert.ok(text.includes(value), value)
     }
     for (const fact of content.facts) assert.ok(text.includes(`${fact.label}: ${fact.value}`))
   }
+})
+
+test('human UTC ranges preserve day boundaries and nonzero fractional seconds without host locale', () => {
+  const content = buildAlertEmailContent([count, { kind: 'WINDOW', fromIso: '2026-09-16T23:59:59.125Z', toIso: '2026-09-17T00:00:00.005Z' }])
+  assert.equal(content.facts.at(-1)?.value, 'Sep 16, 2026, 23:59:59.125 to Sep 17, 2026, 00:00:00.005 UTC')
+  assert.equal(buildAlertEmailContent([{ ...count, incidentsAffected: 1 }]).summary, '1 incident across 1 tenant')
 })
 
 test('every supported security catalog type has code-owned guidance and deterministic snapshot output', () => {

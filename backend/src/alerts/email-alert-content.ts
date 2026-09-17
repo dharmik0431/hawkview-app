@@ -39,6 +39,7 @@ export interface AlertEmailContent {
   readonly eyebrow: string
   readonly headline: string
   readonly intro: string
+  readonly summary: string
   readonly notice: string | null
   readonly facts: readonly { readonly label: string; readonly value: string }[]
   readonly priorityNote: string
@@ -74,6 +75,21 @@ function observedIso(value: unknown): string {
   return canonical
 }
 
+/** Fixed English/UTC formatting is deterministic across hosts and preserves supplied precision. */
+function observedRange(from: string, to: string): string {
+  const date = (iso: string) => {
+    const value = new Date(iso)
+    const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][value.getUTCMonth()]
+    return `${month} ${value.getUTCDate()}, ${value.getUTCFullYear()}`
+  }
+  const time = (iso: string) => {
+    const seconds = iso.slice(17, 19), milliseconds = iso.slice(20, 23)
+    return iso.slice(11, 16) + (seconds !== '00' || milliseconds !== '000' ? `:${seconds}` : '')
+      + (milliseconds !== '000' ? `.${milliseconds}` : '')
+  }
+  return `${date(from)}, ${time(from)} to ${from.slice(0, 10) === to.slice(0, 10) ? '' : `${date(to)}, `}${time(to)} UTC`
+}
+
 /** Pure snapshot content. No clock, I/O, recipient data, current-state lookup or free-text input. */
 export function buildAlertEmailContent(
   body: Body, options: { readonly mode: 'live' | 'historical-test' } = { mode: 'live' },
@@ -94,16 +110,13 @@ export function buildAlertEmailContent(
   const guidance = GUIDANCE[declaration.id]
   const historical = options.mode === 'historical-test'
   const facts = [
-    { label: 'Alert type', value: declaration.summary },
-    { label: 'Catalog priority', value: { ACT_NOW: 'Act now', ACT_TODAY: 'Act today', RECORD_ONLY: 'Record only' }[declaration.severity] },
-    { label: 'Affected tenants', value: String(count.tenantsAffected) },
-    { label: 'Incidents of this type', value: String(count.incidentsAffected) },
+    { label: 'Rule priority', value: { ACT_NOW: 'Act now', ACT_TODAY: 'Act today', RECORD_ONLY: 'Record only' }[declaration.severity] },
   ]
   if (windows.length) {
     const from = observedIso(windows[0].fromIso)
     const to = observedIso(windows[0].toIso)
     if (from > to) return unavailable()
-    facts.push({ label: 'Observed range (UTC)', value: `${from} to ${to}` })
+    facts.push({ label: 'Observed range', value: observedRange(from, to) })
   }
   return {
     subject: `${historical ? '[TEST] ' : ''}HawkView security alert`,
@@ -113,9 +126,10 @@ export function buildAlertEmailContent(
     intro: historical
       ? 'This is a preview of a previously recorded HawkView alert.'
       : 'A security alert needs review in your HawkView workspace.',
+    summary: `${count.incidentsAffected} ${count.incidentsAffected === 1 ? 'incident' : 'incidents'} across ${count.tenantsAffected} ${count.tenantsAffected === 1 ? 'tenant' : 'tenants'}`,
     notice: historical ? 'Not a newly detected incident. No action is required for this test. The guidance below is for reference only.' : null,
     facts,
-    priorityNote: 'Catalog priority is the rule default, not recorded incident severity or your current rule setting.',
+    priorityNote: 'Default rule priority, not recorded severity or a current override.',
     why: guidance.why,
     steps: guidance.steps,
     source: 'Source: HawkView alert classification. This is not a Microsoft-issued notification. Review the underlying source evidence in HawkView.',
@@ -131,10 +145,10 @@ export function alertEmailPlaintext(content: AlertEmailContent): string {
   return [
     content.brand, content.eyebrow, content.headline, '', content.intro,
     ...(content.notice ? [content.notice] : []), '',
-    ...content.facts.map(fact => `${fact.label}: ${fact.value}`),
-    content.priorityNote, '', 'Why it matters', content.why, '', 'Investigation next steps',
-    ...content.steps.map((step, index) => `${index + 1}. ${step}`), '',
-    content.source, '', `${content.actionLabel}: ${content.actionUrl}`, content.authorizationNote,
+    'Why it matters', content.why, '', 'Alert scope', content.summary,
+    ...content.facts.map(fact => `${fact.label}: ${fact.value}`), content.priorityNote, '',
+    `${content.actionLabel}: ${content.actionUrl}`, content.authorizationNote, '',
+    'Investigation next steps', ...content.steps.map((step, index) => `${index + 1}. ${step}`), '', content.source,
     ...(content.previewNote ? ['', content.previewNote] : []), '',
   ].join('\n')
 }
