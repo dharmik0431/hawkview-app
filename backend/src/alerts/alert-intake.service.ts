@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common'
+import { Inject, Injectable, Logger } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   runIntake,
@@ -29,7 +29,7 @@ export type IntakeOutcome =
 export class AlertIntakeService {
   private readonly logger = new Logger(AlertIntakeService.name)
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
   /** Run one tick, inside the window the caller gives it.
    *
