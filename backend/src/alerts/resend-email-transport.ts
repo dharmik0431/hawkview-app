@@ -3,6 +3,7 @@ import { type EmailReleaseConfig, UUID } from './email-release-config.js'
 import { emailHttp, type EmailFetch } from './email-http.js'
 import { allowlistedAlertEmailUrl } from './email-alert-content.js'
 import { renderAlertEmail } from './email-alert-template.js'
+import { type EmailIncidentContext } from './email-incident-context.js'
 
 export interface FrozenEmail {
   readonly key: string
@@ -15,14 +16,19 @@ export type EmailProviderResult =
   | { kind: 'RETRYABLE'; code: 'PROVIDER_BUSY' | 'PROVIDER_RATE_LIMITED'; retryAfterMs: number }
   | { kind: 'PERMANENT'; code: 'PROVIDER_REQUEST_REJECTED' }
 
-export function emailPayload(config: EmailReleaseConfig, address: string, body: Body): string {
+export function emailPayload(config: EmailReleaseConfig, address: string, body: Body, context?: EmailIncidentContext): string {
   allowlistedAlertEmailUrl(config.appOrigin)
   // Only NEW envelopes reach this renderer. The store reuses existing serialized payloads,
   // including legacy plaintext-only messages, byte-for-byte with their original provider key.
-  // No finding titles, identities, tenant names, incident IDs, tracking or bearer links.
-  return JSON.stringify({
-    from: config.from, to: [address], ...renderAlertEmail(body),
-  })
+  // Preserve the legacy no-context factory. Rich new envelopes are budgeted using
+  // COMPLETE serialized UTF-8 bytes, including escaping and address metadata.
+  for (const limit of context ? [160, 96, 48, 24] : [160]) {
+    const payload = JSON.stringify({
+      from: config.from, to: [address], ...renderAlertEmail(body, 'live', context, limit),
+    })
+    if (!context || Buffer.byteLength(payload, 'utf8') <= 8192) return payload
+  }
+  throw new Error('EMAIL_CONTENT_UNAVAILABLE')
 }
 
 /** This adapter never infers an address suppression from an HTTP error. */

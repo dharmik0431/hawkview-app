@@ -1,6 +1,8 @@
 import type { EventOutcome, NormalizedEvent } from '../../risky-users-normalization/contract.js'
 import type { CorrelationRef, DetectorFinding, SignalRecency } from '../../evaluation-core/contract.js'
 import type { FeedBoundDetector } from '../feed-capability.js'
+import type { SourceEventReference } from '../../evaluation-core/contract.js'
+import { latestSourceReference, sourceEventReference } from '../incident-source-reference.js'
 
 /** Somebody is trying passwords against this account.
  *
@@ -49,7 +51,7 @@ export function credentialFailureDetector(
       id: 'repeated-credential-failure',
       monotonic: true,
       run: applicable => {
-        type Tally = Readonly<Record<EventOutcome, { count: number; latest: SignalRecency | null }>> & { latestEvent: NormalizedEvent }
+        type Tally = Readonly<Record<EventOutcome, { count: number; latest: SignalRecency | null; sourceEvent?: SourceEventReference }>> & { latestEvent: NormalizedEvent }
         const blank = (event: NormalizedEvent): Tally => ({
           LOCKED_OUT_AFTER_REPEATED_FAILURES: { count: 0, latest: null },
           PASSWORD_REJECTED: { count: 0, latest: null },
@@ -77,7 +79,8 @@ export function credentialFailureDetector(
             // than once for the family. One shared timestamp is what let 467
             // lockouts render beside a later rejection's date, overstating the
             // lockouts' recency by six days on a real tenant.
-            [outcome]: { count: running[outcome].count + 1, latest: { at: event.eventAt, kind: 'EVENT_OCCURRED' } },
+            [outcome]: { count: running[outcome].count + 1, latest: { at: event.eventAt, kind: 'EVENT_OCCURRED' },
+              sourceEvent: latestSourceReference(running[outcome].sourceEvent, sourceEventReference(event)) },
             latestEvent: event,
           } as Tally)
         }
@@ -101,8 +104,10 @@ export function credentialFailureDetector(
             // evaluated — the same collapse as an uncollected window reading as
             // a quiet tenant, one level down.
             signals: [
-              { signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES', count: lockouts.count, latest: lockouts.latest },
-              { signal: 'PASSWORD_REJECTED', count: rejections.count, latest: rejections.latest },
+              { signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES', count: lockouts.count, latest: lockouts.latest,
+                ...(lockouts.sourceEvent ? { sourceEvent: lockouts.sourceEvent } : {}) },
+              { signal: 'PASSWORD_REJECTED', count: rejections.count, latest: rejections.latest,
+                ...(rejections.sourceEvent ? { sourceEvent: rejections.sourceEvent } : {}) },
             ],
           })
         }

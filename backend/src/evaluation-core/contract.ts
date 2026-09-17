@@ -261,6 +261,19 @@ export type MailboxBinding = 'RESOLVED_NEGATIVE' | 'UNRESOLVED'
  *
  * Separating a count from its recency is a decision a surface then has to make
  * correctly every time, from a doc comment. This makes it unmakeable. */
+/** Optional, bounded provenance for newly evaluated events; not a detection input. */
+export type SourceEventReference = Readonly<{
+  version: 1
+  selection: 'LATEST_QUALIFYING_EVENT_FOR_SIGNAL'
+  organizationId: string
+  customerTenantId: string
+  source: 'GRAPH_SIGN_INS' | 'M365_AUDIT_STS'
+  eventId: string
+  eventAt: string
+  subjectRef: string
+  subjectBinding: 'DIRECTORY_OBJECT_ID' | 'NORMALIZED_UPN'
+}>
+
 export type DetectorSignal = Readonly<{
   /** The detector's own vocabulary. The core never interprets it — same
    * arrangement as `declined` and `notCovered.because`, and the reason a
@@ -285,6 +298,7 @@ export type DetectorSignal = Readonly<{
    * finding of none, it is the absence of a complete reading, and rendering it
    * as "none" states something false about a subject who may have had many. */
   latest: SignalRecency | null
+  readonly sourceEvent?: SourceEventReference
 }>
 
 /** When a signal was last true, AND WHAT KIND OF TIME THAT IS.

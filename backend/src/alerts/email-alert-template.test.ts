@@ -10,6 +10,7 @@ import { EmailReleaseStore, type EmailClaim } from './email-release-store.js'
 import { buildAlertEmailContent, ALERT_EMAIL_CONSOLE_URL, escapeAlertEmailHtml } from './email-alert-content.js'
 import { renderAlertEmail } from './email-alert-template.js'
 import { emailPayload, sendResendEmail } from './resend-email-transport.js'
+import { incidentGrouping } from './alert-incident-key.js'
 
 const body: Body = [{ kind: 'TYPE_COUNT', alertTypeId: 'security.suspected_credential_attack', tenantsAffected: 2, incidentsAffected: 3 },
   { kind: 'WINDOW', fromIso: '2026-09-16T22:00:00.000Z', toIso: '2026-09-16T23:00:00.000Z' }]
@@ -36,7 +37,9 @@ test('HTML and plaintext share every fact, action, qualifier and live/TEST disti
     assert.equal((rendered.html.match(/<h1\b/g) ?? []).length, 1)
     assert.equal((rendered.html.match(/<a\b/g) ?? []).length, 1)
     assert.deepEqual([...rendered.html.matchAll(/href="([^"]+)"/g)].map(match => match[1]), [ALERT_EMAIL_CONSOLE_URL])
-    assert.doesNotMatch(rendered.html, /<script|<img|<svg|<iframe|javascript:|app\.example\.invalid|file:\/\/|@import|display:\s*(?:flex|grid)/i)
+    assert.doesNotMatch(rendered.html, /<script|<svg|<iframe|javascript:|app\.example\.invalid|file:\/\/|@import|display:\s*(?:flex|grid)/i)
+    assert.match(rendered.html, /<img src="https:\/\/console\.hawkviewapp\.com\/brand\/hawkview-mark-256\.png" width="36" height="36" alt="HawkView logo"/)
+    assert.match(rendered.html, />HawkView<\/div>/)
     for (const table of rendered.html.match(/<table\b[^>]*>/g) ?? []) assert.match(table, /role="presentation"/)
     assert.match(rendered.html, /<html lang="en" dir="ltr">/)
     assert.match(rendered.html, /<div lang="en" dir="ltr"/)
@@ -92,7 +95,12 @@ test('actual transport factory sends both parts without serializing auth keys or
   }
 })
 
-function storeHarness(initialPayload: string | null) {
+function storeHarness(initialPayload: string | null, missingFindings = false) {
+  const tenant = '00000000-0000-4000-8000-000000000005'
+  const subject = 'subject:00000000-0000-4000-8000-000000000006'
+  const grouping = incidentGrouping({ id: 'security.suspected_credential_attack', subject: 'ACCOUNT' },
+    { organizationId: config.organizationId, customerTenantId: tenant }, { resolved: true, id: subject })
+  assert.ok(grouping.groups)
   const row = { expires_at: config.expiresAt, recipient_address: initialPayload === null ? null : 'operator@example.test',
     payload: initialPayload, idempotency_key: 'hv-email-v1-stable-envelope-key' }
   let freezes = 0
@@ -101,6 +109,14 @@ function storeHarness(initialPayload: string | null) {
       if (sql.includes('FROM alert_send_jobs')) return [{}]
       if (sql.includes('FROM alert_suppressed_addresses')) return []
       if (sql.includes('FROM alert_email_envelopes')) return [row]
+      if (sql.includes('FROM customer_tenants t')) return [{ organization_id: config.organizationId,
+        customer_tenant_id: tenant, incident_key: grouping.key, alert_type_id: 'security.suspected_credential_attack',
+        tenant_name: 'Synthetic tenant', tenant_domain: 'example.test' }]
+      if (sql.includes('FROM notifications n')) return missingFindings ? [] : [{ organization_id: config.organizationId,
+        customer_tenant_id: tenant, incident_key: grouping.key, alert_type_id: 'security.suspected_credential_attack',
+        finding_id: 'synthetic', rule_id: 'HV-ID-AUTH-011.v1', subject_id: subject, subject_type: 'USER',
+        observed_at: config.startsAt, evidence: {}, total_findings: 1, tenant_name: 'Synthetic tenant', tenant_domain: 'example.test' }]
+      if (sql.includes('FROM directory_users')) return []
       throw new Error('UNEXPECTED_TEST_QUERY')
     },
     execute: async (sql: string, params: readonly unknown[]) => {
@@ -113,7 +129,7 @@ function storeHarness(initialPayload: string | null) {
     },
   }
   const runner = { transaction: async (callback: (value: typeof tx) => Promise<unknown>) => callback(tx) } as unknown as SqlRunner
-  const claim = { config, by: 'synthetic-worker', job: { messageId: 'synthetic-message', attemptsMade: 0 } } as unknown as EmailClaim
+  const claim = { config, by: 'synthetic-worker', job: { messageId: `incident/${config.organizationId}|${grouping.key}`, attemptsMade: 0 } } as unknown as EmailClaim
   const recipient = { kind: 'DESIGNATED_OWNER', address: 'operator@example.test', verifiedAt: new Date(config.startsAt) } as unknown as VerifiedRecipient
   return { store: new EmailReleaseStore(runner), claim, recipient, freezes: () => freezes }
 }
@@ -145,6 +161,18 @@ test('legacy plaintext-only envelope is neither upgraded nor reserialized on ret
   }) as EmailFetch
   assert.deepEqual(await sendResendEmail(config, retried, fetchImpl, new AbortController().signal), { kind: 'UNKNOWN', code: 'PROVIDER_OUTCOME_UNKNOWN' })
   assert.equal(calls[0].body, legacy)
+})
+
+test('missing optional finding evidence preserves a scope-authorized first freeze and unchanged retry', async () => {
+  const h = storeHarness(null, true)
+  const first = await h.store.open(h.claim, h.recipient, body, Date.parse(config.startsAt))
+  assert.ok(first)
+  assert.match(JSON.parse(first.payload).text, /underlying finding evidence is unavailable/)
+  assert.match(JSON.parse(first.payload).text, /Synthetic tenant/)
+  const retry = await h.store.open({ ...h.claim, job: { ...h.claim.job, attemptsMade: 1 } }, h.recipient,
+    [] as unknown as Body, Date.parse(config.startsAt) + 1000)
+  assert.deepEqual(retry, first)
+  assert.equal(h.freezes(), 1)
 })
 
 test('rendering a frozen body is deterministic and never reads time or changes the input', () => {

@@ -1,9 +1,11 @@
 import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
 import { type Body } from './email-delivery.js'
+import { type EmailIncidentContext, validateEmailIncidentContext } from './email-incident-context.js'
 
 export const ALERT_EMAIL_CONSOLE_ORIGIN = 'https://console.hawkviewapp.com'
 export const ALERT_EMAIL_CONSOLE_URL = `${ALERT_EMAIL_CONSOLE_ORIGIN}/risky-users`
-export const ALERT_EMAIL_TEMPLATE_VERSION = 'hawkview-security-v1'
+export const ALERT_EMAIL_TEMPLATE_VERSION = 'hawkview-security-v2'
+export const ALERT_EMAIL_LOGO_URL = 'https://console.hawkviewapp.com/brand/hawkview-mark-256.png'
 
 type SecurityType = Extract<AlertTypeId, `security.${string}`>
 const GUIDANCE: Record<SecurityType, { why: string; steps: readonly string[] }> = {
@@ -50,6 +52,73 @@ export interface AlertEmailContent {
   readonly actionUrl: string
   readonly authorizationNote: string
   readonly previewNote: string | null
+  readonly incidentContext: EmailIncidentContext | null
+  readonly compact: CompactAlertEmailContent | null
+}
+
+export interface CompactAlertEmailContent {
+  readonly headline: string
+  readonly intro: string
+  readonly facts: readonly { readonly label: string; readonly value: string }[]
+  readonly qualification: string
+  readonly action: string
+}
+
+/** Presentation only: keep all fields and counts associated with one supplied snapshot/event. */
+function compactIncidentContent(context: EmailIncidentContext, headline: string): CompactAlertEmailContent {
+  const candidates = context.findings.flatMap(finding => finding.events.map(event => ({ finding, event })))
+  const selected = candidates.find(item => item.event.title === 'Latest qualifying lockout event')
+    ?? candidates.find(item => item.event.title === 'Latest qualifying password-rejection event')
+  const finding = selected?.finding ?? context.findings[0]!
+  const value = (facts: readonly { label: string; value: string }[], label: string) =>
+    facts.find(fact => fact.label === label)?.value ?? 'Not reported'
+  const reported = (entry: string) => !entry.startsWith('Not reported') && !entry.startsWith('Not applicable')
+  const facts = [{ label: 'Tenant', value: value(context.facts, 'Tenant (current directory)') }]
+  const domain = value(context.facts, 'Tenant domain (current directory)')
+  if (reported(domain)) facts.push({ label: 'Domain', value: domain })
+  facts.push({ label: 'Affected user', value: value(context.facts, 'Affected user (current directory)') },
+    { label: 'Email', value: value(context.facts, 'Affected UPN (current directory)') })
+
+  const activity: string[] = []
+  for (const [label, singular, plural] of [
+    ['Password-rejection events', 'password rejection', 'password rejections'],
+    ['Lockout events', 'lockout reported', 'lockouts reported'],
+  ]) {
+    const match = /^(At least )?(\d+) in the evaluated window$/.exec(value(finding.facts, label!))
+    if (!match || !Number.isSafeInteger(Number(match[2])) || Number(match[2]) <= 0) continue
+    activity.push(`${match[1] ?? ''}${match[2]} ${Number(match[2]) === 1 ? singular : plural}`)
+  }
+  if (activity.length) facts.push({ label: 'Activity', value: `${activity.join('; ')} (evaluated window)` })
+  if (selected) {
+    facts.push({ label: 'Selected source event', value: selected.event.title })
+    for (const label of ['Application', 'Resource', 'Source IP']) {
+      const entry = value(selected.event.facts, label)
+      if (reported(entry)) facts.push({ label, value: entry })
+    }
+    facts.push({ label: 'Observed', value: value(selected.event.facts, 'Event time') })
+  } else {
+    facts.push({ label: 'Observed (finding)', value: value(finding.facts, 'Finding observed') })
+  }
+  const missingFinding = finding.facts.some(fact => fact.label === 'Finding details'
+    && fact.value.includes('underlying finding evidence is unavailable'))
+  const eventKind = selected?.event.title === 'Latest qualifying lockout event' ? 'lockout' : 'password-rejection'
+  let qualification = selected
+    ? `Tenant and identity labels are current directory values; application, resource, IP, and time describe the selected ${eventKind} event, not every attempt.`
+    : missingFinding
+      ? 'Tenant and identity labels are current directory values; underlying finding evidence is unavailable.'
+      : 'Tenant and identity labels are current directory values; event-specific application and source IP were not reported for this alert.'
+  const others = context.findings.length - 1 + context.omittedFindings
+  if (others) qualification += ` ${others} other finding snapshots are not shown.`
+  const credential = finding.title === 'Repeated credential failures' && activity.length > 0
+  return {
+    headline: credential ? 'Credential-failure activity needs review' : headline,
+    intro: credential ? 'HawkView recorded repeated authentication failures for this identity.'
+      : 'Review the recorded security activity in your HawkView workspace.',
+    facts, qualification,
+    action: credential
+      ? 'Review the sign-in evidence, confirm whether the activity was expected, and follow your incident-response process if it was not.'
+      : 'Review the available evidence in HawkView and confirm whether the activity was expected before taking action.',
+  }
 }
 
 const unavailable = (): never => { throw new Error('EMAIL_CONTENT_UNAVAILABLE') }
@@ -92,8 +161,9 @@ function observedRange(from: string, to: string): string {
 
 /** Pure snapshot content. No clock, I/O, recipient data, current-state lookup or free-text input. */
 export function buildAlertEmailContent(
-  body: Body, options: { readonly mode: 'live' | 'historical-test' } = { mode: 'live' },
+  body: Body, options: { readonly mode: 'live' | 'historical-test'; readonly incidentContext?: EmailIncidentContext } = { mode: 'live' },
 ): AlertEmailContent {
+  if (options.incidentContext) validateEmailIncidentContext(options.incidentContext)
   if (options.mode !== 'live' && options.mode !== 'historical-test') return unavailable()
   if (!Array.isArray(body) || body.length < 1 || body.length > 2
     || body.some(line => !line || typeof line !== 'object'
@@ -126,9 +196,9 @@ export function buildAlertEmailContent(
     intro: historical
       ? 'This is a preview of a previously recorded HawkView alert.'
       : 'A security alert needs review in your HawkView workspace.',
-    summary: `${count.incidentsAffected} ${count.incidentsAffected === 1 ? 'incident' : 'incidents'} across ${count.tenantsAffected} ${count.tenantsAffected === 1 ? 'tenant' : 'tenants'}`,
+    summary: options.incidentContext ? '1 incident in 1 tenant' : `${count.incidentsAffected} ${count.incidentsAffected === 1 ? 'incident' : 'incidents'} across ${count.tenantsAffected} ${count.tenantsAffected === 1 ? 'tenant' : 'tenants'}`,
     notice: historical ? 'Not a newly detected incident. No action is required for this test. The guidance below is for reference only.' : null,
-    facts,
+    facts: options.incidentContext ? facts.filter(fact => fact.label !== 'Observed range') : facts,
     priorityNote: 'Default rule priority, not recorded severity or a current override.',
     why: guidance.why,
     steps: guidance.steps,
@@ -137,16 +207,39 @@ export function buildAlertEmailContent(
     actionUrl: ALERT_EMAIL_CONSOLE_URL,
     authorizationNote: 'Sign-in and current workspace authorization are required. Select your workspace to see affected tenant and account details.',
     previewNote: historical ? 'This preview is for appearance and provider-delivery checks only. It does not verify the application queue, delivery ledger or end-to-end alert delivery.' : null,
+    incidentContext: options.incidentContext ?? null,
+    compact: options.incidentContext ? compactIncidentContent(options.incidentContext, declaration.summary) : null,
   }
 }
 
 /** The HTML renderer must use this same content object, including all caveats and TEST copy. */
 export function alertEmailPlaintext(content: AlertEmailContent): string {
+  if (content.compact) {
+    const compact = content.compact
+    return [content.brand, content.eyebrow, compact.headline, '', compact.intro,
+      ...(content.notice ? [content.notice] : []), '',
+      ...compact.facts.map(fact => `${fact.label}: ${fact.value}`), '', compact.qualification, '',
+      'Recommended action', compact.action, '',
+      `${content.notice ? content.actionLabel : 'View in HawkView'}: ${content.actionUrl}`,
+      'Sign-in and current workspace authorization are required.',
+      ...(content.previewNote ? ['', content.previewNote] : []), '',
+    ].join('\n')
+  }
   return [
     content.brand, content.eyebrow, content.headline, '', content.intro,
     ...(content.notice ? [content.notice] : []), '',
-    'Why it matters', content.why, '', 'Alert scope', content.summary,
-    ...content.facts.map(fact => `${fact.label}: ${fact.value}`), content.priorityNote, '',
+    ...(content.incidentContext ? [
+      'Incident details', ...content.incidentContext.facts.map(fact => `${fact.label}: ${fact.value}`),
+      ...content.incidentContext.findings.flatMap(finding => [
+        '', finding.title, ...finding.facts.map(fact => `${fact.label}: ${fact.value}`),
+        ...finding.events.flatMap(event => ['', event.title, ...event.facts.map(fact => `${fact.label}: ${fact.value}`)]),
+      ]),
+      ...(content.incidentContext.omittedFindings ? [`${content.incidentContext.omittedFindings} additional finding snapshots for this incident are not shown.`] : []),
+      content.incidentContext.note, '',
+    ] : []),
+    'Why it matters', content.why, '',
+    ...(!content.incidentContext ? ['Alert scope', content.summary,
+      ...content.facts.map(fact => `${fact.label}: ${fact.value}`), content.priorityNote, ''] : []),
     `${content.actionLabel}: ${content.actionUrl}`, content.authorizationNote, '',
     'Investigation next steps', ...content.steps.map((step, index) => `${index + 1}. ${step}`), '', content.source,
     ...(content.previewNote ? ['', content.previewNote] : []), '',
