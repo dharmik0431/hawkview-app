@@ -46,15 +46,23 @@ export function alertPreferenceCapabilities(
   } else if (configuration.config.organizationId !== organizationId || configuration.config.ownerUserId !== userId) {
     reason = 'NOT_DESIGNATED_RECIPIENT'
   } else {
-    availability = 'CONTROLLED'
-    reason = 'CONTROLLED_TRIAL_ONLY'
+    availability = configuration.config.mode === 'regular' ? 'UNAVAILABLE' : 'CONTROLLED'
+    reason = configuration.config.mode === 'regular' ? 'CONFIGURATION_UNAVAILABLE' : 'CONTROLLED_TRIAL_ONLY'
   }
   return {
     version: 1 as const, readState: 'AVAILABLE' as const, policyWriterRole: 'MSP_OWNER' as const,
     supportedDigestModes: ['off'] as const,
     channels: {
       inApp: { supported: true as const, availability: 'AVAILABLE' as const },
-      email: { supported: true as const, availability, reason },
+      email: { supported: true as const, availability, reason,
+        // Legacy v1 clients cannot represent sustained availability. Their conservative
+        // fallback stays parseable; this additive field never grants personal consent.
+        ...(configuration.enabled && configuration.config.mode === 'regular' ? { regular: {
+          availability: configuration.config.organizationId === organizationId && configuration.config.ownerUserId === userId
+            ? 'AVAILABLE' as const : 'UNAVAILABLE' as const,
+          scope: 'DESIGNATED_OWNER' as const, requiresOptIn: true as const,
+        } } : {}),
+      },
     },
   }
 }

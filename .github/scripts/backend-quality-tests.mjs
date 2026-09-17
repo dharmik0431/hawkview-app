@@ -11,6 +11,7 @@ export const backendDirectory = fileURLToPath(new URL('../../backend/', import.m
 export const databaseTests = Object.freeze([
   'alerts/alert-dispositions.database-integration.test.ts',
   'alerts/email-incident-context.database-integration.test.ts',
+  'alerts/email-regular-release.database-integration.test.ts',
   'alerts/finding-pipeline.database-integration.test.ts',
   'alerts/in-app-visibility.database-integration.test.ts',
   'alerts/send-job-withdrawal.database-integration.test.ts',
@@ -43,6 +44,10 @@ export const databaseTests = Object.freeze([
 // Content identities prevent a reviewed mock exception from silently gaining real DB IO.
 // Git blob identities use normalized LF bytes so Windows checkouts remain equivalent.
 export const syntheticExceptions = Object.freeze({
+  'src/prisma/prisma-utc-session.test.ts': {
+    blob: 'e1aae923cbffd971e0d41877f2206364fb64a94b',
+    reason: 'Installed pg-pool with test-owned FakeClient; no socket or PostgreSQL connection is opened.',
+  },
   'src/identity-risk/mailbox-read-transaction.test.ts': {
     blob: '05b183e12495bba38ac8c628e344edcf10a33331',
     reason: 'Malformed URL and test-owned synthetic loopback transport, not shared PostgreSQL.',
@@ -72,7 +77,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: 'bf7c7a5b5f43c03f38bbec8b0badf0d332d5833b',
+    blob: '5f16a59f05ab5715c5ba76a68bd7e6e5df230bc6',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });

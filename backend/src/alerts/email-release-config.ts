@@ -11,6 +11,8 @@ export const validEmail = (value: string): boolean => value.length <= 320
 
 /** Server-only configuration. Never serialize this object or provider responses. */
 export interface EmailReleaseConfig {
+  /** Absent preserves the original controlled contract. Regular has no global expiry. */
+  mode?: 'regular'
   activationId: string
   organizationId: string
   ownerUserId: string
@@ -39,7 +41,8 @@ function httpsOrigin(raw: string | undefined): string | null {
 export function emailReleaseConfiguration(
   env: Readonly<Record<string, string | undefined>>, now = Date.now(),
 ): EmailConfiguration {
-  if (env.HAWKVIEW_ALERT_EMAIL_MODE !== 'controlled') return { enabled: false, reason: 'DISABLED' }
+  const regular = env.HAWKVIEW_ALERT_EMAIL_MODE === 'regular'
+  if (!regular && env.HAWKVIEW_ALERT_EMAIL_MODE !== 'controlled') return { enabled: false, reason: 'DISABLED' }
   const activationId = env.HAWKVIEW_ALERT_EMAIL_ACTIVATION_ID ?? ''
   const organizationId = env.HAWKVIEW_ALERT_EMAIL_ORGANIZATION_ID ?? ''
   const ownerUserId = env.HAWKVIEW_ALERT_EMAIL_OWNER_USER_ID ?? ''
@@ -58,13 +61,14 @@ export function emailReleaseConfiguration(
     || !authOrigin || !/^re_[A-Za-z0-9_-]{12,}$/.test(resendKey)
     || authKey.length < 20 || /\s/.test(authKey)
     || !/^whsec_[A-Za-z0-9+/=]+$/.test(env.RESEND_WEBHOOK_SIGNING_SECRET ?? '')
-    || !Number.isFinite(start) || !Number.isFinite(end)
-    || new Date(start).toISOString() !== startsAt || new Date(end).toISOString() !== expiresAt
-    || end <= start || end - start > ACTIVATION_WINDOW_MS) {
+    || !Number.isFinite(start) || new Date(start).toISOString() !== startsAt
+    || (regular ? expiresAt !== '' : (!Number.isFinite(end)
+      || new Date(end).toISOString() !== expiresAt || end <= start || end - start > ACTIVATION_WINDOW_MS))) {
     return { enabled: false, reason: 'INVALID_CONFIGURATION' }
   }
-  if (now < start || now >= end) return { enabled: false, reason: 'OUTSIDE_ACTIVATION_WINDOW' }
+  if (now < start || (!regular && now >= end)) return { enabled: false, reason: 'OUTSIDE_ACTIVATION_WINDOW' }
   return { enabled: true, config: {
+    ...(regular ? { mode: 'regular' as const } : {}),
     activationId, organizationId, ownerUserId, recipientHash, startsAt, expiresAt,
     from, appOrigin, resendKey, authOrigin, authKey,
   } }

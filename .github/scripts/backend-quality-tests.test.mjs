@@ -20,7 +20,8 @@ const paths = entries => entries.map(entry => entry.path);
 test('partition is the complete disjoint discovery, including the nonstandard real-PG file', () => {
   const entries = fixtureEntries();
   const plan = planTests(entries, paths(entries).reverse());
-  assert.equal(plan.database.length, 28);
+  assert.equal(plan.database.length, 29);
+  assert.ok(plan.database.includes('src/alerts/email-regular-release.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/alerts/email-incident-context.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/tenants/sign-in-provisioning.test.ts'));
   assert.ok(plan.database.includes('src/risky-users-wiring/native-risk-summary.database-integration.test.ts'));

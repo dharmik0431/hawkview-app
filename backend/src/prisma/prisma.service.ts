@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
+import { initializePrismaUtcSession } from './prisma-utc-session.js'
 
 function createAdapter() {
   const connectionString = process.env.DATABASE_URL
@@ -13,7 +14,7 @@ function createAdapter() {
     throw new Error('DATABASE_URL is required to start the HawkView API.')
   }
 
-  return new PrismaPg({ connectionString })
+  return new PrismaPg({ connectionString, onConnect: initializePrismaUtcSession })
 }
 
 @Injectable()

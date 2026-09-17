@@ -14,7 +14,8 @@ export class EmailAlertReleaseService {
       store: new EmailReleaseStore(emailSqlRunner(this.prisma, boundedDeadline)),
       env: process.env, fetchImpl: fetch, deadlineAt: boundedDeadline,
     })
-    this.logger.log(JSON.stringify({ event: 'email_alert_release', ...report }))
+    this.logger.log(JSON.stringify({ event: 'email_alert_release', ...report,
+      ...(process.env.HAWKVIEW_ALERT_EMAIL_MODE === 'regular' ? { mode: 'regular' } : {}) }))
     return report
   }
 }

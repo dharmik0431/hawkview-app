@@ -32,6 +32,10 @@ export function emailSqlRunner(
     const limits = budget.transactionLimits()
     return prisma.$transaction(async tx => {
       budget.remaining()
+      // PrismaPg timestamptz decoding requires UTC on the actual connection.
+      // Keep this transaction-local so pooled connections retain their defaults.
+      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'UTC'")
+      budget.remaining()
       return run(inside(tx))
     }, { ...limits, isolationLevel: 'ReadCommitted' })
   }

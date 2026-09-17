@@ -32,6 +32,11 @@ export type NotificationCapabilities = {
       supported: true
       availability: EmailAvailability
       reason: EmailAvailabilityReason
+      regular?: {
+        availability: 'AVAILABLE' | 'UNAVAILABLE'
+        scope: 'DESIGNATED_OWNER'
+        requiresOptIn: true
+      }
     }
   }
 }
@@ -120,6 +125,16 @@ export function readNotificationCapabilities(
         'NOT_DESIGNATED_RECIPIENT',
       ].includes(email.reason as string))
   if (!validEmailState) return null
+  const regular = email.regular
+  if (regular !== undefined && (
+    !isRecord(regular) ||
+    !isOneOf(regular.availability, ['AVAILABLE', 'UNAVAILABLE']) ||
+    regular.scope !== 'DESIGNATED_OWNER' || regular.requiresOptIn !== true ||
+    email.availability !== 'UNAVAILABLE' ||
+    (regular.availability === 'AVAILABLE'
+      ? email.reason !== 'CONFIGURATION_UNAVAILABLE'
+      : email.reason !== 'NOT_DESIGNATED_RECIPIENT')
+  )) return null
 
   return {
     version: 1,
@@ -132,6 +147,11 @@ export function readNotificationCapabilities(
         supported: true,
         availability: email.availability,
         reason: email.reason,
+        ...(isRecord(regular) ? { regular: {
+          availability: regular.availability as 'AVAILABLE' | 'UNAVAILABLE',
+          scope: 'DESIGNATED_OWNER' as const,
+          requiresOptIn: true as const,
+        } } : {}),
       },
     },
   }
@@ -220,6 +240,13 @@ export function emailAvailabilityCopy(
   capabilities: NotificationCapabilities
 ): { title: string; detail: string } {
   const { availability, reason } = capabilities.channels.email
+  if (capabilities.channels.email.regular?.availability === 'AVAILABLE') {
+    return {
+      title: 'Regular email is available for this account',
+      detail:
+        'Delivery still requires your explicit email and security opt-ins, current workspace authorization, and eligible new alerts. Other accounts are not enabled by this rollout.',
+    }
+  }
   if (availability === 'CONTROLLED') {
     return {
       title: 'Email delivery is controlled',
