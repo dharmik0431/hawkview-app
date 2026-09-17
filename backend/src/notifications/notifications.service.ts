@@ -3,6 +3,9 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { Prisma } from '../generated/prisma/client.js'
 import { alertTierFor } from '../alerts/finding-pipeline.js'
+import { NOTIFICATION_SEVERITIES as severities, notificationSeveritiesAtOrAbove } from './notification-severity.js'
+import { alertPreferenceCapabilities } from '../alerts/alert-type-reach.js'
+import { UUID } from '../alerts/email-release-config.js'
 
 const preferenceFields = [
   'securityEnabled',
@@ -12,7 +15,6 @@ const preferenceFields = [
   'inAppEnabled',
   'emailEnabled',
 ] as const
-const severities = ['info', 'low', 'medium', 'high', 'critical'] as const
 
 /** THE TWO VOCABULARIES A NOTIFICATION IS WRITTEN IN, exported so a second producer cannot
  * invent its own. The alerting pipeline writes notification rows too, and an invented severity
@@ -20,8 +22,6 @@ const severities = ['info', 'low', 'medium', 'high', 'critical'] as const
  * counted in no badge, which is indistinguishable from the feature not working. */
 export type NotificationSeverity = (typeof severities)[number]
 export type NotificationCategory = 'success' | 'info' | 'warning' | 'error'
-const digestModes = ['off', 'daily', 'weekly'] as const
-const severityRank = new Map(severities.map((value, index) => [value, index]))
 
 export type NotificationIncident = {
   organizationId: string
@@ -68,14 +68,14 @@ export class NotificationsService {
             status: 'ACTIVE',
             organization: { status: 'ACTIVE' },
           },
-          select: { organizationId: true },
+          select: { organizationId: true, role: true },
         },
       },
     })
     if (!user || user.disabledAt) {
       throw new ForbiddenException('This HawkView account cannot access notifications.')
     }
-    return { userId: user.id, organizationIds: user.memberships.map((item) => item.organizationId) }
+    return { userId: user.id, memberships: user.memberships, organizationIds: user.memberships.map((item) => item.organizationId) }
   }
 
   private async visible(identity: AuthenticatedIdentity, id: string) {
@@ -124,8 +124,7 @@ export class NotificationsService {
         const preference = preferencesByOrganization.get(organizationId)
         if (!preference) return { organizationId }
 
-        const minimum = severityRank.get(preference.minimumSeverity as (typeof severities)[number]) ?? 0
-        const allowedSeverities = severities.filter((severity) => (severityRank.get(severity) ?? 0) >= minimum)
+        const allowedSeverities = notificationSeveritiesAtOrAbove(preference.minimumSeverity)
         const enabledFamilies: Prisma.NotificationWhereInput[] = [
           ...(preference.securityEnabled ? [knownFamilies[0]] : []),
           ...(preference.connectionEnabled ? [knownFamilies[1]] : []),
@@ -285,26 +284,83 @@ export class NotificationsService {
     return { success: true }
   }
 
+  private preferenceOrganization(organizationIds: string[], requested?: string): string {
+    if (requested !== undefined && (typeof requested !== 'string' || !UUID.test(requested))) {
+      throw new BadRequestException('A valid organizationId is required.')
+    }
+    if (requested === undefined && organizationIds.length > 1) {
+      throw new BadRequestException('Select an explicit organizationId.')
+    }
+    const selected = requested ?? organizationIds[0]
+    if (!selected || !organizationIds.includes(selected)) throw new ForbiddenException('Workspace is not available.')
+    return selected
+  }
+
   async preferences(identity: AuthenticatedIdentity, organizationId?: string) {
     const context = await this.context(identity)
-    const selected = organizationId ?? context.organizationIds[0]
-    if (!selected || !context.organizationIds.includes(selected)) throw new ForbiddenException('Workspace is not available.')
-    return this.prisma.notificationPreference.upsert({
+    const selected = this.preferenceOrganization(context.organizationIds, organizationId)
+    const preferences = await this.prisma.notificationPreference.upsert({
       where: { userId_organizationId: { userId: context.userId, organizationId: selected } },
       create: { userId: context.userId, organizationId: selected },
       update: {},
     })
+    return {
+      ...preferences,
+      canManagePolicy: context.memberships.some(member => member.organizationId === selected && member.role === 'MSP_OWNER'),
+      capabilities: alertPreferenceCapabilities(selected, context.userId),
+    }
   }
 
   async updatePreferences(identity: AuthenticatedIdentity, body: unknown) {
     if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BadRequestException('Notification preferences are required.')
     const payload = body as Record<string, unknown>
-    const current = await this.preferences(identity, typeof payload.organizationId === 'string' ? payload.organizationId : undefined)
+    if (Object.hasOwn(payload, 'organizationId') && (typeof payload.organizationId !== 'string' || !UUID.test(payload.organizationId))) {
+      throw new BadRequestException('A valid organizationId is required.')
+    }
+    const context = await this.context(identity)
+    const selected = this.preferenceOrganization(context.organizationIds, payload.organizationId as string | undefined)
     const data: Prisma.NotificationPreferenceUpdateInput = {}
-    for (const field of preferenceFields) if (typeof payload[field] === 'boolean') data[field] = payload[field]
-    if (typeof payload.minimumSeverity === 'string' && severities.includes(payload.minimumSeverity as (typeof severities)[number])) data.minimumSeverity = payload.minimumSeverity
-    if (typeof payload.digestMode === 'string' && digestModes.includes(payload.digestMode as (typeof digestModes)[number])) data.digestMode = payload.digestMode
-    return this.prisma.notificationPreference.update({ where: { id: current.id }, data })
+    for (const field of preferenceFields) {
+      if (!Object.hasOwn(payload, field)) continue
+      if (typeof payload[field] !== 'boolean') throw new BadRequestException(`${field} must be a boolean.`)
+      data[field] = payload[field]
+    }
+    if (Object.hasOwn(payload, 'minimumSeverity')) {
+      if (typeof payload.minimumSeverity !== 'string' || !severities.includes(payload.minimumSeverity as NotificationSeverity)) {
+        throw new BadRequestException('minimumSeverity must be a recognized notification severity.')
+      }
+      data.minimumSeverity = payload.minimumSeverity
+    }
+    const preferences = await this.prisma.$transaction(async tx => {
+      // Lock current authorization until commit; an earlier GET/context is not a write grant.
+      const eligible = await tx.$queryRaw<{ id: string; role: string }[]>`SELECT u.id, m.role FROM users u
+        JOIN memberships m ON m.user_id = u.id
+        JOIN organizations o ON o.id = m.organization_id
+        WHERE u.id = ${context.userId}::uuid AND u.auth_provider_user_id = ${identity.subject}
+          AND u.disabled_at IS NULL AND m.organization_id = ${selected}::uuid
+          AND m.status = 'ACTIVE' AND o.status = 'ACTIVE'
+        FOR SHARE OF u, m, o`
+      if (eligible.length !== 1) throw new ForbiddenException('Workspace is not available.')
+      const where = { userId_organizationId: { userId: context.userId, organizationId: selected } }
+      const current = await tx.notificationPreference.findUnique({ where })
+      if (Object.hasOwn(payload, 'digestMode')) {
+        if (payload.digestMode === 'off') data.digestMode = 'off'
+        else if (typeof payload.digestMode !== 'string' || !['daily', 'weekly'].includes(payload.digestMode)
+          || payload.digestMode !== current?.digestMode) {
+          throw new BadRequestException('Only off is supported for a new digest selection.')
+        }
+        // Unchanged unsupported digest values stay stored, not re-written or silently enabled.
+      }
+      await tx.notificationPreference.upsert({
+        where, create: { userId: context.userId, organizationId: selected }, update: {},
+      })
+      return {
+        ...await tx.notificationPreference.update({ where, data }),
+        canManagePolicy: eligible[0].role === 'MSP_OWNER',
+        capabilities: alertPreferenceCapabilities(selected, context.userId),
+      }
+    })
+    return preferences
   }
 
   async publishIncident(input: NotificationIncident) {

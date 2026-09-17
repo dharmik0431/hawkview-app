@@ -75,6 +75,20 @@ import {
   workspaceAuditSafeIdentifier,
   workspaceAuditTargetLabel,
 } from '@/lib/workspace/audit-evidence'
+import {
+  emailAvailabilityCopy,
+  hasPreferenceChanges,
+  NOTIFICATION_SEVERITIES,
+  notificationPreferencesPatch,
+  readNotificationPreferences,
+  type NotificationPreferences as NotificationPref,
+} from '@/lib/notifications/preferences-contract'
+import {
+  NotificationScopedRequestGuard,
+  notificationRequestScope,
+  notificationRequestScopeKey,
+  type NotificationRequestScope,
+} from '@/lib/notifications/scoped-request-guard'
 
 type MembershipRole =
   | 'MSP_OWNER'
@@ -130,19 +144,6 @@ type WorkspaceResponse = {
 }
 
 type AuditResponse = { items: AuditEntry[] }
-
-type NotificationPref = {
-  id: string
-  organizationId: string
-  securityEnabled: boolean
-  connectionEnabled: boolean
-  synchronizationEnabled: boolean
-  accountEnabled: boolean
-  inAppEnabled: boolean
-  emailEnabled: boolean
-  minimumSeverity: 'info' | 'low' | 'medium' | 'high' | 'critical'
-  digestMode: 'off' | 'daily' | 'weekly'
-}
 
 type SortField = 'member' | 'role' | 'status' | 'createdAt'
 type SortDirection = 'asc' | 'desc'
@@ -447,16 +448,21 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
 
   const [workspaceResponse, setWorkspace] = useState<WorkspaceResponse | null>(null)
   const adminLoadGuard = useRef(new WorkspaceOrganizationLoadGuard())
+  const notificationRequestGuard = useRef(new NotificationScopedRequestGuard())
+  const currentNotificationScopeRef = useRef<NotificationRequestScope | null>(null)
   const adminWorkspaceSignalGuard = useRef(new WorkspaceChangeSignalGuard())
   const adminPassiveRefreshLimiter = useRef(
     new PassiveWorkspaceRefreshLimiter()
   )
   const [auditEntriesResponse, setAuditEntries] = useState<AuditEntry[]>([])
   const [notificationPrefs, setNotificationPrefs] = useState<NotificationPref | null>(null)
+  const [notificationPrefsScopeKey, setNotificationPrefsScopeKey] = useState<string | null>(null)
 
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [prefSaving, setPrefSaving] = useState(false)
+  const prefSavingRef = useRef(prefSaving)
+  prefSavingRef.current = prefSaving
 
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
@@ -510,17 +516,6 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
   // Notifications tab form state
   const [formNotificationPrefs, setFormNotificationPrefs] = useState<NotificationPref | null>(null)
 
-  useEffect(() => {
-    if (notificationPrefs) {
-      setFormNotificationPrefs(notificationPrefs)
-    }
-  }, [notificationPrefs])
-
-  const isPrefDirty = useMemo(() => {
-    if (!notificationPrefs || !formNotificationPrefs) return false
-    return ( JSON.stringify(notificationPrefs) !== JSON.stringify(formNotificationPrefs))
-  }, [notificationPrefs, formNotificationPrefs])
-
   // Audit Log Tab state
   const [auditSortField, setAuditSortField] = useState<'createdAt' | 'action' | 'target' | 'actor' | 'outcome'>('createdAt')
   const [auditSortDir, setAuditSortDir] = useState<'asc' | 'desc'>('desc')
@@ -554,6 +549,38 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     organizationContext.state === 'selected'
       ? organizationContext.selected.id
       : null
+  const notificationScope = useMemo(
+    () =>
+      notificationRequestScope(
+        identityUser?.id ?? session?.user.id,
+        selectedOrganizationId
+      ),
+    [identityUser?.id, selectedOrganizationId, session?.user.id]
+  )
+  const notificationScopeKey = notificationRequestScopeKey(notificationScope)
+  currentNotificationScopeRef.current = notificationScope
+  notificationRequestGuard.current.setScope(notificationScope)
+  const scopedNotificationPrefs =
+    notificationPrefsScopeKey === notificationScopeKey &&
+    notificationPrefs?.organizationId === selectedOrganizationId
+      ? notificationPrefs
+      : null
+  const scopedFormNotificationPrefs =
+    notificationPrefsScopeKey === notificationScopeKey &&
+    formNotificationPrefs?.organizationId === selectedOrganizationId
+      ? formNotificationPrefs
+      : null
+  const isPrefDirty = useMemo(() => {
+    if (!scopedNotificationPrefs || !scopedFormNotificationPrefs) return false
+    return hasPreferenceChanges(scopedNotificationPrefs, scopedFormNotificationPrefs)
+  }, [scopedNotificationPrefs, scopedFormNotificationPrefs])
+  const notificationEmailAvailability = useMemo(
+    () =>
+      scopedFormNotificationPrefs
+        ? emailAvailabilityCopy(scopedFormNotificationPrefs.capabilities)
+        : null,
+    [scopedFormNotificationPrefs]
+  )
 
   useEffect(() => {
     adminLoadGuard.current.invalidate()
@@ -566,7 +593,12 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     setSelectedMembershipIds(new Set())
     setBulkConfirmModal(null)
     setInviteModalOpen(false)
-  }, [selectedOrganizationId])
+    setNotificationPrefs(null)
+    setFormNotificationPrefs(null)
+    setNotificationPrefsScopeKey(null)
+    setPrefSaving(false)
+    prefSavingRef.current = false
+  }, [notificationScopeKey, selectedOrganizationId])
 
   const workspace =
     workspaceResponse?.organization.id === selectedOrganizationId
@@ -641,6 +673,13 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
       return
     }
     const ticket = adminLoadGuard.current.begin(selectedOrganizationId)
+    const preferenceScope = notificationScope
+    const scopeTicket = preferenceScope
+      ? notificationRequestGuard.current.begin(preferenceScope, 'admin-load')
+      : null
+    const preferenceTicket = preferenceScope && !prefSavingRef.current
+      ? notificationRequestGuard.current.begin(preferenceScope, 'load')
+      : null
     if (!keepCurrent) {
       setLoading(true)
       setTenantsLoading(true)
@@ -654,28 +693,75 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
         apiClient.get<AuditResponse>('/api/workspace/audit-logs', {
           params: { organizationId: selectedOrganizationId },
         }),
-        apiClient.get<NotificationPref>('/api/notifications/preferences').catch(() => null),
+        apiClient.get<unknown>('/api/notifications/preferences', {
+          params: { organizationId: selectedOrganizationId },
+        }).catch(() => null),
         apiClient.get<TenantsResponse>('/api/tenants').catch(() => null),
       ])
-      if (!adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) return
+      if (
+        !adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId) ||
+        !scopeTicket ||
+        !notificationRequestGuard.current.isCurrent(
+          scopeTicket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        return
+      }
       setWorkspace(membersData)
       setAuditEntries(Array.isArray(auditData?.items) ? auditData.items : [])
-      if (prefsData) setNotificationPrefs(prefsData)
+      if (
+        preferenceScope &&
+        preferenceTicket &&
+        notificationRequestGuard.current.isCurrent(
+          preferenceTicket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        const parsedPreferences = readNotificationPreferences(prefsData)
+        if (parsedPreferences?.organizationId === selectedOrganizationId) {
+          setNotificationPrefs(parsedPreferences)
+          setFormNotificationPrefs(parsedPreferences)
+          setNotificationPrefsScopeKey(
+            notificationRequestScopeKey(preferenceScope)
+          )
+        } else {
+          setNotificationPrefs(null)
+          setFormNotificationPrefs(null)
+          setNotificationPrefsScopeKey(null)
+        }
+      }
       if (tenantsRes && Array.isArray(tenantsRes.tenants)) {
         setTenantsData(tenantsRes.tenants)
       } else {
         setTenantsData(null)
       }
     } catch (requestError) {
-      if (!adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) return
+      if (
+        !adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId) ||
+        !scopeTicket ||
+        !notificationRequestGuard.current.isCurrent(
+          scopeTicket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        return
+      }
       setError(errorMessage(requestError, 'Admin Panel information could not be loaded.'))
     } finally {
-      if (adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId)) {
+      if (
+        adminLoadGuard.current.isCurrent(ticket, selectedOrganizationId) &&
+        scopeTicket &&
+        notificationRequestGuard.current.isCurrent(
+          scopeTicket,
+          currentNotificationScopeRef.current
+        )
+      ) {
         setLoading(false)
         setTenantsLoading(false)
       }
     }
-  }, [selectedOrganizationId])
+  }, [notificationScope, selectedOrganizationId])
 
   useEffect(() => {
     if (isMspOwner && selectedOrganizationId) {
@@ -1416,25 +1502,75 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
   }
 
   const handleSaveNotificationPrefs = async () => {
-    if (!formNotificationPrefs) return
+    const scope = currentNotificationScopeRef.current
+    if (
+      !scope ||
+      !scopedNotificationPrefs ||
+      !scopedFormNotificationPrefs ||
+      scopedNotificationPrefs.organizationId !== scope.organizationId ||
+      scopedFormNotificationPrefs.organizationId !== scope.organizationId
+    ) {
+      return
+    }
+    const patch = notificationPreferencesPatch(
+      scopedNotificationPrefs,
+      scopedFormNotificationPrefs
+    )
+    if (Object.keys(patch).length === 1) return
+    notificationRequestGuard.current.invalidateLane('load')
+    const ticket = notificationRequestGuard.current.begin(scope, 'save')
+    prefSavingRef.current = true
     setPrefSaving(true)
     setError(null)
     setNotice(null)
     try {
-      const updated = await apiClient.patch<NotificationPref>('/api/notifications/preferences', formNotificationPrefs)
+      const body = await apiClient.patch<unknown>(
+        '/api/notifications/preferences',
+        patch
+      )
+      if (
+        !notificationRequestGuard.current.isCurrent(
+          ticket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        return
+      }
+      const updated = readNotificationPreferences(body)
+      if (!updated || updated.organizationId !== scope.organizationId) {
+        throw new Error('Notification preference response could not be verified.')
+      }
       setNotificationPrefs(updated)
       setFormNotificationPrefs(updated)
+      setNotificationPrefsScopeKey(notificationRequestScopeKey(scope))
       setNotice('Notification preferences saved successfully.')
-    } catch (requestError) {
-      setError(errorMessage(requestError, 'Failed to save notification preferences.'))
+    } catch {
+      if (
+        !notificationRequestGuard.current.isCurrent(
+          ticket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        return
+      }
+      setFormNotificationPrefs(scopedNotificationPrefs)
+      setError('Notification preferences could not be verified, so no unverified change was kept.')
     } finally {
-      setPrefSaving(false)
+      if (
+        notificationRequestGuard.current.isCurrent(
+          ticket,
+          currentNotificationScopeRef.current
+        )
+      ) {
+        prefSavingRef.current = false
+        setPrefSaving(false)
+      }
     }
   }
 
   const handleCancelNotificationPrefs = () => {
-    if (notificationPrefs) {
-      setFormNotificationPrefs(notificationPrefs)
+    if (scopedNotificationPrefs) {
+      setFormNotificationPrefs(scopedNotificationPrefs)
     }
   }
 
@@ -2933,7 +3069,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
             <div className="flex items-center justify-between border-b border-border pb-3">
               <div className="flex items-center gap-2">
                 <Bell className="h-4 w-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
-                <h2 className="text-sm font-bold text-foreground">Notification Preferences</h2>
+                <h2 className="text-sm font-bold text-foreground">My notification delivery</h2>
               </div>
               {prefSaving && (
                 <span className="text-xs text-muted-foreground flex items-center gap-1.5 font-medium">
@@ -2943,157 +3079,71 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
               )}
             </div>
 
-            {/* THE OTHER GRAIN. These switches are about how THIS PERSON hears; whether an alert type is urgent at all is the organisation's answer and the same for everyone. Two people in one MSP disagreeing about that is the thing the split prevents, and without a pointer here the org page is not reachable from the place people go looking. */}
             <p className="text-xs text-muted-foreground">
-              These control how you hear about alerts. What counts as urgent is set for the whole organisation on{' '}
-              <Link href="/settings/alerts" className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400">alert settings</Link>.
+              These preferences belong to your account in this workspace. MSP owners set workspace urgency separately on{' '}
+              <Link href={`/settings/alerts?organizationId=${encodeURIComponent(selectedOrganizationId ?? '')}`} className="font-medium text-blue-600 underline-offset-4 hover:underline dark:text-blue-400">workspace alert policy</Link>.
             </p>
 
-            {/* Read-only banner if notification preferences are not persisted */}
-            {!notificationPrefs && !loading && (
-              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2">
+            {!scopedNotificationPrefs && !loading && (
+              <div role="alert" className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800/60 text-xs text-amber-800 dark:text-amber-300 flex items-center gap-2">
                 <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" />
-                <span>Notification preference saving is not available yet.</span>
+                <span>HawkView could not verify notification capabilities. All preference controls are disabled and no setting was inferred.</span>
               </div>
             )}
 
-            <div className="space-y-6 text-xs">
-              {/* Category 1: Security */}
-              <div className="space-y-2.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
-                  Security Alerts
-                </h3>
-                <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
-                  <div className="space-y-0.5">
-                    <p className="font-semibold text-foreground">Password resets, MFA resets, and role changes</p>
-                    <p className="text-[11px] text-muted-foreground">Receive immediate notifications for member authentication and privilege alterations.</p>
-                  </div>
-                  <Checkbox
-                    checked={formNotificationPrefs?.securityEnabled ?? true}
-                    disabled={!notificationPrefs || prefSaving}
-                    onCheckedChange={(checked) => {
-                      if (!formNotificationPrefs) return
-                      setFormNotificationPrefs({ ...formNotificationPrefs, securityEnabled: Boolean(checked), })
-                    }}
-                    aria-label="Toggle Security Alerts"
-                  />
-                </div>
+            <div className="space-y-5 text-xs">
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                Critical in-app notifications remain visible even when your category or notification-center preferences are off.
               </div>
 
-              {/* Category 2: Tenant Operations */}
-              <div className="space-y-2.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
-                  Tenant Operations
-                </h3>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
-                    <div className="space-y-0.5">
-                      <p className="font-semibold text-foreground">Connection or consent problems</p>
-                      <p className="text-[11px] text-muted-foreground">Alerts when Microsoft 365 tenant authorization or partner consent degrades.</p>
-                    </div>
-                    <Checkbox
-                      checked={formNotificationPrefs?.connectionEnabled ?? true}
-                      disabled={!notificationPrefs || prefSaving}
-                      onCheckedChange={(checked) => {
-                        if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({ ...formNotificationPrefs, connectionEnabled: Boolean(checked), })
-                      }}
-                      aria-label="Toggle Connection or consent problems"
-                    />
-                  </div>
+              {([
+                ['inAppEnabled', 'Notification center', 'Show supported operational notifications inside HawkView.'],
+                ['securityEnabled', 'Security alerts', 'Risky identity and supported security events.'],
+                ['connectionEnabled', 'Tenant connections', 'Microsoft tenant connection and consent events.'],
+                ['synchronizationEnabled', 'Synchronization health', 'Supported tenant data synchronization events.'],
+                ['accountEnabled', 'Account activity', 'Important changes to your HawkView account.'],
+              ] as const).map(([key, label, description]) => (
+                <div key={key} className="flex items-start justify-between gap-4 border-b border-border py-3 last:border-0">
+                  <div><p className="font-semibold text-foreground">{label}</p><p className="mt-0.5 text-[11px] text-muted-foreground">{description}</p></div>
+                  <Checkbox checked={scopedFormNotificationPrefs?.[key] ?? false} disabled={!scopedNotificationPrefs || prefSaving} onCheckedChange={(checked) => scopedFormNotificationPrefs && setFormNotificationPrefs({ ...scopedFormNotificationPrefs, [key]: Boolean(checked) })} aria-label={`Toggle ${label}`} />
+                </div>
+              ))}
 
-                  <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
-                    <div className="space-y-0.5">
-                      <p className="font-semibold text-foreground">Synchronization failures & stale tenant data</p>
-                      <p className="text-[11px] text-muted-foreground">Alerts for automated sync job failures or stale security score telemetry.</p>
-                    </div>
-                    <Checkbox
-                      checked={formNotificationPrefs?.synchronizationEnabled ?? true}
-                      disabled={!notificationPrefs || prefSaving}
-                      onCheckedChange={(checked) => {
-                        if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({ ...formNotificationPrefs, synchronizationEnabled: Boolean(checked), })
-                      }}
-                      aria-label="Toggle Synchronization failures"
-                    />
+              <div className="grid grid-cols-1 gap-4 border-t border-border pt-5 sm:grid-cols-2">
+                <div className="rounded-lg bg-muted/40 p-3">
+                  <Label htmlFor="admin-minimum-severity" className="text-xs font-medium text-foreground">Minimum personal severity</Label>
+                  <select id="admin-minimum-severity" value={scopedFormNotificationPrefs?.minimumSeverity ?? 'info'} disabled={!scopedFormNotificationPrefs || prefSaving} onChange={(event) => scopedFormNotificationPrefs && setFormNotificationPrefs({ ...scopedFormNotificationPrefs, minimumSeverity: event.target.value as NotificationPref['minimumSeverity'] })} className="mt-2 flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-70">
+                    {NOTIFICATION_SEVERITIES.map((severity) => <option key={severity} value={severity}>{severity.charAt(0).toUpperCase() + severity.slice(1)}</option>)}
+                  </select>
+                  <p className="mt-2 text-[11px] text-muted-foreground">Filters your personal notifications by severity. Workspace urgency remains a separate MSP-owner policy.</p>
+                </div>
+
+                <div className="rounded-lg bg-muted/40 p-3">
+                  <Label className="text-xs font-medium text-foreground">Email preference</Label>
+                  <div className="mt-2 flex items-start justify-between gap-3">
+                    <div><p className="font-semibold text-foreground">Opt in to email</p><p className="mt-0.5 text-[11px] text-muted-foreground">{notificationEmailAvailability ? `${notificationEmailAvailability.title}. ${notificationEmailAvailability.detail}` : 'Capability unavailable.'}</p></div>
+                    <Checkbox checked={scopedFormNotificationPrefs?.emailEnabled ?? false} disabled={!scopedNotificationPrefs || prefSaving} onCheckedChange={(checked) => scopedFormNotificationPrefs && setFormNotificationPrefs({ ...scopedFormNotificationPrefs, emailEnabled: Boolean(checked) })} aria-label="Toggle personal email preference" />
                   </div>
                 </div>
               </div>
 
-              {/* Category 3: Team */}
-              <div className="space-y-2.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
-                  Team Membership
-                </h3>
-                <div className="flex items-center justify-between py-2 px-3 rounded-lg border border-border bg-card hover:bg-muted/20 transition-colors">
-                  <div className="space-y-0.5">
-                    <p className="font-semibold text-foreground">Invitations, account setup, suspensions, and removals</p>
-                    <p className="text-[11px] text-muted-foreground">Notifications when members are invited, complete setup, or get suspended.</p>
-                  </div>
-                  <Checkbox
-                    checked={formNotificationPrefs?.accountEnabled ?? true}
-                    disabled={!notificationPrefs || prefSaving}
-                    onCheckedChange={(checked) => {
-                      if (!formNotificationPrefs) return
-                      setFormNotificationPrefs({ ...formNotificationPrefs, accountEnabled: Boolean(checked), })
-                    }}
-                    aria-label="Toggle Team Membership notifications"
-                  />
-                </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs font-medium text-foreground">Digest schedule</Label>
+                <select
+                  value={scopedFormNotificationPrefs?.digestMode ?? 'off'}
+                  disabled={!scopedNotificationPrefs || prefSaving || scopedFormNotificationPrefs?.digestMode === 'off'}
+                  onChange={(event) => {
+                    if (scopedFormNotificationPrefs && event.target.value === 'off') setFormNotificationPrefs({ ...scopedFormNotificationPrefs, digestMode: 'off' })
+                  }}
+                  className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-70"
+                >
+                  {scopedFormNotificationPrefs?.digestMode !== 'off' && <option value={scopedFormNotificationPrefs?.digestMode}>{scopedFormNotificationPrefs?.digestMode === 'daily' ? 'Daily digest' : 'Weekly digest'} — stored, unsupported</option>}
+                  <option value="off">No digest — supported</option>
+                </select>
+                <p className="text-[11px] text-muted-foreground">Daily and weekly digests are not available. Existing values are preserved until you explicitly choose No digest.</p>
               </div>
 
-              {/* Category 4: Delivery */}
-              <div className="space-y-2.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground border-b border-border/50 pb-1">
-                  Delivery Preferences
-                </h3>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  <div className="space-y-1.5">
-                    <Label className="text-xs font-medium text-foreground">Minimum Severity Threshold</Label>
-                    <select
-                      value={formNotificationPrefs?.minimumSeverity || 'info'}
-                      disabled={!notificationPrefs || prefSaving}
-                      onChange={(e) => {
-                        if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({
-                          ...formNotificationPrefs,
-                          minimumSeverity: e.target.value as NotificationPref['minimumSeverity'],
-                        })
-                      }}
-                      className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50"
-                    >
-                      <option value="info">Info (All notifications)</option>
-                      <option value="low">Low severity and above</option>
-                      <option value="medium">Medium severity and above</option>
-                      <option value="high">High severity and above</option>
-                      <option value="critical">Critical only</option>
-                    </select>
-                  </div>
-
-                  <div className="space-y-1.5">
-                    <Label className="text-xs font-medium text-foreground">Delivery Mode</Label>
-                    <select
-                      value={formNotificationPrefs?.digestMode || 'off'}
-                      disabled={!notificationPrefs || prefSaving}
-                      onChange={(e) => {
-                        if (!formNotificationPrefs) return
-                        setFormNotificationPrefs({
-                          ...formNotificationPrefs,
-                          digestMode: e.target.value as NotificationPref['digestMode'],
-                        })
-                      }}
-                      className="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-50"
-                    >
-                      <option value="off">Real-time / Instant delivery</option>
-                      <option value="daily">Daily summary digest</option>
-                      <option value="weekly">Weekly summary digest</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-
-              {/* Actions Footer */}
-              {notificationPrefs && (
+              {scopedNotificationPrefs && (
                 <div className="pt-4 border-t border-border flex items-center justify-end gap-2">
                   <Button
                     type="button"
@@ -3118,7 +3168,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                         <span>Saving…</span>
                       </>
                     ) : (
-                      <span>Save changes</span>
+                      <span>Save my preferences</span>
                     )}
                   </Button>
                 </div>

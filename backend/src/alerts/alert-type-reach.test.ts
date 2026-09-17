@@ -3,6 +3,7 @@ import test from 'node:test'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import { alertTypeForRule } from './finding-pipeline.js'
 import {
+  alertPolicyCapability, alertPreferenceCapabilities, hasProvenAlertProducer,
   dispositionIsConsulted,
   reachOfAlertTypes,
   settingDoesSomething,
@@ -99,5 +100,50 @@ test('BEING FED DOES NOT MAKE AN UNWIRED TYPE CLAIM A WORKING SETTING', () => {
   assert.ok(unwired.length > 0, 'the fixture needs at least one unwired type to be worth running')
   for (const each of unwired) {
     assert.equal(settingDoesSomething(each.alertTypeId, everything), false, each.alertTypeId)
+  }
+})
+
+test('proof, legacy observed input and edit permission are separate', () => {
+  const none = typesWithProducerInput([])
+  assert.deepEqual(alertPolicyCapability('security.suspected_credential_attack', none, true), {
+    intakeWiring: 'MAPPED', producerSupport: 'PROVEN', observedInput: 'NO_OPEN_FINDING', editable: true, reason: 'READY',
+  })
+  assert.equal(settingDoesSomething('security.suspected_credential_attack', none), false)
+  assert.equal(alertPolicyCapability('security.suspected_credential_attack', none, false).reason, 'OWNER_REQUIRED')
+  const access = alertPolicyCapability('security.privileged_directory_change', typesWithProducerInput([FEEDS_ACCESS]), true)
+  assert.deepEqual(access, {
+    intakeWiring: 'MAPPED', producerSupport: 'NOT_ESTABLISHED', observedInput: 'OPEN_FINDING_PRESENT',
+    editable: false, reason: 'PRODUCER_NOT_ESTABLISHED',
+  })
+  assert.equal(ALERT_CATALOG.filter(type => hasProvenAlertProducer(type.id)).length, 1)
+  for (const type of ALERT_CATALOG.filter(type => !dispositionIsConsulted(type.id))) {
+    assert.equal(alertPolicyCapability(type.id, none, true).reason, 'INTAKE_UNMAPPED')
+  }
+})
+
+test('channel capabilities expose safe configuration availability, not secrets or delivery claims', () => {
+  const org = '00000000-0000-4000-8000-000000000051'
+  const owner = '00000000-0000-4000-8000-000000000052'
+  const now = Date.parse('2026-09-16T12:10:00.000Z')
+  const env = {
+    HAWKVIEW_ALERT_EMAIL_MODE: 'controlled', HAWKVIEW_ALERT_EMAIL_ACTIVATION_ID: org,
+    HAWKVIEW_ALERT_EMAIL_ORGANIZATION_ID: org, HAWKVIEW_ALERT_EMAIL_OWNER_USER_ID: owner,
+    HAWKVIEW_ALERT_EMAIL_RECIPIENT_SHA256: 'a'.repeat(64),
+    HAWKVIEW_ALERT_EMAIL_STARTS_AT: '2026-09-16T12:00:00.000Z',
+    HAWKVIEW_ALERT_EMAIL_EXPIRES_AT: '2026-09-16T13:00:00.000Z',
+    HAWKVIEW_ALERT_EMAIL_FROM: 'alerts@example.test', FRONTEND_APP_URL: 'https://console.hawkviewapp.com',
+    SUPABASE_URL: 'https://auth.example.test', SUPABASE_SERVICE_ROLE_KEY: 'synthetic-not-a-real-service-key',
+    RESEND_API_KEY: 're_synthetic_not_a_real_key', RESEND_WEBHOOK_SIGNING_SECRET: 'whsec_c3ludGhldGlj',
+  }
+  assert.deepEqual(alertPreferenceCapabilities(org, owner, {}, now).channels.email,
+    { supported: true, availability: 'DISABLED', reason: 'SENDER_OFF' })
+  assert.equal(alertPreferenceCapabilities(org, owner, { HAWKVIEW_ALERT_EMAIL_MODE: 'controlled' }, now).channels.email.reason, 'CONFIGURATION_UNAVAILABLE')
+  const controlled = alertPreferenceCapabilities(org, owner, env, now)
+  assert.deepEqual(controlled.channels.email, { supported: true, availability: 'CONTROLLED', reason: 'CONTROLLED_TRIAL_ONLY' })
+  assert.equal(alertPreferenceCapabilities(org, org, env, now).channels.email.reason, 'NOT_DESIGNATED_RECIPIENT')
+  assert.equal(alertPreferenceCapabilities(owner, owner, env, now).channels.email.reason, 'NOT_DESIGNATED_RECIPIENT')
+  assert.equal(alertPreferenceCapabilities(org, owner, env, now + 3_600_000).channels.email.reason, 'OUTSIDE_ACTIVATION_WINDOW')
+  for (const value of [org, owner, env.RESEND_API_KEY, env.SUPABASE_SERVICE_ROLE_KEY, env.HAWKVIEW_ALERT_EMAIL_RECIPIENT_SHA256]) {
+    assert.equal(JSON.stringify(controlled).includes(value), false)
   }
 })

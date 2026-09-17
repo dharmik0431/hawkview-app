@@ -4,11 +4,15 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import test, { after, before } from 'node:test'
 import pg from 'pg'
 import { PrismaPg } from '@prisma/adapter-pg'
-import { PrismaClient } from '../generated/prisma/client.js'
+import { PrismaClient, type Prisma } from '../generated/prisma/client.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
 import { AlertDispositionsService } from './alert-dispositions.service.js'
 import { ALERT_CATALOG } from './alert-catalog.js'
 import { dispositionIsConsulted } from './alert-type-reach.js'
+import { NotificationsService } from '../notifications/notifications.service.js'
+import { emailNotificationVisible } from './email-release.js'
+import { EmailReleaseStore, type EmailClaim } from './email-release-store.js'
+import type { SqlRunner } from './pipeline-store.js'
 
 /**
  * THE SETTINGS PAGE'S TWO ENDPOINTS, against a real database.
@@ -57,6 +61,7 @@ interface Fixture {
   identity: { subject: string; email: string }
   organizations: { id: string; slug: string }[]
   userCreated: boolean
+  emailJobs: string[]
 }
 
 const pendingCleanup = new Set<Fixture>()
@@ -75,6 +80,7 @@ function newFixture(): Fixture {
     },
     organizations: [],
     userCreated: false,
+    emailJobs: [],
   }
 }
 
@@ -135,6 +141,13 @@ async function assertOwnedRowsAbsent(client: pg.Client, fixtures: Fixture[]) {
 
 async function cleanupFixture(client: pg.Client, fixture: Fixture) {
   const errors: unknown[] = []
+  // Email jobs have no organization FK. Delete only successful inserts owned by this fixture.
+  for (const messageId of fixture.emailJobs) {
+    try {
+      await client.query('DELETE FROM alert_email_envelopes WHERE message_id = $1', [messageId])
+      await client.query('DELETE FROM alert_send_jobs WHERE message_id = $1', [messageId])
+    } catch (error) { errors.push(error) }
+  }
   // The migrated foreign keys cascade owned dispositions and memberships from organizations.
   for (const organization of fixture.organizations) {
     try {
@@ -371,4 +384,389 @@ test('OWNED FIXTURES REMAIN ISOLATED and cleanup preserves another live fixture'
   assert.ok(gate)
   await assertOwnedRowsAbsent(gate, fixtures)
   // This disposition sentinel checks ownership, not the retained-finding contamination itself.
+})
+
+
+const preferencesFor = (prisma: PrismaClient) => new NotificationsService(prisma as unknown as PrismaService)
+const ROLES = ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN', 'MSP_VIEWER'] as const
+
+test('workspace policy is owner-only; personal preferences are available to every active role', { skip: !RUN || !URL }, async () =>
+  withFixture(async (client, prisma, fixture) => {
+    const policy = serviceFor(prisma)
+    const personal = preferencesFor(prisma)
+    const initial = await personal.preferences(fixture.identity, fixture.org)
+    assert.equal(initial.minimumSeverity, 'info')
+    assert.equal(initial.digestMode, 'off')
+    assert.equal(initial.emailEnabled, false)
+    assert.equal(initial.inAppEnabled, true)
+    for (const role of ROLES) {
+      await client.query('UPDATE memberships SET role = $3::"MembershipRole" WHERE organization_id = $1 AND user_id = $2',
+        [fixture.org, fixture.user, role])
+      const result = await policy.list(fixture.identity, fixture.org)
+      const credential = result.dispositions.find(row => row.alertTypeId === LIVE)!
+      assert.equal(result.canManagePolicy, role === 'MSP_OWNER')
+      assert.equal(credential.mapped, false)
+      assert.equal(credential.capability.observedInput, 'NO_OPEN_FINDING')
+      assert.equal(credential.capability.editable, role === 'MSP_OWNER')
+      if (role === 'MSP_OWNER') await policy.set(fixture.identity, LIVE, { disposition: 'ACT_TODAY' }, fixture.org)
+      else await assert.rejects(policy.set(fixture.identity, LIVE, { disposition: 'RECORD_ONLY' }, fixture.org), /Only MSP_OWNER/)
+      const preference = await personal.updatePreferences(fixture.identity, { organizationId: fixture.org, emailEnabled: true })
+      assert.equal(preference.emailEnabled, true)
+      assert.equal(preference.canManagePolicy, role === 'MSP_OWNER')
+    }
+    await client.query('UPDATE memberships SET role = \'MSP_OWNER\' WHERE organization_id = $1', [fixture.org])
+    for (const type of ALERT_CATALOG.filter(type => type.id !== LIVE)) {
+      await client.query(`INSERT INTO alert_rule_dispositions (id, organization_id, alert_type_id, disposition, updated_at)
+        VALUES (gen_random_uuid(), $1, $2, 'RECORD_ONLY', now())`, [fixture.org, type.id])
+      await assert.rejects(policy.set(fixture.identity, type.id, { disposition: 'ACT_NOW' }, fixture.org), /established producer/)
+      const stored = await prisma.alertRuleDisposition.findUnique({
+        where: { organizationId_alertTypeId: { organizationId: fixture.org, alertTypeId: type.id } },
+      })
+      assert.equal(stored?.disposition, 'RECORD_ONLY', 'unsupported stored policies remain untouched')
+    }
+  }))
+
+test('selected organization is required when ambiguous; inactive and foreign scopes never write', { skip: !RUN || !URL }, async () =>
+  withFixture(async (client, prisma, fixture) => {
+    await insertOrganization(client, fixture, fixture.foreignOrg, fixture.foreignSlug)
+    const policy = serviceFor(prisma)
+    const personal = preferencesFor(prisma)
+    await assert.rejects(personal.preferences(fixture.identity, fixture.foreignOrg), /Workspace is not available/)
+    await assert.rejects(personal.updatePreferences(fixture.identity, { organizationId: fixture.foreignOrg, emailEnabled: true }), /Workspace is not available/)
+    await client.query(`INSERT INTO memberships (id, user_id, organization_id, role, status, updated_at)
+      VALUES (gen_random_uuid(), $1, $2, 'MSP_OWNER', 'ACTIVE', now())`, [fixture.user, fixture.foreignOrg])
+    await assert.rejects(policy.list(fixture.identity), /explicit organizationId/)
+    await assert.rejects(policy.set(fixture.identity, LIVE, { disposition: 'ACT_TODAY' }), /explicit organizationId/)
+    await assert.rejects(personal.preferences(fixture.identity), /explicit organizationId/)
+    await assert.rejects(personal.updatePreferences(fixture.identity, { emailEnabled: true }), /explicit organizationId/)
+    for (const organizationId of [fixture.org, fixture.foreignOrg]) {
+      assert.equal((await policy.list(fixture.identity, organizationId)).organizationId, organizationId)
+      assert.equal((await personal.preferences(fixture.identity, organizationId)).organizationId, organizationId)
+    }
+    await client.query("UPDATE memberships SET status = 'SUSPENDED' WHERE organization_id = $1", [fixture.foreignOrg])
+    for (const role of ROLES) {
+      await client.query('UPDATE memberships SET role = $2::"MembershipRole" WHERE organization_id = $1', [fixture.foreignOrg, role])
+      await assert.rejects(policy.list(fixture.identity, fixture.foreignOrg), /Workspace is not available/)
+      await assert.rejects(personal.preferences(fixture.identity, fixture.foreignOrg), /Workspace is not available/)
+      await assert.rejects(policy.set(fixture.identity, LIVE, { disposition: 'ACT_NOW' }, fixture.foreignOrg), /Workspace is not available/)
+      await assert.rejects(personal.updatePreferences(fixture.identity, { organizationId: fixture.foreignOrg, emailEnabled: true }), /Workspace is not available/)
+    }
+    assert.equal((await personal.preferences(fixture.identity)).organizationId, fixture.org, 'single active legacy scope remains compatible')
+    await client.query("UPDATE memberships SET status = 'ACTIVE' WHERE organization_id = $1", [fixture.foreignOrg])
+    await client.query("UPDATE organizations SET status = 'SUSPENDED' WHERE id = $1", [fixture.foreignOrg])
+    await assert.rejects(policy.list(fixture.identity, fixture.foreignOrg), /Workspace is not available/)
+    await assert.rejects(personal.updatePreferences(fixture.identity, { organizationId: fixture.foreignOrg, emailEnabled: true }), /Workspace is not available/)
+  }))
+
+test('both mutations recheck revocation after context read and immediately before the write', { skip: !RUN || !URL }, async () => {
+  for (const target of ['policy', 'personal']) {
+    for (const revoke of ['membership', 'organization', 'disabled', ...(target === 'policy' ? ['role'] : [])]) {
+      await withFixture(async (client, prisma, fixture) => {
+        await preferencesFor(prisma).preferences(fixture.identity, fixture.org)
+        await serviceFor(prisma).list(fixture.identity, fixture.org)
+        const wrapped = {
+          user: prisma.user,
+          $transaction: async (body: any) => {
+            if (revoke === 'membership') await client.query("UPDATE memberships SET status = 'SUSPENDED' WHERE organization_id = $1", [fixture.org])
+            if (revoke === 'organization') await client.query("UPDATE organizations SET status = 'SUSPENDED' WHERE id = $1", [fixture.org])
+            if (revoke === 'disabled') await client.query('UPDATE users SET disabled_at = now() WHERE id = $1', [fixture.user])
+            if (revoke === 'role') await client.query("UPDATE memberships SET role = 'MSP_ADMIN' WHERE organization_id = $1", [fixture.org])
+            return prisma.$transaction(body)
+          },
+        } as unknown as PrismaService
+        const action = target === 'policy'
+          ? new AlertDispositionsService(wrapped).set(fixture.identity, LIVE, { disposition: 'RECORD_ONLY' }, fixture.org)
+          : new NotificationsService(wrapped).updatePreferences(fixture.identity, { organizationId: fixture.org, emailEnabled: true })
+        await assert.rejects(action, /not available|no longer available/, target + ':' + revoke)
+        assert.equal((await prisma.notificationPreference.findUnique({
+          where: { userId_organizationId: { userId: fixture.user, organizationId: fixture.org } },
+        }))?.emailEnabled, false)
+        assert.equal(await prisma.alertRuleDisposition.count({ where: { organizationId: fixture.org } }), 0)
+      })
+    }
+  }
+})
+
+test('policy read failure propagates instead of presenting healthy default controls', { skip: !RUN || !URL }, async () =>
+  withFixture(async (_client, prisma, fixture) => {
+    const failing = new AlertDispositionsService({
+      user: prisma.user, alertRuleDisposition: prisma.alertRuleDisposition,
+      identityRiskFinding: { findMany: async () => { throw new Error('synthetic input read unavailable') } },
+    } as unknown as PrismaService)
+    await assert.rejects(failing.list(fixture.identity, fixture.org), /input read unavailable/)
+  }))
+
+function runnerForPreferences(client: pg.Client): SqlRunner {
+  const runner: SqlRunner = {
+    query: async (sql, params) => (await client.query(sql, [...params])).rows,
+    execute: async (sql, params) => (await client.query(sql, [...params])).rowCount ?? 0,
+    transaction: async body => {
+      await client.query('BEGIN')
+      try {
+        const result = await body(runner)
+        await client.query('COMMIT')
+        return result
+      } catch (error) { await client.query('ROLLBACK'); throw error }
+    },
+  }
+  return runner
+}
+
+async function emailEligibilityFixture(client: pg.Client, prisma: PrismaClient, fixture: Fixture) {
+  const incidentKey = 'preferences-' + randomUUID()
+  const messageId = 'incident/' + fixture.org + '|' + incidentKey
+  const by = 'preferences/' + randomUUID()
+  const key = 'hv-email-v1-' + randomUUID()
+  await prisma.notificationPreference.create({ data: {
+    userId: fixture.user, organizationId: fixture.org, emailEnabled: true, securityEnabled: true,
+    minimumSeverity: 'info', digestMode: 'off',
+  } })
+  await client.query(`INSERT INTO alert_incidents
+    (id, organization_id, incident_key, alert_type_id, ownership, condition, investigation,
+     ownership_at, condition_at, investigation_at, updated_at)
+    VALUES (gen_random_uuid(), $1, $2, $3, 'UNACKNOWLEDGED', 'ACTIVE', 'OPEN', now(), now(), now(), now())`,
+  [fixture.org, incidentKey, LIVE])
+  const notification = await prisma.notification.create({ data: {
+    organizationId: fixture.org, eventType: 'security.preferences_test', category: 'warning',
+    severity: 'info', title: 'Synthetic preferences fixture', description: 'Synthetic source-only regression',
+    dedupeKey: incidentKey, source: 'preferences-test', alertTypeId: LIVE, incidentKey,
+  } })
+  await client.query(`INSERT INTO alert_send_jobs
+    (id, message_id, idempotency_key, state, attempts_made, max_attempts, not_before_at,
+     claimed_by, claimed_at, claim_expires_at, updated_at)
+    VALUES (gen_random_uuid(), $1, $2, 'CLAIMED', 1, 3, now(), $3, now(), now() + interval '5 minutes', now())`,
+  [messageId, key, by])
+  fixture.emailJobs.push(messageId)
+  await client.query(`INSERT INTO alert_email_envelopes
+    (message_id, activation_id, organization_id, owner_user_id, recipient_hash, starts_at, expires_at,
+     from_address, app_origin, recipient_address, verified_at, payload, idempotency_key)
+    VALUES ($1, $2, $3, $4, $5, now() - interval '1 minute', now() + interval '5 minutes',
+      'alerts@example.test', 'https://console.hawkviewapp.com', $6, now(), '{}', $7)`,
+  [messageId, randomUUID(), fixture.org, fixture.user, 'a'.repeat(64), fixture.identity.email, key])
+  // Only gate methods are invoked. There is no provider, activation, claim, or send call.
+  const claim = { by, config: {}, job: {
+    messageId, idempotencyKey: key, state: 'CLAIMED', attemptsMade: 0, maxAttempts: 3,
+    notBeforeIso: new Date().toISOString(), claim: null, providerId: null,
+  } } as EmailClaim
+  const envelope = { key, recipient: fixture.identity.email, payload: '{}' }
+  const runner = runnerForPreferences(client)
+  const store = new EmailReleaseStore(runner)
+  return {
+    notification, store, claim, envelope,
+    initial: () => emailNotificationVisible(runner, fixture.org, incidentKey, fixture.user),
+    final: () => store.maySend(claim, envelope, LIVE, 'ACT_NOW'),
+  }
+}
+
+test('all 25 severity/threshold pairs run through BOTH actual PostgreSQL email eligibility gates', { skip: !RUN || !URL }, async () =>
+  withFixture(async (client, prisma, fixture) => {
+    const gates = await emailEligibilityFixture(client, prisma, fixture)
+    const severities = ['info', 'low', 'medium', 'high', 'critical']
+    for (const [rank, severity] of severities.entries()) {
+      await client.query('UPDATE notifications SET severity = $2 WHERE id = $1', [gates.notification.id, severity])
+      for (const [minimumRank, minimum] of severities.entries()) {
+        await client.query('UPDATE notification_preferences SET minimum_severity = $3 WHERE organization_id = $1 AND user_id = $2',
+          [fixture.org, fixture.user, minimum])
+        assert.equal(await gates.initial(), rank >= minimumRank, 'initial ' + severity + '/' + minimum)
+        assert.equal(await gates.final(), rank >= minimumRank, 'final ' + severity + '/' + minimum)
+      }
+    }
+    for (const [severity, disposition] of [['high', 'ACT_TODAY'], ['critical', 'ACT_NOW']]) {
+      await serviceFor(prisma).set(fixture.identity, LIVE, { disposition }, fixture.org)
+      await client.query('UPDATE notifications SET severity = $2 WHERE id = $1', [gates.notification.id, severity])
+      await client.query('UPDATE notification_preferences SET minimum_severity = $3 WHERE organization_id = $1 AND user_id = $2',
+        [fixture.org, fixture.user, severity])
+      assert.equal(await gates.initial(), true)
+      assert.equal(await gates.final(), true)
+    }
+    // The disposable-only NULL probe runs serially under the integration gate. Rollback restores
+    // constraints AND fixture values; no migration or application schema is changed.
+    await client.query('BEGIN')
+    try {
+      await client.query('ALTER TABLE notifications ALTER COLUMN severity DROP NOT NULL')
+      await client.query('ALTER TABLE notification_preferences ALTER COLUMN minimum_severity DROP NOT NULL')
+      for (const invalid of [null, 'unknown', 'warning', 'error', 'ACT_NOW']) {
+        for (const badColumn of ['severity', 'minimum']) {
+          await client.query('UPDATE notifications SET severity = $2 WHERE id = $1',
+            [gates.notification.id, badColumn === 'severity' ? invalid : 'critical'])
+          await client.query('UPDATE notification_preferences SET minimum_severity = $3 WHERE organization_id = $1 AND user_id = $2',
+            [fixture.org, fixture.user, badColumn === 'minimum' ? invalid : 'info'])
+          assert.equal(await gates.initial(), false, 'initial invalid ' + badColumn + ':' + invalid)
+          assert.equal(await gates.final(), false, 'final invalid ' + badColumn + ':' + invalid)
+        }
+      }
+    } finally { await client.query('ROLLBACK') }
+    const nullable = await client.query(`SELECT table_name, is_nullable FROM information_schema.columns
+      WHERE table_schema = 'public' AND ((table_name = 'notifications' AND column_name = 'severity')
+        OR (table_name = 'notification_preferences' AND column_name = 'minimum_severity')) ORDER BY table_name`)
+    assert.equal(nullable.rows.length, 2)
+    assert.ok(nullable.rows.every(row => row.is_nullable === 'NO'), 'NULL probe restores both NOT NULL constraints')
+    assert.equal(await gates.final(), true, 'rollback restores a valid, eligible boundary')
+    for (const [deny, restore, params] of [
+      ["UPDATE notification_preferences SET email_enabled = false WHERE organization_id = $1", "UPDATE notification_preferences SET email_enabled = true WHERE organization_id = $1", [fixture.org]],
+      ["UPDATE notification_preferences SET security_enabled = false WHERE organization_id = $1", "UPDATE notification_preferences SET security_enabled = true WHERE organization_id = $1", [fixture.org]],
+      ["UPDATE notification_preferences SET digest_mode = 'daily' WHERE organization_id = $1", "UPDATE notification_preferences SET digest_mode = 'off' WHERE organization_id = $1", [fixture.org]],
+      ["UPDATE users SET disabled_at = now() WHERE id = $1", "UPDATE users SET disabled_at = NULL WHERE id = $1", [fixture.user]],
+      ["UPDATE memberships SET role = 'MSP_ADMIN' WHERE organization_id = $1", "UPDATE memberships SET role = 'MSP_OWNER' WHERE organization_id = $1", [fixture.org]],
+      ["UPDATE memberships SET status = 'SUSPENDED' WHERE organization_id = $1", "UPDATE memberships SET status = 'ACTIVE' WHERE organization_id = $1", [fixture.org]],
+      ["UPDATE organizations SET status = 'SUSPENDED' WHERE id = $1", "UPDATE organizations SET status = 'ACTIVE' WHERE id = $1", [fixture.org]],
+      ["UPDATE alert_rule_dispositions SET disposition = 'RECORD_ONLY' WHERE organization_id = $1", "UPDATE alert_rule_dispositions SET disposition = 'ACT_NOW' WHERE organization_id = $1", [fixture.org]],
+    ] as const) {
+      await client.query(deny, [...params])
+      assert.equal(await gates.final(), false, deny)
+      await client.query(restore, [...params])
+      assert.equal(await gates.final(), true, restore)
+    }
+  }))
+
+test('critical in-app override never bypasses user or organization scope; preferences do not stop publication', { skip: !RUN || !URL }, async () =>
+  withFixture(async (_client, prisma, fixture) => {
+    await withFixture(async (_otherClient, _otherPrisma, other) => {
+      const personal = preferencesFor(prisma)
+      await personal.updatePreferences(fixture.identity, { organizationId: fixture.org, inAppEnabled: false, securityEnabled: false, emailEnabled: false })
+      const make = (organizationId: string, severity: string, recipientUserId?: string) => prisma.notification.create({ data: {
+        organizationId, severity, recipientUserId, eventType: 'security.preferences_test', category: 'warning',
+        title: 'Synthetic visibility fixture', description: 'Synthetic only', dedupeKey: randomUUID(), source: 'preferences-test',
+      } })
+      const ownCritical = await make(fixture.org, 'critical')
+      await make(fixture.org, 'high')
+      await make(fixture.org, 'critical', other.user)
+      await make(other.org, 'critical')
+      const result = await personal.list(fixture.identity)
+      assert.deepEqual(result.items.map(item => item.id), [ownCritical.id])
+      assert.equal(result.total, 1)
+      const published = await personal.publishIncident({
+        organizationId: fixture.org, eventType: 'security.preferences_test', category: 'warning', severity: 'high',
+        title: 'Synthetic collected event', description: 'Delivery preferences are not collection controls',
+        dedupeKey: randomUUID(), source: 'preferences-test',
+      })
+      assert.ok(published, 'OFF does not stop event publication')
+      assert.equal((await personal.list(fixture.identity)).total, 1)
+      await prisma.notificationPreference.update({
+        where: { userId_organizationId: { userId: fixture.user, organizationId: fixture.org } },
+        data: { inAppEnabled: true, securityEnabled: true, minimumSeverity: 'unknown' },
+      })
+      assert.deepEqual((await personal.list(fixture.identity)).items.map(item => item.id), [ownCritical.id])
+      await prisma.membership.update({
+        where: { userId_organizationId: { userId: fixture.user, organizationId: fixture.org } }, data: { status: 'SUSPENDED' },
+      })
+      assert.equal((await personal.list(fixture.identity)).total, 0)
+      await prisma.user.update({ where: { id: fixture.user }, data: { disabledAt: new Date() } })
+      await assert.rejects(personal.list(fixture.identity), /cannot access notifications/)
+    })
+  }))
+
+
+function preferenceBarrier<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(complete => { resolve = complete })
+  return { promise, resolve }
+}
+
+test('authorization locks order concurrent revocation AFTER the actual service mutation', { skip: !RUN || !URL }, async t => {
+  for (const target of ['policy', 'personal'] as const) {
+    for (const revoke of ['membership', 'organization', 'disabled', ...(target === 'policy' ? ['role'] : [])]) {
+      await t.test(target + ':' + revoke, async () => withFixture(async (client, prisma, fixture) => {
+        await preferencesFor(prisma).preferences(fixture.identity, fixture.org)
+        if (target === 'policy') {
+          await serviceFor(prisma).set(fixture.identity, LIVE, { disposition: 'ACT_NOW' }, fixture.org)
+        }
+        const revokerPid = Number((await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid)
+        const locked = preferenceBarrier<Prisma.TransactionClient>()
+        const resume = preferenceBarrier<void>()
+        const wrapped = {
+          user: prisma.user,
+          alertRuleDisposition: prisma.alertRuleDisposition,
+          identityRiskFinding: prisma.identityRiskFinding,
+          $transaction: (body: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
+            prisma.$transaction(async tx => body(new Proxy(tx, {
+              get(database, property, receiver) {
+                if (property === '$queryRaw') {
+                  return async (query: TemplateStringsArray, ...values: unknown[]) => {
+                    // Execute the REAL service authorization SELECT before introducing the barrier.
+                    const rows = await database.$queryRaw(query, ...values)
+                    locked.resolve(database)
+                    await resume.promise
+                    return rows
+                  }
+                }
+                return Reflect.get(database, property, receiver)
+              },
+            })), { maxWait: 5_000, timeout: 15_000 }),
+        } as unknown as PrismaService
+        await client.query('BEGIN')
+        let committed = false
+        let mutation: Promise<unknown> | undefined
+        let revocation: Promise<unknown> | undefined
+        let revocationFinished = false
+        try {
+          await client.query("SET LOCAL lock_timeout = '10s'")
+          mutation = target === 'policy'
+            ? new AlertDispositionsService(wrapped).set(fixture.identity, LIVE, { disposition: 'RECORD_ONLY' }, fixture.org)
+            : new NotificationsService(wrapped).updatePreferences(fixture.identity, { organizationId: fixture.org, emailEnabled: true })
+          const held = await Promise.race([
+            locked.promise,
+            mutation.then(() => { throw new Error('Mutation finished without the authorization barrier.') }),
+          ])
+          const statement = revoke === 'membership'
+            ? ["UPDATE memberships SET status = 'SUSPENDED' WHERE organization_id = $1 AND user_id = $2", [fixture.org, fixture.user]] as const
+            : revoke === 'organization'
+              ? ["UPDATE organizations SET status = 'SUSPENDED' WHERE id = $1", [fixture.org]] as const
+              : revoke === 'disabled'
+                ? ['UPDATE users SET disabled_at = now() WHERE id = $1', [fixture.user]] as const
+                : ["UPDATE memberships SET role = 'MSP_ADMIN' WHERE organization_id = $1 AND user_id = $2", [fixture.org, fixture.user]] as const
+          revocation = client.query(statement[0], [...statement[1]]).then(
+            result => { revocationFinished = true; return result },
+            error => { revocationFinished = true; throw error },
+          )
+          // Handle any failure immediately; the same promise is still asserted below.
+          void revocation.catch(() => {})
+          const deadline = Date.now() + 5_000
+          for (;;) {
+            // Observe from the already-held service connection: exactly two DB connections.
+            // Refresh PostgreSQL's per-transaction statistics snapshot before each observation.
+            await held.$executeRaw`SELECT pg_stat_clear_snapshot()`
+            const activity = await held.$queryRaw<{ wait_event_type: string | null }[]>`
+              SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${revokerPid}`
+            if (activity[0]?.wait_event_type === 'Lock') break
+            assert.equal(revocationFinished, false, 'revocation must not escape the authorization locks')
+            assert.ok(Date.now() < deadline, 'revoker must reach an observable PostgreSQL lock wait')
+            await new Promise(resolve => setTimeout(resolve, 10))
+          }
+          assert.equal(revocationFinished, false, 'revocation is blocked while the service holds FOR SHARE')
+          resume.resolve(undefined)
+          await mutation
+          await revocation
+          // Revocation has acquired its row lock, but has not committed yet. Seeing the changed
+          // setting from this other connection proves the mutation committed BEFORE it unblocked.
+          if (target === 'policy') {
+            const saved = await client.query(
+              'SELECT disposition FROM alert_rule_dispositions WHERE organization_id = $1 AND alert_type_id = $2',
+              [fixture.org, LIVE])
+            assert.equal(saved.rows[0]?.disposition, 'RECORD_ONLY')
+          } else {
+            const saved = await client.query(
+              'SELECT email_enabled FROM notification_preferences WHERE organization_id = $1 AND user_id = $2',
+              [fixture.org, fixture.user])
+            assert.equal(saved.rows[0]?.email_enabled, true)
+          }
+          await client.query('COMMIT')
+          committed = true
+          // Once revocation wins, a subsequent mutation cannot reuse the earlier grant.
+          if (target === 'policy') {
+            await assert.rejects(serviceFor(prisma).set(fixture.identity, LIVE, { disposition: 'ACT_NOW' }, fixture.org),
+              /Only MSP_OWNER|Workspace is not available|cannot access alert settings/)
+          } else {
+            await assert.rejects(preferencesFor(prisma).updatePreferences(fixture.identity, { organizationId: fixture.org, emailEnabled: false }),
+              /Workspace is not available|cannot access notifications/)
+          }
+        } finally {
+          resume.resolve(undefined)
+          await mutation?.catch(() => {})
+          await revocation?.catch(() => {})
+          if (!committed) await client.query('ROLLBACK')
+        }
+      }))
+    }
+  }
 })

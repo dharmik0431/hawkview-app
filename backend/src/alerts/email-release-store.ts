@@ -7,6 +7,7 @@ import { type WithdrawnReason } from './send-worker.js'
 import { type VerifiedRecipient } from './routing-policy.js'
 import { emailPayload, type FrozenEmail, type EmailProviderResult } from './resend-email-transport.js'
 import { lockEmailProvider, reconcileEmailProvider } from './email-delivery-reconciliation.js'
+import { notificationSeveritySql } from '../notifications/notification-severity.js'
 
 type JobRow = {
   message_id: string; idempotency_key: string; state: SendJob['state']; attempts_made: number
@@ -147,8 +148,8 @@ export class EmailReleaseStore {
         AND i.ownership IN ('ACKNOWLEDGED', 'UNACKNOWLEDGED')
         AND (i.condition <> 'CLEARED' OR i.ownership = 'UNACKNOWLEDGED')
         AND EXISTS (SELECT 1 FROM notifications n WHERE n.organization_id = o.id AND n.incident_key = i.incident_key
-          AND (CASE n.severity WHEN 'info' THEN 0 WHEN 'warning' THEN 1 WHEN 'error' THEN 2 WHEN 'critical' THEN 3 END)
-            >= (CASE p.minimum_severity WHEN 'info' THEN 0 WHEN 'warning' THEN 1 WHEN 'error' THEN 2 WHEN 'critical' THEN 3 END))
+          AND ${notificationSeveritySql('n.severity')}
+            >= ${notificationSeveritySql('p.minimum_severity')})
         AND NOT EXISTS (SELECT 1 FROM alert_suppressed_addresses WHERE address = $4)`,
     [claim.job.messageId, claim.by, claim.job.attemptsMade + 1, envelope.recipient, envelope.key, alertTypeId, defaultDisposition])
     return rows.length === 1
