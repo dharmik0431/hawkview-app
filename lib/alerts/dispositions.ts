@@ -1,3 +1,5 @@
+import type { NotificationCapabilities } from '../notifications/preferences-contract.ts'
+
 /**
  * The organisation's answer to "what counts as urgent here".
  *
@@ -39,6 +41,21 @@ export type AlertDispositionRow = {
    */
   mapped: boolean
   /**
+   * Server-evaluated capability. `mapped` is retained for backwards-compatible
+   * diagnostics only and must never enable a write.
+   */
+  capability: {
+    intakeWiring: 'MAPPED' | 'UNMAPPED'
+    producerSupport: 'PROVEN' | 'NOT_ESTABLISHED'
+    observedInput: 'OPEN_FINDING_PRESENT' | 'NO_OPEN_FINDING'
+    editable: boolean
+    reason:
+      | 'READY'
+      | 'OWNER_REQUIRED'
+      | 'PRODUCER_NOT_ESTABLISHED'
+      | 'INTAKE_UNMAPPED'
+  }
+  /**
    * A stored value outside the vocabulary, verbatim, when there is one.
    *
    * Reported rather than defaulted away. `disposition` says what the product
@@ -48,77 +65,6 @@ export type AlertDispositionRow = {
   storedValueIgnored?: string
 }
 
-/* -------------------------------------------------------------------------- */
-/* What each tier actually delivers, as data                                  */
-/* -------------------------------------------------------------------------- */
-
-export type DeliveryChannel = 'PHONE' | 'EMAIL' | 'IN_APP'
-
-export type ChannelState = {
-  channel: DeliveryChannel
-  /**
-   * Whether this channel can carry anything today.
-   *
-   * SMS is deferred: the channel was shelved and the tier kept, so ACT_NOW will
-   * keep meaning "phone" in the routing table long after nothing can dial. A
-   * label derived from the tier's name would promise a call until somebody
-   * remembered to edit a string; a label derived from THIS stops promising it
-   * the moment the channel goes dark.
-   */
-  live: boolean
-  /** Why it cannot carry anything, when it cannot. */
-  deferredBecause?: string
-}
-
-/**
- * The channels behind each tier, and whether each one works.
- *
- * Carried as data rather than derived from the tier name. That is the whole
- * point: the tier is a property of the finding, the channel is a property of
- * how we can reach somebody today, and exactly one of those has changed.
- */
-export type TierChannels = Readonly<
-  Record<AlertDisposition, readonly ChannelState[]>
->
-
-export const TIER_CHANNELS: TierChannels = {
-  ACT_NOW: [
-    {
-      channel: 'PHONE',
-      live: false,
-      deferredBecause:
-        'Phone delivery is not available yet — carrier registration, consent and retention obligations are outstanding.',
-    },
-    { channel: 'EMAIL', live: true },
-    { channel: 'IN_APP', live: true },
-  ],
-  ACT_TODAY: [
-    { channel: 'EMAIL', live: true },
-    { channel: 'IN_APP', live: true },
-  ],
-  /**
-   * NO CHANNEL AT ALL, and that is the ruling rather than a capability gap.
-   *
-   * This said `IN_APP, live: true` while the pipeline wrote the notification
-   * row and withheld only the email. The ruling is: *retain evidence and
-   * inspectable history, but suppress active notifications, unread bell counts,
-   * and email.* The pipeline now writes no notification row, so there is no
-   * in-app delivery to declare.
-   *
-   * EMPTY RATHER THAN DEFERRED. A deferred channel is one we intend to use and
-   * cannot yet — it earns the "not available yet" sentence. Record only is a
-   * choice the MSP made, and describing it as a delivery that has not arrived
-   * would tell them to expect something.
-   */
-  RECORD_ONLY: [],
-}
-
-const CHANNEL_NAMES: Record<DeliveryChannel, string> = {
-  PHONE: 'phone',
-  EMAIL: 'email',
-  IN_APP: 'in-app',
-}
-
 export const DISPOSITION_LABELS: Record<AlertDisposition, string> = {
   ACT_NOW: 'Act now',
   ACT_TODAY: 'Act today',
@@ -126,10 +72,8 @@ export const DISPOSITION_LABELS: Record<AlertDisposition, string> = {
 }
 
 export type DeliveryDescription = {
-  /** What an MSP gets today. Never mentions a channel that is not live. */
   today: string
-  /** What is not available and why. Empty when nothing is deferred. */
-  deferred: string[]
+  limitation: string | null
 }
 
 /**
@@ -141,64 +85,94 @@ export type DeliveryDescription = {
  */
 export function deliveryDescription(
   disposition: AlertDisposition,
-  /**
-   * Whether any detector currently feeds this alert type.
-   *
-   * REQUIRED, NOT DEFAULTED. Rendering the row showed the reason: an unmapped
-   * row carried the badge "Nothing feeds this yet" and the sentence "Delivered
-   * by email and in-app" on the same card. Each was true on its own and the
-   * pair was a contradiction -- the delivery sentence is about what happens
-   * when the type fires, and for an unmapped type nothing does. A default of
-   * true would have let a caller reproduce that by saying nothing; making it
-   * required means the compiler asks every caller which case they are in.
-   */
-  mapped: boolean,
-  // Taken as a parameter rather than read from the module so the derivation can
-  // be demonstrated against a table where a channel is dark, without mutating
-  // shared state to do it. A test that had to reach in and change the real
-  // table would be testing its own mutation as much as the function.
-  channelTable: TierChannels = TIER_CHANNELS
+  capabilities: NotificationCapabilities
 ): DeliveryDescription {
-  const channels = channelTable[disposition]
-  const live = channels.filter((entry) => entry.live)
-  const deferred = channels.filter((entry) => !entry.live)
-
-  const names = live.map((entry) => CHANNEL_NAMES[entry.channel])
-  const joined =
-    names.length === 0
-      ? null
-      : names.length === 1
-        ? names[0]
-        : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1]
-
-  // The label keeps its capital. "marked act now" read as a broken sentence on
-  // the assembled screen; "marked Act now" reads as what it is, the name of the
-  // tier the reader just chose.
   const label = DISPOSITION_LABELS[disposition]
-  // RECORD_ONLY FIRST, because its emptiness is a decision and not a dark
-  // channel. Falling through to the `joined === null` branch would tell the
-  // reader the tier is "recorded and visible here", which stopped being true
-  // when the pipeline stopped writing the notification row.
-  const today =
-    disposition === 'RECORD_ONLY'
-      ? mapped
-        ? 'Recorded with the risky user, where you can still look it up. No notification, no unread count, no email.'
-        : 'Nothing raises this alert type today. If something did, it would be recorded with the risky user — no notification, no unread count, no email.'
-      : joined === null
-        ? mapped
-          ? 'Nothing can be delivered for this tier today. It is recorded and visible here only.'
-          : 'Nothing feeds this alert type, and nothing can be delivered for this tier today either.'
-        : mapped
-          ? `Delivered by ${joined}, marked ${label}.`
-          : `Nothing raises this alert type today. If something did, it would be delivered by ${joined}, marked ${label}.`
+  if (disposition === 'RECORD_ONLY') {
+    return {
+      today:
+        'Evidence stays with the risky user. No notification, unread count, or email is created.',
+      limitation: null,
+    }
+  }
 
+  const email = capabilities.channels.email
+  const limitation =
+    email.availability === 'DISABLED'
+      ? 'Email sending is currently off. A saved personal email opt-in does not activate it.'
+      : email.availability === 'CONTROLLED'
+        ? 'Email delivery is controlled separately by recipient eligibility and release status.'
+        : 'Email delivery is unavailable. This policy does not enable it.'
   return {
-    today,
-    deferred: deferred.map(
-      (entry) =>
-        entry.deferredBecause ??
-        `${CHANNEL_NAMES[entry.channel]} delivery is not available yet.`
-    ),
+    today: `Future alerts are marked ${label}. In-app delivery is available.`,
+    limitation,
+  }
+}
+
+export function rowDeliveryDescription(
+  row: AlertDispositionRow,
+  capabilities: NotificationCapabilities
+): DeliveryDescription {
+  if (
+    row.capability.intakeWiring !== 'MAPPED' ||
+    row.capability.producerSupport !== 'PROVEN'
+  ) {
+    return {
+      today:
+        'This saved urgency is inactive because HawkView has not established a working producer and intake path for this alert type.',
+      limitation: 'No notification delivery is promised for this alert type.',
+    }
+  }
+  return deliveryDescription(row.disposition, capabilities)
+}
+
+export function canEditDisposition(
+  row: AlertDispositionRow,
+  canManagePolicy: boolean
+) {
+  return (
+    canManagePolicy &&
+    row.capability.editable &&
+    row.capability.reason === 'READY' &&
+    row.capability.intakeWiring === 'MAPPED' &&
+    row.capability.producerSupport === 'PROVEN'
+  )
+}
+
+export function capabilityCopy(row: AlertDispositionRow): {
+  label: string
+  detail: string
+  tone: 'ready' | 'quiet' | 'warning'
+} {
+  if (row.capability.reason === 'READY') {
+    return {
+      label: 'Configurable',
+      detail:
+        row.capability.observedInput === 'OPEN_FINDING_PRESENT'
+          ? 'A proven producer is wired to intake and currently has open findings.'
+          : 'A proven producer is wired to intake. No open finding is present; the policy is still configurable.',
+      tone: 'ready',
+    }
+  }
+  if (row.capability.reason === 'OWNER_REQUIRED') {
+    return {
+      label: 'Owner required',
+      detail: 'Only an MSP owner can change this workspace policy.',
+      tone: 'warning',
+    }
+  }
+  if (row.capability.reason === 'INTAKE_UNMAPPED') {
+    return {
+      label: 'Not available',
+      detail: 'No intake mapping exists for this alert type, so changing it would have no effect.',
+      tone: 'quiet',
+    }
+  }
+  return {
+    label: 'Not available',
+    detail:
+      'Intake wiring exists, but a producer for this alert type has not been established. The policy is read-only.',
+    tone: 'quiet',
   }
 }
 

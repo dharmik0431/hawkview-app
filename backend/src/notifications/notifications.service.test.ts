@@ -50,3 +50,110 @@ test('notification operational logs never include hostile caller event types on 
     assert.equal('eventType' in event, false)
   }
 })
+
+const preferenceOrg = '00000000-0000-4000-8000-000000000041'
+const preferenceOtherOrg = '00000000-0000-4000-8000-000000000042'
+const preferenceUser = '00000000-0000-4000-8000-000000000043'
+const preferenceIdentity = { subject: 'auth|preferences-unit', email: 'preferences@example.test' }
+
+function preferenceHarness() {
+  const record: Record<string, unknown> = {
+    id: '00000000-0000-4000-8000-000000000044', userId: preferenceUser, organizationId: preferenceOrg,
+    securityEnabled: true, connectionEnabled: true, synchronizationEnabled: true,
+    accountEnabled: true, inAppEnabled: true, emailEnabled: false, minimumSeverity: 'info', digestMode: 'off',
+  }
+  const state = {
+    disabledAt: null as Date | null, memberships: [{ organizationId: preferenceOrg, role: 'MSP_VIEWER' }],
+    eligible: true, writes: 0, failRead: false, beforeWrite: () => {},
+  }
+  const prisma: any = {
+    user: { findUnique: async () => ({ id: preferenceUser, disabledAt: state.disabledAt, memberships: state.memberships }) },
+    notificationPreference: {
+      findUnique: async () => ({ ...record }),
+      upsert: async ({ where }: any) => {
+        if (state.failRead) throw new Error('preference read unavailable')
+        assert.deepEqual(where, { userId_organizationId: { userId: preferenceUser, organizationId: preferenceOrg } })
+        return { ...record }
+      },
+      update: async ({ where, data }: any) => {
+        assert.deepEqual(where, { userId_organizationId: { userId: preferenceUser, organizationId: preferenceOrg } })
+        state.writes++
+        Object.assign(record, data)
+        return { ...record }
+      },
+    },
+    $queryRaw: async () => state.eligible ? [{ id: preferenceUser, role: state.memberships[0].role }] : [],
+    $transaction: async (body: (tx: any) => unknown) => { state.beforeWrite(); return body(prisma) },
+  }
+  return { service: new NotificationsService(prisma), record, state }
+}
+
+test('personal GET retains defaults and separates personal access from workspace policy authority', async () => {
+  const { service, record } = preferenceHarness()
+  const response = await service.preferences(preferenceIdentity, preferenceOrg)
+  for (const field of Object.keys(record)) assert.equal((response as any)[field], record[field])
+  assert.equal(response.canManagePolicy, false)
+  assert.equal(response.capabilities.readState, 'AVAILABLE')
+  assert.deepEqual(response.capabilities.supportedDigestModes, ['off'])
+})
+
+test('personal preferences reject malformed, foreign and ambiguous organization scope', async () => {
+  const { service, state } = preferenceHarness()
+  for (const organizationId of ['', 'not-a-uuid', null, 1, []]) {
+    await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId, emailEnabled: true }), /valid organizationId/)
+  }
+  await assert.rejects(service.preferences(preferenceIdentity, preferenceOtherOrg), /Workspace is not available/)
+  state.memberships.push({ organizationId: preferenceOtherOrg, role: 'MSP_ADMIN' })
+  await assert.rejects(service.preferences(preferenceIdentity), /explicit organizationId/)
+  await assert.rejects(service.updatePreferences(preferenceIdentity, { emailEnabled: true }), /explicit organizationId/)
+  assert.equal(state.writes, 0)
+  state.memberships.pop()
+  assert.equal((await service.updatePreferences(preferenceIdentity, { emailEnabled: true })).organizationId, preferenceOrg)
+})
+
+test('personal PATCH rejects malformed boolean and minimum severity fields', async () => {
+  const { service, state } = preferenceHarness()
+  for (const field of ['securityEnabled', 'connectionEnabled', 'synchronizationEnabled', 'accountEnabled', 'inAppEnabled', 'emailEnabled']) {
+    await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, [field]: 'true' }), /must be a boolean/)
+  }
+  for (const minimumSeverity of ['warning', 'error', 'ACT_NOW', '', null, 2]) {
+    await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, minimumSeverity }), /recognized notification severity/)
+  }
+  assert.equal(state.writes, 0)
+  for (const minimumSeverity of ['info', 'low', 'medium', 'high', 'critical']) {
+    assert.equal((await service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, minimumSeverity })).minimumSeverity, minimumSeverity)
+  }
+})
+
+test('unsupported stored digests survive read and unrelated write, but cannot be newly selected', async () => {
+  for (const digest of ['daily', 'weekly']) {
+    const { service, record } = preferenceHarness()
+    record.digestMode = digest
+    assert.equal((await service.preferences(preferenceIdentity, preferenceOrg)).digestMode, digest)
+    assert.equal((await service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, emailEnabled: false })).digestMode, digest)
+    assert.equal((await service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, digestMode: digest })).digestMode, digest)
+    await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, digestMode: digest === 'daily' ? 'weekly' : 'daily' }), /Only off/)
+    assert.equal((await service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, digestMode: 'off' })).digestMode, 'off')
+    await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, digestMode: digest }), /Only off/)
+  }
+})
+
+test('personal write rechecks authorization and cannot target another user', async () => {
+  const { service, state, record } = preferenceHarness()
+  await service.preferences(preferenceIdentity, preferenceOrg)
+  state.beforeWrite = () => { state.eligible = false }
+  await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, emailEnabled: true }), /Workspace is not available/)
+  assert.equal(state.writes, 0)
+  assert.equal(record.emailEnabled, false)
+  state.beforeWrite = () => { state.eligible = true }
+  const result = await service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, userId: 'someone-else', emailEnabled: true })
+  assert.equal(result.userId, preferenceUser)
+  state.disabledAt = new Date()
+  await assert.rejects(service.updatePreferences(preferenceIdentity, { organizationId: preferenceOrg, emailEnabled: false }), /cannot access notifications/)
+})
+
+test('preference read failures never turn into default-looking available settings', async () => {
+  const { service, state } = preferenceHarness()
+  state.failRead = true
+  await assert.rejects(service.preferences(preferenceIdentity, preferenceOrg), /read unavailable/)
+})

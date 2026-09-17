@@ -20,12 +20,15 @@ import {
 } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import {
+  canEditDisposition,
+  capabilityCopy,
   DISPOSITION_LABELS,
   SAVED_APPLIES_FROM,
-  deliveryDescription,
+  rowDeliveryDescription,
   type AlertDisposition,
   type AlertDispositionRow,
 } from '@/lib/alerts/dispositions'
+import type { NotificationCapabilities } from '@/lib/notifications/preferences-contract'
 
 const TIERS: AlertDisposition[] = ['ACT_NOW', 'ACT_TODAY', 'RECORD_ONLY']
 
@@ -41,12 +44,18 @@ export function DispositionRow({
   row,
   save,
   onChoose,
+  canManagePolicy,
+  policyCapabilities,
 }: {
   row: AlertDispositionRow
   save: SaveState
   onChoose: (row: AlertDispositionRow, next: AlertDisposition) => void
+  canManagePolicy: boolean
+  policyCapabilities: NotificationCapabilities
 }) {
-  const delivery = deliveryDescription(row.disposition, row.mapped)
+  const delivery = rowDeliveryDescription(row, policyCapabilities)
+  const capability = capabilityCopy(row)
+  const editable = canEditDisposition(row, canManagePolicy)
 
   return (
     <Card>
@@ -58,15 +67,18 @@ export function DispositionRow({
               {row.category} &middot; {row.alertTypeId}
             </CardDescription>
           </div>
-          {!row.mapped && (
-            // SHOWN, NOT HIDDEN. Several catalogue types have no detector
-            // feeding them, and an MSP who sets a disposition on one of those
-            // has configured something that cannot fire. Finding that out by
-            // never being alerted is the expensive way.
-            <Badge variant="warning" className="shrink-0 text-[10px]">
-              Nothing feeds this yet
-            </Badge>
-          )}
+          <Badge
+            variant={
+              capability.tone === 'ready'
+                ? 'success'
+                : capability.tone === 'warning'
+                  ? 'warning'
+                  : 'secondary'
+            }
+            className="shrink-0 text-[10px]"
+          >
+            {capability.label}
+          </Badge>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -79,8 +91,9 @@ export function DispositionRow({
                 type="button"
                 size="sm"
                 variant={selected ? 'default' : 'outline'}
-                disabled={save.kind === 'SAVING'}
+                disabled={!editable || save.kind === 'SAVING'}
                 aria-pressed={selected}
+                aria-describedby={`alert-capability-${row.alertTypeId}`}
                 onClick={() => onChoose(row, tier)}
               >
                 {DISPOSITION_LABELS[tier]}
@@ -102,6 +115,13 @@ export function DispositionRow({
           })}
         </div>
 
+        <p
+          id={`alert-capability-${row.alertTypeId}`}
+          className="text-xs text-muted-foreground"
+        >
+          {capability.detail}
+        </p>
+
         {row.storedValueIgnored && (
           <p className="flex items-start gap-1.5 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
             <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
@@ -119,13 +139,11 @@ export function DispositionRow({
         )}
         <div className="space-y-1 text-xs text-muted-foreground">
           <p>{delivery.today}</p>
-          {delivery.deferred.map((sentence) => (
-            // What is deferred is stated where the claim was made, not on a
-            // help page nobody opens.
-            <p key={sentence} className="text-amber-700 dark:text-amber-400">
-              {sentence}
+          {delivery.limitation && (
+            <p className="text-amber-700 dark:text-amber-400">
+              {delivery.limitation}
             </p>
-          ))}
+          )}
           {/* The departure is already legible: the "recommended" chip sits on
               the catalogue's tier and a different one is selected. A sentence
               repeating it two inches below was the same fact twice, and on the

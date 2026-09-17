@@ -8,6 +8,23 @@ import { type VerifiedRecipient } from './routing-policy.js'
 import { alertType } from './alert-catalog.js'
 import { sendResendEmail } from './resend-email-transport.js'
 import { emailDeadline } from './email-deadline.js'
+import { notificationSeveritySql } from '../notifications/notification-severity.js'
+import type { SqlRunner } from './pipeline-store.js'
+
+/** The initial visibility gate, also exercised directly against disposable PostgreSQL. */
+export async function emailNotificationVisible(
+  runner: SqlRunner, organizationId: string, incidentKey: string, ownerUserId: string,
+): Promise<boolean> {
+  const rows = await runner.query([
+    'SELECT 1 FROM notifications n',
+    'JOIN notification_preferences p ON p.organization_id = n.organization_id AND p.user_id = $3::uuid',
+    'WHERE n.organization_id = $1::uuid AND n.incident_key = $2',
+    "AND p.email_enabled = true AND p.security_enabled = true AND p.digest_mode = 'off'",
+    `AND ${notificationSeveritySql('n.severity')} >= ${notificationSeveritySql('p.minimum_severity')}`,
+    'LIMIT 1',
+  ].join(' '), [organizationId, incidentKey, ownerUserId])
+  return rows.length > 0
+}
 
 export interface EmailRunReport {
   status: 'DISABLED' | 'INVALID_CONFIGURATION' | 'OUTSIDE_ACTIVATION_WINDOW' | 'NO_BUDGET'
@@ -62,16 +79,8 @@ export async function runEmailRelease(options: {
       },
       visibility: async ref => {
         budget.remaining()
-        const rows = await options.store.runner.query([
-          'SELECT 1 FROM notifications n',
-          'JOIN notification_preferences p ON p.organization_id = n.organization_id AND p.user_id = $3::uuid',
-          'WHERE n.organization_id = $1::uuid AND n.incident_key = $2',
-          "AND p.email_enabled = true AND p.security_enabled = true AND p.digest_mode = 'off'",
-          "AND (CASE n.severity WHEN 'info' THEN 0 WHEN 'warning' THEN 1 WHEN 'error' THEN 2 WHEN 'critical' THEN 3 END)",
-          ">= (CASE p.minimum_severity WHEN 'info' THEN 0 WHEN 'warning' THEN 1 WHEN 'error' THEN 2 WHEN 'critical' THEN 3 END)",
-          'LIMIT 1',
-        ].join(' '), [ref.organizationId, ref.incidentKey, config.ownerUserId])
-        return rows.length ? 'SURFACED' : 'CONTENT_UNAVAILABLE'
+        return await emailNotificationVisible(options.store.runner, ref.organizationId, ref.incidentKey, config.ownerUserId)
+          ? 'SURFACED' : 'CONTENT_UNAVAILABLE'
       },
     })
     budget.remaining()

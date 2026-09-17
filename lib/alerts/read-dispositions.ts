@@ -22,6 +22,10 @@ import {
   type AlertDispositionRow,
   type Emptiness,
 } from './dispositions.ts'
+import {
+  readNotificationCapabilities,
+  type NotificationCapabilities,
+} from '../notifications/preferences-contract.ts'
 
 const DISPOSITIONS: readonly AlertDisposition[] = [
   'ACT_NOW',
@@ -39,6 +43,9 @@ const DISPOSITIONS: readonly AlertDisposition[] = [
 export type DispositionsRead =
   | {
       outcome: 'LOADED'
+      organizationId: string
+      canManagePolicy: boolean
+      capabilities: NotificationCapabilities
       rows: AlertDispositionRow[]
       /**
        * Stored settings whose alert type id the catalogue does not declare.
@@ -74,6 +81,57 @@ function text(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null
 }
 
+function readCapability(
+  value: unknown
+): AlertDispositionRow['capability'] | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return null
+  }
+  const capability = value as Record<string, unknown>
+  if (!['MAPPED', 'UNMAPPED'].includes(capability.intakeWiring as string)) {
+    return null
+  }
+  if (!['PROVEN', 'NOT_ESTABLISHED'].includes(capability.producerSupport as string)) {
+    return null
+  }
+  if (
+    !['OPEN_FINDING_PRESENT', 'NO_OPEN_FINDING'].includes(
+      capability.observedInput as string
+    )
+  ) {
+    return null
+  }
+  if (typeof capability.editable !== 'boolean') return null
+  if (
+    ![
+      'READY',
+      'OWNER_REQUIRED',
+      'PRODUCER_NOT_ESTABLISHED',
+      'INTAKE_UNMAPPED',
+    ].includes(capability.reason as string)
+  ) {
+    return null
+  }
+  if (
+    (capability.intakeWiring !== 'MAPPED' ||
+      capability.producerSupport !== 'PROVEN') &&
+    capability.editable
+  ) {
+    return null
+  }
+  const expectedReason =
+    capability.intakeWiring === 'UNMAPPED'
+      ? 'INTAKE_UNMAPPED'
+      : capability.producerSupport === 'NOT_ESTABLISHED'
+        ? 'PRODUCER_NOT_ESTABLISHED'
+        : capability.editable
+          ? 'READY'
+          : 'OWNER_REQUIRED'
+  if (capability.reason !== expectedReason) return null
+
+  return capability as AlertDispositionRow['capability']
+}
+
 /**
  * One row, or null when it cannot be read as a setting.
  *
@@ -100,6 +158,8 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
   if (!isDisposition(row.disposition)) return null
   if (!isDisposition(row.catalogueSeverity)) return null
   if (typeof row.mapped !== 'boolean') return null
+  const capability = readCapability(row.capability)
+  if (!capability) return null
 
   // A STORED VALUE THE BACKEND COULD NOT READ, CARRIED RATHER THAN DROPPED.
   // The endpoint reports it deliberately: `disposition` already says what the
@@ -115,6 +175,7 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
     catalogueSeverity: row.catalogueSeverity,
     disposition: row.disposition,
     mapped: row.mapped,
+    capability,
     ...(storedValueIgnored ? { storedValueIgnored } : {}),
   }
 }
@@ -126,36 +187,34 @@ export function readDispositionRow(value: unknown): AlertDispositionRow | null {
  * body that is not that shape is UNREADABLE, not an empty organisation.
  */
 export function readDispositions(body: unknown): DispositionsRead {
-  // THE KEY IS `dispositions`, WHICH I LEARNED BY READING THE ENDPOINT RATHER
-  // THAN BY ASSUMING. This accepted a bare array or `{ items }` -- both guesses,
-  // written before the endpoint existed. The real response is
-  // `{ organizationId, dispositions }`, so the page would have reported the
-  // live API as UNREADABLE and shown "no request has succeeded" over a perfectly
-  // good response. `items` is kept because nothing costs less and a reader that
-  // accepts more shapes is not the risk here; a reader that accepts FEWER than
-  // the producer sends is.
-  const fromKey = (key: string): unknown[] | null => {
-    if (typeof body !== 'object' || body === null) return null
-    const value = (body as Record<string, unknown>)[key]
-    return Array.isArray(value) ? (value as unknown[]) : null
-  }
-  const container = Array.isArray(body)
-    ? body
-    : fromKey('dispositions') ?? fromKey('items')
-
-  if (container === null) {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     return {
       outcome: 'UNREADABLE',
-      because: 'The alert settings response did not contain a list of alert types.',
+      because: 'The alert settings response was not a readable workspace result.',
+    }
+  }
+  const envelope = body as Record<string, unknown>
+  const organizationId = text(envelope.organizationId)
+  const capabilities = readNotificationCapabilities(envelope.capabilities)
+  const container = Array.isArray(envelope.dispositions)
+    ? envelope.dispositions
+    : null
+  if (
+    !organizationId ||
+    typeof envelope.canManagePolicy !== 'boolean' ||
+    !capabilities ||
+    container === null
+  ) {
+    return {
+      outcome: 'UNREADABLE',
+      because:
+        'HawkView could not verify this workspace policy capability, so changes are unavailable.',
     }
   }
 
   // Read from the envelope rather than the array, because that is where the
   // endpoint puts them -- they have no row.
-  const unrecognisedKeys =
-    typeof body === 'object' && body !== null
-      ? ((body as Record<string, unknown>).unrecognisedKeys ?? [])
-      : []
+  const unrecognisedKeys = envelope.unrecognisedKeys ?? []
   const keys = Array.isArray(unrecognisedKeys)
     ? unrecognisedKeys
         .map((each) => (typeof each === 'string' && each.trim() ? each : null))
@@ -168,6 +227,23 @@ export function readDispositions(body: unknown): DispositionsRead {
     if (row) rows.push(row)
   }
   const discarded = container.length - rows.length
+
+  const manageabilityMismatch = rows.some((row) => {
+    const supported =
+      row.capability.intakeWiring === 'MAPPED' &&
+      row.capability.producerSupport === 'PROVEN'
+    if (!supported) return row.capability.editable
+    return envelope.canManagePolicy
+      ? !row.capability.editable || row.capability.reason !== 'READY'
+      : row.capability.editable || row.capability.reason !== 'OWNER_REQUIRED'
+  })
+  if (manageabilityMismatch) {
+    return {
+      outcome: 'UNREADABLE',
+      because:
+        'HawkView could not verify that workspace authorization matched the alert policy controls.',
+    }
+  }
 
   // A RESPONSE WHOSE EVERY ROW WAS DISCARDED IS NOT AN EMPTY ORGANISATION.
   // Without this the two are indistinguishable downstream: both arrive as a
@@ -186,7 +262,15 @@ export function readDispositions(body: unknown): DispositionsRead {
     }
   }
 
-  return { outcome: 'LOADED', rows, discarded, unrecognisedKeys: keys }
+  return {
+    outcome: 'LOADED',
+    organizationId,
+    canManagePolicy: envelope.canManagePolicy,
+    capabilities,
+    rows,
+    discarded,
+    unrecognisedKeys: keys,
+  }
 }
 
 /**

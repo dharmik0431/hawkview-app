@@ -1,5 +1,63 @@
 import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
 import { alertTypeForRule, TYPE_FOR_GUIDANCE } from './finding-pipeline.js'
+import { emailReleaseConfiguration } from './email-release-config.js'
+
+/** Explicit source-backed proof, not a claim inferred from mappings or stored findings. */
+export const hasProvenAlertProducer = (alertTypeId: string): boolean =>
+  alertTypeId === 'security.suspected_credential_attack'
+
+export interface AlertPolicyCapability {
+  intakeWiring: 'MAPPED' | 'UNMAPPED'
+  producerSupport: 'PROVEN' | 'NOT_ESTABLISHED'
+  observedInput: 'OPEN_FINDING_PRESENT' | 'NO_OPEN_FINDING'
+  editable: boolean
+  reason: 'READY' | 'OWNER_REQUIRED' | 'PRODUCER_NOT_ESTABLISHED' | 'INTAKE_UNMAPPED'
+}
+
+export function alertPolicyCapability(
+  alertTypeId: string, fedTypes: ReadonlySet<AlertTypeId>, canManagePolicy: boolean,
+): AlertPolicyCapability {
+  const mapped = dispositionIsConsulted(alertTypeId)
+  const proven = hasProvenAlertProducer(alertTypeId)
+  return {
+    intakeWiring: mapped ? 'MAPPED' : 'UNMAPPED',
+    producerSupport: proven ? 'PROVEN' : 'NOT_ESTABLISHED',
+    observedInput: fedTypes.has(alertTypeId as AlertTypeId) ? 'OPEN_FINDING_PRESENT' : 'NO_OPEN_FINDING',
+    editable: mapped && proven && canManagePolicy,
+    reason: !mapped ? 'INTAKE_UNMAPPED' : !proven ? 'PRODUCER_NOT_ESTABLISHED'
+      : !canManagePolicy ? 'OWNER_REQUIRED' : 'READY',
+  }
+}
+
+/** Configuration availability only; never serialize the server configuration or promise delivery. */
+export function alertPreferenceCapabilities(
+  organizationId: string, userId: string,
+  env: Readonly<Record<string, string | undefined>> = process.env, now = Date.now(),
+) {
+  const configuration = emailReleaseConfiguration(env, now)
+  let availability: 'DISABLED' | 'CONTROLLED' | 'UNAVAILABLE' = 'UNAVAILABLE'
+  let reason: 'SENDER_OFF' | 'CONTROLLED_TRIAL_ONLY' | 'CONFIGURATION_UNAVAILABLE'
+    | 'OUTSIDE_ACTIVATION_WINDOW' | 'NOT_DESIGNATED_RECIPIENT'
+  if (!configuration.enabled) {
+    availability = configuration.reason === 'DISABLED' ? 'DISABLED' : 'UNAVAILABLE'
+    reason = configuration.reason === 'DISABLED' ? 'SENDER_OFF'
+      : configuration.reason === 'OUTSIDE_ACTIVATION_WINDOW' ? 'OUTSIDE_ACTIVATION_WINDOW'
+        : 'CONFIGURATION_UNAVAILABLE'
+  } else if (configuration.config.organizationId !== organizationId || configuration.config.ownerUserId !== userId) {
+    reason = 'NOT_DESIGNATED_RECIPIENT'
+  } else {
+    availability = 'CONTROLLED'
+    reason = 'CONTROLLED_TRIAL_ONLY'
+  }
+  return {
+    version: 1 as const, readState: 'AVAILABLE' as const, policyWriterRole: 'MSP_OWNER' as const,
+    supportedDigestModes: ['off'] as const,
+    channels: {
+      inApp: { supported: true as const, availability: 'AVAILABLE' as const },
+      email: { supported: true as const, availability, reason },
+    },
+  }
+}
 
 /**
  * FOR EACH ALERT TYPE: DOES A SETTING FOR IT DO ANYTHING?

@@ -1,253 +1,312 @@
 'use client'
 
-/**
- * What this organisation treats as urgent.
- *
- * ORG-LEVEL, NOT PER-PERSON, and the distinction is the reason this page exists
- * separately from notification preferences. Two people in one MSP must not
- * disagree about whether a privileged role grant is worth waking somebody for,
- * so the tier belongs to the organisation; the channel and the quiet hours
- * belong to the person. Nothing here writes a user preference.
- *
- * Everything honesty-shaped on this page lives in lib/alerts, tested there:
- * which empty state a read earns, what a tier actually delivers today, and when
- * a saved change starts to matter. This file renders those answers and does not
- * recompute any of them.
- */
-
-import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, BellRing, Loader2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { AlertTriangle, BellRing, Loader2, RefreshCcw, Shield } from 'lucide-react'
+import { useAuth } from '@/components/providers/auth-provider'
+import { DispositionRow, type SaveState } from '@/components/alerts/disposition-row'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { apiClient } from '@/lib/api/client'
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
-import {
+  canEditDisposition,
   type AlertDisposition,
   type AlertDispositionRow,
 } from '@/lib/alerts/dispositions'
+import { readDispositions } from '@/lib/alerts/read-dispositions'
 import { settingsView, type SettingsPhase } from '@/lib/alerts/settings-view'
 import {
-  DispositionRow,
-  type SaveState,
-} from '@/components/alerts/disposition-row'
-import {
-  readDispositions,
-  type DispositionsRead,
-} from '@/lib/alerts/read-dispositions'
+  NotificationScopedRequestGuard,
+  notificationRequestScope,
+  notificationRequestScopeKey,
+  type NotificationRequestScope,
+} from '@/lib/notifications/scoped-request-guard'
 
-/**
- * Whether a read has completed at all.
- *
- * Kept beside the read rather than inferred from `rows.length`, for the reason
- * the notification bell had to learn twice: before the first response, an empty
- * list is not a result. LOADING here means "no answer yet" and must never
- * render as "nothing is configured".
- */
-// The state union lives with settingsView, which is declared against it. Two
-// copies of it here and there could drift, and the page would then be holding a
-// shape the decision function does not accept.
-
+type OrganizationOption = { id: string; name: string }
 
 export default function AlertSettingsPage() {
+  const { session, isLoading: authLoading } = useAuth()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const organizations = useMemo<OrganizationOption[]>(() => {
+    const byId = new Map<string, OrganizationOption>()
+    for (const membership of session?.user.memberships ?? []) {
+      if (membership.status !== 'ACTIVE' || membership.organization.status !== 'ACTIVE') continue
+      if (!byId.has(membership.organization.id)) {
+        byId.set(membership.organization.id, {
+          id: membership.organization.id,
+          name: membership.organization.name,
+        })
+      }
+    }
+    return Array.from(byId.values()).sort((a, b) => a.name.localeCompare(b.name))
+  }, [session])
+  const requested = searchParams.get('organizationId')
+  const selected = requested
+    ? organizations.find((organization) => organization.id === requested) ?? null
+    : organizations.length === 1
+      ? organizations[0]
+      : null
+  const requestScope = notificationRequestScope(session?.user.id, selected?.id)
+  const requestScopeKey = notificationRequestScopeKey(requestScope)
+  const currentScopeRef = useRef<NotificationRequestScope | null>(requestScope)
+  const requestGuard = useRef(new NotificationScopedRequestGuard())
+  currentScopeRef.current = requestScope
+  requestGuard.current.setScope(requestScope)
+
   const [state, setState] = useState<SettingsPhase>({ phase: 'LOADING' })
+  const [stateScopeKey, setStateScopeKey] = useState<string | null>(null)
   const [rows, setRows] = useState<AlertDispositionRow[]>([])
   const [saves, setSaves] = useState<Record<string, SaveState>>({})
+  const saveInFlight = Object.values(saves).some((save) => save.kind === 'SAVING')
+  const saveInFlightRef = useRef(saveInFlight)
+  saveInFlightRef.current = saveInFlight
 
-  useEffect(() => {
-    let cancelled = false
-    apiClient
-      .get<unknown>('/api/alerts/dispositions')
-      .then((body) => {
-        if (cancelled) return
-        const read = readDispositions(body)
-        setState({ phase: 'READ', read })
-        if (read.outcome === 'LOADED') setRows(read.rows)
+  const load = useCallback(async () => {
+    if (saveInFlightRef.current) return
+    const scope = currentScopeRef.current
+    if (!scope) return
+    const ticket = requestGuard.current.begin(scope, 'load')
+    const scopeKey = notificationRequestScopeKey(scope)
+    setState({ phase: 'LOADING' })
+    setStateScopeKey(scopeKey)
+    setRows([])
+    setSaves({})
+    try {
+      const body = await apiClient.get<unknown>('/api/alerts/dispositions', {
+        params: { organizationId: scope.organizationId },
       })
-      .catch((error: unknown) => {
-        if (cancelled) return
-        // A THROWN REQUEST IS NOT AN EMPTY ORGANISATION. It reaches FAILED, and
-        // emptinessOf sends FAILED to NEVER_OBSERVED -- so the screen says
-        // HawkView could not look, rather than that nothing is configured.
+      if (!requestGuard.current.isCurrent(ticket, currentScopeRef.current)) return
+      const read = readDispositions(body)
+      if (
+        read.outcome === 'LOADED' &&
+        read.organizationId !== scope.organizationId
+      ) {
         setState({
           phase: 'READ',
           read: {
-            outcome: 'FAILED',
-            because:
-              error instanceof Error
-                ? error.message
-                : 'The alert settings request did not complete.',
+            outcome: 'UNREADABLE',
+            because: 'HawkView could not verify the selected workspace response.',
           },
         })
+        return
+      }
+      setState({ phase: 'READ', read })
+      setStateScopeKey(scopeKey)
+      if (read.outcome === 'LOADED') setRows(read.rows)
+    } catch {
+      if (!requestGuard.current.isCurrent(ticket, currentScopeRef.current)) return
+      setState({
+        phase: 'READ',
+        read: {
+          outcome: 'FAILED',
+          because: 'The workspace alert policy request did not complete.',
+        },
       })
-    return () => {
-      cancelled = true
+      setStateScopeKey(scopeKey)
     }
   }, [])
 
+  useEffect(() => {
+    const guard = requestGuard.current
+    setState({ phase: 'LOADING' })
+    setStateScopeKey(requestScopeKey)
+    setRows([])
+    setSaves({})
+    saveInFlightRef.current = false
+    if (requestScopeKey) void load()
+    return () => guard.invalidate()
+  }, [load, requestScopeKey])
+
+  const loaded =
+    stateScopeKey === requestScopeKey &&
+    state.phase === 'READ' &&
+    state.read.outcome === 'LOADED' &&
+    state.read.organizationId === requestScope?.organizationId
+      ? state.read
+      : null
+
   const choose = useCallback(
     async (row: AlertDispositionRow, disposition: AlertDisposition) => {
-      if (disposition === row.disposition) return
+      if (
+        !requestScope ||
+        !loaded ||
+        disposition === row.disposition ||
+        !canEditDisposition(row, loaded.canManagePolicy)
+      ) {
+        return
+      }
+      const scope = requestScope
+      requestGuard.current.invalidateLane('load')
+      const ticket = requestGuard.current.begin(scope, `save:${row.alertTypeId}`)
       const previous = row.disposition
-      setSaves((current) => ({
-        ...current,
-        [row.alertTypeId]: { kind: 'SAVING' },
-      }))
+      setSaves((current) => ({ ...current, [row.alertTypeId]: { kind: 'SAVING' } }))
       setRows((current) =>
-        current.map((each) =>
-          each.alertTypeId === row.alertTypeId ? { ...each, disposition } : each
+        current.map((item) =>
+          item.alertTypeId === row.alertTypeId ? { ...item, disposition } : item
         )
       )
       try {
-        // PATCH, NOT PUT. This was `put` -- a guess made before the endpoint
-        // existed, and the controller declares @Patch, so every save would have
-        // failed on a method the route does not have.
-        //
-        // The endpoint returns the whole refreshed list, so the row is replaced
-        // with what the server now holds rather than kept as what this page
-        // optimistically set. The rollback below is still needed for a failed
-        // write, but a successful one no longer has to be trusted.
-        const after = await apiClient.patch<unknown>(
-          '/api/alerts/dispositions/' + row.alertTypeId,
-          { disposition }
+        const body = await apiClient.patch<unknown>(
+          `/api/alerts/dispositions/${encodeURIComponent(row.alertTypeId)}`,
+          { disposition },
+          { params: { organizationId: scope.organizationId } }
         )
-        const confirmed = readDispositions(after)
-        if (confirmed.outcome === 'LOADED' && confirmed.rows.length > 0) {
-          setRows(confirmed.rows)
+        if (!requestGuard.current.isCurrent(ticket, currentScopeRef.current)) return
+        const confirmed = readDispositions(body)
+        if (
+          confirmed.outcome !== 'LOADED' ||
+          confirmed.organizationId !== scope.organizationId
+        ) {
+          throw new Error('unverified response')
         }
-        setSaves((current) => ({
-          ...current,
-          [row.alertTypeId]: { kind: 'SAVED' },
-        }))
-      } catch (error: unknown) {
-        // THE CONTROL GOES BACK. An optimistic update left in place after a
-        // failed write is a screen showing a setting the server does not have,
-        // which is the worst version of this page: an MSP believes they have
-        // silenced something and has not.
+        setRows(confirmed.rows)
+        setState({ phase: 'READ', read: confirmed })
+        setSaves((current) => ({ ...current, [row.alertTypeId]: { kind: 'SAVED' } }))
+      } catch {
+        if (!requestGuard.current.isCurrent(ticket, currentScopeRef.current)) return
         setRows((current) =>
-          current.map((each) =>
-            each.alertTypeId === row.alertTypeId
-              ? { ...each, disposition: previous }
-              : each
+          current.map((item) =>
+            item.alertTypeId === row.alertTypeId
+              ? { ...item, disposition: previous }
+              : item
           )
         )
         setSaves((current) => ({
           ...current,
           [row.alertTypeId]: {
             kind: 'FAILED',
-            because:
-              error instanceof Error
-                ? error.message
-                : 'The change could not be saved.',
+            because: 'HawkView could not verify the saved workspace policy.',
           },
         }))
       }
     },
-    []
+    [loaded, requestScope]
   )
 
-  // ONE DECISION, NOT FOUR. These were four inline ternaries, and the property
-  // that matters is not a property of any one of them: the empty-state card and
-  // the list must never both be on screen. Spread across four expressions that
-  // held only because emptinessCopy happens to return null for HAS_ITEMS --
-  // emergent, unstated, and nothing could fail if an edit broke it.
-  const {
-    loading,
-    empty,
-    because,
-    discarded,
-    unrecognisedKeys,
-    rows: visibleRows,
-  } = settingsView(
-    state,
-    rows
-  )
+  if (authLoading) {
+    return (
+      <div className="flex min-h-[240px] items-center justify-center text-sm text-muted-foreground">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
+        Verifying workspace access…
+      </div>
+    )
+  }
+
+  if (!selected) {
+    return (
+      <div className="mx-auto w-full max-w-2xl space-y-4 p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">
+              {organizations.length ? 'Choose a workspace' : 'Workspace unavailable'}
+            </CardTitle>
+            <CardDescription>
+              {organizations.length
+                ? 'Alert policy is workspace-specific. Select the organization you want to review.'
+                : 'No active HawkView workspace is available to this account.'}
+            </CardDescription>
+          </CardHeader>
+          {organizations.length > 0 && (
+            <CardContent>
+              <label htmlFor="alert-workspace" className="text-sm font-medium">MSP workspace</label>
+              <select
+                id="alert-workspace"
+                defaultValue=""
+                onChange={(event) => {
+                  if (event.target.value) {
+                    router.replace(`/settings/alerts?organizationId=${encodeURIComponent(event.target.value)}`)
+                  }
+                }}
+                className="mt-2 block w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <option value="">Select a workspace</option>
+                {organizations.map((organization) => (
+                  <option key={organization.id} value={organization.id}>{organization.name}</option>
+                ))}
+              </select>
+            </CardContent>
+          )}
+        </Card>
+      </div>
+    )
+  }
+
+  const scopedState: SettingsPhase =
+    stateScopeKey === requestScopeKey ? state : { phase: 'LOADING' }
+  const scopedRows = stateScopeKey === requestScopeKey ? rows : []
+  const view = settingsView(scopedState, scopedRows)
 
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-6 p-6">
-      <div className="space-y-1">
-        <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-          <BellRing className="h-5 w-5 text-muted-foreground" />
-          Alert settings
-        </h1>
-        <p className="max-w-2xl text-sm text-muted-foreground">
-          What this organisation treats as urgent. Everyone in the organisation
-          sees the same answer &mdash; how and when you personally hear about it
-          is set on your notification preferences.
-        </p>
-      </div>
+    <div className="mx-auto w-full max-w-4xl space-y-6 p-4 sm:p-6">
+      <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="space-y-1">
+          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
+            <BellRing className="h-5 w-5 text-blue-600" aria-hidden="true" />
+            Alert preferences
+          </h1>
+          <p className="max-w-2xl text-sm text-muted-foreground">
+            Workspace policy for {selected.name}. MSP owners decide urgency; each member controls their own delivery preferences.
+          </p>
+        </div>
+        <Button type="button" variant="outline" size="sm" onClick={() => void load()} disabled={view.loading || saveInFlight}>
+          <RefreshCcw className={`mr-2 h-4 w-4 ${view.loading ? 'animate-spin' : ''}`} aria-hidden="true" />
+          Retry
+        </Button>
+      </header>
 
-      {loading && (
+      {loaded && (
+        <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 px-4 py-3">
+          <Shield className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-medium">Workspace policy</p>
+            <p className="text-xs text-muted-foreground">
+              {loaded.canManagePolicy
+                ? 'You can change alert urgency where HawkView confirms a proven producer and intake wiring.'
+                : 'Read-only. Only an MSP owner can change workspace alert policy.'}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {view.loading && (
+        <Card><CardContent className="flex items-center gap-2 py-10 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />Loading workspace alert policy…</CardContent></Card>
+      )}
+
+      {view.empty && (
         <Card>
-          <CardContent className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading alert settings&hellip;
+          <CardHeader><CardTitle className="text-base">{view.empty.title}</CardTitle><CardDescription>{view.empty.detail}</CardDescription></CardHeader>
+          <CardContent className="space-y-3 pt-0">
+            {view.because && <p role="alert" className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">{view.because}</p>}
+            <Button type="button" variant="outline" size="sm" onClick={() => void load()}>Retry</Button>
           </CardContent>
         </Card>
       )}
 
-      {empty && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">{empty.title}</CardTitle>
-            <CardDescription>{empty.detail}</CardDescription>
-          </CardHeader>
-          {because && (
-            <CardContent className="pt-0">
-              <p className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
-                {because}
-              </p>
-            </CardContent>
-          )}
-        </Card>
-      )}
-
-      {unrecognisedKeys.length > 0 && (
-        <p className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          {/* THESE HAVE NO ROW TO APPEAR ON. The list walks the catalogue, so a
-              saved setting keyed to an alert type this build does not declare is
-              invisible in it -- the rows come back and none mentions it. The
-              endpoint lists them separately for exactly that reason, and showing
-              nothing here would leave somebody believing a choice took effect
-              when the catalogue default is what applies. */}
-          <span>
-            {unrecognisedKeys.length} saved{' '}
-            {unrecognisedKeys.length === 1 ? 'setting refers' : 'settings refer'} to
-            alert {unrecognisedKeys.length === 1 ? 'a type' : 'types'} this version
-            of HawkView does not have, so{' '}
-            {unrecognisedKeys.length === 1 ? 'it does' : 'they do'} nothing:{' '}
-            <span className="font-mono">{unrecognisedKeys.join(', ')}</span>. The
-            catalogue default applies to anything they were meant to cover.
-          </span>
+      {view.unrecognisedKeys.length > 0 && (
+        <p role="status" className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {view.unrecognisedKeys.length} stored setting {view.unrecognisedKeys.length === 1 ? 'uses' : 'use'} an alert type this version cannot recognize. The catalogue default applies.
         </p>
       )}
 
-      {discarded > 0 && (
-        <p className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          {/* Stated rather than swallowed: a list quietly short by one is a list
-              somebody will trust completely. */}
-          <span>
-            {discarded} alert {discarded === 1 ? 'type' : 'types'} could not be
-            read by this version of HawkView and{' '}
-            {discarded === 1 ? 'is' : 'are'} not shown. The list below is
-            incomplete.
-          </span>
+      {view.discarded > 0 && (
+        <p role="status" className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+          {view.discarded} alert {view.discarded === 1 ? 'type was' : 'types were'} not readable. The list is incomplete.
         </p>
       )}
 
-      {visibleRows.length > 0 && (
+      {loaded && view.rows.length > 0 && (
         <div className="space-y-3">
-          {visibleRows.map((row) => (
+          {view.rows.map((row) => (
             <DispositionRow
               key={row.alertTypeId}
               row={row}
               save={saves[row.alertTypeId] ?? { kind: 'IDLE' }}
               onChoose={choose}
+              canManagePolicy={loaded.canManagePolicy}
+              policyCapabilities={loaded.capabilities}
             />
           ))}
         </div>

@@ -3,7 +3,11 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { ALERT_CATALOG, type AlertTypeId } from './alert-catalog.js'
 import { type Severity } from './alert-type.js'
-import { settingDoesSomething, typesWithProducerInput } from './alert-type-reach.js'
+import { UUID } from './email-release-config.js'
+import {
+  alertPolicyCapability, alertPreferenceCapabilities, hasProvenAlertProducer,
+  dispositionIsConsulted, settingDoesSomething, typesWithProducerInput, type AlertPolicyCapability,
+} from './alert-type-reach.js'
 
 /**
  * WHAT AN MSP CONSIDERS URGENT, READ AND WRITTEN.
@@ -44,6 +48,8 @@ export interface DispositionRow {
    * two types reported a working setting while the pipeline behind them had never been handed a
    * finding. */
   readonly mapped: boolean
+  /** Separate proof, observed input, and caller authorization. */
+  readonly capability: AlertPolicyCapability
   /** A stored value outside the vocabulary, verbatim.
    *
    * **REPORTED, NEVER DEFAULTED AWAY.** `disposition` above already says what the product will
@@ -59,7 +65,9 @@ export class AlertDispositionsService {
 
   /** Every catalogue type, with what this organisation has chosen for it. */
   async list(identity: AuthenticatedIdentity, organizationId?: string) {
-    const organisation = await this.organisationFor(identity, organizationId)
+    const context = await this.context(identity)
+    const organisation = this.organisationFor(context.organizationIds, organizationId)
+    const canManagePolicy = context.memberships.some(member => member.organizationId === organisation && member.role === 'MSP_OWNER')
     const stored = await this.prisma.alertRuleDisposition.findMany({
       where: { organizationId: organisation },
       select: { alertTypeId: true, disposition: true },
@@ -87,6 +95,7 @@ export class AlertDispositionsService {
         catalogueSeverity: type.severity,
         disposition: readable ? raw : type.severity,
         mapped: settingDoesSomething(type.id, fedTypes),
+        capability: alertPolicyCapability(type.id, fedTypes, canManagePolicy),
         ...(raw !== undefined && !readable ? { storedValueIgnored: raw } : {}),
       }
     })
@@ -105,7 +114,10 @@ export class AlertDispositionsService {
       .filter((id) => !declared.has(id))
       .sort()
 
-    return { organizationId: organisation, dispositions, unrecognisedKeys }
+    return {
+      organizationId: organisation, dispositions, unrecognisedKeys, canManagePolicy,
+      capabilities: alertPreferenceCapabilities(organisation, context.userId),
+    }
   }
 
   /** Set one type's disposition for this organisation.
@@ -113,42 +125,49 @@ export class AlertDispositionsService {
    * AN UNKNOWN TYPE AND AN UNKNOWN VALUE ARE BOTH REFUSED, and neither writes. A settings page
    * that accepts a value the pipeline will never read is the defect the column rename closed —
    * the row exists, the write succeeds, the MSP sees their choice saved, and nothing changes. */
-  async set(
-    identity: AuthenticatedIdentity,
-    alertTypeId: string,
-    body: unknown,
-    organizationId?: string,
-  ) {
-    const organisation = await this.organisationFor(identity, organizationId)
-    const type = ALERT_CATALOG.find((each) => each.id === alertTypeId)
-    if (type === undefined) {
-      throw new BadRequestException(`No alert type is declared with the id ${alertTypeId}.`)
+  async set(identity: AuthenticatedIdentity, alertTypeId: string, body: unknown, organizationId?: string) {
+    const context = await this.context(identity)
+    const organisation = this.organisationFor(context.organizationIds, organizationId)
+    if (!context.memberships.some(member => member.organizationId === organisation && member.role === 'MSP_OWNER')) {
+      throw new ForbiddenException('Only MSP_OWNER can manage workspace alert policy.')
+    }
+    const type = ALERT_CATALOG.find(each => each.id === alertTypeId)
+    if (type === undefined) throw new BadRequestException(`No alert type is declared with the id ${alertTypeId}.`)
+    if (!dispositionIsConsulted(type.id) || !hasProvenAlertProducer(type.id)) {
+      throw new BadRequestException('This alert type does not have an established producer and cannot be edited.')
     }
     const disposition = (body as { disposition?: unknown } | null)?.disposition
     if (typeof disposition !== 'string' || !isDisposition(disposition)) {
-      throw new BadRequestException(
-        `disposition must be one of ${DISPOSITIONS.join(', ')}.`)
+      throw new BadRequestException(`disposition must be one of ${DISPOSITIONS.join(', ')}.`)
     }
-
-    const setByUserId = (await this.context(identity)).userId
-    await this.prisma.alertRuleDisposition.upsert({
-      where: { organizationId_alertTypeId: { organizationId: organisation, alertTypeId: type.id } },
-      create: { organizationId: organisation, alertTypeId: type.id, disposition, setByUserId },
-      update: { disposition, setByUserId },
+    await this.prisma.$transaction(async tx => {
+      // The mutation checks and locks identity, membership, role, and organization until commit.
+      const eligible = await tx.$queryRaw<{ id: string }[]>`SELECT u.id FROM users u
+        JOIN memberships m ON m.user_id = u.id
+        JOIN organizations o ON o.id = m.organization_id
+        WHERE u.id = ${context.userId}::uuid AND u.auth_provider_user_id = ${identity.subject}
+          AND u.disabled_at IS NULL AND m.organization_id = ${organisation}::uuid
+          AND m.status = 'ACTIVE' AND m.role = 'MSP_OWNER' AND o.status = 'ACTIVE'
+        FOR SHARE OF u, m, o`
+      if (eligible.length !== 1) throw new ForbiddenException('Workspace policy authorization is no longer available.')
+      await tx.alertRuleDisposition.upsert({
+        where: { organizationId_alertTypeId: { organizationId: organisation, alertTypeId: type.id } },
+        create: { organizationId: organisation, alertTypeId: type.id, disposition, setByUserId: context.userId },
+        update: { disposition, setByUserId: context.userId },
+      })
     })
     return this.list(identity, organisation)
   }
 
-  /** The organisation this request is about, refusing one the caller is not a member of.
-   *
-   * SHAPED LIKE `NotificationsService.preferences`, deliberately: the same question answered two
-   * ways in one product is how one of them ends up not checking membership. */
-  private async organisationFor(identity: AuthenticatedIdentity, requested?: string) {
-    const { organizationIds } = await this.context(identity)
-    const selected = requested ?? organizationIds[0]
-    if (selected === undefined || !organizationIds.includes(selected)) {
-      throw new ForbiddenException('Workspace is not available.')
+  private organisationFor(organizationIds: string[], requested?: string): string {
+    if (requested !== undefined && (typeof requested !== 'string' || !UUID.test(requested))) {
+      throw new BadRequestException('A valid organizationId is required.')
     }
+    if (requested === undefined && organizationIds.length > 1) {
+      throw new BadRequestException('Select an explicit organizationId.')
+    }
+    const selected = requested ?? organizationIds[0]
+    if (!selected || !organizationIds.includes(selected)) throw new ForbiddenException('Workspace is not available.')
     return selected
   }
 
@@ -160,14 +179,14 @@ export class AlertDispositionsService {
         disabledAt: true,
         memberships: {
           where: { status: 'ACTIVE', organization: { status: 'ACTIVE' } },
-          select: { organizationId: true },
+          select: { organizationId: true, role: true },
         },
       },
     })
     if (!user || user.disabledAt) {
       throw new ForbiddenException('This HawkView account cannot access alert settings.')
     }
-    return { userId: user.id, organizationIds: user.memberships.map((each) => each.organizationId) }
+    return { userId: user.id, memberships: user.memberships, organizationIds: user.memberships.map((each) => each.organizationId) }
   }
 }
 

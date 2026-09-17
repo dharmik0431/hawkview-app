@@ -170,12 +170,12 @@ test('every severity the backend declares survives the read', () => {
   // construction and could never catch the drift it exists to catch.
   const service = readFileSync(
     new URL(
-      '../../backend/src/notifications/notifications.service.ts',
+      '../../backend/src/notifications/notification-severity.ts',
       import.meta.url
     ),
     'utf8'
   )
-  const OPEN = 'const severities = ['
+  const OPEN = 'NOTIFICATION_SEVERITIES = ['
   const CLOSE = "] as const"
   const from = service.indexOf(OPEN)
   const to = from === -1 ? -1 : service.indexOf(CLOSE, from)
