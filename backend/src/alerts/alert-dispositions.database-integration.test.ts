@@ -12,6 +12,7 @@ import { dispositionIsConsulted } from './alert-type-reach.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { emailNotificationVisible } from './email-release.js'
 import { EmailReleaseStore, type EmailClaim } from './email-release-store.js'
+import { incidentGrouping } from './alert-incident-key.js'
 import type { SqlRunner } from './pipeline-store.js'
 
 /**
@@ -513,7 +514,15 @@ function runnerForPreferences(client: pg.Client): SqlRunner {
 }
 
 async function emailEligibilityFixture(client: pg.Client, prisma: PrismaClient, fixture: Fixture) {
-  const incidentKey = 'preferences-' + randomUUID()
+  const tenant = await prisma.customerTenant.create({ data: {
+    organizationId: fixture.org, microsoftTenantId: randomUUID(),
+    displayName: 'Synthetic preferences tenant', primaryDomain: 'preferences.example.test', status: 'ACTIVE',
+  } })
+  const grouping = incidentGrouping({ id: LIVE, subject: 'ACCOUNT' },
+    { organizationId: fixture.org, customerTenantId: tenant.id },
+    { resolved: true, id: 'subject:' + randomUUID() })
+  assert.ok(grouping.groups)
+  const incidentKey = grouping.key
   const messageId = 'incident/' + fixture.org + '|' + incidentKey
   const by = 'preferences/' + randomUUID()
   const key = 'hv-email-v1-' + randomUUID()
@@ -527,7 +536,8 @@ async function emailEligibilityFixture(client: pg.Client, prisma: PrismaClient, 
     VALUES (gen_random_uuid(), $1, $2, $3, 'UNACKNOWLEDGED', 'ACTIVE', 'OPEN', now(), now(), now(), now())`,
   [fixture.org, incidentKey, LIVE])
   const notification = await prisma.notification.create({ data: {
-    organizationId: fixture.org, eventType: 'security.preferences_test', category: 'warning',
+    organizationId: fixture.org, customerTenantId: tenant.id,
+    eventType: 'security.preferences_test', category: 'warning',
     severity: 'info', title: 'Synthetic preferences fixture', description: 'Synthetic source-only regression',
     dedupeKey: incidentKey, source: 'preferences-test', alertTypeId: LIVE, incidentKey,
   } })
@@ -544,7 +554,7 @@ async function emailEligibilityFixture(client: pg.Client, prisma: PrismaClient, 
       'alerts@example.test', 'https://console.hawkviewapp.com', $6, now(), '{}', $7)`,
   [messageId, randomUUID(), fixture.org, fixture.user, 'a'.repeat(64), fixture.identity.email, key])
   // Only gate methods are invoked. There is no provider, activation, claim, or send call.
-  const claim = { by, config: {}, job: {
+  const claim = { by, config: { organizationId: fixture.org, ownerUserId: fixture.user }, job: {
     messageId, idempotencyKey: key, state: 'CLAIMED', attemptsMade: 0, maxAttempts: 3,
     notBeforeIso: new Date().toISOString(), claim: null, providerId: null,
   } } as EmailClaim
