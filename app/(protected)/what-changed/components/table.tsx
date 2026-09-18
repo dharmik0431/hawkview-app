@@ -77,8 +77,6 @@ function getCategoryHeadingLabel(key: SummaryCategoryKey): string {
       return 'Evidence events'
     case 'changes':
       return 'Directory changes'
-    case 'signIns':
-      return 'Related sign-ins'
     case 'highRisk':
       return 'High-risk events'
     case 'apps':
@@ -229,15 +227,12 @@ export function WhatChangedView() {
   const summaryCounts = React.useMemo(() => {
     let total = baseFilteredChanges.length
     let changes = 0
-    let signIns = 0
     let highRisk = 0
     let apps = 0
 
     for (const e of baseFilteredChanges) {
-      const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
-      if (isSignIn) {
-        signIns++
-      } else if (e.eventType === 'change') {
+      // Count the timeline's explicit change events without inferring from another category.
+      if (e.eventType === 'change') {
         changes++
       }
 
@@ -250,7 +245,7 @@ export function WhatChangedView() {
       }
     }
 
-    return { total, changes, signIns, highRisk, apps }
+    return { total, changes, highRisk, apps }
   }, [baseFilteredChanges])
 
   // Final filtering by selected summary category
@@ -258,13 +253,8 @@ export function WhatChangedView() {
     if (selectedCategory === 'all') return baseFilteredChanges
 
     return baseFilteredChanges.filter((e) => {
-      const isSignIn = e.eventType === 'sign-in' || e.category === 'Sign-ins'
-
       if (selectedCategory === 'changes') {
         return e.eventType === 'change'
-      }
-      if (selectedCategory === 'signIns') {
-        return isSignIn
       }
       if (selectedCategory === 'highRisk') {
         return classifyEvent(e).isHighRisk

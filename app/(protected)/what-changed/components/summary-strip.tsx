@@ -4,19 +4,17 @@ import * as React from 'react'
 import {
   FileText,
   Layers,
-  LogIn,
   AlertTriangle,
   AppWindow,
   type LucideIcon,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-export type SummaryCategoryKey = 'all' | 'changes' | 'signIns' | 'highRisk' | 'apps'
+export type SummaryCategoryKey = 'all' | 'changes' | 'highRisk' | 'apps'
 
 export type IncidentSummaryData = {
   total: number
   changes: number
-  signIns: number
   highRisk: number
   apps: number
 }
@@ -53,12 +51,6 @@ export function SummaryStrip({
       Icon: Layers,
     },
     {
-      key: 'signIns',
-      label: 'Related sign-ins',
-      count: summary.signIns,
-      Icon: LogIn,
-    },
-    {
       key: 'highRisk',
       label: 'High-risk events',
       count: summary.highRisk,
@@ -75,7 +67,7 @@ export function SummaryStrip({
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card shadow-2xs">
-      <div className="grid grid-cols-2 divide-y divide-border sm:grid-cols-5 sm:divide-x sm:divide-y-0" role="region" aria-label="Investigation Categories">
+      <div className="grid grid-cols-2 divide-y divide-border sm:grid-cols-4 sm:divide-x sm:divide-y-0" role="region" aria-label="Investigation Categories">
         {items.map((item) => {
           const isSelected = selectedCategory === item.key
           const isHighRisk = item.isWarning && hasHighRisk
