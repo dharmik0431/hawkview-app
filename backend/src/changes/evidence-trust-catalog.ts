@@ -64,6 +64,18 @@ function hasExplicitNonSuccessfulResult(value: string | null | undefined) {
   return !['success', 'succeeded', 'completed', 'true', 'partially succeeded'].includes(words(value))
 }
 
+function hasExplicitSuccessfulResult(value: string | null | undefined) {
+  return ['success', 'succeeded'].includes(words(value))
+}
+
+function hasMeaningfulStateField(input: EvidenceTrustInput, field: string) {
+  return [input.beforeState, input.afterState].some((state) => {
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) return false
+    return Object.entries(state as Record<string, unknown>)
+      .some(([name, value]) => words(name) === field && meaningful(value))
+  })
+}
+
 export function isReadOnlyEvidenceOperation(operation: string | null | undefined, operationType?: string | null) {
   const operationWords = words(operation)
   const typeWords = words(operationType)
@@ -132,7 +144,27 @@ function classifySnapshot(input: EvidenceTrustInput, operationWords: string) {
 
 function classifyDirectoryAudit(input: EvidenceTrustInput, operationWords: string) {
   const operationType = words(input.operationType)
-  const targetTypes = words((input.targetResourceTypes ?? []).filter(Boolean).join(' '))
+  const category = words(input.category)
+  const targetTypeList = (input.targetResourceTypes ?? []).filter(Boolean).map((value) => words(value))
+  const targetTypes = targetTypeList.join(' ')
+  const explicitSuccess = hasExplicitSuccessfulResult(input.result)
+
+  if (operationWords === 'add member to role' && category === 'role management' &&
+      ['assign', 'assign eligible role'].includes(operationType) && explicitSuccess &&
+      targetTypeList.length > 0 &&
+      targetTypeList.every((type) => type === 'user' || type === 'service principal') &&
+      hasMeaningfulStateField(input, 'role display name')) {
+    return primary(input, 'entra.role-member-assignment', 'administrative_action', 'Roles', 'High')
+  }
+  if (operationWords === 'invite external user' && category === 'user management' &&
+      operationType === 'add' && explicitSuccess && targetTypeList.length > 0 &&
+      targetTypeList.every((type) => type === 'user')) {
+    return primary(input, 'entra.external-user-invitation', 'identity_change', 'Users', 'Medium')
+  }
+  if (/\badd member to role\b|\binvite external user\b/.test(operationWords)) {
+    return hidden(input, 'system.unreviewed-directory-operation', 'LOW')
+  }
+
   if (!['add', 'assign', 'create', 'delete', 'remove', 'update'].includes(operationType)) {
     return hidden(input, 'system.directory-nonmutation')
   }
