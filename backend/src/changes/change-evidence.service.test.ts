@@ -153,10 +153,13 @@ test('admits only exact successful Microsoft role-member and external-invitation
     { ...role, operationType: 'Read' },
     { ...role, targetResourceTypes: [] },
     { ...role, targetResourceTypes: ['Group'] },
+    { ...role, targetResourceTypes: ['User', 'Group'] },
     { ...role, beforeState: {}, afterState: {} },
     { ...role, operation: 'Add member to role completed' },
+    { ...role, operation: 'Add member to role assignment', targetResourceTypes: ['Role'] },
     { ...role, operation: 'Add eligible member to role', operationType: 'AssignEligibleRole' },
     { ...role, operation: 'Request add member to role' },
+    { ...role, operation: 'Request add member to role assignment', targetResourceTypes: ['Role'] },
     { ...role, operation: 'Approve member to role' },
     { ...role, source: 'UNKNOWN_SOURCE' },
     { ...role, source: 'M365_UNIFIED_AUDIT', workload: 'AzureActiveDirectory' },
@@ -168,6 +171,7 @@ test('admits only exact successful Microsoft role-member and external-invitation
     { ...invitation, operationType: 'Read' },
     { ...invitation, targetResourceTypes: [] },
     { ...invitation, targetResourceTypes: ['ServicePrincipal'] },
+    { ...invitation, targetResourceTypes: ['User', 'ServicePrincipal'] },
     { ...invitation, operation: 'Invite external user approved' },
     { ...invitation, operation: 'Unknown operation' },
   ]
@@ -177,6 +181,12 @@ test('admits only exact successful Microsoft role-member and external-invitation
   assert.equal(classifyEvidenceTrust({
     ...role, source: 'SIGN_IN', operation: 'Add member to role',
   }).visibility, 'SUPPORTING')
+  const existingDirectoryRole = classifyEvidenceTrust({
+    source: 'DIRECTORY_AUDIT', operation: 'Remove member from directory role',
+    category: 'RoleManagement', operationType: 'Remove', targetResourceTypes: ['Role'], result: 'success',
+  })
+  assert.equal(existingDirectoryRole.visibility, 'PRIMARY')
+  assert.equal(existingDirectoryRole.catalogId, 'entra.role-administration')
 })
 
 test('shows only exact successful role assignments and external invitations in What Changed', async () => {
@@ -218,6 +228,36 @@ test('shows only exact successful role assignments and external invitations in W
       eventDateTime: new Date('2026-08-01T11:59:00.000Z'), activityDisplayName: 'Add member to role',
       category: 'RoleManagement', operationType: 'Assign', result: 'success',
       targetResources: [{ type: 'User', displayName: 'Unproven role holder', modifiedProperties: [] }],
+    },
+    {
+      ...base, id: 'mixed-role-targets', microsoftAuditId: 'mixed-role-targets',
+      eventDateTime: new Date('2026-08-01T11:58:00.000Z'), activityDisplayName: 'Add member to role',
+      category: 'RoleManagement', operationType: 'Assign', result: 'success',
+      targetResources: [
+        { type: 'User', displayName: 'Role holder', modifiedProperties: [] },
+        { type: 'Group', displayName: 'Unexpected target', modifiedProperties: roleProperties },
+      ],
+    },
+    {
+      ...base, id: 'mixed-invite-targets', microsoftAuditId: 'mixed-invite-targets',
+      eventDateTime: new Date('2026-08-01T11:57:00.000Z'), activityDisplayName: 'Invite external user',
+      category: 'UserManagement', operationType: 'Add', result: 'success',
+      targetResources: [
+        { type: 'User', userPrincipalName: 'guest@example.test' },
+        { type: 'ServicePrincipal', displayName: 'Unexpected target' },
+      ],
+    },
+    {
+      ...base, id: 'role-suffix', microsoftAuditId: 'role-suffix',
+      eventDateTime: new Date('2026-08-01T11:56:00.000Z'), activityDisplayName: 'Add member to role assignment',
+      category: 'RoleManagement', operationType: 'Assign', result: 'success',
+      targetResources: [{ type: 'Role', displayName: 'Global Administrator', modifiedProperties: roleProperties }],
+    },
+    {
+      ...base, id: 'role-request-suffix', microsoftAuditId: 'role-request-suffix',
+      eventDateTime: new Date('2026-08-01T11:55:00.000Z'), activityDisplayName: 'Request add member to role assignment',
+      category: 'RoleManagement', operationType: 'Assign', result: 'success',
+      targetResources: [{ type: 'Role', displayName: 'Global Administrator', modifiedProperties: roleProperties }],
     },
   ]
   let auditQuery: any

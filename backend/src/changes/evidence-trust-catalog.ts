@@ -151,13 +151,18 @@ function classifyDirectoryAudit(input: EvidenceTrustInput, operationWords: strin
 
   if (operationWords === 'add member to role' && category === 'role management' &&
       ['assign', 'assign eligible role'].includes(operationType) && explicitSuccess &&
-      targetTypeList.some((type) => type === 'user' || type === 'service principal') &&
+      targetTypeList.length > 0 &&
+      targetTypeList.every((type) => type === 'user' || type === 'service principal') &&
       hasMeaningfulStateField(input, 'role display name')) {
     return primary(input, 'entra.role-member-assignment', 'administrative_action', 'Roles', 'High')
   }
   if (operationWords === 'invite external user' && category === 'user management' &&
-      operationType === 'add' && explicitSuccess && targetTypeList.includes('user')) {
+      operationType === 'add' && explicitSuccess && targetTypeList.length > 0 &&
+      targetTypeList.every((type) => type === 'user')) {
     return primary(input, 'entra.external-user-invitation', 'identity_change', 'Users', 'Medium')
+  }
+  if (/\badd member to role\b|\binvite external user\b/.test(operationWords)) {
+    return hidden(input, 'system.unreviewed-directory-operation', 'LOW')
   }
 
   if (!['add', 'assign', 'create', 'delete', 'remove', 'update'].includes(operationType)) {
