@@ -9,6 +9,7 @@ import { LanguageVariant, SyntaxKind } from 'typescript/unstable/ast'
 const root = fileURLToPath(new URL('../', import.meta.url))
 const expected = [
   "alerts/alert-dispositions.database-integration.test.ts",
+  "alerts/alert-intake-connected.database-integration.test.ts",
   "alerts/email-incident-context.database-integration.test.ts",
   "alerts/email-regular-release.database-integration.test.ts",
   "alerts/finding-pipeline.database-integration.test.ts",
