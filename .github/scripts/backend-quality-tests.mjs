@@ -10,6 +10,7 @@ export const backendDirectory = fileURLToPath(new URL('../../backend/', import.m
 // Producer-only fixtures and suites with global DELETE/TRUNCATE participate as well.
 export const databaseTests = Object.freeze([
   'alerts/alert-dispositions.database-integration.test.ts',
+  'alerts/alert-intake-connected.database-integration.test.ts',
   'alerts/email-incident-context.database-integration.test.ts',
   'alerts/email-regular-release.database-integration.test.ts',
   'alerts/finding-pipeline.database-integration.test.ts',
@@ -77,7 +78,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: '5f16a59f05ab5715c5ba76a68bd7e6e5df230bc6',
+    blob: 'c215505503c4a59cc25dd085af9f70de24d7ba38',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });
