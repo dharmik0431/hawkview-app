@@ -110,6 +110,143 @@ test('uses structured audit metadata without hiding real policy or synchronizati
   assert.equal(isPrimaryChange({ source: 'DIRECTORY_AUDIT', activity: 'Unmapped Microsoft operation', category: 'Unknown' }), false)
 })
 
+test('admits only exact successful Microsoft role-member and external-invitation audit shapes', () => {
+  const role = {
+    source: 'DIRECTORY_AUDIT', operation: 'Add member to role', category: 'RoleManagement',
+    operationType: 'Assign', targetResourceTypes: ['User'], result: 'success',
+    beforeState: { 'Role.DisplayName': null }, afterState: { 'Role.DisplayName': 'Global Administrator' },
+  }
+  for (const input of [
+    role,
+    { ...role, operationType: 'AssignEligibleRole', targetResourceTypes: ['ServicePrincipal'], result: 'succeeded' },
+  ]) {
+    const decision = classifyEvidenceTrust(input)
+    assert.deepEqual({
+      visibility: decision.visibility, classification: decision.classification,
+      catalogId: decision.catalogId, category: decision.category, severity: decision.severity,
+    }, {
+      visibility: 'PRIMARY', classification: 'administrative_action',
+      catalogId: 'entra.role-member-assignment', category: 'Roles', severity: 'High',
+    })
+  }
+
+  const invitation = {
+    source: 'DIRECTORY_AUDIT', operation: 'Invite external user', category: 'UserManagement',
+    operationType: 'Add', targetResourceTypes: ['User'], result: 'success',
+  }
+  const invitationDecision = classifyEvidenceTrust(invitation)
+  assert.deepEqual({
+    visibility: invitationDecision.visibility, classification: invitationDecision.classification,
+    catalogId: invitationDecision.catalogId, category: invitationDecision.category,
+    severity: invitationDecision.severity,
+  }, {
+    visibility: 'PRIMARY', classification: 'identity_change',
+    catalogId: 'entra.external-user-invitation', category: 'Users', severity: 'Medium',
+  })
+
+  const rejected = [
+    { ...role, result: undefined },
+    { ...role, result: 'unknownFutureValue' },
+    { ...role, result: 'failure' },
+    { ...role, result: 'partially succeeded' },
+    { ...role, category: 'UserManagement' },
+    { ...role, operationType: 'Read' },
+    { ...role, targetResourceTypes: [] },
+    { ...role, targetResourceTypes: ['Group'] },
+    { ...role, beforeState: {}, afterState: {} },
+    { ...role, operation: 'Add member to role completed' },
+    { ...role, operation: 'Add eligible member to role', operationType: 'AssignEligibleRole' },
+    { ...role, operation: 'Request add member to role' },
+    { ...role, operation: 'Approve member to role' },
+    { ...role, source: 'UNKNOWN_SOURCE' },
+    { ...role, source: 'M365_UNIFIED_AUDIT', workload: 'AzureActiveDirectory' },
+    { ...invitation, result: undefined },
+    { ...invitation, result: 'unknownFutureValue' },
+    { ...invitation, result: 'failed' },
+    { ...invitation, result: 'partially succeeded' },
+    { ...invitation, category: 'RoleManagement' },
+    { ...invitation, operationType: 'Read' },
+    { ...invitation, targetResourceTypes: [] },
+    { ...invitation, targetResourceTypes: ['ServicePrincipal'] },
+    { ...invitation, operation: 'Invite external user approved' },
+    { ...invitation, operation: 'Unknown operation' },
+  ]
+  for (const input of rejected) {
+    assert.equal(classifyEvidenceTrust(input).visibility, 'HIDDEN', JSON.stringify(input))
+  }
+  assert.equal(classifyEvidenceTrust({
+    ...role, source: 'SIGN_IN', operation: 'Add member to role',
+  }).visibility, 'SUPPORTING')
+})
+
+test('shows only exact successful role assignments and external invitations in What Changed', async () => {
+  const base = {
+    id: 'raw', customerTenantId: 'tenant-1', resultReason: null,
+    initiatedBy: { user: { userPrincipalName: 'owner@example.test' } },
+    additionalDetails: null, raw: {}, correlationId: null,
+  }
+  const roleProperties = [{
+    displayName: 'Role.DisplayName', oldValue: null, newValue: 'Global Administrator',
+  }]
+  const audits = [
+    {
+      ...base, id: 'role-user', microsoftAuditId: 'role-user',
+      eventDateTime: new Date('2026-08-01T12:03:00.000Z'), activityDisplayName: 'Add member to role',
+      category: 'RoleManagement', operationType: 'Assign', result: 'success',
+      targetResources: [{ type: 'User', displayName: 'Role holder', modifiedProperties: roleProperties }],
+    },
+    {
+      ...base, id: 'role-app', microsoftAuditId: 'role-app',
+      eventDateTime: new Date('2026-08-01T12:02:00.000Z'), activityDisplayName: 'Add member to role',
+      category: 'RoleManagement', operationType: 'AssignEligibleRole', result: 'succeeded',
+      targetResources: [{ type: 'ServicePrincipal', displayName: 'Automation app', modifiedProperties: roleProperties }],
+    },
+    {
+      ...base, id: 'invite-user', microsoftAuditId: 'invite-user',
+      eventDateTime: new Date('2026-08-01T12:01:00.000Z'), activityDisplayName: 'Invite external user',
+      category: 'UserManagement', operationType: 'Add', result: 'success',
+      targetResources: [{ type: 'User', userPrincipalName: 'guest@example.test' }],
+    },
+    {
+      ...base, id: 'failed-invite', microsoftAuditId: 'failed-invite',
+      eventDateTime: new Date('2026-08-01T12:00:00.000Z'), activityDisplayName: 'Invite external user',
+      category: 'UserManagement', operationType: 'Add', result: 'failure',
+      targetResources: [{ type: 'User', userPrincipalName: 'not-invited@example.test' }],
+    },
+    {
+      ...base, id: 'role-no-evidence', microsoftAuditId: 'role-no-evidence',
+      eventDateTime: new Date('2026-08-01T11:59:00.000Z'), activityDisplayName: 'Add member to role',
+      category: 'RoleManagement', operationType: 'Assign', result: 'success',
+      targetResources: [{ type: 'User', displayName: 'Unproven role holder', modifiedProperties: [] }],
+    },
+  ]
+  let auditQuery: any
+  const service = new ChangesService(changesPrisma({
+    directoryAuditLog: {
+      findMany: async (args: unknown) => { auditQuery = args; return audits },
+      findFirst: async () => null,
+    },
+  }) as never)
+  const result = await service.list(identity, range)
+  assert.deepEqual(auditQuery.where, {
+    organizationId: { in: ['org-1'] },
+    customerTenantId: { in: ['tenant-1'] },
+    eventDateTime: { gte: new Date(range.from), lte: new Date(range.to) },
+  })
+  assert.deepEqual(result.changes.map((event) => ({
+    id: event.id, title: event.title, classification: event.classification,
+    category: event.category, severity: event.severity, source: event.source,
+    tenantId: event.tenantId, tenantName: event.tenantName,
+    provenance: (event.evidence as { provenance?: string }).provenance,
+    microsoftSource: (event.evidence as { microsoftSource?: string }).microsoftSource,
+  })), [
+    { id: 'audit:role-user', title: 'Add member to role', classification: 'administrative_action', category: 'Roles', severity: 'High', source: 'Entra', tenantId: 'tenant-1', tenantName: 'Example MSP tenant', provenance: 'Microsoft Graph directoryAudit', microsoftSource: 'Microsoft Graph directory audit' },
+    { id: 'audit:role-app', title: 'Add member to role', classification: 'administrative_action', category: 'Roles', severity: 'High', source: 'Entra', tenantId: 'tenant-1', tenantName: 'Example MSP tenant', provenance: 'Microsoft Graph directoryAudit', microsoftSource: 'Microsoft Graph directory audit' },
+    { id: 'audit:invite-user', title: 'Invite external user', classification: 'identity_change', category: 'Users', severity: 'Medium', source: 'Entra', tenantId: 'tenant-1', tenantName: 'Example MSP tenant', provenance: 'Microsoft Graph directoryAudit', microsoftSource: 'Microsoft Graph directory audit' },
+  ])
+  assert.equal(result.summary.changes, 3)
+})
+
 test('suppresses read suffixes and routine synchronization telemetry before noun classification', () => {
   for (const activity of ['Policy_Get', 'Groups_List', 'Applications_Read', 'Report_Export', 'InventorySyncCompleted', 'CollectionRefreshStarted']) {
     assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity, category: 'Groups', operationType: 'Update' }), 'system_or_collection_event', activity)
