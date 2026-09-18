@@ -6,10 +6,10 @@ function source(relativePath: string): string {
   return readFileSync(new URL(`../${relativePath}`, import.meta.url), 'utf8')
 }
 
-test('What Changed renders four summary categories with no sign-in category or filter path', () => {
+test('What Changed source exposes four summary categories with no sign-in filter path', () => {
   const summary = source('app/(protected)/what-changed/components/summary-strip.tsx')
   const table = source('app/(protected)/what-changed/components/table.tsx')
-  const categoryKeys = [...summary.matchAll(/key:\s*'([^']+)'/g)].map((match) => match[1])
+  const categoryKeys = Array.from(summary.matchAll(/key:\s*'([^']+)'/g), (match) => match[1])
 
   assert.deepEqual(categoryKeys, ['all', 'changes', 'highRisk', 'apps'])
   assert.match(summary, /SummaryCategoryKey = 'all' \| 'changes' \| 'highRisk' \| 'apps'/)
