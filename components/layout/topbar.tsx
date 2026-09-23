@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import { usePathname } from 'next/navigation'
+import { SiteVersion } from '@/components/layout/site-version'
 import { NotificationPanel } from '@/components/layout/notification-panel'
 import { UserMenu } from '@/components/layout/user-menu'
 import { MobileNavigation } from '@/components/layout/mobile-navigation'
@@ -136,18 +137,22 @@ export function Topbar() {
   }, [isAdminRoute, isTenantRoute, tenantName, pathname])
 
   return (
-    <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-4 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">
+    <div className="sticky top-0 z-40 flex h-16 shrink-0 items-center gap-x-3 border-b border-border bg-background px-4 shadow-sm sm:gap-x-6 sm:px-6 lg:px-8">
       <MobileNavigation />
-      {!isHideTitleRoute && (
-        <h1
-          className="text-xl font-semibold text-foreground truncate max-w-[200px] sm:max-w-[360px] md:max-w-md lg:max-w-lg"
-          title={pageTitle}
-        >
-          {pageTitle}
-        </h1>
-      )}
+      <div className="min-w-0 flex-1">
+        {!isHideTitleRoute && (
+          <h1
+            className="text-xl font-semibold text-foreground truncate max-w-[200px] sm:max-w-[360px] md:max-w-md lg:max-w-lg"
+            title={pageTitle}
+          >
+            {pageTitle}
+          </h1>
+        )}
 
-      <div className="flex flex-1 justify-end items-center gap-x-3 sm:gap-x-4">
+        <SiteVersion />
+      </div>
+
+      <div className="flex shrink-0 justify-end items-center gap-x-3 sm:gap-x-4">
         {/* Notification Bell Panel */}
         <NotificationPanel />
 
