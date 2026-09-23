@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { SERVICE_FRESHNESS_WINDOWS } from '../tenants/service-sync-freshness.js'
 import { NATIVE_SUMMARY_RUN_BYTES, NATIVE_SUMMARY_SQL, readNativeRiskSummary, type NativeSummaryScope } from './native-risk-summary.js'
 
 const now = new Date('2026-09-15T12:00:00Z')
@@ -8,6 +9,7 @@ const scope = (tenants = [tenant()], totalTenants = tenants.length): NativeSumma
 function row(id = 'tenant-a', value = 2) {
   return {
     organizationId: 'org-a', customerTenantId: id, readLimitExceeded: false,
+    collectorStatus: 'IDLE', collectorLastSuccessfulAt: '2026-09-15T11:00:00.000Z',
     completedAt: '2026-09-15T11:00:00.000Z', windowStart: '2026-09-01T00:00:00.000Z',
     windowEnd: '2026-09-15T10:00:00.000Z', expiresAt: '2026-09-16T00:00:00.000Z',
     evaluationCoverage: { version: 'hawkview-run-coverage/v1', streams: [{ stream: 'GRAPH_SIGN_INS', coverage: {
@@ -19,7 +21,7 @@ function row(id = 'tenant-a', value = 2) {
       count: { accuracy: 'EXACT', value, scope: { evidenceRequested: ['GRAPH_INTERACTIVE_ONLY'], setAside: [], covered: ['synthetic-detector'], notCovered: [] } },
       // Deliberately not the same number of rows as the canonical count.
       items: Array.from({ length: value === 0 ? 0 : value + 1 }, (_, index) => ({ detectorId: 'synthetic-detector', subject: { kind: 'DIRECTORY_USER', userRef: `synthetic-private-subject-${index % value}` },
-        signals: [{ signal: 'SYNTHETIC_SIGNAL', count: 99, latest: null, capped: false }] })), sources: [],
+        signals: [{ signal: 'SYNTHETIC_SIGNAL', count: 99, latest: null, capped: false }] })), sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-15T11:00:00.000Z' }],
     },
   }
 }
@@ -174,4 +176,120 @@ test('repeated and concurrent reads are deterministic; read failure never become
   const results = await Promise.all(Array.from({ length: 10 }, () => readNativeRiskSummary(client, scope(), now)))
   for (const result of results) assert.deepEqual(result, results[0])
   await assert.rejects(readNativeRiskSummary({ $queryRawUnsafe: async () => { throw new Error('synthetic failure') } }, scope(), now))
+})
+
+function dated(value: number, age: number) {
+  const result = row('tenant-a', value)
+  const at = new Date(now.getTime() - age).toISOString()
+  result.completedAt = at
+  result.windowEnd = at
+  result.windowStart = new Date(now.getTime() - 90 * 24 * 60 * 60_000).toISOString()
+  result.evaluationFindings.sources[0].lastSuccessfulCollectionAt = at
+  result.collectorLastSuccessfulAt = at
+  return result
+}
+
+test('52-day retained clean run is stale, never a current exact zero', async () => {
+  const stale = dated(0, 52 * 24 * 60 * 60_000)
+  const result = await readNativeRiskSummary(reader([stale]).client, scope(), now)
+  assert.equal(result.fleet.accuracy, 'NOT_AVAILABLE')
+  assert.equal(result.fleet.availability, 'UNAVAILABLE')
+  assert.equal(result.fleet.distinctUserCount, null)
+  assert.equal(result.tenants[0].evaluatedAt, stale.completedAt)
+  assert.equal(result.fleet.assessedTenants, 1, 'decoded assessment is historical, not a current-coverage claim')
+  assert.deepEqual(result.fleet.limitations, ['STALE_ASSESSMENT'])
+})
+
+test('freshness uses the native collector policy inclusive boundary, independent of retention', async () => {
+  const limit = SERVICE_FRESHNESS_WINDOWS.incremental.agingMs
+  for (const [age, accuracy] of [[limit - 1, 'EXACT'], [limit, 'EXACT'], [limit + 1, 'NOT_AVAILABLE']] as const) {
+    const result = await readNativeRiskSummary(reader([dated(0, age)]).client, scope(), now)
+    assert.equal(result.fleet.accuracy, accuracy)
+  }
+})
+
+test('fresh completion cannot launder old window or selected source collection', async () => {
+  for (const field of ['window', 'source', 'collector'] as const) {
+    const input = dated(0, 0)
+    const old = new Date(now.getTime() - SERVICE_FRESHNESS_WINDOWS.incremental.agingMs - 1).toISOString()
+    if (field === 'window') input.windowEnd = old
+    if (field === 'source') input.evaluationFindings.sources[0].lastSuccessfulCollectionAt = old
+    if (field === 'collector') input.collectorLastSuccessfulAt = old
+    const result = await readNativeRiskSummary(reader([input]).client, scope(), now)
+    assert.equal(result.fleet.accuracy, 'NOT_AVAILABLE', field)
+    assert.deepEqual(result.fleet.limitations, ['STALE_ASSESSMENT'])
+  }
+})
+
+test('stale positives remain qualified historical lower bounds, including mixed fleet', async () => {
+  const stale = dated(3, SERVICE_FRESHNESS_WINDOWS.incremental.agingMs + 1)
+  const result = await readNativeRiskSummary(reader([stale, row('tenant-b', 2)]).client, scope([tenant(), tenant('tenant-b')]), now)
+  assert.equal(result.fleet.distinctUserCount, 5)
+  assert.equal(result.fleet.accuracy, 'AT_LEAST')
+  assert.equal(result.tenants[0].accuracy, 'AT_LEAST')
+  assert.equal(result.tenants[0].complete, false)
+  assert.deepEqual(result.fleet.limitations, ['STALE_ASSESSMENT'])
+})
+
+test('missing, malformed, duplicate and future selected source clocks refuse current zero without dropping positives', async () => {
+  const cases = [[], [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: null }],
+    [null], [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: 'bad-clock' }],
+    [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: new Date(now.getTime() + 1).toISOString() }],
+    [...row().evaluationFindings.sources, ...row().evaluationFindings.sources]]
+  for (const value of [0, 2]) for (const sources of cases) {
+    const input = row('tenant-a', value)
+    Object.assign(input.evaluationFindings, { sources })
+    const result = await readNativeRiskSummary(reader([input]).client, scope(), now)
+    assert.equal(result.fleet.distinctUserCount, value || null)
+    assert.equal(result.fleet.accuracy, value ? 'AT_LEAST' : 'NOT_AVAILABLE')
+    assert.deepEqual(result.fleet.limitations, ['SOURCE_FRESHNESS_UNKNOWN'])
+  }
+})
+
+test('current collector failure after a clean run blocks all-clear; in-flight refresh preserves fresh prior success', async () => {
+  for (const status of ['FAILED', 'RUNNING', 'SUCCEEDED', 'IDLE']) {
+    const result = await readNativeRiskSummary(reader([{ ...row('tenant-a', 0), collectorStatus: status }]).client, scope(), now)
+    assert.equal(result.fleet.accuracy, status === 'FAILED' ? 'NOT_AVAILABLE' : 'EXACT')
+    assert.deepEqual(result.fleet.limitations, status === 'FAILED' ? ['SOURCE_UNAVAILABLE'] : [])
+  }
+  for (const change of [{ collectorStatus: null, collectorLastSuccessfulAt: null },
+    { collectorStatus: 'RUNNING', collectorLastSuccessfulAt: null },
+    { collectorLastSuccessfulAt: new Date(now.getTime() + 1).toISOString() }]) {
+    const result = await readNativeRiskSummary(reader([{ ...row('tenant-a', 0), ...change }]).client, scope(), now)
+    assert.equal(result.fleet.distinctUserCount, null)
+    assert.deepEqual(result.fleet.limitations, ['SOURCE_FRESHNESS_UNKNOWN'])
+  }
+})
+
+test('selected audit feed checks SIGN_INS freshness and ignores an unrelated source snapshot', async () => {
+  const input = row('tenant-a', 0)
+  input.evaluationCoverage.streams[0].stream = 'M365_AUDIT_STS'
+  input.evaluationFindings.sources = [{ source: 'M365_AUDIT_STS', status: 'SUCCESS', lastSuccessfulCollectionAt: input.completedAt },
+    { source: 'GRAPH_SIGN_INS', status: 'FAILED', lastSuccessfulCollectionAt: '2020-01-01T00:00:00.000Z' }]
+  const result = await readNativeRiskSummary(reader([input]).client, scope(), now)
+  assert.equal(result.fleet.accuracy, 'EXACT')
+  assert.match(NATIVE_SUMMARY_SQL, /ss\.organization_id=r\.organization_id AND ss\.customer_tenant_id=r\.customer_tenant_id/)
+  assert.match(NATIVE_SUMMARY_SQL, /ss\.resource_type='SIGN_INS'/)
+})
+
+test('selected unavailable source and unknown feed never erase known findings', async () => {
+  for (const change of ['failed', 'unknown-feed'] as const) {
+    for (const value of [0, 2]) {
+      const input = row('tenant-a', value)
+      if (change === 'failed') input.evaluationFindings.sources[0].status = 'FAILED'
+      else input.evaluationCoverage.streams[0].stream = 'FUTURE_FEED'
+      const result = await readNativeRiskSummary(reader([input]).client, scope(), now)
+      assert.equal(result.fleet.accuracy, value ? 'AT_LEAST' : 'NOT_AVAILABLE')
+      assert.equal(result.fleet.distinctUserCount, value || null)
+      assert.deepEqual(result.fleet.limitations, [change === 'failed' ? 'SOURCE_UNAVAILABLE' : 'SOURCE_FRESHNESS_UNKNOWN'])
+    }
+  }
+})
+
+test('stale withheld count retains both uncertainty and measured staleness', async () => {
+  const input = dated(0, SERVICE_FRESHNESS_WINDOWS.incremental.agingMs + 1)
+  Object.assign(input.evaluationFindings.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  const result = await readNativeRiskSummary(reader([input]).client, scope(), now)
+  assert.equal(result.fleet.distinctUserCount, null)
+  assert.deepEqual(result.fleet.limitations, ['COUNT_WITHHELD', 'STALE_ASSESSMENT'])
 })

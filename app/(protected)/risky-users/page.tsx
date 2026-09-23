@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import {
   AlertCircle,
   Building2,
@@ -107,37 +107,10 @@ function LatestEvidenceCell({ row }: { row: FleetRiskyUserRow }) {
 }
 
 function DataStateBadge({ row }: { row: FleetRiskyUserRow }) {
-  if (row.detection.microsoft === 'UNAVAILABLE') {
-    return (
-      <Badge
-        variant="outline"
-        className="bg-slate-100 text-slate-700 border-slate-300 dark:bg-slate-800/80 dark:text-slate-300 dark:border-slate-700 text-2xs gap-1 font-medium"
-      >
-        <ShieldOff className="h-3 w-3 text-slate-400" />
-        Partial Source
-      </Badge>
-    )
-  }
-  if (row.lastSeenState === 'DATELESS') {
-    return (
-      <Badge
-        variant="outline"
-        className="bg-amber-50 text-amber-900 border-amber-200 dark:bg-amber-950/50 dark:text-amber-200 dark:border-amber-800 text-2xs gap-1 font-medium"
-      >
-        <Clock3 className="h-3 w-3 text-amber-500" />
-        Dateless
-      </Badge>
-    )
-  }
-  return (
-    <Badge
-      variant="outline"
-      className="bg-emerald-50 text-emerald-800 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800 text-2xs gap-1 font-medium"
-    >
-      <CheckCircle2 className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
-      Current
-    </Badge>
-  )
+  return <Badge variant="outline" className="text-2xs">
+    {row.evidenceState === 'CURRENT' ? 'Current evidence'
+      : row.evidenceState === 'HISTORICAL' ? 'Historical evidence' : 'Freshness unverified'}
+  </Badge>
 }
 
 export default function FleetRiskyUsersPage() {
@@ -145,6 +118,8 @@ export default function FleetRiskyUsersPage() {
     tenants,
     fleetRows,
     tenantStatuses,
+    deliveryGaps,
+    cacheScope,
     metrics,
     isLoading,
     isError,
@@ -156,8 +131,12 @@ export default function FleetRiskyUsersPage() {
   const [sourceFilter, setSourceFilter] = useState<'ALL' | 'HAWKVIEW' | 'MICROSOFT' | 'BOTH'>('ALL')
   const [priorityFilter, setPriorityFilter] = useState<'ALL' | 'HIGH' | 'MEDIUM' | 'LOW'>('ALL')
 
-  const [drawerRow, setDrawerRow] = useState<FleetRiskyUserRow | null>(null)
+  const [drawerSelection, setDrawerSelection] = useState<{ id: string; scope: string | null | undefined } | null>(null)
+  const drawerRow = drawerSelection?.scope === cacheScope ? fleetRows.find((row) => row.id === drawerSelection?.id) ?? null : null
   const [isDrawerOpen, setIsDrawerOpen] = useState(false)
+  useEffect(() => {
+    if (!drawerRow) { setIsDrawerOpen(false); setDrawerSelection(null) }
+  }, [drawerRow])
 
   // ONE FACT, ONE RENDERING. The badge showed `{filteredRows.length} users`
   // and a KPI tile several inches away showed "N tenants unavailable", and
@@ -263,7 +242,7 @@ export default function FleetRiskyUsersPage() {
   )
 
   const openDrawer = (row: FleetRiskyUserRow) => {
-    setDrawerRow(row)
+    setDrawerSelection({ id: row.id, scope: cacheScope })
     setIsDrawerOpen(true)
   }
 
@@ -322,6 +301,13 @@ export default function FleetRiskyUsersPage() {
         </div>
       </div>
 
+      {deliveryGaps.map((gap) => (
+        <p key={`${gap.tenantId}:${gap.source}`} className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+          {gap.tenantName}: {gap.source} reports {gap.lowerBound ? 'at least ' : ''}{gap.reported} identities; {gap.shown} details shown. Details are incomplete.{' '}
+          {gap.evidenceState === 'CURRENT' ? 'Current source evidence' : gap.evidenceState === 'HISTORICAL' ? 'Historical source evidence' : 'Source freshness unverified'} · {formatTimestamp(gap.asOf)}.
+        </p>
+      ))}
+
       {/* Fleet Summary Row */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
         {/* Primary Card: Users Requiring Review */}
@@ -339,7 +325,7 @@ export default function FleetRiskyUsersPage() {
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              distinct people across the evaluated tenants
+              observed identities shown; incomplete lists may omit other positives
             </p>
           </div>
 
@@ -407,13 +393,13 @@ export default function FleetRiskyUsersPage() {
                 {isLoading ? '...' : metrics.totalHawkViewUsers}
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                distinct users flagged
+                observed identities; may include retained evidence
                 {notAssessed > 0 &&
                   ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
               </p>
             </div>
             <div className="text-2xs font-medium text-blue-700 dark:text-blue-300 pt-1 border-t border-blue-100 dark:border-blue-900/40">
-              {totalFindingsCount} active rule finding{totalFindingsCount === 1 ? '' : 's'}
+              {totalFindingsCount} observed rule finding{totalFindingsCount === 1 ? '' : 's'}
             </div>
           </div>
 
@@ -432,7 +418,7 @@ export default function FleetRiskyUsersPage() {
                 {isLoading ? '...' : metrics.totalMicrosoftUsers}
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                reported active in Entra ID
+                observed Microsoft positives; may include retained evidence
                 {/* THE SCREENSHOT FOUND THESE TWO. Side by side, a fully
                     assessed fleet and a one-third assessed one rendered these
                     tiles identically: a bare 0 with no coverage on it. The
@@ -505,7 +491,7 @@ export default function FleetRiskyUsersPage() {
                   alone: the visible half fixed and the reassuring half not,
                   which is the shape this whole sweep is about. */}
               {fleetWide.assessed === fleetWide.inScope
-                ? `All ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} assessed`
+                ? fleetWide.inScope > 0 && fleetWide.fleet.kind === 'KNOWN' ? `All ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} assessed` : 'No assessed fleet confirmed'
                 : `${fleetWide.inScope - fleetWide.assessed} of ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} not assessed`}
             </div>
           </div>
@@ -1049,7 +1035,7 @@ export default function FleetRiskyUsersPage() {
       {/* User Details Drawer */}
       <FleetRiskAssessmentDrawer
         row={drawerRow}
-        isOpen={isDrawerOpen}
+        isOpen={isDrawerOpen && Boolean(drawerRow)}
         onClose={() => setIsDrawerOpen(false)}
       />
     </div>

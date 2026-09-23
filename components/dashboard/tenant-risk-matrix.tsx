@@ -66,6 +66,7 @@ function NativeRiskEvidence({ status, summary }: {
   summary?: NativeTenantRiskSummary
 }) {
   return <div className="mt-1 max-w-[210px] break-words text-[10px] text-slate-500">
+    {status.evidenceLabel ? <p className="text-amber-700 dark:text-amber-300">{status.evidenceLabel}</p> : null}
     {summary?.evaluatedAt ? <div>Evaluated <time dateTime={summary.evaluatedAt}>{formatNativeRiskClock(summary.evaluatedAt)}</time></div> : null}
     <details onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()}>
       <summary className="cursor-pointer rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500">Assessment details</summary>

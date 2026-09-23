@@ -143,7 +143,7 @@ function shortfall(coverage: AssessmentCoverage): string {
   const parts: string[] = []
   if (coverage.failed > 0) parts.push(`${coverage.failed} could not be reached`)
   if (coverage.unavailable > 0) {
-    parts.push(`${coverage.unavailable} returned no assessment`)
+    parts.push(`${coverage.unavailable} have incomplete or unavailable evidence`)
   }
   if (coverage.loading > 0) parts.push(`${coverage.loading} still loading`)
   return parts.join(', ')
@@ -189,7 +189,7 @@ export function riskyUsersSummary(
       ? `${matching} ${plural(matching, 'user', 'users')}`
       : complete
         ? `${matching} ${plural(matching, 'user', 'users')}`
-        : `${matching} ${plural(matching, 'user', 'users')} across ` +
+        : `${matching} ${plural(matching, 'user', 'users')} shown; complete evidence for ` +
           `${coverage.assessed} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')}`
 
   if (matching > 0) return { headline, complete, empty: null }
@@ -222,7 +222,7 @@ export function riskyUsersSummary(
       complete,
       empty: {
         tone: 'UNKNOWN',
-        title: 'No users to review among the tenants HawkView assessed',
+        title: 'No matching users shown — coverage is incomplete',
         detail:
           `${missing} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant was', 'tenants were')} ` +
           `not assessed (${shortfall(coverage)}): ${named(coverage.missed)}. ` +
@@ -247,7 +247,7 @@ export function riskyUsersSummary(
           title: 'No users require review',
           detail:
             `All ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')} in scope were ` +
-            'assessed, and no rule finding or Microsoft detection matched anyone. No filters are narrowing this.',
+            'assessed, and no rule finding or Microsoft detection matched anyone in the assessed evidence. No filters are narrowing this.',
         },
   }
 }

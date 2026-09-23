@@ -130,7 +130,7 @@ test('the shortfall says WHY, because the remedies differ', () => {
   })
   const detail = riskyUsersSummary(0, mixed, false).empty!.detail
   assert.match(detail, /1 could not be reached/)
-  assert.match(detail, /2 returned no assessment/)
+  assert.match(detail, /2 have incomplete or unavailable evidence/)
   assert.match(detail, /2 still loading/)
   assert.match(detail, /5 of 6 tenants were not assessed/)
 
@@ -527,12 +527,12 @@ test('no KPI tile renders a bare count over an unassessed fleet', () => {
     'utf8'
   ).split(String.fromCharCode(13)).join('')
 
-  assert.ok(page.includes('distinct users flagged'), 'tile copy moved')
+  assert.ok(page.includes('observed identities; may include retained evidence'), 'tile copy moved')
 
   const code = stripComments(page)
 
   // Each of the two tiles must carry coverage within a few lines of its label.
-  for (const label of ['distinct users flagged', 'reported active in Entra ID']) {
+  for (const label of ['observed identities; may include retained evidence', 'observed Microsoft positives; may include retained evidence']) {
     const at = code.indexOf(label)
     assert.ok(at !== -1, label + ' not found in the page')
     const after = code.slice(at, at + 260)

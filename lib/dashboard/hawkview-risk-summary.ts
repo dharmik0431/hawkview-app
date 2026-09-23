@@ -40,6 +40,17 @@ export type HawkViewRiskStatus = {
   accessibleValue: string
   state: 'available' | 'partial' | 'withheld' | 'loading' | 'failed' | 'unavailable'
   detail: string
+  evidenceLabel?: string
+}
+
+function currentRiskUnconfirmed(limitations: string[]): boolean {
+  return limitations.some((reason) => ['STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE'].includes(reason))
+}
+
+function savedAssessmentReason(limitations: string[]): string {
+  if (limitations.includes('SOURCE_UNAVAILABLE')) return 'The evidence source is unavailable.'
+  if (limitations.includes('SOURCE_FRESHNESS_UNKNOWN')) return 'Evidence freshness could not be confirmed.'
+  return 'The saved assessment or its evidence is older than the current assessment window.'
 }
 
 export function formatNativeRiskClock(value: string | null | undefined): string {
@@ -84,6 +95,20 @@ export function presentHawkViewTenantRisk(
         requestState === 'LOADING'
           ? 'HawkView assessment is still loading'
           : 'No HawkView assessment summary was returned for this tenant',
+    }
+  }
+
+  if (currentRiskUnconfirmed(status.limitations)) {
+    const observed = status.distinctUserCount !== null && status.distinctUserCount > 0 ? status.distinctUserCount : null
+    return {
+      count: observed, exact: false,
+      display: observed === null ? 'Not available' : `≥${observed.toLocaleString()} observed`,
+      accessibleValue: observed === null ? 'Current HawkView risk is unconfirmed' : `At least ${observed.toLocaleString()} users observed in a saved assessment; current risk is unconfirmed`,
+      state: observed === null ? 'unavailable' : 'partial',
+      evidenceLabel: 'Saved assessment; current risk unconfirmed.',
+      detail: `${savedAssessmentReason(status.limitations)} ${observed === null
+        ? 'The saved result does not establish the current number of users with findings.'
+        : 'This count describes findings observed in the saved assessment, not a lower bound on current risky users.'}`,
     }
   }
 
@@ -167,6 +192,22 @@ export function summarizeHawkViewPortfolioRisk(
       detail: 'The HawkView risk summary could not be loaded. Counts are withheld until a retry succeeds.',
       assessedTenants: 0,
       totalTenants: null,
+    }
+  }
+
+  if (currentRiskUnconfirmed(fleet.limitations)) {
+    const observed = fleet.distinctUserCount !== null && fleet.distinctUserCount > 0 ? fleet.distinctUserCount : null
+    return {
+      count: observed, exact: false,
+      display: observed === null ? 'Not available' : `≥${observed.toLocaleString()} observed`,
+      accessibleValue: observed === null ? 'Current HawkView fleet risk is unconfirmed' : `At least ${observed.toLocaleString()} users observed across saved assessments; current fleet risk is unconfirmed`,
+      state: observed === null ? 'unavailable' : 'partial',
+      evidenceLabel: 'Includes older or unconfirmed assessments.',
+      detail: 'Current risk is not confirmed for the full fleet. ' + (observed === null
+        ? 'Saved results do not establish the current number of users with findings.'
+        : 'The count describes users observed across saved assessments, not a lower bound on current risky users.') +
+        (!fleet.scopeComplete ? ` Summary limited to ${fleet.enumeratedTenants.toLocaleString()} tenants.` : '') + ' Users are counted separately in each tenant.',
+      assessedTenants: fleet.assessedTenants, totalTenants: fleet.totalTenants,
     }
   }
 
