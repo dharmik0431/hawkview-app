@@ -81,7 +81,7 @@ test('missing required directories/files and invalid clock fail production gener
 
 test('Next config resolves shared context only in build phase, labels development, and does not inject defaults on startup', (t) => {
   const root = fixture(t)
-  const module = { exports: undefined as any }
+  const configModule = { exports: undefined as any }
   let calls = 0
   const environment = {}
   new Function('require', 'module', '__dirname', readFileSync(new URL('../../next.config.js', import.meta.url), 'utf8'))(
@@ -91,8 +91,8 @@ test('Next config resolves shared context only in build phase, labels developmen
       return { resolveFrontendBuildIdentity: (received: string) => {
         assert.equal(received, root); calls++; return resolveFrontendBuildIdentity(root, environment, at)
       } }
-    }, module, root)
-  const config = module.exports
+    }, configModule, root)
+  const config = configModule.exports
   assert.equal(config(phases.PHASE_PRODUCTION_SERVER).env, undefined)
   assert.equal(calls, 0)
   assert.equal(JSON.parse(config(phases.PHASE_DEVELOPMENT_SERVER).env.NEXT_PUBLIC_HAWKVIEW_BUILD_IDENTITY).kind, 'development')
