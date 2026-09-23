@@ -3,6 +3,7 @@
 import React, { useEffect, useState } from 'react'
 import { Moon, Sun, Shield, Layers, Activity } from 'lucide-react'
 import { useTheme } from 'next-themes'
+import { SiteVersion } from '@/components/layout/site-version'
 import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 
 export function AuthLayout({ children }: { children: React.ReactNode }) {
@@ -127,10 +128,12 @@ export function AuthLayout({ children }: { children: React.ReactNode }) {
           {children}
         </div>
 
-        {/* Mobile / Tablet Footer */}
-        <div className="w-full max-w-[440px] mx-auto text-center lg:hidden text-xs text-slate-400 dark:text-slate-500 pt-4">
-          © {new Date().getFullYear()} HawkView. Microsoft 365 visibility built
-          for MSPs.
+        {/* Version is visible at every breakpoint; copyright remains mobile-only. */}
+        <div className="w-full max-w-[440px] mx-auto text-center text-xs text-slate-400 dark:text-slate-500 pt-4">
+          <SiteVersion align="center" placement="top" />
+          <p className="mt-2 lg:hidden">
+            © {new Date().getFullYear()} HawkView. Microsoft 365 visibility built for MSPs.
+          </p>
         </div>
       </div>
     </div>
