@@ -24,7 +24,7 @@ function fixture(overrides: Record<string, unknown> = {}) {
     evaluation_findings: {
       version: 'hawkview-run-findings/v1', complete: true, claim: { permitted: true },
       count: { accuracy: 'EXACT', value: 1, scope: { evidenceRequested: ['GRAPH_INTERACTIVE_ONLY'], setAside: [], covered: ['synthetic-detector'], notCovered: [] } },
-      sources: [], items: [{ detectorId: 'synthetic-detector', subject: { kind: 'DIRECTORY_USER', userRef: 'synthetic-only' },
+      sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: '2026-09-15T11:00:00.123Z' }], items: [{ detectorId: 'synthetic-detector', subject: { kind: 'DIRECTORY_USER', userRef: 'synthetic-only' },
         signals: [{ signal: 'SYNTHETIC_SIGNAL', count: 1, capped: false, latest: null }] }],
     }, ...overrides,
   }
@@ -40,6 +40,10 @@ function fixtureQuery(sql: string) {
       id uuid, organization_id uuid, customer_tenant_id uuid, status text, engine_version text,
       completed_at timestamptz, window_start timestamptz, window_end timestamptz, expires_at timestamptz,
       evaluation_coverage jsonb, evaluation_findings jsonb)
+  ), sync_states AS (
+    SELECT '${organizationId}'::uuid AS organization_id, '${tenantId}'::uuid AS customer_tenant_id,
+      'SIGN_INS'::text AS resource_type, 'SUCCEEDED'::text AS status,
+      '2026-09-15T11:00:00.123Z'::timestamptz AS last_successful_at
   ), ${sql.slice('WITH '.length)}`
 }
 

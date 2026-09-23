@@ -84,6 +84,8 @@ export function FleetRiskAssessmentDrawer({
 
   const isHawkView = row.reasons.length > 0
   const isMicrosoft = row.detection.microsoft === 'REPORTED'
+  const retainedEvidence = row.evidenceState !== undefined && row.evidenceState !== 'CURRENT'
+  const evidenceLabel = row.evidenceState === 'HISTORICAL' ? 'Historical evidence' : 'Freshness unverified'
   const isBoth = isHawkView && isMicrosoft
   const isHawkViewOnly = isHawkView && !isMicrosoft
 
@@ -235,7 +237,7 @@ export function FleetRiskAssessmentDrawer({
                   <ShieldCheck className="h-3.5 w-3.5 text-purple-600 dark:text-purple-400 shrink-0" />
                   <span>
                     {isMicrosoft
-                      ? 'Active risk reported by Microsoft Entra ID Protection'
+                      ? retainedEvidence ? 'Retained Microsoft risk report — ' + evidenceLabel.toLowerCase() : 'Active risk reported by Microsoft Entra ID Protection'
                       : row.detection.microsoft === 'UNAVAILABLE'
                       ? 'Microsoft Entra risk data unavailable'
                       : isUnmatchedOrPartial
@@ -445,9 +447,9 @@ export function FleetRiskAssessmentDrawer({
                   </div>
                   <Badge
                     variant="outline"
-                    className="text-2xs font-medium bg-emerald-50 text-emerald-800 border-emerald-200/80 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-900/80 self-start sm:self-auto shrink-0"
+                    className={retainedEvidence ? "text-2xs font-medium bg-amber-50 text-amber-800 border-amber-200 self-start sm:self-auto shrink-0" : "text-2xs font-medium bg-emerald-50 text-emerald-800 border-emerald-200/80 dark:bg-emerald-950/60 dark:text-emerald-300 dark:border-emerald-900/80 self-start sm:self-auto shrink-0"}
                   >
-                    {row.lastSeenState === 'DATED' ? 'Current evidence' : 'Dateless evidence'}
+                    {retainedEvidence ? evidenceLabel : row.lastSeenState === 'DATED' ? 'Current evidence' : 'Dateless evidence'}
                   </Badge>
                 </div>
 
@@ -459,7 +461,7 @@ export function FleetRiskAssessmentDrawer({
                     </span>
                     <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
                       {isMicrosoft
-                        ? 'Microsoft Entra ID Protection has flagged an active risk record for this identity.'
+                        ? retainedEvidence ? 'A retained Microsoft risk record flagged this identity. Its present risk state is not confirmed.' : 'Microsoft Entra ID Protection has flagged an active risk record for this identity.'
                         : isUnmatchedOrPartial
                         ? 'Microsoft risk coverage for this identity may be incomplete or unavailable.'
                         : 'Microsoft currently has no active risk record for this identity. This does not confirm the account is safe.'}
@@ -476,7 +478,7 @@ export function FleetRiskAssessmentDrawer({
                     }`}
                   >
                     {isMicrosoft
-                      ? 'Active risk reported'
+                      ? retainedEvidence ? 'Retained risk report' : 'Active risk reported'
                       : isUnmatchedOrPartial
                       ? 'Partial coverage'
                       : 'No active risk reported'}

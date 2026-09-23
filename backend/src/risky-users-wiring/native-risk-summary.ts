@@ -1,15 +1,16 @@
-import { decodeNativeRunRow, type RunRow } from './read-run.js'
+import { SERVICE_FRESHNESS_WINDOWS } from '../tenants/service-sync-freshness.js'
+import { decodeNativeRunRow, type RunRow, type ReadRunResult } from './read-run.js'
 import { RUN_ENGINE_VERSION, RUN_STATUS } from './persist-run.js'
 
 export const NATIVE_SUMMARY_TENANT_LIMIT = 100
 export const NATIVE_SUMMARY_RUN_BYTES = 256 * 1024
-export const NATIVE_SUMMARY_REASONS = ['NO_TENANTS', 'SCOPE_CAPPED', 'NOT_ENABLED_FOR_TENANT', 'EVALUATION_DISABLED', 'NO_CURRENT_RUN', 'INVALID_RUN', 'COUNT_WITHHELD', 'PARTIAL_ASSESSMENT', 'READ_LIMIT_EXCEEDED'] as const
+export const NATIVE_SUMMARY_REASONS = ['NO_TENANTS', 'SCOPE_CAPPED', 'NOT_ENABLED_FOR_TENANT', 'EVALUATION_DISABLED', 'NO_CURRENT_RUN', 'INVALID_RUN', 'COUNT_WITHHELD', 'PARTIAL_ASSESSMENT', 'READ_LIMIT_EXCEEDED', 'STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE'] as const
 type Reason = typeof NATIVE_SUMMARY_REASONS[number]
 type Accuracy = 'EXACT' | 'AT_LEAST' | 'NOT_AVAILABLE'
 type Availability = 'AVAILABLE' | 'PARTIAL' | 'UNAVAILABLE'
 export type NativeSummaryScope = { totalTenants: number; tenants: Array<{ id: string; organizationId: string; gate: 'NOT_ENABLED_FOR_TENANT' | 'EVALUATION_DISABLED' | null }> }
 type TenantSummary = { tenantId: string; availability: Availability; accuracy: Accuracy; distinctUserCount: number | null; evaluatedAt: string | null; windowStart: string | null; windowEnd: string | null; complete: boolean; limitations: Reason[] }
-type BatchRow = Pick<RunRow, 'evaluationCoverage' | 'evaluationFindings'> & { organizationId: string; customerTenantId: string; completedAt: unknown; windowStart: unknown; windowEnd: unknown; expiresAt: unknown; readLimitExceeded: boolean }
+type BatchRow = Pick<RunRow, 'evaluationCoverage' | 'evaluationFindings'> & { organizationId: string; customerTenantId: string; completedAt: unknown; windowStart: unknown; windowEnd: unknown; expiresAt: unknown; readLimitExceeded: boolean; collectorStatus: unknown; collectorLastSuccessfulAt: unknown }
 type Reader = { $queryRawUnsafe: <T>(query: string, ...values: unknown[]) => Promise<T> }
 const unique = (reasons: Reason[]): Reason[] => [...new Set(reasons)].sort()
 const date = (value: unknown): value is Date => value instanceof Date && Number.isFinite(value.getTime())
@@ -49,6 +50,38 @@ function safeDocument(value: unknown, depth = 0, budget = { remaining: 50_000 })
     !['__proto__', 'prototype', 'constructor'].includes(key) && safeDocument(item, depth + 1, budget))
 }
 
+/** Both native feeds read SIGN_INS. Reuse its existing freshness ceiling;
+ * retention is a storage lifetime, not evidence of current coverage. */
+function freshnessReasons(run: Extract<ReadRunResult, { present: true }>, row: BatchRow, now: Date): Reason[] {
+  const reasons: Reason[] = []
+  const stale = (clock: Date) => now.getTime() - clock.getTime() > SERVICE_FRESHNESS_WINDOWS.incremental.agingMs
+  if (stale(run.completedAt) || stale(run.windowEnd)) reasons.push('STALE_ASSESSMENT')
+  for (const { stream } of run.streams) {
+    if (!['GRAPH_SIGN_INS', 'M365_AUDIT_STS'].includes(stream)) {
+      reasons.push('SOURCE_FRESHNESS_UNKNOWN')
+      continue
+    }
+    const sources = run.sources.filter((source) => record(source) && source.source === stream)
+    if (sources.length !== 1) {
+      reasons.push('SOURCE_FRESHNESS_UNKNOWN')
+      continue
+    }
+    const source = sources[0]
+    const success = utcClock(source.lastSuccessfulCollectionAt)
+    if (!success || success > run.completedAt) reasons.push('SOURCE_FRESHNESS_UNKNOWN')
+    else if (stale(success)) reasons.push('STALE_ASSESSMENT')
+    if (source.status === 'STALE') reasons.push('STALE_ASSESSMENT')
+    else if (!['SUCCESS', 'EMPTY'].includes(source.status)) reasons.push('SOURCE_UNAVAILABLE')
+  }
+  // Only collector metadata is projected, never raw provider errors or identities.
+  const currentSuccess = utcClock(row.collectorLastSuccessfulAt)
+  if (!currentSuccess || currentSuccess > now) reasons.push('SOURCE_FRESHNESS_UNKNOWN')
+  else if (stale(currentSuccess)) reasons.push('STALE_ASSESSMENT')
+  if (row.collectorStatus === null || row.collectorStatus === undefined) reasons.push('SOURCE_FRESHNESS_UNKNOWN')
+  else if (!['IDLE', 'RUNNING', 'SUCCEEDED'].includes(String(row.collectorStatus))) reasons.push('SOURCE_UNAVAILABLE')
+  return unique(reasons)
+}
+
 /** Bounded at the SQL projection BEFORE JSON leaves PostgreSQL; never load a fleet of identities. */
 export const NATIVE_SUMMARY_SQL = `WITH authorized AS (
   SELECT * FROM jsonb_to_recordset($1::jsonb) AS s("organizationId" uuid, id uuid)
@@ -61,6 +94,8 @@ export const NATIVE_SUMMARY_SQL = `WITH authorized AS (
   ) selected ON true
 )
 SELECT r.organization_id AS "organizationId",r.customer_tenant_id AS "customerTenantId",
+ ss.status::text AS "collectorStatus",
+ to_char(ss.last_successful_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "collectorLastSuccessfulAt",
  to_char(r.completed_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "completedAt",
  to_char(r.window_start AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "windowStart",
  to_char(r.window_end AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "windowEnd",
@@ -68,7 +103,9 @@ SELECT r.organization_id AS "organizationId",r.customer_tenant_id AS "customerTe
  (coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)>$5) AS "readLimitExceeded",
  CASE WHEN coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)<=$5 THEN r.evaluation_coverage ELSE NULL END AS "evaluationCoverage",
  CASE WHEN coalesce(octet_length(r.evaluation_coverage::text),0)+coalesce(octet_length(r.evaluation_findings::text),0)<=$5 THEN r.evaluation_findings ELSE NULL END AS "evaluationFindings"
-FROM identity_risk_evaluation_runs r JOIN latest l ON l.id=r.id`
+FROM identity_risk_evaluation_runs r JOIN latest l ON l.id=r.id
+LEFT JOIN sync_states ss ON ss.organization_id=r.organization_id AND ss.customer_tenant_id=r.customer_tenant_id
+ AND ss.resource_type='SIGN_INS'`
 
 export async function readNativeRiskSummary(client: Reader, scope: NativeSummaryScope, now: Date) {
   if (!date(now) || !Number.isSafeInteger(scope.totalTenants) || scope.totalTenants < scope.tenants.length || scope.tenants.length > NATIVE_SUMMARY_TENANT_LIMIT || new Set(scope.tenants.map((t) => t.id)).size !== scope.tenants.length) throw new Error('Invalid summary scope')
@@ -103,11 +140,12 @@ export async function readNativeRiskSummary(client: Reader, scope: NativeSummary
     if (count.accuracy !== 'NOT_AVAILABLE' && (!Number.isSafeInteger(count.value) || count.value < 0 || count.value > 1_000_000)) return unavailable('INVALID_RUN')
     assessedTenants++
     const clocks = { evaluatedAt: run.completedAt.toISOString(), windowStart: run.windowStart.toISOString(), windowEnd: run.windowEnd.toISOString() }
-    if (count.accuracy === 'NOT_AVAILABLE') return { ...unavailable('COUNT_WITHHELD'), ...clocks }
+    const freshness = freshnessReasons(run, row, now)
+    if (count.accuracy === 'NOT_AVAILABLE') return { ...unavailable('COUNT_WITHHELD'), ...clocks, limitations: unique(['COUNT_WITHHELD', ...freshness]) }
     const complete = count.accuracy === 'EXACT' && run.complete && run.claim.permitted && count.scope.notCovered.length === 0 &&
       run.streams.length > 0 && count.scope.covered.length > 0 && count.scope.evidenceRequested.length > 0
-    if (complete) return { tenantId: tenant.id, availability: 'AVAILABLE', accuracy: 'EXACT', distinctUserCount: count.value, ...clocks, complete: true, limitations: [] }
-    return { tenantId: tenant.id, availability: 'PARTIAL', accuracy: count.value > 0 ? 'AT_LEAST' : 'NOT_AVAILABLE', distinctUserCount: count.value > 0 ? count.value : null, ...clocks, complete: false, limitations: ['PARTIAL_ASSESSMENT'] }
+    if (complete && freshness.length === 0) return { tenantId: tenant.id, availability: 'AVAILABLE', accuracy: 'EXACT', distinctUserCount: count.value, ...clocks, complete: true, limitations: [] }
+    return { tenantId: tenant.id, availability: freshness.length > 0 && count.value === 0 ? 'UNAVAILABLE' : 'PARTIAL', accuracy: count.value > 0 ? 'AT_LEAST' : 'NOT_AVAILABLE', distinctUserCount: count.value > 0 ? count.value : null, ...clocks, complete: false, limitations: unique([...freshness, ...(!complete ? ['PARTIAL_ASSESSMENT' as const] : [])]) }
   })
   const scopeComplete = tenants.length === scope.totalTenants
   const complete = scopeComplete && tenants.length > 0 && tenants.every((tenant) => tenant.complete)

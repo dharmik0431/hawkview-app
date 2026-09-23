@@ -11,6 +11,9 @@ const LIMITATIONS = [
   'COUNT_WITHHELD',
   'PARTIAL_ASSESSMENT',
   'READ_LIMIT_EXCEEDED',
+  'STALE_ASSESSMENT',
+  'SOURCE_FRESHNESS_UNKNOWN',
+  'SOURCE_UNAVAILABLE',
 ] as const
 
 const availability = z.enum(['AVAILABLE', 'PARTIAL', 'UNAVAILABLE'])
@@ -106,8 +109,12 @@ export function parseNativeRiskSummary(
   for (const tenant of result.tenants) {
     const clocks = [tenant.windowStart, tenant.windowEnd, tenant.evaluatedAt]
     const hasClocks = clocks.every((value) => value !== null)
+    const unconfirmed = tenant.limitations.some((reason) =>
+      ['STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE'].includes(reason))
     if (
       tenantIds.has(tenant.tenantId) ||
+      (unconfirmed && (!hasClocks || tenant.complete || tenant.accuracy === 'EXACT' ||
+        (tenant.distinctUserCount === null && tenant.availability !== 'UNAVAILABLE'))) ||
       (!hasClocks && clocks.some((value) => value !== null)) ||
       (hasClocks && (tenant.windowStart! > tenant.windowEnd! || tenant.windowEnd! > tenant.evaluatedAt! || tenant.evaluatedAt! > result.generatedAt)) ||
       (tenant.accuracy !== 'NOT_AVAILABLE' && !hasClocks) ||

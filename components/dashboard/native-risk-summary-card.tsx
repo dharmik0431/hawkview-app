@@ -26,6 +26,7 @@ export function NativeRiskSummaryCard({ risk, requestState, onRetry }: {
               <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">HawkView Risky Users</div>
               <div className={`mt-1 break-words font-bold ${risk.count === null ? 'text-2xl' : 'text-3xl'}`} aria-live="polite">{risk.display}</div>
               <div className="mt-1 text-xs text-slate-500">{subtitle}</div>
+              {risk.evidenceLabel ? <div className="mt-1 text-xs text-amber-700 dark:text-amber-300">{risk.evidenceLabel}</div> : null}
             </div>
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-red-100 bg-red-50"><ShieldAlert className="h-5 w-5 text-red-600" aria-hidden="true" /></div>
           </div>

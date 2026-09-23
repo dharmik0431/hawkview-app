@@ -178,3 +178,49 @@ test('native values are dynamic and saved-withheld is not described as never ass
   assert.match(formatNativeRiskClock(withheld.evaluatedAt), /UTC/)
   assert.equal(formatNativeRiskClock(null), 'Not reported')
 })
+
+for (const reason of ['STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE']) {
+  test(`${reason}: saved positive and zero retain clocks without current-risk claims`, () => {
+    for (const count of [0, 4]) {
+      const value = response()
+      value.tenants = [{ ...value.tenants[0], complete: false, limitations: [reason],
+        availability: count ? 'PARTIAL' : 'UNAVAILABLE', accuracy: count ? 'AT_LEAST' : 'NOT_AVAILABLE',
+        distinctUserCount: count || null }]
+      Object.assign(value.fleet, { totalTenants: 1, enumeratedTenants: 1, assessedTenants: 1,
+        availability: count ? 'PARTIAL' : 'UNAVAILABLE', accuracy: count ? 'AT_LEAST' : 'NOT_AVAILABLE',
+        distinctUserCount: count || null, limitations: [reason] })
+      const parsed = parseNativeRiskSummary(value)
+      assert.ok(parsed)
+      const tenant = presentHawkViewTenantRisk(parsed.tenants[0])
+      const fleet = summarizeHawkViewPortfolioRisk(parsed.fleet, 'SUCCESS')
+      for (const result of [tenant, fleet]) {
+        assert.equal(result.exact, false)
+        assert.equal(result.display, count ? '≥4 observed' : 'Not available')
+        assert.match(result.accessibleValue, /unconfirmed/)
+        assert.ok(result.evidenceLabel)
+        assert.doesNotMatch(result.detail, /from the current HawkView assessment|current HawkView finding/)
+      }
+      assert.equal(parsed.tenants[0].evaluatedAt, value.tenants[0].evaluatedAt)
+      for (const state of ['ERROR', 'LOADING'] as const) {
+        assert.equal(presentHawkViewTenantRisk(parsed.tenants[0], state).count, null)
+        assert.equal(summarizeHawkViewPortfolioRisk(parsed.fleet, state).evidenceLabel, undefined)
+      }
+    }
+  })
+}
+
+test('new freshness limitations cannot coexist with exact clean, missing historical clocks or contradictory availability', () => {
+  for (const reason of ['STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE']) {
+    const exact = response()
+    exact.tenants[0].limitations = [reason]
+    exact.fleet.limitations = [reason]
+    assert.equal(parseNativeRiskSummary(exact), null)
+    const missing = response()
+    missing.tenants = [{ ...missing.tenants[0], complete: false, limitations: [reason],
+      availability: 'UNAVAILABLE', accuracy: 'NOT_AVAILABLE', distinctUserCount: null,
+      evaluatedAt: null, windowStart: null, windowEnd: null }]
+    Object.assign(missing.fleet, { totalTenants: 1, enumeratedTenants: 1, assessedTenants: 0,
+      availability: 'UNAVAILABLE', accuracy: 'NOT_AVAILABLE', distinctUserCount: null, limitations: [reason] })
+    assert.equal(parseNativeRiskSummary(missing), null)
+  }
+})

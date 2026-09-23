@@ -48,6 +48,52 @@ const matrix = compile('../../components/dashboard/tenant-risk-matrix.tsx', {
 const { NativeRiskSummaryCard } = compile('../../components/dashboard/native-risk-summary-card.tsx', {
   ...shared, 'next/link': { default: ({ children, ...props }: Record<string, unknown>) => h('a', props, children) },
 })
+
+// Real producer and decoders, same realm as the parser. Only the database reader below is synthetic.
+// Explicit dependency allowlist prevents this regression from importing a Prisma/provider runtime.
+const coverageRecord = compile('../../backend/src/evaluation-core/coverage-record.ts', {})
+const runCoverage = compile('../../backend/src/risky-users-wiring/run-coverage.ts', {
+  '../evaluation-core/coverage-record.js': coverageRecord,
+})
+const runFindings = compile('../../backend/src/risky-users-wiring/run-findings.ts', {})
+const persistedRun = compile('../../backend/src/risky-users-wiring/persist-run.ts', {
+  './run-coverage.js': runCoverage, './run-findings.js': runFindings,
+})
+const runReader = compile('../../backend/src/risky-users-wiring/read-run.ts', {
+  './persist-run.js': persistedRun, './run-coverage.js': runCoverage, './run-findings.js': runFindings,
+})
+const nativeProducer = compile('../../backend/src/risky-users-wiring/native-risk-summary.ts', {
+  './read-run.js': runReader, './persist-run.js': persistedRun,
+  '../tenants/service-sync-freshness.js': compile('../../backend/src/tenants/service-sync-freshness.ts', {}),
+})
+
+function producerRow(id = 'synthetic-a', value = 4, at = '2026-09-15T11:00:00.000Z') {
+  return {
+    organizationId: 'synthetic-org', customerTenantId: id, readLimitExceeded: false,
+    collectorStatus: 'IDLE' as string | null, collectorLastSuccessfulAt: at as string | null,
+    completedAt: at, windowStart: '2026-09-01T00:00:00.000Z', windowEnd: at,
+    expiresAt: '2026-12-01T00:00:00.000Z',
+    evaluationCoverage: { version: 'hawkview-run-coverage/v1', streams: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+      version: 'hawkview-coverage/v1', collectionScope: { declared: true, asked: 'GRAPH_INTERACTIVE_ONLY' },
+      applies: 10, doesNotApply: {}, notYetCited: {}, unknown: {}, unprocessable: {},
+    } }] },
+    evaluationFindings: {
+      version: 'hawkview-run-findings/v1', complete: true, claim: { permitted: true },
+      count: { accuracy: 'EXACT', value, scope: { evidenceRequested: ['GRAPH_INTERACTIVE_ONLY'], setAside: [], covered: ['synthetic-detector'], notCovered: [] } },
+      items: Array.from({ length: value }, (_, index) => ({ detectorId: 'synthetic-detector', subject: { kind: 'DIRECTORY_USER', userRef: `private-user-${index}` },
+        signals: [{ signal: 'SYNTHETIC_SIGNAL', count: 1, latest: null, capped: false }] })),
+      sources: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: at }],
+    },
+  }
+}
+async function produced(rows: ReturnType<typeof producerRow>[], totalTenants = rows.length) {
+  const raw = await nativeProducer.readNativeRiskSummary({ $queryRawUnsafe: async () => rows }, {
+    totalTenants, tenants: rows.map((row) => ({ id: row.customerTenantId, organizationId: row.organizationId, gate: null })),
+  }, new Date('2026-09-15T12:00:00.000Z'))
+  const parsed = parseNativeRiskSummary(raw)
+  assert.ok(parsed, JSON.stringify(raw))
+  return parsed
+}
 function fixture(value = 7): native.NativeRiskSummaryResponse {
   return {
     contractVersion: 'hawkview-native-risk-summary/v1', source: 'HAWKVIEW_NATIVE_ASSESSMENT', countUnit: 'TENANT_USER_IDENTITIES',
@@ -130,6 +176,61 @@ test('matrix desktop and mobile render native counts with assessment clocks; nev
     if (count === 0) assert.match(document.body.textContent, /0 in assessed scope/)
     else assert.equal(document.querySelectorAll('[aria-label="7"]').length, 2)
   }
+})
+
+test('actual native producer -> strict parser -> card and both matrix layouts qualify retained evidence', async () => {
+  for (const limitation of ['STALE_ASSESSMENT', 'SOURCE_FRESHNESS_UNKNOWN', 'SOURCE_UNAVAILABLE']) {
+    for (const count of [0, 4]) {
+      const row = producerRow('synthetic-a', count, limitation === 'STALE_ASSESSMENT' ? '2026-09-10T11:00:00.000Z' : undefined)
+      if (limitation === 'SOURCE_FRESHNESS_UNKNOWN') row.collectorLastSuccessfulAt = null
+      if (limitation === 'SOURCE_UNAVAILABLE') row.collectorStatus = 'FAILED'
+      const value = await produced([row])
+      assert.ok(value.fleet.limitations.includes(limitation))
+      assert.equal(value.fleet.distinctUserCount, count || null)
+      assert.equal(value.fleet.assessedTenants, 1, 'historical decoded assessment is not current coverage')
+      const card = documentFor(NativeRiskSummaryCard, cardProps(value))
+      assert.equal(card.querySelector('[aria-live]')?.textContent, count ? '≥4 observed' : 'Not available')
+      assert.match(card.body.textContent, /Includes older or unconfirmed assessments/)
+      assert.match(card.querySelector('a')?.getAttribute('aria-label'), /unconfirmed/)
+      const document = documentFor(matrix.TenantRiskMatrix, { tenants: [tenant], nativeRiskByTenant: new Map([[tenant.id, value.tenants[0]]]) })
+      const labels = [...document.querySelectorAll('p')].filter((p: any) => p.textContent === 'Saved assessment; current risk unconfirmed.')
+      assert.equal(labels.length, 2)
+      assert.ok(labels.every((p: any) => p.closest('details') === null), 'qualification visible outside collapsed details')
+      assert.equal(document.querySelectorAll(`time[datetime="${row.completedAt}"]`).length, 2)
+      assert.doesNotMatch(document.body.textContent, /0 in assessed scope|current HawkView finding|from the current HawkView assessment|all clear|all safe|private-user/)
+      if (count) assert.equal(document.querySelectorAll('[aria-label*="observed in a saved assessment"]').length, 2)
+    }
+  }
+})
+
+test('actual producer mixed fleet retains observed totals, fresh zero control, and scope cap qualification', async () => {
+  const fresh = await produced([producerRow('synthetic-a', 0)])
+  assert.equal(fresh.fleet.accuracy, 'EXACT')
+  assert.equal(documentFor(NativeRiskSummaryCard, cardProps(fresh)).querySelector('[aria-live]')?.textContent, '0')
+  const mixed = await produced([producerRow('synthetic-a', 4, '2026-09-10T11:00:00.000Z'), producerRow('synthetic-b', 2)])
+  assert.equal(mixed.fleet.distinctUserCount, 6)
+  assert.equal(mixed.fleet.accuracy, 'AT_LEAST')
+  const presentation = native.summarizeHawkViewPortfolioRisk(mixed.fleet, 'SUCCESS')
+  assert.match(presentation.detail, /not a lower bound on current risky users/)
+  assert.match(documentFor(NativeRiskSummaryCard, cardProps(mixed)).body.textContent, /≥6 observed/)
+  const capped = await produced(Array.from({ length: 100 }, (_, index) => producerRow(`synthetic-${index}`, 1, '2026-09-10T11:00:00.000Z')), 101)
+  assert.match(native.summarizeHawkViewPortfolioRisk(capped.fleet, 'SUCCESS').detail, /limited to 100 tenants/)
+  for (const state of ['LOADING', 'ERROR'] as const) {
+    const document = documentFor(NativeRiskSummaryCard, cardProps(mixed, state))
+    assert.doesNotMatch(document.body.textContent, /≥6|Includes older|observed/)
+  }
+})
+
+test('actual producer stale withheld assessment preserves original clocks and both reasons', async () => {
+  const row = producerRow('synthetic-a', 0, '2026-09-10T11:00:00.000Z')
+  Object.assign(row.evaluationFindings.count, { accuracy: 'NOT_AVAILABLE', value: null })
+  const value = await produced([row])
+  assert.deepEqual(value.fleet.limitations, ['COUNT_WITHHELD', 'STALE_ASSESSMENT'])
+  assert.equal(value.fleet.assessedTenants, 1)
+  assert.equal(value.tenants[0].evaluatedAt, row.completedAt)
+  const document = documentFor(NativeRiskSummaryCard, cardProps(value))
+  assert.equal(document.querySelector('[aria-live]')?.textContent, 'Not available')
+  assert.match(document.body.textContent, /Includes older or unconfirmed assessments/)
 })
 
 test('matrix cached counts disappear on loading and error, and unknown sorts last in either direction', () => {
