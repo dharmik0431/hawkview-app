@@ -65,6 +65,21 @@ test('actual login chain and signed-in topbar render the same accessible compile
   assert.ok(!dom.window.document.querySelector('#login details')!.parentElement!.className.includes('lg:hidden'))
   dom.window.close()
 })
+test('source identity renders the same version on login and signed-in without invented build time', () => {
+  identity = { kind: 'source', sourceHash: build.sourceHash, builtAt: null }; pathname = '/dashboard'
+  const dom = new JSDOM(renderToStaticMarkup(app()))
+  for (const id of ['login', 'signed-in']) {
+    const surface = dom.window.document.getElementById(id)!
+    assert.match(surface.querySelector('summary')!.textContent!, /Version a1234567890b/)
+    assert.equal(surface.querySelector('dd')!.textContent, build.sourceHash)
+    assert.equal(surface.querySelector('time'), null)
+    assert.match(surface.textContent!, /source used for this compilation/)
+    assert.doesNotMatch(surface.textContent!, /Development|Built \(UTC\)|production|deployment/i)
+    surface.querySelector('summary')!.click()
+    assert.equal(surface.querySelector('details')!.open, true)
+  }
+  dom.window.close()
+})
 test('title-hidden admin and team routes retain the visible version', () => {
   identity = build
   for (pathname of ['/admin/overview', '/settings/team', '/team-access']) {
@@ -86,8 +101,8 @@ test('development and unavailable identities are explicit on both surfaces', () 
     dom.window.close()
   }
 })
-test('SSR hydration preserves the build identity without clocks or API calls', async () => {
-  identity = build; pathname = '/dashboard'
+for (const hydratedIdentity of [build, { kind: 'source', sourceHash: build.sourceHash, builtAt: null }]) test(`SSR hydration preserves ${hydratedIdentity.kind} identity without clocks or API calls`, async () => {
+  identity = hydratedIdentity; pathname = '/dashboard'
   const dom = new JSDOM('<div id="root">' + renderToString(app()) + '</div>', { url: 'https://synthetic.invalid' })
   const saved = new Map<string, PropertyDescriptor | undefined>()
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true })) {
@@ -98,7 +113,8 @@ test('SSR hydration preserves the build identity without clocks or API calls', a
     await React.act(async () => { root = hydrateRoot(dom.window.document.getElementById('root'), app(), { onRecoverableError: (error: unknown) => errors.push(error) }) })
     assert.deepEqual(errors, [])
     assert.deepEqual(Array.from(dom.window.document.querySelectorAll('dd')).map((node: any) => node.textContent).filter((value: string) => value === build.sourceHash), [build.sourceHash, build.sourceHash])
-    assert.equal(dom.window.document.querySelectorAll('time[datetime="' + build.builtAt + '"]').length, 2)
+    assert.equal(dom.window.document.querySelectorAll('time').length, hydratedIdentity.kind === 'build' ? 2 : 0)
+    if (hydratedIdentity.kind === 'source') assert.doesNotMatch(dom.window.document.body.textContent!, /Development|Built \(UTC\)/)
   } finally {
     if (root) await React.act(async () => root.unmount())
     for (const [key, descriptor] of Array.from(saved)) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key] }
