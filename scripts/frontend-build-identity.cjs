@@ -14,7 +14,7 @@ function excluded(name) {
 }
 
 /** Source inputs only: never Git, environment values, runtime output or backend identity. */
-function frontendSourceHash(root) {
+function frontendSourceFiles(root) {
   const base = path.resolve(root)
   const files = []
   function stat(relative) {
@@ -46,8 +46,21 @@ function frontendSourceHash(root) {
     if (!stat(file).isFile()) throw new Error('Frontend build identity requires its build inputs.')
     files.push(file)
   }
+  return files.sort()
+}
+
+function frontendSourceDependencies(root) {
+  const base = path.resolve(root)
+  return {
+    fileDependencies: frontendSourceFiles(base).map((file) => path.join(base, file)),
+    contextDependencies: INPUT_DIRECTORIES.map((directory) => path.join(base, directory)),
+  }
+}
+
+function frontendSourceHash(root) {
+  const base = path.resolve(root)
   const hash = createHash('sha256').update('hawkview-frontend-source/v1\0')
-  for (const file of files.sort()) {
+  for (const file of frontendSourceFiles(base)) {
     const name = Buffer.from(file, 'utf8')
     const bytes = fs.readFileSync(path.join(base, file))
     hash.update(`${name.length}:`).update(name).update(`${bytes.length}:`).update(bytes)
@@ -85,7 +98,7 @@ function resolveFrontendBuildIdentity(root, environment = process.env, builtAt =
   return identity
 }
 
-module.exports = { frontendSourceHash, createFrontendBuildIdentity, resolveFrontendBuildIdentity, BUILD_CONTEXT_KEY }
+module.exports = { frontendSourceHash, frontendSourceDependencies, createFrontendBuildIdentity, resolveFrontendBuildIdentity, BUILD_CONTEXT_KEY }
 
 // Read-only operator command: matches the fingerprint embedded by the production build.
 if (require.main === module) console.log(frontendSourceHash(path.resolve(__dirname, '..')))

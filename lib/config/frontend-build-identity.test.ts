@@ -8,7 +8,7 @@ import test from 'node:test'
 import { parseFrontendBuildIdentity } from './frontend-build-identity.ts'
 
 const require = createRequire(import.meta.url)
-const { frontendSourceHash, createFrontendBuildIdentity, resolveFrontendBuildIdentity, BUILD_CONTEXT_KEY } = require('../../scripts/frontend-build-identity.cjs')
+const { frontendSourceHash, frontendSourceDependencies, createFrontendBuildIdentity, resolveFrontendBuildIdentity, BUILD_CONTEXT_KEY } = require('../../scripts/frontend-build-identity.cjs')
 const phases = require('next/constants')
 const at = new Date('2026-09-23T12:00:00.000Z')
 const requiredFiles = ['package.json', 'package-lock.json', 'next.config.js', 'tsconfig.json',
@@ -79,7 +79,7 @@ test('missing required directories/files and invalid clock fail production gener
   assert.throws(() => frontendSourceHash(second))
 })
 
-test('Next config resolves shared context only in build phase, labels development, and does not inject defaults on startup', (t) => {
+test('Next config preserves production context and wires source-dependent timestamp-free dev compilation', (t) => {
   const root = fixture(t)
   const configModule = { exports: undefined as any }
   let calls = 0
@@ -88,14 +88,35 @@ test('Next config resolves shared context only in build phase, labels developmen
     (name: string) => {
       if (name === 'next/constants') return phases
       assert.equal(name, './scripts/frontend-build-identity.cjs')
-      return { resolveFrontendBuildIdentity: (received: string) => {
+      return { frontendSourceHash, frontendSourceDependencies, resolveFrontendBuildIdentity: (received: string) => {
         assert.equal(received, root); calls++; return resolveFrontendBuildIdentity(root, environment, at)
       } }
     }, configModule, root)
   const config = configModule.exports
   assert.equal(config(phases.PHASE_PRODUCTION_SERVER).env, undefined)
   assert.equal(calls, 0)
-  assert.equal(JSON.parse(config(phases.PHASE_DEVELOPMENT_SERVER).env.NEXT_PUBLIC_HAWKVIEW_BUILD_IDENTITY).kind, 'development')
+  const devConfig = config(phases.PHASE_DEVELOPMENT_SERVER)
+  assert.equal(devConfig.env, undefined, 'no competing NEXT_PUBLIC declaration for source identity')
+  class DefinePlugin {
+    readonly definitions: Record<string, any>
+    constructor(definitions: Record<string, any>) { this.definitions = definitions }
+    static runtimeValue(fn: () => string, options: Record<string, any>) { return { fn, options } }
+  }
+  const compilation = devConfig.webpack({ plugins: [] }, { dev: true, webpack: { DefinePlugin } })
+  const runtime = compilation.plugins[0].definitions.__HAWKVIEW_SOURCE_IDENTITY__
+  const read = () => JSON.parse(JSON.parse(runtime.fn()))
+  assert.deepEqual(read(), { kind: 'source', sourceHash: frontendSourceHash(root), builtAt: null })
+  assert.ok(runtime.options.fileDependencies.includes(join(root, 'app/page.tsx')))
+  assert.ok(runtime.options.contextDependencies.includes(join(root, 'public')))
+  const before = read().sourceHash
+  put(root, 'public/new/nested.asset', 'new public asset')
+  assert.notEqual(read().sourceHash, before)
+  assert.equal(runtime.options.version(), read().sourceHash)
+  rmSync(join(root, 'public/new'), { recursive: true })
+  assert.equal(read().sourceHash, before)
+  put(root, 'app/.env.local', 'not a version input')
+  assert.equal(read().sourceHash, before)
+  assert.equal(devConfig.webpack({ plugins: [] }, { dev: false, webpack: { DefinePlugin } }).plugins.length, 0)
   assert.equal(calls, 0)
   const first = config(phases.PHASE_PRODUCTION_BUILD)
   assert.equal(first.output, 'standalone')
@@ -132,10 +153,12 @@ test('inherited contexts cannot silently reuse a different root/source or malfor
 test('public metadata parser rejects malformed, extra-field and misleading provenance without runtime fallback', () => {
   const valid = { kind: 'build', sourceHash: 'a'.repeat(64), builtAt: at.toISOString() }
   assert.deepEqual(parseFrontendBuildIdentity(JSON.stringify(valid)), valid)
+  assert.deepEqual(parseFrontendBuildIdentity(JSON.stringify({ ...valid, kind: 'source', builtAt: null })), { ...valid, kind: 'source', builtAt: null })
   assert.equal(parseFrontendBuildIdentity(JSON.stringify({ kind: 'development', sourceHash: null, builtAt: null })).kind, 'development')
   for (const value of [undefined, '', 'null', '[]', '{}', 'x'.repeat(513),
     JSON.stringify({ ...valid, sourceHash: 'a'.repeat(12) }), JSON.stringify({ ...valid, builtAt: 'yesterday' }),
     JSON.stringify({ ...valid, builtAt: '2026-09-23T12:00:00Z' }), JSON.stringify({ ...valid, revision: 'claimed' }),
+    JSON.stringify({ ...valid, kind: 'source' }),
     JSON.stringify({ kind: 'development', sourceHash: valid.sourceHash, builtAt: null }),
     '{"__proto__":{},"kind":"build","sourceHash":"fake","builtAt":null}']) {
     assert.deepEqual(parseFrontendBuildIdentity(value), { kind: 'unavailable', sourceHash: null, builtAt: null })
