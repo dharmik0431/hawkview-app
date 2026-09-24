@@ -10,12 +10,11 @@ const { hydrateRoot } = require('react-dom/client')
 const { JSDOM } = require('jsdom')
 const ts = require('typescript')
 const base = resolve(dirname(new URL(import.meta.url).pathname), '../..')
-const build = { kind: 'build', sourceHash: 'a1234567890b'.repeat(5) + 'cdef', builtAt: '2026-09-23T15:30:00.000Z' }
-let identity: any = build
+let release: any = { phase: 1, pullRequest: 296, label: '1.296' }
 let pathname = '/dashboard'
 const h = React.createElement
 const mocks: Record<string, any> = {
-  '@/lib/config/frontend-build-identity': { get FRONTEND_BUILD_IDENTITY() { return identity } },
+  '@/lib/config/frontend-release': { get FRONTEND_RELEASE() { return release } },
   'next-themes': { useTheme: () => ({ theme: 'light', resolvedTheme: 'light', setTheme() {} }) },
   'next/navigation': { usePathname: () => pathname },
   '@/components/brand/hawkview-brand': { HawkViewBrand: (props: any) => h('span', { className: props.className }, 'HawkView') },
@@ -28,6 +27,7 @@ const mocks: Record<string, any> = {
 }
 const cache = new Map<string, any>()
 function load(path: string): any {
+  if (path.endsWith('.json')) return JSON.parse(readFileSync(path, 'utf8'))
   if (cache.has(path)) return cache.get(path)
   const exports: any = {}; cache.set(path, exports)
   const js = ts.transpileModule(readFileSync(path, 'utf8'), { compilerOptions: {
@@ -46,63 +46,55 @@ const { Topbar } = load(resolve(base, 'components/layout/topbar.tsx'))
 const { SiteVersion } = load(resolve(base, 'components/layout/site-version.tsx'))
 function app() { return h('div', null, h('section', { id: 'login' }, h(Login)), h('section', { id: 'signed-in' }, h(Topbar))) }
 
-test('actual login chain and signed-in topbar render the same accessible compiled identity', () => {
-  identity = build; pathname = '/dashboard'
+function assertLabelOnly(surface: Element, label: string) {
+  const labels = surface.querySelectorAll('[aria-label="Frontend site version"]')
+  assert.equal(labels.length, 1)
+  const labelNode = labels[0]
+  assert.equal(labelNode.tagName, 'SPAN')
+  assert.equal(labelNode.textContent, `Version ${label}`)
+  assert.equal(labelNode.getAttribute('tabindex'), null)
+  assert.equal(labelNode.getAttribute('title'), null)
+  assert.equal(surface.querySelector('details, summary, time'), null)
+  assert.doesNotMatch(surface.textContent ?? '', /Source fingerprint|Frontend version details|Built \(UTC\)|show version details/)
+}
+test('actual login chain and signed-in topbar show only the phase.PR label', () => {
+  release = { phase: 1, pullRequest: 296, label: '1.296' }; pathname = '/dashboard'
   const dom = new JSDOM(renderToStaticMarkup(app()))
-  for (const id of ['login', 'signed-in']) {
-    const surface = dom.window.document.getElementById(id)!
-    assert.equal(surface.querySelectorAll('details').length, 1)
-    assert.match(surface.querySelector('summary')!.textContent!, /Version a1234567890b/)
-    assert.match(surface.querySelector('summary')!.getAttribute('aria-label')!, /Frontend site version/)
-    assert.equal(surface.querySelector('dd')!.textContent, build.sourceHash)
-    assert.equal(surface.querySelector('time')!.getAttribute('datetime'), build.builtAt)
-    assert.match(surface.textContent!, /15:30:00 UTC/)
-    const details = surface.querySelector('details')!
-    assert.equal(details.open, false)
-    surface.querySelector('summary')!.click()
-    assert.equal(details.open, true, 'native disclosure opens without application JS')
-  }
-  assert.ok(!dom.window.document.querySelector('#login details')!.parentElement!.className.includes('lg:hidden'))
+  for (const id of ['login', 'signed-in']) assertLabelOnly(dom.window.document.getElementById(id)!, '1.296')
+  assert.ok(!dom.window.document.querySelector('#login [aria-label="Frontend site version"]')!.parentElement!.className.includes('lg:hidden'))
   dom.window.close()
 })
-test('source identity renders the same version on login and signed-in without invented build time', () => {
-  identity = { kind: 'source', sourceHash: build.sourceHash, builtAt: null }; pathname = '/dashboard'
-  const dom = new JSDOM(renderToStaticMarkup(app()))
-  for (const id of ['login', 'signed-in']) {
-    const surface = dom.window.document.getElementById(id)!
-    assert.match(surface.querySelector('summary')!.textContent!, /Version a1234567890b/)
-    assert.equal(surface.querySelector('dd')!.textContent, build.sourceHash)
-    assert.equal(surface.querySelector('time'), null)
-    assert.match(surface.textContent!, /source used for this compilation/)
-    assert.doesNotMatch(surface.textContent!, /Development|Built \(UTC\)|production|deployment/i)
-    surface.querySelector('summary')!.click()
-    assert.equal(surface.querySelector('details')!.open, true)
-  }
-  dom.window.close()
-})
-test('title-hidden admin and team routes retain the visible version', () => {
-  identity = build
+test('title-hidden admin and team routes retain the plain version label', () => {
   for (pathname of ['/admin/overview', '/settings/team', '/team-access']) {
     const dom = new JSDOM(renderToStaticMarkup(h(Topbar)))
     assert.equal(dom.window.document.querySelector('h1'), null)
-    assert.match(dom.window.document.querySelector('summary')!.textContent!, /Version a1234567890b/)
+    assertLabelOnly(dom.window.document.body, '1.296')
     dom.window.close()
   }
 })
-test('development and unavailable identities are explicit on both surfaces', () => {
-  pathname = '/dashboard'
-  for (const [kind, label] of [['development', 'Development'], ['unavailable', 'Version unavailable']]) {
-    identity = { kind, sourceHash: null, builtAt: null }
+test('unassigned and invalid releases show only truthful fallback labels', () => {
+  for (const value of [{ phase: 1, pullRequest: null, label: '1.local' }, { phase: null, pullRequest: null, label: 'Unavailable' }]) {
+    release = value
     const dom = new JSDOM(renderToStaticMarkup(app()))
-    for (const id of ['login', 'signed-in']) {
-      assert.equal(dom.window.document.querySelector(`#${id} [aria-label="Frontend site version"]`)!.textContent, label)
-      assert.equal(dom.window.document.querySelector(`#${id} details`), null)
-    }
+    for (const id of ['login', 'signed-in']) assertLabelOnly(dom.window.document.getElementById(id)!, value.label === 'Unavailable' ? 'unavailable' : value.label)
     dom.window.close()
   }
+  release = { phase: 1, pullRequest: 296, label: '1.296' }
 })
-for (const hydratedIdentity of [build, { kind: 'source', sourceHash: build.sourceHash, builtAt: null }]) test(`SSR hydration preserves ${hydratedIdentity.kind} identity without clocks or API calls`, async () => {
-  identity = hydratedIdentity; pathname = '/dashboard'
+test('actual tracked release JSON and reader feed both UI mounting points', () => {
+  const actual = load(resolve(base, 'lib/config/frontend-release.ts')).FRONTEND_RELEASE
+  const tracked = JSON.parse(readFileSync(resolve(base, 'lib/config/frontend-release.json'), 'utf8'))
+  assert.equal(actual.phase, tracked.phase)
+  assert.equal(actual.pullRequest, tracked.pullRequest)
+  assert.equal(actual.label, `${tracked.phase}.${tracked.pullRequest ?? 'local'}`)
+  release = actual; pathname = '/dashboard'
+  const dom = new JSDOM(renderToStaticMarkup(app()))
+  for (const id of ['login', 'signed-in']) assertLabelOnly(dom.window.document.getElementById(id)!, actual.label)
+  dom.window.close()
+  release = { phase: 1, pullRequest: 296, label: '1.296' }
+})
+test('SSR hydration preserves the release label without additional details or API calls', async () => {
+  pathname = '/dashboard'
   const dom = new JSDOM('<div id="root">' + renderToString(app()) + '</div>', { url: 'https://synthetic.invalid' })
   const saved = new Map<string, PropertyDescriptor | undefined>()
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true })) {
@@ -112,9 +104,7 @@ for (const hydratedIdentity of [build, { kind: 'source', sourceHash: build.sourc
   try {
     await React.act(async () => { root = hydrateRoot(dom.window.document.getElementById('root'), app(), { onRecoverableError: (error: unknown) => errors.push(error) }) })
     assert.deepEqual(errors, [])
-    assert.deepEqual(Array.from(dom.window.document.querySelectorAll('dd')).map((node: any) => node.textContent).filter((value: string) => value === build.sourceHash), [build.sourceHash, build.sourceHash])
-    assert.equal(dom.window.document.querySelectorAll('time').length, hydratedIdentity.kind === 'build' ? 2 : 0)
-    if (hydratedIdentity.kind === 'source') assert.doesNotMatch(dom.window.document.body.textContent!, /Development|Built \(UTC\)/)
+    for (const id of ['login', 'signed-in']) assertLabelOnly(dom.window.document.getElementById(id)!, '1.296')
   } finally {
     if (root) await React.act(async () => root.unmount())
     for (const [key, descriptor] of Array.from(saved)) { if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key] }
@@ -123,7 +113,7 @@ for (const hydratedIdentity of [build, { kind: 'source', sourceHash: build.sourc
 })
 // Optional local visual artifact; never fetched from a backend or published.
 if (process.env.HAWKVIEW_VERSION_PREVIEW_DIR) {
-  identity = build; pathname = '/dashboard'
+  pathname = '/dashboard'
   for (const [name, node] of [['login', h(Login)], ['topbar', h(Topbar)], ['details', h(SiteVersion)]]) {
     writeFileSync(resolve(process.env.HAWKVIEW_VERSION_PREVIEW_DIR, `${name}.html`), '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="/style.css"></head><body>' + renderToStaticMarkup(node) + '</body></html>')
   }
