@@ -2,7 +2,6 @@
 
 import React, { useEffect, useMemo, useState } from 'react'
 import { usePathname } from 'next/navigation'
-import { SiteVersion } from '@/components/layout/site-version'
 import { NotificationPanel } from '@/components/layout/notification-panel'
 import { UserMenu } from '@/components/layout/user-menu'
 import { MobileNavigation } from '@/components/layout/mobile-navigation'
@@ -149,7 +148,6 @@ export function Topbar() {
           </h1>
         )}
 
-        <SiteVersion />
       </div>
 
       <div className="flex shrink-0 justify-end items-center gap-x-3 sm:gap-x-4">
