@@ -6,6 +6,7 @@ import { cn } from '@/lib/utils'
 import { History as HistoryIcon, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { useSidebar } from '@/components/providers/sidebar-provider'
+import { SiteVersion } from '@/components/layout/site-version'
 import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 import {
   Tooltip,
@@ -155,6 +156,9 @@ export function Sidebar() {
 
           {/* Bottom actions + user (pinned) */}
           <div className="mt-4 space-y-2">
+            <div className="text-center [&>span]:block [&>span]:break-words [&>span]:text-slate-400">
+              <SiteVersion />
+            </div>
             {isMspOwner && (
               <Tooltip>
                 <TooltipTrigger asChild>

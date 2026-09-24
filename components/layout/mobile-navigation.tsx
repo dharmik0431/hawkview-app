@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { Menu, ShieldCheck, X } from 'lucide-react'
+import { SiteVersion } from '@/components/layout/site-version'
 import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 import { useAuth } from '@/components/providers/auth-provider'
 import { cn } from '@/lib/utils'
@@ -135,6 +136,12 @@ export function MobileNavigation() {
                 </div>
               ))}
 
+            </nav>
+
+            <div className="space-y-2 pt-3">
+              <div className="text-center [&>span]:text-slate-400">
+                <SiteVersion />
+              </div>
               {isMspOwner && (
                 <Link
                   href="/admin/overview"
@@ -151,14 +158,14 @@ export function MobileNavigation() {
                   Admin Panel
                 </Link>
               )}
-            </nav>
 
-            <a
-              href="mailto:support@hawkviewapp.com?subject=HawkView%20Support"
-              className="rounded-lg border border-slate-700 px-3 py-2.5 text-center text-sm font-medium text-slate-200 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-            >
-              Contact support
-            </a>
+              <a
+                href="mailto:support@hawkviewapp.com?subject=HawkView%20Support"
+                className="block rounded-lg border border-slate-700 px-3 py-2.5 text-center text-sm font-medium text-slate-200 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+              >
+                Contact support
+              </a>
+            </div>
           </aside>
         </div>
       )}
