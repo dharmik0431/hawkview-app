@@ -446,7 +446,9 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
     maximumGeneric = Math.max(maximumGeneric, activeGeneric)
     await new Promise<void>((resolve) => setImmediate(resolve))
     activeGeneric -= 1
-    return new Response(JSON.stringify({ value: [{ id: url.slice(-24) }] }))
+    return new Response(JSON.stringify({ value: [url.includes('/security/secureScores')
+      ? { id: 'current-score', createdDateTime: new Date().toISOString(), currentScore: 75, maxScore: 100 }
+      : { id: url.slice(-24) }] }))
   }
   ;(service as any).syncGroups = async (tenant: unknown, token: string) =>
     (service as any).syncEntraCollection(
@@ -513,6 +515,7 @@ test('actual full sync continues from a failed sign-in collector to audit withou
     'syncM365AuditActivity', 'syncSecurityDefaults', 'refreshCollectionFieldStates',
   ]) (service as any)[method] = async () => undefined
   ;(service as any).syncEntraCollection = async () => undefined
+  ;(service as any).syncCurrentSecureScore = async () => undefined
 
   const order: string[] = []
   let signInActive = false

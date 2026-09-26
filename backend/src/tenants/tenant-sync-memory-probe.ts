@@ -237,7 +237,7 @@ const originalUsers = (actualService as any).synchronizeUsers.bind(actualService
   actualSnapshots += 1
   peakRss = Math.max(peakRss, process.memoryUsage().rss)
 }
-for (const method of ['syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups', 'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage', 'syncDomainDnsHealth', 'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy', 'syncSecurityDefaults', 'syncSignInLogs', 'syncDirectoryAuditLogs', 'syncM365AuditActivity', 'syncEntraCollection', 'refreshCollectionFieldStates']) {
+for (const method of ['syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups', 'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage', 'syncDomainDnsHealth', 'syncAuthenticationRegistrations', 'syncAuthenticationMethodPolicy', 'syncSecurityDefaults', 'syncSignInLogs', 'syncDirectoryAuditLogs', 'syncM365AuditActivity', 'syncEntraCollection', 'syncCurrentSecureScore', 'refreshCollectionFieldStates']) {
   ;(actualService as any)[method] = async () => undefined
 }
 ;(actualService as any).fetchGraphPage = async (url: string) => {
