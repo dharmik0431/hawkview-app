@@ -1,3 +1,4 @@
+import { lockRiskEvaluationScope } from '../identity-risk/risk-evaluation-scope.js'
 import { randomUUID } from 'node:crypto'
 import type { Prisma, PrismaClient } from '../generated/prisma/client.js'
 import type { TenantAssessment } from '../evaluation-core/compose.js'
@@ -82,6 +83,20 @@ const UPSERT_STANDING = `
    AND existing.subject_type = EXCLUDED.subject_type AND existing.subject_id = EXCLUDED.subject_id
    AND EXCLUDED.observed_at >= existing.observed_at`
 
+/** Reused at source admission and publication; publication holds every lock
+ * through all run/finding/lifecycle writes. A revoked scope cannot commit. */
+export async function assertNativeEvaluationScope(
+  tx: Prisma.TransactionClient,
+  scope: Readonly<{ organizationId: string; customerTenantId: string }>,
+  publishing = false,
+) {
+  const eligibility = await lockRiskEvaluationScope({
+    lock: async key => { await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', key) },
+    query: (sql, values) => tx.$queryRawUnsafe<unknown[]>(sql, ...values),
+  }, scope, publishing ? 'UPDATE' : 'SHARE')
+  if (eligibility !== 'ELIGIBLE') throw new Error('NATIVE_PUBLICATION_SCOPE_UNAVAILABLE')
+}
+
 /** The real production seam. A marker, run and every parent/finding commit in
  * ONE transaction. Tenant row locking serializes publishers (including replay)
  * without holding a lock while source evaluation runs. No email is sent here. */
@@ -89,12 +104,7 @@ export async function publishNativeAssessment(
   prisma: PrismaClient, assessment: TenantAssessment, input: PersistRunInput,
 ): Promise<{ id: string; publication: NativePublication }> {
   return prisma.$transaction(async tx => {
-    const scope = await tx.$queryRawUnsafe<{ id: string }[]>(
-      `SELECT id FROM customer_tenants
-       WHERE id = $1::uuid AND organization_id = $2::uuid AND status = 'ACTIVE' FOR UPDATE`,
-      input.customerTenantId, input.organizationId,
-    )
-    if (scope.length !== 1) throw new Error('NATIVE_PUBLICATION_SCOPE_UNAVAILABLE')
+    await assertNativeEvaluationScope(tx, input, true)
     const existing = await tx.identityRiskEvaluationRun.findUnique({
       where: { organizationId_customerTenantId_runKey: {
         organizationId: input.organizationId, customerTenantId: input.customerTenantId, runKey: runKeyFor(input),
@@ -146,5 +156,5 @@ export async function publishNativeAssessment(
         [MARKER]: { version: PUBLICATION_VERSION, status: publication } } as Prisma.InputJsonValue,
     } })
     return { id, publication }
-  }, { maxWait: 5_000, timeout: 30_000 })
+  }, { maxWait: 5_000, timeout: 30_000, isolationLevel: 'ReadCommitted' })
 }

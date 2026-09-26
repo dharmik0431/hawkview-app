@@ -61,6 +61,9 @@ async function seed(prisma: PrismaService, at: Date): Promise<Scope> {
       microsoftTenantId: randomUUID(), displayName: 'Exact QA tenant',
       primaryDomain: 'exact-qa.example', status: 'ACTIVE' },
   })
+  await prisma.tenantConnection.create({ data: {
+    organizationId: scope.organizationId, customerTenantId: scope.customerTenantId, status: 'CONNECTED',
+  } })
   await prisma.syncState.create({ data: {
     organizationId: scope.organizationId, customerTenantId: scope.customerTenantId,
     resourceType: 'SIGN_INS', status: 'SUCCEEDED', lastAttemptAt: at,

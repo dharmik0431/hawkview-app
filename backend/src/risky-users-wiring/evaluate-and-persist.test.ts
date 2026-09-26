@@ -22,7 +22,8 @@ function client(options: Readonly<{ failAt?: 'syncState' | 'tenant' | 'rows' }> 
         calls.push('commit')
         return result
       },
-      $queryRawUnsafe: async () => [{ id: scope.customerTenantId }],
+      $queryRawUnsafe: async (sql: string) => sql.includes('FROM identity_risk_operational_controls') ? [] : [{ id: scope.customerTenantId }],
+      $executeRawUnsafe: async () => 0,
       identityRiskFinding: { updateMany: async () => ({ count: 0 }) },
       syncState: {
         findMany: async () => {

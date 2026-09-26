@@ -78,6 +78,8 @@ let refusedBy: string | null = null
 try {
   await prisma.organization.create({ data: { id: organizationId, name: 'QA round trip', slug: `qa-rt-${organizationId}` } })
   await prisma.customerTenant.create({ data: { id: customerTenantId, organizationId, microsoftTenantId, displayName: 'QA round trip tenant', status: 'ACTIVE' } })
+  await prisma.tenantConnection.create({ data: { organizationId, customerTenantId,
+    connectionMode: 'HAWKVIEW_MANAGED', status: 'CONNECTED' } })
   await prisma.directoryUser.create({ data: { organizationId, customerTenantId, microsoftUserId: userId,
     displayName: upn, userPrincipalName: upn, userType: 'Member', lastSeenAt: ago(24 * HOUR), updatedAt: ago(24 * HOUR) } })
   await prisma.signInLog.createMany({ data: Array.from({ length: 15 }, (_, i) => row(i)) })

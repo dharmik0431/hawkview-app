@@ -32,11 +32,16 @@ function database(options: Options = {}) {
     events.push({ name, data })
   }
   const tx = {
-    $queryRawUnsafe: async (_sql: string, tenant: string, org: string) => {
-      assert.equal(tenant, input.customerTenantId); assert.equal(org, input.organizationId)
-      capture('scope'); return options.foreign ? [] : [{ id: tenant }]
+    $queryRawUnsafe: async (sql: string, first: string, second: string) => {
+      if (sql.includes('FROM identity_risk_operational_controls')) return []
+      if (sql.includes('FROM organizations')) { assert.equal(first, input.organizationId); return [{ id: first }] }
+      assert.equal(first, input.customerTenantId); assert.equal(second, input.organizationId)
+      if (sql.includes('FROM tenant_connections')) return [{ id: 'connection' }]
+      assert.match(sql, /FROM customer_tenants/)
+      capture('scope'); return options.foreign ? [] : [{ id: first }]
     },
     $executeRawUnsafe: async (sql: string, org: string, tenant: string, payload: string) => {
+      if (sql.includes('pg_advisory_xact_lock')) return 0
       capture('standing', { sql, org, tenant, rows: JSON.parse(payload) }); return 1
     },
     identityRiskEvaluationRun: {

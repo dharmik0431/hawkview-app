@@ -135,9 +135,9 @@ test('known locked admission branches alone classify expected skips; actual ensu
         pg.Client.prototype.query = (async (sql: string) => {
           if (sql.includes("current_setting('TimeZone')")) return { rows: [{ timezone: 'UTC' }], rowCount: 1 }
           if (sql.includes('pg_advisory_xact_lock') && branch === 'query') throw hostile
-          if (sql.includes('identity_risk_operational_controls')) return { rows: [], rowCount: branch === 'control' ? 1 : 0 }
+          if (sql.includes('identity_risk_operational_controls')) return { rows: branch === 'control' ? [{ id: 'synthetic-control' }] : [], rowCount: branch === 'control' ? 1 : 0 }
           for (const [name, table] of [['owner','organizations'],['tenant','customer_tenants'],['connection','tenant_connections']]) {
-            if (sql.includes(`FROM ${table} WHERE`) || sql.includes(`FROM ${table}\n`)) return { rows: [], rowCount: branch === name ? 0 : 1 }
+            if (sql.includes(`FROM ${table} WHERE`) || sql.includes(`FROM ${table}\n`)) return { rows: branch === name ? [] : [{ id: `synthetic-${name}` }], rowCount: branch === name ? 0 : 1 }
           }
           if (sql.includes('identity_risk_pseudonym_key_versions')) {
             if (branch === 'cipher') {
