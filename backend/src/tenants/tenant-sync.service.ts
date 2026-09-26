@@ -48,6 +48,7 @@ import {
   type SignInLocation,
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
+import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreResponseError } from './secure-score-collection.js'
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
   deriveInitialSyncStatus,
@@ -690,17 +691,24 @@ type MailboxRuleUser = { microsoftUserId: string; userPrincipalName: string }
 
 /**
  * A snapshot baseline may only advance after a collector can attest that its
- * response is complete. This avoids treating an interrupted or bounded read
- * as a destructive inventory deletion.
+ * response is complete for its declared scope. Inventories require complete
+ * pagination; current_score_complete is only the bounded SECURE_SCORES query,
+ * never a full-history or all-provider coverage attestation.
  */
 export type SnapshotCollectionResult = {
   rows: unknown[]
-  completeness: 'authoritative_complete' | 'partial_or_unknown'
+  completeness: 'authoritative_complete' | 'current_score_complete' | 'partial_or_unknown'
 }
 
 export const authoritativeSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
   rows,
   completeness: 'authoritative_complete',
+})
+
+/** Only the validated bounded current-score response, not score history. */
+export const currentScoreSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
+  rows,
+  completeness: 'current_score_complete',
 })
 
 export const partialSnapshot = (rows: unknown[]): SnapshotCollectionResult => ({
@@ -2496,12 +2504,7 @@ export class TenantSyncService {
           'passwordCredentials,keyCredentials,requiredResourceAccess&' +
           '$expand=owners($select=id,displayName,userPrincipalName)'
       ) },
-      { resource: 'SECURE_SCORES', synchronize: () => this.syncEntraCollection(
-        tenant,
-        snapshotAccessToken,
-        'SECURE_SCORES',
-        'https://graph.microsoft.com/v1.0/security/secureScores?$top=25'
-      ) },
+      { resource: 'SECURE_SCORES', synchronize: () => this.syncCurrentSecureScore(tenant, snapshotAccessToken) },
       { resource: 'SECURITY_DEFAULTS', synchronize: () => this.syncSecurityDefaults(tenant, snapshotAccessToken) },
     ]
     const entraResults = await settleSyncCollectorModules(entraModules)
@@ -3374,6 +3377,56 @@ export class TenantSyncService {
         ownerFailures.length,
         membershipFailures.length
       )
+    })
+  }
+
+  private async syncCurrentSecureScore(
+    tenant: { id: string; organizationId: string },
+    accessToken: string,
+  ) {
+    return this.runSnapshotSync(tenant, 'SECURE_SCORES', async () => {
+      const limits = { ...entraCollectionLimitsForResource('SECURE_SCORES'), pages: 1 }
+      const deadlineAt = Date.now() + limits.collectorDeadlineMs
+      let phase: 'TRANSPORT' | 'RESPONSE' | 'VALIDATION' | 'RETENTION' = 'TRANSPORT'
+      let rows
+      try {
+        const response = await this.fetchGraphPage(CURRENT_SECURE_SCORE_URL, accessToken, 'secure scores', {
+          timeoutMs: limits.requestTimeoutMs, deadlineAt,
+        })
+        phase = 'RESPONSE'
+        // Security API provider errors can be 206 + Warning. Reject any Warning
+        // even on 200 defensively; do not change shared collector HTTP handling.
+        if (response.status !== 200 || response.headers.has('warning')) {
+          await cancelBoundedStream(() => response.body?.cancel())
+          throw new SecureScoreResponseError(response.status === 206 || response.headers.has('warning')
+            ? 'PARTIAL_PROVIDER_RESPONSE' : 'INVALID_HTTP_STATUS')
+        }
+        // Bound raw bytes independently from the much smaller projected score.
+        // Do not use the historical collector's retained-bytes * 4 wire limit.
+        const text = await readBoundedResponseText(response, limits.pageBytes,
+          'Microsoft secure scores exceeded the bounded response-size limit.', deadlineAt)
+        phase = 'VALIDATION'
+        let payload: unknown
+        try { payload = JSON.parse(text) } catch { throw new SecureScoreResponseError('INVALID_RESPONSE') }
+        rows = currentSecureScoresFromResponse(payload, Date.now(), limits.rows)
+        phase = 'RETENTION'
+        if (Date.now() >= deadlineAt) throw new Error('Microsoft secure scores exceeded its bounded collection deadline.')
+        if (Buffer.byteLength(JSON.stringify(rows), 'utf8') > limits.materializedBytes) {
+          throw new Error('Microsoft secure scores exceeded the bounded collection retained-byte limit.')
+        }
+      } catch (error) {
+        // Fixed enums only: no response content, URL, credentials or identity.
+        const message = error instanceof Error ? error.message : ''
+        const reason = error instanceof SecureScoreResponseError ? error.reason
+          : /bounded collection deadline/.test(message) ? 'DEADLINE_LIMIT'
+          : /bounded response-size limit/.test(message) ? 'RAW_BYTE_LIMIT'
+          : /retained-byte limit/.test(message) ? 'RETAINED_BYTE_LIMIT'
+          : 'READ_OR_TRANSPORT_FAILURE'
+        this.logger.warn(JSON.stringify({ event: 'secure_score_collection_rejected', phase, reason }))
+        throw error
+      }
+      // Complete for the explicitly scoped current-score query, not history.
+      await this.saveSnapshot(tenant, 'SECURE_SCORES', currentScoreSnapshot(rows))
     })
   }
 
@@ -4986,7 +5039,8 @@ export class TenantSyncService {
      *  values with defaults; every other resource keeps replace-wholesale semantics unchanged. */
     mergeWithPrevious?: (previous: readonly unknown[], incoming: readonly unknown[]) => unknown[],
   ) {
-    if (result.completeness !== 'authoritative_complete') {
+    if (result.completeness !== 'authoritative_complete' &&
+      !(resourceType === 'SECURE_SCORES' && result.completeness === 'current_score_complete')) {
       throw new Error(
         `Refusing to advance ${resourceType} snapshot baseline from a partial or unverified collection.`
       )
@@ -5014,10 +5068,10 @@ export class TenantSyncService {
       // MERGED BEFORE THE EVIDENCE IS BUILT, not after. Comparing the baseline against a merged
       // snapshot means an absent property no longer reads as a change -- which it never was.
       const rows = mergeWithPrevious ? mergeWithPrevious(previousRows, incomingRows) : incomingRows
-      // This method only accepts a collector result that explicitly attests
-      // to complete pagination. A legitimate empty inventory can therefore
-      // remove prior objects, while failed or partial reads cannot advance
-      // the baseline or create mass-removal evidence.
+      // Inventory snapshots attest complete pagination. SECURE_SCORES alone
+      // may declare the bounded current-score scope and has no historical
+      // difference catalog; reducing its history cannot invent removals.
+      // Failed/partial reads never advance either kind of baseline.
       const evidence = this.changeEvidence.buildSnapshotDifferenceEvidence({
         tenant, resourceType, previousPayload: existing?.payload, currentPayload: rows,
         observedAt, baselineObservedAt: existing?.observedAt, expiresAt: logExpirationDate(observedAt),
