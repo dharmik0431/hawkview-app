@@ -10,6 +10,7 @@ import {
   MICROSOFT_COLLECTOR_RESOURCE_TYPES,
 } from './microsoft-access-contract.js'
 import { MicrosoftConsentService } from './microsoft-consent.service.js'
+import { CURRENT_SECURE_SCORE_URL } from '../tenants/secure-score-collection.js'
 import { effectiveMicrosoftConnectionStatus } from '../tenants/tenants.service.js'
 
 test('registers every requested application permission against a real capability and exact resource', () => {
@@ -89,7 +90,6 @@ test('keeps current Microsoft call-site families represented in the registry', (
     ['/policies/identitySecurityDefaultsEnforcementPolicy', '/policies/identitySecurityDefaultsEnforcementPolicy'],
     ['/applications?', '/applications'],
     ['/servicePrincipals?', '/servicePrincipals'],
-    ['/security/secureScores', '/security/secureScores'],
     ['/identityProtection/riskyUsers', '/identityProtection/riskyUsers'],
     ['/subscribedSkus', '/subscribedSkus'],
     ['/admin/sharepoint/settings', '/admin/sharepoint/settings'],
@@ -105,6 +105,14 @@ test('keeps current Microsoft call-site families represented in the registry', (
     assert.ok(tenantSync.includes(sourceNeedle), `collector call disappeared: ${sourceNeedle}`)
     assert.ok(registered.includes(registryNeedle), `collector call is not registered: ${registryNeedle}`)
   }
+  // Secure Scores now owns its URL in a dedicated collector module. Verify
+  // that exact endpoint, its registry entry, and the actual service call site.
+  assert.equal(CURRENT_SECURE_SCORE_URL, 'https://graph.microsoft.com/v1.0/security/secureScores?$top=1')
+  const secureScores = MICROSOFT_ACCESS_CAPABILITIES.find((capability) => capability.key === 'entra_secure_scores')
+  assert.ok(secureScores, 'Secure Scores capability disappeared')
+  assert.ok(secureScores.endpointPatterns.includes('GET /v1.0/security/secureScores'), 'Secure Scores endpoint is not registered')
+  assert.match(tenantSync, /import\s*\{[^}]*\bCURRENT_SECURE_SCORE_URL\b[^}]*\}\s*from ['"]\.\/secure-score-collection\.js['"]/, 'Secure Scores URL import disappeared')
+  assert.match(tenantSync, /this\.fetchGraphPage\(\s*CURRENT_SECURE_SCORE_URL\s*,/, 'Secure Scores URL is not used by the collector')
   for (const needle of ['/subscriptions/list', '/subscriptions/start', '/subscriptions/content']) {
     assert.ok(activity.includes(needle), `activity call disappeared: ${needle}`)
     assert.ok(registered.includes(needle), `activity call is not registered: ${needle}`)

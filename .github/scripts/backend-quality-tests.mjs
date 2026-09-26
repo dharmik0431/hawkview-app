@@ -58,7 +58,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Test-owned fake PostgreSQL wire server on an ephemeral loopback port.',
   },
   'src/identity-risk/risk-cycle-failure-stages.test.ts': {
-    blob: '01ba665f37c7afa6a856f671ed3c9cef03e311cb',
+    blob: '4bfc12af09e183f7b98bae6de9f5b3929bbe9a6e',
     reason: 'Synthetic dependency failures and closed-port configuration, not fixture DB IO.',
   },
   'src/risky-users-wiring/risky-users-gates.test.ts': {
