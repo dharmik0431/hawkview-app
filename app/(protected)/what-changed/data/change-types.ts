@@ -161,7 +161,11 @@ export type ChangesPagination = {
   totalPages: number
 }
 
+export type SourceReadStatus = 'available' | 'partial' | 'unavailable' | 'unknown'
+export type SourceAvailability = { directoryAudit: SourceReadStatus; normalizedEvidence: SourceReadStatus }
+
 export type NormalizedChangesResponse = {
+  sourceAvailability: SourceAvailability
   changes: ChangeEvent[]
   tenants: { id: string; name: string }[]
   validPayload: boolean
@@ -436,8 +440,26 @@ export function normalizeChangeEvent(value: unknown): ChangeEvent | null {
   }
 }
 
+function normalizeSourceStatus(value: unknown): SourceReadStatus {
+  const status = record(value)?.status
+  return status === 'available' || status === 'partial' || status === 'unavailable' ? status : 'unknown'
+}
+
+function mergeSourceStatus(statuses: SourceReadStatus[]): SourceReadStatus {
+  if (statuses.includes('unknown')) return 'unknown'
+  if (statuses.every((status) => status === 'available')) return 'available'
+  if (statuses.every((status) => status === 'unavailable')) return 'unavailable'
+  return 'partial'
+}
+
 export function normalizeChangesResponse(value: unknown): NormalizedChangesResponse {
   const input = record(value)
+  const availability = record(input?.sourceAvailability)
+  const sourceAvailability = {
+    directoryAudit: normalizeSourceStatus(availability?.directoryAudit),
+    normalizedEvidence: normalizeSourceStatus(availability?.normalizedEvidence),
+  }
+  const readsAvailable = Object.values(sourceAvailability).every((status) => status === 'available')
   const candidates = Array.isArray(input?.changes) ? input.changes : []
   const normalized = candidates.map(normalizeChangeEvent)
   const unique = new Map<string, ChangeEvent>()
@@ -493,10 +515,11 @@ export function normalizeChangesResponse(value: unknown): NormalizedChangesRespo
   return {
     changes,
     tenants,
+    sourceAvailability,
     summary,
     pagination,
     validPayload,
-    partialPayload: validPayload && (!Array.isArray(input?.tenants) || summary === undefined),
+    partialPayload: validPayload && (!readsAvailable || !Array.isArray(input?.tenants) || summary === undefined),
     discardedCount: normalized.filter((event) => event === null).length + duplicateCount,
   }
 }
@@ -517,6 +540,10 @@ export function mergeChangesPages(pages: NormalizedChangesResponse[]): Normalize
   for (const page of pages) for (const tenant of page.tenants) uniqueTenants.set(tenant.id, tenant)
   const lastPage = pages[pages.length - 1]
   return {
+    sourceAvailability: {
+      directoryAudit: mergeSourceStatus(pages.map((page) => page.sourceAvailability.directoryAudit)),
+      normalizedEvidence: mergeSourceStatus(pages.map((page) => page.sourceAvailability.normalizedEvidence)),
+    },
     changes: Array.from(uniqueChanges.values()),
     tenants: Array.from(uniqueTenants.values()),
     validPayload: pages.every((page) => page.validPayload),
