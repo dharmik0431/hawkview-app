@@ -30,6 +30,9 @@ async function seedFailingSignIns(prisma: PrismaService, at: Date, humanId = ran
       status: 'ACTIVE',
     },
   })
+  await prisma.tenantConnection.create({ data: {
+    organizationId: scope.organizationId, customerTenantId: scope.customerTenantId, status: 'CONNECTED',
+  } })
   await prisma.syncState.create({
     data: {
       organizationId: scope.organizationId,

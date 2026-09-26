@@ -18,8 +18,8 @@ type Dependencies = {
    *
    * Optional, so the cycle behaves identically when it is absent — which is
    * what makes this additive rather than a change to a path customers currently
-   * depend on. Called only after `evaluate` has already succeeded and been
-   * counted, and inside its own try/catch, so a throw here cannot turn a
+   * depend on. Called only after shared admission succeeds. A primary detector
+   * failure does not disable this independent evaluation, and inside its own try/catch, so a throw here cannot turn a
    * completed run into a failed one.
    *
    * It receives the REMAINING budget rather than an extension: this must make
@@ -85,10 +85,12 @@ export async function runGlobalRiskCycle(deps: Dependencies, requestDeadlineAt: 
       attempted++
       let stage: CycleReason = 'ATTEMPT_RECORD_FAILED'
       let ineligible = false
+      let admitted = false
       try {
         const attemptId = await deps.recordAttempt(scope, lease, Math.min(deadline, now() + 2_000))
         stage = 'KEY_ENSURE_FAILED'
         await deps.ensure(scope, Math.min(deadline, now() + 4_000), () => { ineligible = true })
+        admitted = true
         // Reserve transaction/cleanup time after bounded source materialization.
         if (deadline - now() < 15_000) { observeCycle(deps.observe, 'ADMISSION_BUDGET_EXHAUSTED'); break }
         stage = 'EVALUATION_FAILED'
@@ -111,7 +113,7 @@ export async function runGlobalRiskCycle(deps: Dependencies, requestDeadlineAt: 
       // failed a run it had already completed. Defence in depth against a future
       // edit, not the mechanism today.
       if (deps.alsoEvaluate !== undefined) {
-        if (deadline - now() < ALSO_EVALUATE_MIN_MS) deps.alsoObserve?.('SKIPPED')
+        if (!admitted || deadline - now() < ALSO_EVALUATE_MIN_MS) deps.alsoObserve?.('SKIPPED')
         else {
           try { await deps.alsoEvaluate(scope, deadline - 1_000); deps.alsoObserve?.('COMPLETED') }
           catch { deps.alsoObserve?.('FAILED') }

@@ -85,6 +85,8 @@ try {
   for (const [id, ms, label] of [[tenantA, msTenantA, 'A'], [tenantB, msTenantB, 'B']] as const) {
     await prisma.customerTenant.create({ data: { id, organizationId, microsoftTenantId: ms, displayName: `QA tenant ${label}`, status: 'ACTIVE' } })
   }
+  await prisma.tenantConnection.create({ data: { organizationId, customerTenantId: tenantA,
+    connectionMode: 'HAWKVIEW_MANAGED', status: 'CONNECTED' } })
   // U1 lives in tenant A and stays there — it is the proof that resolution ran.
   await prisma.directoryUser.create({ data: { organizationId, customerTenantId: tenantA,
     microsoftUserId: U1, displayName: NAME_A, userPrincipalName: UPN_A,
