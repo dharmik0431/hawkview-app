@@ -106,6 +106,7 @@ export default function ActivityPage() {
     'idle' | 'loading' | 'ready' | 'error'
   >('idle')
   const [bundleReloadKey, setBundleReloadKey] = React.useState(0)
+  const [loadedBundleReloadKey, setLoadedBundleReloadKey] = React.useState<number | null>(null)
   const [tenants, setTenants] = React.useState<
     Array<{ id: string; name: string }>
   >([])
@@ -182,6 +183,7 @@ export default function ActivityPage() {
       })
       .then((data) => {
         if (!alive) return
+        setLoadedBundleReloadKey(bundleReloadKey)
         setSelectedBundle(data.bundle ?? null)
         setBundleState(data.bundle ? 'ready' : 'error')
       })
@@ -631,6 +633,22 @@ export default function ActivityPage() {
     ;(nextTab === 'signins' ? signInsTabRef : auditTabRef).current?.focus()
   }
 
+  // Retention describes HawkView's policy, not how much history was collected.
+  // Check the tenant before effects clear an old bundle during a selection change.
+  const reportedRetentionMonths =
+    bundleState === 'ready' &&
+    loadedBundleReloadKey === bundleReloadKey &&
+    filters.tenantId &&
+    selectedBundle?.tenant?.id === filters.tenantId
+      ? selectedBundle?.logRetention?.months
+      : null
+  const retentionLabel =
+    typeof reportedRetentionMonths === 'number' &&
+    Number.isSafeInteger(reportedRetentionMonths) &&
+    reportedRetentionMonths > 0
+      ? `${reportedRetentionMonths} ${reportedRetentionMonths === 1 ? 'month' : 'months'}`
+      : 'Not reported'
+
   const activeMatchingCount =
     tab === 'signins' ? signInRows.length : auditRows.length
   const signInCountLabel =
@@ -660,7 +678,7 @@ export default function ActivityPage() {
         </div>
 
         <Badge variant="secondary" className="h-8 px-3 rounded-full">
-          Retention: Not reported
+          Retention: {retentionLabel}
         </Badge>
       </div>
 
