@@ -262,6 +262,8 @@ async function mounted(
             )
           )
         )
+        const toggle = dom.window.document.querySelector('button[aria-controls="fleet-evidence-availability"]')
+        if (toggle?.getAttribute('aria-expanded') === 'false') await React.act(async () => toggle.click())
       },
       renderSync: () =>
         require('react-dom').flushSync(() =>

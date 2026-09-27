@@ -133,3 +133,15 @@ test('undelivered source totals remain separate, qualified, and timestamped', ()
     ['HawkView', 7, 0, true, 'HISTORICAL', stamp], ['Microsoft', 3, 0, false, 'HISTORICAL', stamp],
   ])
 })
+
+
+test('controller-shaped not-yet-cited coverage preserves READY without introducing a veto', () => {
+  const n = native(true)
+  n.coverage[0].coverage = { applies: 1, unknown: {}, unprocessable: {}, notYetCited: { PENDING_BASIS: 14 } }
+  const result = project(n, microsoft())
+  assert.equal(result.tenantStatuses[0].nativeSource, 'READY')
+  assert.equal(result.tenantStatuses[0].count.accuracy, 'EXACT')
+  assert.equal(result.tenantStatuses[0].count.value, 1)
+  assert.match(result.tenantStatuses[0].count.caption, /14 events held pending a citation/)
+  assert.doesNotMatch(result.tenantStatuses[0].count.caption, /could not be interpreted/)
+})

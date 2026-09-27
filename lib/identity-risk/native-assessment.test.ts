@@ -990,3 +990,62 @@ test('the join compares what the ref contains, not how the subject was matched',
   )
   assert.equal(correlation && correlation.available && correlation.ref, 'obj-1')
 })
+
+
+test('DTO reason maps preserve independent uninterpreted and not-yet-cited totals', () => {
+  const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+    applies: 9, unknown: { UNRECOGNIZED_ERROR_CODE: 2 }, unprocessable: { SUBJECT_NOT_IN_DIRECTORY: 3 }, notYetCited: { PENDING_BASIS: 7 },
+    uninterpretedEvents: 0, notYetCitedEvents: 0,
+  } }] }))
+  assert.ok(adapted?.available)
+  assert.deepEqual(adapted.coverage, [{ stream: 'GRAPH_SIGN_INS', applies: 9, uninterpretedEvents: 5, notYetCitedEvents: 7 }])
+  const count = nativeRiskyUserCount(adapted)
+  assert.match(count.caption, /5 events could not be interpreted/)
+  assert.match(count.caption, /7 events held pending a citation/)
+  assert.equal(count.accuracy, 'EXACT', 'Adapter must not rewrite producer count verdict')
+})
+
+test('missing malformed and overflowing coverage stays unknown, never zero or all-accounted', () => {
+  for (const invalid of [undefined, null, [], '1', { BAD: -1 }, { BAD: 0.5 }, { BAD: '1' }, { BAD: NaN }, { BAD: Infinity }, { A: Number.MAX_SAFE_INTEGER, B: 1 }]) {
+    const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+      applies: 1, unknown: invalid, unprocessable: {}, notYetCited: {}, uninterpretedEvents: 0,
+    } }] }))
+    assert.ok(adapted?.available)
+    assert.equal(adapted.coverage[0].uninterpretedEvents, null)
+    assert.equal(adapted.coverage[0].notYetCitedEvents, 0)
+    assert.match(nativeRiskyUserCount(adapted).caption, /number of uninterpreted events is unknown/)
+    assert.doesNotMatch(nativeRiskyUserCount(adapted).caption, /Every event/)
+  }
+  for (const coverage of [{}, { applies: -1, unknown: {}, unprocessable: {}, notYetCited: null }, { applies: 1, unknown: { A: Number.MAX_SAFE_INTEGER }, unprocessable: { B: 1 }, notYetCited: {} }]) {
+    const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage }] }))
+    assert.ok(adapted?.available)
+    assert.match(nativeRiskyUserCount(adapted).caption, /unknown/)
+    assert.doesNotMatch(nativeRiskyUserCount(adapted).caption, /Every event/)
+  }
+})
+
+test('not-yet-cited maps do not become an interpretation veto; explicit empty maps remain measured zero', () => {
+  for (const pending of [0, 14]) {
+    const adapted = adaptNativeAssessment(available({ count: { accuracy: 'EXACT', value: 1, scope: { evidenceRequested: ['GRAPH_SIGN_INS'], covered: ['credential-failure'], notCovered: [] } }, coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+      applies: 1, unknown: {}, unprocessable: {}, notYetCited: pending ? { PENDING_BASIS: pending } : {},
+    } }] }))
+    assert.ok(adapted?.available)
+    assert.equal(adapted.coverage[0].uninterpretedEvents, 0)
+    assert.equal(adapted.coverage[0].notYetCitedEvents, pending)
+    assert.equal(nativeRiskyUserCount(adapted).accuracy, 'EXACT')
+    if (pending) assert.match(nativeRiskyUserCount(adapted).caption, /14 events held pending a citation/)
+    else assert.match(nativeRiskyUserCount(adapted).caption, /Every event/)
+  }
+})
+
+
+test('cross-stream overflow and a missing component cannot produce complete-zero reassurance', () => {
+  for (const second of [1, null]) {
+    const adapted = adaptNativeAssessment(available({ coverage: [Number.MAX_SAFE_INTEGER, second].map((count, index) => ({
+      stream: `STREAM_${index}`, coverage: { applies: 1, unknown: count === null ? null : { REASON: count }, unprocessable: {}, notYetCited: {} },
+    })) }))
+    assert.ok(adapted?.available)
+    assert.match(nativeRiskyUserCount(adapted).caption, /number of uninterpreted events is unknown/)
+    assert.doesNotMatch(nativeRiskyUserCount(adapted).caption, /Every event/)
+  }
+})
