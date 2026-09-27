@@ -11,11 +11,13 @@ const { createRoot } = require('react-dom/client')
 const ts = require('typescript')
 const base = resolve(dirname(new URL(import.meta.url).pathname), '../..')
 let nativeQuery: any; let microsoftQuery: any; let scope = 'synthetic'
+const queryClient = new (require('@tanstack/react-query').QueryClient)()
 const mocks: Record<string, any> = {
   '@/components/providers/auth-provider': { useAuth: () => ({ cacheScope: scope }) },
   './hooks': { useTenants: () => ({ data: { tenants: [{ id: 'tenant-a', name: 'Synthetic tenant' }] }, refetch() {} }) },
   './client': { apiClient: { get() { throw Error('Unexpected network') } } },
-  '@tanstack/react-query': { useQueries: ({ queries }: any) => [queries[0].queryKey[3] === 'assessment' ? nativeQuery : microsoftQuery] },
+  '@tanstack/react-query': {
+    useQueryClient: () => queryClient, useQueries: ({ queries }: any) => [queries[0].queryKey[3] === 'assessment' ? nativeQuery : microsoftQuery] },
 }
 const cache = new Map<string, any>()
 function load(path: string): any {

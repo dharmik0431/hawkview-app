@@ -132,7 +132,7 @@ test('the shortfall says WHY, because the remedies differ', () => {
   assert.match(detail, /1 could not be reached/)
   assert.match(detail, /2 have incomplete or unavailable evidence/)
   assert.match(detail, /2 still loading/)
-  assert.match(detail, /5 of 6 tenants were not assessed/)
+  assert.match(detail, /5 of 6 tenants have incomplete combined evidence/)
 
   // Only the causes that actually occurred are named, or every screen would
   // list three problems when it has one.
@@ -217,12 +217,12 @@ test('grammar survives the one-tenant fleet and the impossible coverage', () => 
   assert.match(
     riskyUsersSummary(0, cov({ inScope: 1, assessed: 0, loading: 0, failed: 1, unavailable: 0 }), false)
       .empty!.detail,
-    /1 of 1 tenant was not assessed/
+    /1 of 1 tenant has incomplete combined evidence/
   )
   assert.match(
     riskyUsersSummary(0, cov({ inScope: 3, assessed: 1, loading: 0, failed: 2, unavailable: 0 }), false)
       .empty!.detail,
-    /2 of 3 tenants were not assessed/
+    /2 of 3 tenants have incomplete combined evidence/
   )
 
   // `assessed` above `inScope` should be impossible; if a refactor makes it
@@ -347,7 +347,7 @@ test('the KPI tile is gated on the same coverage as the list', () => {
     'a coverage claim still reads a count that ignores UNAVAILABLE'
   )
   assert.ok(
-    code.includes('fleetWide.assessed === fleetWide.inScope'),
+    code.includes('enumerationKnown && fleetWide.inScope > 0 && notAssessed === 0'),
     'the tile is not gated on assessment coverage'
   )
 
@@ -537,7 +537,7 @@ test('no KPI tile renders a bare count over an unassessed fleet', () => {
     assert.ok(at !== -1, label + ' not found in the page')
     const after = code.slice(at, at + 260)
     assert.ok(
-      after.includes('notAssessed') && after.includes('fleetWide'),
+      after.includes('enumerationKnown') && after.includes('sourceCoverage') && after.includes('fleetWide'),
       label + ' renders a count with no coverage beside it'
     )
   }
