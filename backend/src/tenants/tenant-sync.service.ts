@@ -1,3 +1,4 @@
+import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
   BadRequestException,
   BadGatewayException,
@@ -31,6 +32,7 @@ import {
   customerCollectionFailureMessage,
   fetchMicrosoftWithRetry,
   MicrosoftRequestError,
+  type MicrosoftFailureProjection,
 } from '../microsoft/microsoft-request.js'
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
 import { Prisma } from '../generated/prisma/client.js'
@@ -2776,8 +2778,12 @@ export class TenantSyncService {
         update: {
           status: 'RUNNING',
           lastAttemptAt,
-          lastErrorCode: null,
-          lastErrorMessage: null,
+          // SIGN_INS uses its prior outcome to qualify retained evidence and
+          // the selected authentication source while this attempt is in flight.
+          ...(resourceType === 'SIGN_INS' ? {} : {
+            lastErrorCode: null,
+            lastErrorMessage: null,
+          }),
         },
       }))
     } catch (error) {
@@ -2854,7 +2860,9 @@ export class TenantSyncService {
         )
         return
       }
-      if (error instanceof CollectionPartialError) {
+      const corePartial = error instanceof CollectionPartialError &&
+        isCoreAuthenticationPartial(resourceType, error.code)
+      if (error instanceof CollectionPartialError && !corePartial) {
         await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
@@ -2876,12 +2884,21 @@ export class TenantSyncService {
         )
         return
       }
-      const failure = classifyMicrosoftFailure(error, technicalMessage)
-      const message = customerCollectionFailureMessage(
-        resourceType.replaceAll('_', ' ').toLowerCase(),
-        failure,
-        Boolean(previousState?.lastSuccessfulAt),
-      )
+      // Core evidence loss follows the existing failure/incident lifecycle.
+      // It must not advance the last complete success or erase recurrence.
+      const failure: MicrosoftFailureProjection = corePartial ? {
+        failureClass: 'INVALID_MICROSOFT_RESPONSE',
+        reasonCode: CORE_AUTHENTICATION_PARTIAL,
+        status: null, microsoftCode: null, requestId: null,
+        retryable: false, customerAction: 'CONTACT_SUPPORT',
+      } : classifyMicrosoftFailure(error, technicalMessage)
+      const message = corePartial
+        ? 'Some Microsoft authentication records could not be validated. Authentication evidence coverage remains incomplete.'
+        : customerCollectionFailureMessage(
+          resourceType.replaceAll('_', ' ').toLowerCase(),
+          failure,
+          Boolean(previousState?.lastSuccessfulAt),
+        )
       this.logger.warn(JSON.stringify({
         event: 'microsoft_collection_failed',
         resourceType,
@@ -4299,7 +4316,7 @@ export class TenantSyncService {
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
       })
       await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
-      if (records.length !== rows.length) throw new CollectionPartialError('sign-ins-record-validation-partial',
+      if (records.length !== rows.length) throw new CollectionPartialError(CORE_AUTHENTICATION_PARTIAL,
         'Some Microsoft authentication records could not be validated. Authentication evidence coverage remains incomplete.')
       // WHAT THE COLLECTION OBSERVED, not what it requested. `records` is what
       // was validated and persisted this pass; the partial check above has
