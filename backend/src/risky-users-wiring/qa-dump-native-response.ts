@@ -55,6 +55,8 @@ const row = (userId: string, upn: string, code: number) => {
 try {
   await prisma.organization.create({ data: { id: organizationId, name: 'QA dump', slug: `qa-dump-${organizationId}` } })
   await prisma.customerTenant.create({ data: { id: customerTenantId, organizationId, microsoftTenantId, displayName: 'Greentech-shaped fixture', status: 'ACTIVE' } })
+  await prisma.tenantConnection.create({ data: { organizationId, customerTenantId,
+    connectionMode: 'HAWKVIEW_MANAGED', status: 'CONNECTED' } })
   for (const p of people) {
     await prisma.directoryUser.create({ data: { organizationId, customerTenantId, microsoftUserId: p.id,
       displayName: p.name, userPrincipalName: p.upn, userType: 'Member',

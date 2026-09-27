@@ -1,7 +1,7 @@
 import { IDENTITY_RISK_RUN_RETENTION_MS } from '../identity-risk/identity-risk.contract.js'
 import { collectorStatus } from '../tenants/service-sync-freshness.js'
 import { credentialFailureDetector } from './detectors/credential-failure.js'
-import { publishNativeAssessment, type NativePublication } from './native-alert-publisher.js'
+import { assertNativeEvaluationScope, publishNativeAssessment, type NativePublication } from './native-alert-publisher.js'
 import type { SourceCollection } from './run-findings.js'
 import { readTenantAssessment } from './read-tenant.js'
 import type { PrismaClient } from '../generated/prisma/client.js'
@@ -146,6 +146,11 @@ export async function evaluateAndPersistTenant(
   scope: Readonly<{ organizationId: string; customerTenantId: string }>,
   options: Readonly<{ now?: Date; rejectionThreshold?: number; maxEvents?: number }> = {},
 ): Promise<EvaluateAndPersistResult> {
+  // Admit before reading source evidence, then recheck under publication
+  // locks after evaluation. Do not hold revocation locks across source work.
+  await prisma.$transaction(tx => assertNativeEvaluationScope(tx, scope), {
+    maxWait: 5_000, timeout: 30_000, isolationLevel: 'ReadCommitted',
+  })
   // ONE CLOCK for the window end, the completion stamp and the retention
   // horizon. Three reads of `new Date()` would put microseconds between values
   // that downstream compares for equality of intent.
