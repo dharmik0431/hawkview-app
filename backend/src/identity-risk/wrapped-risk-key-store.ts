@@ -1,3 +1,4 @@
+import { lockRiskEvaluationScope } from './risk-evaluation-scope.js'
 import { randomBytes, randomUUID } from 'node:crypto'
 import type pg from 'pg'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
@@ -54,32 +55,17 @@ export class WrappedRiskKeyStore {
   }
 
   private async assertAutomaticScope(client: pg.Client, scope: PseudonymScope, ineligible?: () => void) {
-    const rejectIneligible = () => {
+    const eligibility = await lockRiskEvaluationScope({
+      lock: async key => { await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]) },
+      query: async (sql, values) => (await client.query(sql, [...values])).rows,
+    }, scope, 'SHARE', () => {
+      this.allowed(scope)
+      if (!isGlobalRiskConfig(riskRuntimeConfig())) throw keyUnavailable()
+    })
+    if (eligibility === 'INELIGIBLE') {
       try { ineligible?.() } catch { /* Diagnostic observers cannot affect admission. */ }
-      throw keyUnavailable()
     }
-    // Same exclusive advisory namespace AND ordering as evaluator/stop controls.
-    const keys = ['GLOBAL', `${scope.organizationId}:${scope.customerTenantId}`]
-      .map(key => `hawkview:identity-risk-control:EVALUATION_HARD_DISABLED:${key}`).sort()
-    for (const key of keys) await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key])
-    this.allowed(scope)
-    if (!isGlobalRiskConfig(riskRuntimeConfig())) throw keyUnavailable()
-    const stop = await client.query(`SELECT id FROM identity_risk_operational_controls
-      WHERE state='ACTIVE' AND control_type='EVALUATION_HARD_DISABLED' AND
-      ((scope_type='GLOBAL' AND scope_key='GLOBAL') OR
-       (scope_type='TENANT' AND scope_key=$3 AND organization_id=$1::uuid AND customer_tenant_id=$2::uuid)) LIMIT 1`,
-    [scope.organizationId, scope.customerTenantId, `${scope.organizationId}:${scope.customerTenantId}`])
-    if (stop.rowCount) throw keyUnavailable()
-    // Row locks linearize suspension/disconnect/deletion with enrollment. All
-    // ownership predicates remain inside this transaction, not a stale page DTO.
-    const owner = await client.query("SELECT id FROM organizations WHERE id=$1::uuid AND status='ACTIVE' FOR SHARE", [scope.organizationId])
-    if (owner.rowCount !== 1) rejectIneligible()
-    const tenant = await client.query(`SELECT id FROM customer_tenants
-      WHERE id=$1::uuid AND organization_id=$2::uuid AND status='ACTIVE' FOR SHARE`, [scope.customerTenantId, scope.organizationId])
-    if (tenant.rowCount !== 1) rejectIneligible()
-    const connection = await client.query(`SELECT id FROM tenant_connections
-      WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND status='CONNECTED' FOR SHARE`, [scope.customerTenantId, scope.organizationId])
-    if (connection.rowCount !== 1) rejectIneligible()
+    if (eligibility !== 'ELIGIBLE') throw keyUnavailable()
   }
 
   private async createOrLoad(scope: PseudonymScope, versionId: string, deadlineAt: number, automatic: boolean, ineligible?: () => void): Promise<PseudonymKeyVersion> {
