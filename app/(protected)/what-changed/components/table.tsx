@@ -175,6 +175,12 @@ export function WhatChangedView() {
     [pagedData?.pages],
   )
 
+  const incomplete = !data?.validPayload || data.partialPayload || data.discardedCount > 0 || Boolean(error) || Boolean(hasNextPage)
+  const missingSources = data ? [
+    data.sourceAvailability.directoryAudit !== 'available' ? 'directory audit evidence' : null,
+    data.sourceAvailability.normalizedEvidence !== 'available' ? 'normalized directory, Microsoft 365 unified audit and snapshot evidence' : null,
+  ].filter(Boolean).join('; ') : ''
+
   const rawChanges = React.useMemo(() => data?.changes ?? [], [data?.changes])
   const tenants = React.useMemo(() => data?.tenants ?? uniqTenants(rawChanges), [data?.tenants, rawChanges])
 
@@ -373,9 +379,10 @@ export function WhatChangedView() {
       )}
 
       {/* Clickable Investigation Summary Strip */}
-      {!isLoading && !error && data?.validPayload && (
+      {!isLoading && data?.validPayload && (
         <SummaryStrip
           summary={summaryCounts}
+          incomplete={incomplete}
           selectedCategory={selectedCategory}
           onSelectCategory={setSelectedCategory}
         />
@@ -387,7 +394,7 @@ export function WhatChangedView() {
           <div className="flex items-center gap-2">
             <AlertCircle className="h-4 w-4 shrink-0" />
             <span>
-              The investigation activity could not be loaded. Please retry.
+              {data?.validPayload ? 'Additional investigation evidence could not be loaded. Previously loaded rows remain available; counts are incomplete. Please retry.' : 'The investigation activity could not be loaded. Please retry.'}
             </span>
           </div>
           <Button
@@ -409,12 +416,15 @@ export function WhatChangedView() {
             ? 'Change evidence is unavailable because the service response could not be verified.'
             : data.discardedCount > 0
             ? `Some evidence could not be displayed (${data.discardedCount} malformed ${data.discardedCount === 1 ? 'record' : 'records'}).`
+            : missingSources
+            ? 'Some change evidence could not be read completely or its availability is unverified.'
             : 'Change evidence is partially available because response metadata could not be verified.'}
+          {missingSources && ` Source reads are incomplete or unverified: ${missingSources}. The unread remainder is unknown.`}
         </div>
       )}
 
       {/* Timeline List Section */}
-      {!error && data?.validPayload && <div className="space-y-4 pt-1">
+      {data?.validPayload && <div className="space-y-4 pt-1">
         {/* Selected Category Heading */}
         {!isLoading && (
           <div className="flex items-center justify-between border-b border-border/60 pb-2">
@@ -473,15 +483,15 @@ export function WhatChangedView() {
               <ShieldAlert className="h-6 w-6" />
             </div>
             <div className="text-sm font-semibold text-foreground">
-              {rawChanges.length === 0 && !data.partialPayload && data.discardedCount === 0
+              {rawChanges.length === 0 && !incomplete
                 ? 'No administrative changes were reported for this range.'
                 : rawChanges.length === 0
                   ? 'No verified administrative changes can be displayed.'
                   : 'No events match the selected filters.'}
             </div>
             <p className="text-xs text-muted-foreground max-w-md mx-auto">
-              {rawChanges.length === 0 && !data.partialPayload && data.discardedCount === 0
-                ? 'HawkView received an authoritative empty result for the selected time range.'
+              {rawChanges.length === 0 && !incomplete
+                ? 'Both source reads completed with no matching retained evidence. This does not verify upstream collection completeness.'
                 : rawChanges.length === 0
                   ? 'Some response evidence was unavailable or malformed, so this is not a verified zero.'
                   : 'Try another category or clear the active filters.'}

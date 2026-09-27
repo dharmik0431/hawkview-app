@@ -1949,3 +1949,36 @@ test('documents supported Microsoft administrative evidence and the implemented 
   assert.equal(DOMAIN_DETAIL_COVERAGE_GAP.decision, 'permission_blocked_not_implemented')
   assert.equal(MICROSOFT_ADMIN_CHANGE_CATALOG.some((entry) => entry.microsoftSource.includes('/domains')), false)
 })
+
+for (const source of ['directoryAuditLog', 'changeEvidenceEvent'] as const) {
+  const key = source === 'directoryAuditLog' ? 'directoryAudit' : 'normalizedEvidence'
+  test(`HAW66 declares ${source} read failure without certifying zero`, async () => {
+    const service = new ChangesService(changesPrisma({
+      [source]: { findMany: async () => { throw new Error('private diagnostic') } },
+    }) as never)
+    const result = await service.list(identity, range)
+    assert.equal(result.sourceAvailability[key].status, 'unavailable')
+    assert.equal(result.summary.countStatus, 'unknown')
+    assert.equal(result.collectionCompleteness, 'unknown')
+    assert.equal(JSON.stringify(result).includes('private diagnostic'), false)
+  })
+  for (const mode of ['missing', 'repeated'] as const) {
+    test(`HAW66 propagates ${source} ${mode} cursor safety failure`, async () => {
+      const service = new ChangesService(changesPrisma({
+        [source]: { findMany: async () => Array.from({ length: 1000 }, () => ({ id: mode === 'missing' ? '' : 'same' })) },
+      }) as never)
+      await assert.rejects(() => service.list(identity, range), /pagination could not advance safely/)
+    })
+  }
+}
+
+test('HAW66 successful empty reads qualify stored counts without claiming collection completeness', async () => {
+  const result = await new ChangesService(changesPrisma() as never).list(identity, range)
+  assert.equal(result.sourceAvailability.directoryAudit.status, 'available')
+  assert.equal(result.sourceAvailability.normalizedEvidence.status, 'available')
+  assert.equal(result.summary.countStatus, 'observed')
+  assert.equal(result.collectionCompleteness, 'unknown')
+})
+
+// Keep the composed service/query/table regression in the normal backend CI inventory.
+await import(new URL('../../../scripts/what-changed-availability.test.mjs', import.meta.url).href)

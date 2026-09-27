@@ -48,6 +48,7 @@ test('fails closed for malformed, non-primary, invalid-date, and duplicate evide
   assert.equal(normalizeChangeEvent(Object.create({ ...baseEvent })), null)
 
   const normalized = normalizeChangesResponse({
+    sourceAvailability: { directoryAudit: { status: 'available' }, normalizedEvidence: { status: 'available' } },
     changes: [
       baseEvent,
       { ...baseEvent },
@@ -227,5 +228,37 @@ test('keeps the product-guidance table and every entry deeply immutable', () => 
 
     assert.deepEqual(productGuidanceForImpactId(impactId), canonical)
     assert.deepEqual(PRODUCT_GUIDANCE[impactId as keyof typeof PRODUCT_GUIDANCE], canonical)
+  }
+})
+
+const completeReads = {
+  directoryAudit: { status: 'available', evidenceClasses: ['DIRECTORY_AUDIT'] },
+  normalizedEvidence: { status: 'available', evidenceClasses: ['DIRECTORY_AUDIT', 'M365_UNIFIED_AUDIT', 'SNAPSHOT_DIFFERENCE'] },
+}
+const emptyResponse = {
+  changes: [], tenants: [], summary: { total: 0, changes: 0, signIns: 0, highRisk: 0, apps: 0 },
+  pagination: { page: 1, pageSize: 250, total: 0, totalPages: 0 },
+}
+
+test('HAW66 source availability is explicit and legacy or unknown values stay unverified', () => {
+  assert.equal(normalizeChangesResponse({ ...emptyResponse, sourceAvailability: completeReads }).partialPayload, false)
+  for (const status of [undefined, 'new-status', 'partial', 'unavailable']) {
+    const normalized = normalizeChangesResponse({ ...emptyResponse, sourceAvailability: {
+      ...completeReads, directoryAudit: { status },
+    } })
+    assert.equal(normalized.partialPayload, true)
+  }
+  assert.equal(normalizeChangesResponse(emptyResponse).partialPayload, true)
+})
+
+test('HAW66 page merging cannot erase failed or legacy source availability in either order', () => {
+  const complete = normalizeChangesResponse({ ...emptyResponse, sourceAvailability: completeReads })
+  const legacy = normalizeChangesResponse(emptyResponse)
+  const partial = normalizeChangesResponse({ ...emptyResponse, changes: [baseEvent], sourceAvailability: {
+    ...completeReads, normalizedEvidence: { status: 'partial' },
+  } })
+  for (const pages of [[complete, legacy], [legacy, complete], [complete, partial], [partial, complete]]) {
+    assert.equal(mergeChangesPages(pages)?.partialPayload, true)
+    assert.notEqual(mergeChangesPages(pages)?.sourceAvailability.normalizedEvidence, 'available')
   }
 })
