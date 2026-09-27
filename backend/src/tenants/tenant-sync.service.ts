@@ -1,3 +1,4 @@
+import { validatedLicenseRows } from './license-validation.js'
 import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
   BadRequestException,
@@ -642,38 +643,6 @@ interface GraphUsersPage {
   value?: GraphUser[]
   '@odata.nextLink'?: string
   '@odata.deltaLink'?: string
-}
-
-interface GraphSubscribedSku {
-  skuId?: string
-  skuPartNumber?: string | null
-  consumedUnits?: number | null
-  capabilityStatus?: string | null
-  prepaidUnits?: {
-    enabled?: number | null
-    warning?: number | null
-    suspended?: number | null
-    lockedOut?: number | null
-  } | null
-  servicePlans?: Array<{
-    servicePlanId?: string | null
-    servicePlanName?: string | null
-    provisioningStatus?: string | null
-    appliesTo?: string | null
-  }> | null
-}
-
-function boundedServicePlans(value: GraphSubscribedSku['servicePlans']) {
-  if (!Array.isArray(value)) return null
-  const plans = value.slice(0, 128).flatMap((plan) => {
-    if (!plan || typeof plan !== 'object') return []
-    const servicePlanId = typeof plan.servicePlanId === 'string' ? plan.servicePlanId.trim().slice(0, 80) : ''
-    const servicePlanName = typeof plan.servicePlanName === 'string' ? plan.servicePlanName.trim().slice(0, 120) : ''
-    const provisioningStatus = typeof plan.provisioningStatus === 'string' ? plan.provisioningStatus.trim().slice(0, 50) : ''
-    const appliesTo = typeof plan.appliesTo === 'string' ? plan.appliesTo.trim().slice(0, 50) : ''
-    return servicePlanId && servicePlanName && provisioningStatus ? [{ servicePlanId, servicePlanName, provisioningStatus, ...(appliesTo ? { appliesTo } : {}) }] : []
-  })
-  return plans.sort((left, right) => `${left.servicePlanId}:${left.servicePlanName}`.localeCompare(`${right.servicePlanId}:${right.servicePlanName}`))
 }
 
 interface GraphOrganization {
@@ -2969,17 +2938,10 @@ export class TenantSyncService {
         'https://graph.microsoft.com/v1.0/subscribedSkus', accessToken, 'license',
         { timeoutMs: 20_000 },
       )
-      const body = await readBoundedSingleton(response) as { value?: GraphSubscribedSku[] }
-      if (!Array.isArray(body.value) || body.value.length > 1_000) throw new Error('Microsoft licenses exceeded the bounded record limit.')
+      if (response.status !== 200) throw new Error('Microsoft returned an invalid partial license inventory response.')
+      const body = await readBoundedSingleton(response)
+      const rows = validatedLicenseRows(body.value)
       const observedAt = new Date()
-      const rows = body.value.map((value) => ({
-        ...closedFields(value, ['skuId', 'skuPartNumber', 'consumedUnits', 'capabilityStatus']),
-        prepaidUnits: value.prepaidUnits ? closedFields(value.prepaidUnits, ['enabled', 'warning', 'suspended', 'lockedOut']) : null,
-        servicePlans: boundedServicePlans(value.servicePlans),
-      }) as GraphSubscribedSku).filter(
-        (sku) =>
-          typeof sku.skuId === 'string' && typeof sku.skuPartNumber === 'string'
-      )
 
       await this.saveSnapshot(tenant, 'LICENSES', authoritativeSnapshot(rows), async (transaction) => {
         for (const sku of rows) {
@@ -3001,7 +2963,7 @@ export class TenantSyncService {
               suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
               lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
               capabilityStatus: sku.capabilityStatus?.trim() || null,
-              servicePlans: boundedServicePlans(sku.servicePlans) ?? Prisma.JsonNull,
+              servicePlans: sku.servicePlans,
               lastSeenAt: observedAt,
             },
             update: {
@@ -3012,7 +2974,7 @@ export class TenantSyncService {
               suspendedUnits: Math.max(0, sku.prepaidUnits?.suspended ?? 0),
               lockedOutUnits: Math.max(0, sku.prepaidUnits?.lockedOut ?? 0),
               capabilityStatus: sku.capabilityStatus?.trim() || null,
-              servicePlans: boundedServicePlans(sku.servicePlans) ?? Prisma.JsonNull,
+              servicePlans: sku.servicePlans,
               lastSeenAt: observedAt,
             },
           })
@@ -3020,7 +2982,8 @@ export class TenantSyncService {
         await transaction.tenantLicense.deleteMany({
           where: {
             customerTenantId: tenant.id,
-            lastSeenAt: { lt: observedAt },
+            organizationId: tenant.organizationId,
+            microsoftSkuId: { notIn: rows.map((row) => row.skuId) },
           },
         })
       })
