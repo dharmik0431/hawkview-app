@@ -122,7 +122,7 @@ export type EmptyTone =
   | 'QUIET'
   /** Nothing matched the filters, over a fleet that was fully assessed. */
   | 'FILTERED'
-  /** Nothing found, and some tenants were never looked at. */
+  /** Nothing found, and some tenants lack complete combined evidence. */
   | 'UNKNOWN'
   /** The fleet itself could not be enumerated. Not a statement about tenants. */
   | 'COULD_NOT_LOOK'
@@ -143,7 +143,7 @@ function shortfall(coverage: AssessmentCoverage): string {
   const parts: string[] = []
   if (coverage.failed > 0) parts.push(`${coverage.failed} could not be reached`)
   if (coverage.unavailable > 0) {
-    parts.push(`${coverage.unavailable} have incomplete or unavailable evidence`)
+    parts.push(`${coverage.unavailable} have incomplete or unavailable evidence from one or both sources`)
   }
   if (coverage.loading > 0) parts.push(`${coverage.loading} still loading`)
   return parts.join(', ')
@@ -176,7 +176,7 @@ export function riskyUsersSummary(
         detail:
           coverage.fleet.because +
           ' Nothing here is a statement about your tenants, and no tenant has been ' +
-          'assessed or cleared.',
+          'confirmed to have complete current evidence from both sources.',
       },
     }
   }
@@ -224,8 +224,8 @@ export function riskyUsersSummary(
         tone: 'UNKNOWN',
         title: 'No matching users shown — coverage is incomplete',
         detail:
-          `${missing} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant was', 'tenants were')} ` +
-          `not assessed (${shortfall(coverage)}): ${named(coverage.missed)}. ` +
+          `${missing} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant has', 'tenants have')} ` +
+          `incomplete combined evidence (${shortfall(coverage)}): ${named(coverage.missed)}. ` +
           'This is not a statement that those tenants have no risky users.',
       },
     }
@@ -240,14 +240,14 @@ export function riskyUsersSummary(
           title: 'No users match the selected filters',
           detail:
             `All ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')} in scope were ` +
-            'assessed. Try adjusting your search terms, tenant selection, or detection source criteria.',
+            'confirmed to have complete evidence from both sources. Try adjusting your search terms, tenant selection, or detection source criteria.',
         }
       : {
           tone: 'QUIET',
           title: 'No users require review',
           detail:
             `All ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')} in scope were ` +
-            'assessed, and no rule finding or Microsoft detection matched anyone in the assessed evidence. No filters are narrowing this.',
+            'confirmed to have complete evidence from both sources, and no rule finding or Microsoft detection matched anyone in the assessed evidence. No filters are narrowing this.',
         },
   }
 }

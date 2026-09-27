@@ -17,6 +17,28 @@ export type FleetRiskyUserRow = RiskyUserRow & {
   evidenceState?: FleetEvidenceState
 }
 
+export type FleetSourceState = 'READY' | 'LOADING' | 'READ_FAILED' | 'LICENSE_REQUIRED' | 'PERMISSION_REQUIRED' | 'DISABLED' | 'STALE' | 'MISSING' | 'SOURCE_UNAVAILABLE' | 'UNCONFIRMED' | 'INCOMPLETE'
+
+export const fleetSourceStateCopy: Record<FleetSourceState, string> = {
+  READY: 'Complete current evidence',
+  LOADING: 'Loading results',
+  READ_FAILED: 'Results could not be loaded',
+  LICENSE_REQUIRED: 'Microsoft reports a license requirement',
+  PERMISSION_REQUIRED: 'Microsoft reports missing permission',
+  DISABLED: 'Assessment is not enabled',
+  STALE: 'Retained evidence is older than the freshness window',
+  MISSING: 'No assessment or collection result is available',
+  SOURCE_UNAVAILABLE: 'Source evidence is unavailable',
+  UNCONFIRMED: 'Evidence freshness or validity could not be confirmed',
+  INCOMPLETE: 'Evidence or delivered user details are incomplete',
+}
+
+function readState(query: FleetQuery | undefined): FleetSourceState | null {
+  if (query?.isLoading || query?.isFetching) return 'LOADING'
+  if (query?.isError) return 'READ_FAILED'
+  return null
+}
+
 function clockState(values: (string | null | undefined)[], now: number, maxAge = FLEET_EVIDENCE_MAX_AGE_MS): FleetEvidenceState {
   const clocks = values.map((value) => value ? Date.parse(value) : NaN)
   if (!clocks.length || clocks.some((value) => !Number.isFinite(value) || value > now)) return 'UNKNOWN'
@@ -83,6 +105,26 @@ export function projectFleetRisk(tenants: readonly FleetTenant[], nativeQueries:
     const nativeComplete = Boolean(raw?.claim?.permitted === true && rawCollectorsValid && nativeCurrent && native?.available && native.complete && count.accuracy === 'EXACT' &&
       count.listCoverage === 'COMPLETE' && count.value === list.rows.length && native.count.covered.length > 0 &&
       native.count.notCovered.length === 0 && native.withheld.length === 0)
+    // These are read/evidence states, not collector commands or diagnoses inferred
+    // from missing rows. Keep the two channels independent of combined coverage.
+    const nativeSource: FleetSourceState = readState(query) ?? (
+      !native ? (query?.data == null ? 'MISSING' : 'UNCONFIRMED')
+        : !native.available ? (['EVALUATION_DISABLED', 'NOT_ENABLED_FOR_TENANT'].includes(native.because) ? 'DISABLED' : native.because === 'NO_RUN' ? 'MISSING' : 'SOURCE_UNAVAILABLE')
+        : nativeComplete ? 'READY'
+        : nativeState === 'HISTORICAL' ? 'STALE'
+        : selectedCollectors.some((collectors) => collectors.some((collector) => !['SUCCESS', 'EMPTY'].includes(collector.status))) ? 'SOURCE_UNAVAILABLE'
+        : !nativeCurrent ? 'UNCONFIRMED' : 'INCOMPLETE'
+    )
+    const microsoftSource: FleetSourceState = readState(msQuery) ?? (
+      msComplete ? 'READY'
+        : channel.state === 'CONTRADICTORY' ? 'INCOMPLETE'
+        : ms.meta.reasonCode === 'LICENSE_REQUIRED' ? 'LICENSE_REQUIRED'
+        : ms.meta.reasonCode === 'MISSING_PERMISSION' ? 'PERMISSION_REQUIRED'
+        : msState === 'HISTORICAL' ? 'STALE'
+        : ms.meta.reasonCode === 'WAITING_FOR_COLLECTION' || msQuery?.data == null ? 'MISSING'
+        : ms.meta.reasonCode === 'COLLECTION_FAILED' || summary?.reasonCode === 'COLLECTION_NOT_SUCCEEDED' || summary?.availability === 'UNAVAILABLE' ? 'SOURCE_UNAVAILABLE'
+        : msState !== 'CURRENT' ? 'UNCONFIRMED' : 'INCOMPLETE'
+    )
     const matched = new Set<string>()
     const rows = list.rows.map((row) => {
       const findings = native?.available ? native.findings.filter((finding) => finding.subject.kind === 'DIRECTORY_USER' && finding.subject.ref === row.reference) : []
@@ -114,7 +156,7 @@ export function projectFleetRisk(tenants: readonly FleetTenant[], nativeQueries:
     return { tenantId: tenant.id, tenantName, tenantDomain: tenant.domain,
       status: query?.isLoading || msQuery?.isLoading ? 'LOADING' as const : query?.isError ? 'FAILED' as const
         : nativeComplete && msComplete ? 'SUCCESS' as const : 'UNAVAILABLE' as const,
-      count, channel, userCount: rows.length,
+      count, channel, userCount: rows.length, nativeSource, microsoftSource,
     }
   })
   return { fleetRows, tenantStatuses, deliveryGaps, metrics: {

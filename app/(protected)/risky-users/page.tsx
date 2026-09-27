@@ -22,6 +22,7 @@ import {
   riskyUsersSummary,
   type FleetSize,
 } from '@/lib/identity-risk/fleet-coverage'
+import { fleetSourceStateCopy, type FleetSourceState } from '@/lib/identity-risk/fleet-risk-projection'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -114,6 +115,7 @@ function DataStateBadge({ row }: { row: FleetRiskyUserRow }) {
 }
 
 export default function FleetRiskyUsersPage() {
+  const [selectedTenant, setSelectedTenant] = useState<string>('ALL')
   const {
     tenants,
     fleetRows,
@@ -123,11 +125,12 @@ export default function FleetRiskyUsersPage() {
     metrics,
     isLoading,
     isError,
-    retryAll,
-  } = useFleetRiskyUsers()
+    enumerationKnown,
+    hasFailedRequests,
+    reloadFailedResults,
+  } = useFleetRiskyUsers(selectedTenant)
 
   const [searchQuery, setSearchQuery] = useState('')
-  const [selectedTenant, setSelectedTenant] = useState<string>('ALL')
   const [sourceFilter, setSourceFilter] = useState<'ALL' | 'HAWKVIEW' | 'MICROSOFT' | 'BOTH'>('ALL')
   const [priorityFilter, setPriorityFilter] = useState<'ALL' | 'HIGH' | 'MEDIUM' | 'LOW'>('ALL')
 
@@ -160,14 +163,14 @@ export default function FleetRiskyUsersPage() {
   // time. Caught by lint rather than by me.
   const fleetSize: FleetSize = useMemo(
     () =>
-      isError
+      !enumerationKnown
         ? {
             kind: 'UNKNOWN',
             because:
-              'The list of tenants could not be loaded, so HawkView does not know which tenants exist.',
+              isError ? 'The list of tenants could not be loaded.' : 'The list of tenants has not been confirmed yet.',
           }
         : { kind: 'KNOWN' },
-    [isError]
+    [enumerationKnown, isError]
   )
 
   const fleetWide = useMemo(
@@ -182,6 +185,15 @@ export default function FleetRiskyUsersPage() {
   // ALL for a fleet whose tenants came back UNAVAILABLE rather than errored.
   // One derived number now, so the page cannot tell two coverage stories.
   const notAssessed = fleetWide.inScope - fleetWide.assessed
+  const combinedComplete = enumerationKnown && fleetWide.inScope > 0 && notAssessed === 0
+  const sourceCoverage = useMemo(() => (['nativeSource', 'microsoftSource'] as const).map((source) => ({
+    label: source === 'nativeSource' ? 'HawkView assessments' : 'Microsoft risk evidence',
+    ready: tenantStatuses.filter((tenant) => tenant[source] === 'READY').length,
+    groups: (Object.keys(fleetSourceStateCopy) as FleetSourceState[])
+      .filter((state) => state !== 'READY')
+      .map((state) => ({ state, tenants: tenantStatuses.filter((tenant) => tenant[source] === state) }))
+      .filter((group) => group.tenants.length > 0),
+  })), [tenantStatuses])
 
   const coverage = useMemo(
     () => fleetCoverage(tenantStatuses, selectedTenant, fleetSize),
@@ -278,26 +290,23 @@ export default function FleetRiskyUsersPage() {
               Review users requiring investigation across the Microsoft 365 tenants you manage.
             </p>
             <div className="flex items-center gap-2 mt-1.5 text-xs text-slate-500 dark:text-slate-400 font-medium">
-              <span>{fleetWide.assessed} of {fleetWide.inScope} tenants assessed</span>
+              <span>{enumerationKnown ? `${fleetWide.assessed} of ${fleetWide.inScope} tenants have complete current evidence from both sources` : 'Tenant scope unconfirmed'}</span>
               <span className="text-slate-300 dark:text-slate-700">•</span>
-              <span>Updated continuously</span>
+              <span>Native and Microsoft evidence are evaluated separately</span>
             </div>
           </div>
         </div>
 
         <div className="flex items-center gap-3 shrink-0 self-start sm:self-center">
-          <Button
+          {hasFailedRequests && <Button
             variant="outline"
             size="sm"
-            onClick={retryAll}
-            disabled={isLoading}
-            aria-label="Refresh assessment"
-            aria-busy={isLoading}
-            className="h-9 px-3.5 text-xs font-medium text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800/80 transition-colors shadow-2xs"
+            onClick={reloadFailedResults}
+            className="h-9 px-3.5 text-xs font-medium"
           >
-            <RefreshCw className={cn('h-3.5 w-3.5 mr-2 text-slate-500 dark:text-slate-400', isLoading && 'animate-spin')} />
-            {isLoading ? 'Refreshing...' : 'Refresh assessment'}
-          </Button>
+            <RefreshCw className="h-3.5 w-3.5 mr-2" />
+            Reload results
+          </Button>}
         </div>
       </div>
 
@@ -315,7 +324,7 @@ export default function FleetRiskyUsersPage() {
           <div>
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                {notAssessed > 0 ? 'Users Shown (Partial Fleet)' : 'Users Requiring Review'}
+                {!combinedComplete ? 'Users Shown (Evidence Incomplete)' : 'Users Requiring Review'}
               </span>
               <Users className="h-4 w-4 text-slate-400" />
             </div>
@@ -394,8 +403,7 @@ export default function FleetRiskyUsersPage() {
               </div>
               <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                 observed identities; may include retained evidence
-                {notAssessed > 0 &&
-                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
+                {enumerationKnown ? `; complete current HawkView evidence for ${sourceCoverage[0].ready} of ${fleetWide.inScope} tenants` : '; tenant scope unconfirmed'}
               </p>
             </div>
             <div className="text-2xs font-medium text-blue-700 dark:text-blue-300 pt-1 border-t border-blue-100 dark:border-blue-900/40">
@@ -424,8 +432,7 @@ export default function FleetRiskyUsersPage() {
                     tiles identically: a bare 0 with no coverage on it. The
                     sweep missed them because it looked for `.length` counts
                     and health words, and these are aggregate metrics. */}
-                {notAssessed > 0 &&
-                  ` across ${fleetWide.assessed} of ${fleetWide.inScope} tenants`}
+                {enumerationKnown ? `; complete current Microsoft evidence for ${sourceCoverage[1].ready} of ${fleetWide.inScope} tenants` : '; tenant scope unconfirmed'}
               </p>
             </div>
             <div className="text-2xs font-medium text-purple-700 dark:text-purple-300 pt-1 border-t border-purple-100 dark:border-purple-900/40">
@@ -433,95 +440,33 @@ export default function FleetRiskyUsersPage() {
             </div>
           </div>
 
-          {/* Tenant Coverage */}
-          <div
-            className={cn(
-              'p-4 rounded-xl border shadow-2xs flex flex-col justify-between space-y-3',
-              notAssessed === 0
-                ? 'border-emerald-200/70 dark:border-emerald-900/40 bg-emerald-50/30 dark:bg-emerald-950/20'
-                : notAssessed < fleetWide.inScope
-                ? 'border-amber-200/70 dark:border-amber-900/40 bg-amber-50/30 dark:bg-amber-950/20'
-                : 'border-rose-200/70 dark:border-rose-900/40 bg-rose-50/30 dark:bg-rose-950/20'
-            )}
-          >
-            <div className="flex items-center justify-between">
-              <span
-                className={cn(
-                  'text-xs font-semibold',
-                  notAssessed === 0
-                    ? 'text-emerald-900 dark:text-emerald-300'
-                    : 'text-amber-900 dark:text-amber-300'
-                )}
-              >
-                Tenant Coverage
-              </span>
-              <div
-                className={cn(
-                  'p-1.5 rounded-lg border',
-                  notAssessed === 0
-                    ? 'bg-emerald-100/80 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 border-emerald-200/80 dark:border-emerald-800/60'
-                    : 'bg-amber-100/80 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300 border-amber-200/80 dark:border-amber-800/60'
-                )}
-              >
-                <Building2 className="h-4 w-4" />
-              </div>
+          <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 space-y-3">
+            <span className="text-xs font-semibold">Complete evidence from both sources</span>
+            <div className="text-2xl font-bold">
+              {enumerationKnown ? `${fleetWide.assessed} of ${fleetWide.inScope}` : 'Unknown'}
             </div>
-            <div>
-              <div className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-                {isLoading ? '...' : `${fleetWide.assessed} of ${fleetWide.inScope}`}
-              </div>
-              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                evaluated tenants
-              </p>
-            </div>
-            <div
-              className={cn(
-                'text-2xs font-medium pt-1 border-t',
-                fleetWide.assessed === fleetWide.inScope
-                  ? 'text-emerald-700 dark:text-emerald-300 border-emerald-100 dark:border-emerald-900/40'
-                  : 'text-amber-700 dark:text-amber-300 border-amber-100 dark:border-amber-900/40'
-              )}
-            >
-              {/* '100% tenants synced' WAS DERIVED FROM failedTenants, WHICH
-                  COUNTS ONLY assessmentError. A tenant whose assessment came
-                  back null is UNAVAILABLE -- not an error, and it contributed
-                  no rows -- so this tile claimed a fully synced fleet over
-                  tenants nobody assessed. I named that in the commit that fixed
-                  the badge and the empty states and then left the tile itself
-                  alone: the visible half fixed and the reassuring half not,
-                  which is the shape this whole sweep is about. */}
-              {fleetWide.assessed === fleetWide.inScope
-                ? fleetWide.inScope > 0 && fleetWide.fleet.kind === 'KNOWN' ? `All ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} assessed` : 'No assessed fleet confirmed'
-                : `${fleetWide.inScope - fleetWide.assessed} of ${fleetWide.inScope} tenant${fleetWide.inScope === 1 ? '' : 's'} not assessed`}
-            </div>
+            <p className="text-xs text-slate-500">
+              {combinedComplete ? 'Both sources have complete current evidence for every tenant in scope.'
+                : enumerationKnown && fleetWide.inScope === 0 ? 'No tenants are in scope.'
+                : enumerationKnown ? 'See each source’s availability below.' : 'The tenant list must be confirmed before coverage can be counted.'}
+            </p>
           </div>
         </div>
       </div>
 
-      {/* Coverage Status Ribbon */}
-      {notAssessed > 0 && (
-        <div className="rounded-xl border border-amber-200/80 bg-amber-50/70 dark:border-amber-900/60 dark:bg-amber-950/30 p-3.5 px-4 text-xs text-amber-900 dark:text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
-          <div className="flex items-center gap-2.5">
-            <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
-            <div>
-              <span className="font-semibold">
-                Partial fleet coverage: {notAssessed} of {fleetWide.inScope} tenant{fleetWide.inScope === 1 ? '' : 's'} could not be fully assessed.
-              </span>
-              <span className="block sm:inline text-2xs text-amber-800 dark:text-amber-300/80 sm:ml-2">
-                Available tenant findings remain displayed below without interruption.
-              </span>
-            </div>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={retryAll}
-            className="h-7 px-2.5 text-2xs font-medium border-amber-300 dark:border-amber-800 text-amber-900 dark:text-amber-200 bg-white/80 dark:bg-slate-900 hover:bg-amber-100/80 self-start sm:self-center shrink-0"
-          >
-            Retry failed tenants
-          </Button>
-        </div>
-      )}
+      <section aria-label="Evidence availability" className="rounded-xl border border-slate-200 dark:border-slate-700 p-4 space-y-3">
+        <h2 className="text-sm font-semibold">Evidence availability</h2>
+        {!enumerationKnown ? <p role="status" className="text-sm">
+          {isError ? 'The tenant list could not be loaded.' : 'Confirming the tenant list.'} Coverage is unknown. Retained findings are not proof of current coverage.
+        </p> : sourceCoverage.map((source) => <div key={source.label} className="space-y-2">
+          <p className="text-sm font-medium">{source.label}: {source.ready} of {fleetWide.inScope} tenants have complete current evidence</p>
+          {source.groups.map((group) => <details key={group.state} className="text-sm">
+            <summary>{fleetSourceStateCopy[group.state]}: {group.tenants.length} {group.tenants.length === 1 ? 'tenant' : 'tenants'}</summary>
+            <ul className="ml-5 list-disc">{group.tenants.map((tenant) => <li key={tenant.tenantId}>{tenant.tenantName}</li>)}</ul>
+          </details>)}
+        </div>)}
+        <p className="text-xs text-slate-500">Available findings remain visible. Missing or limited evidence does not mean no risk. Reloading failed reads does not start collection or change licensing or permissions.</p>
+      </section>
 
       {/* Main Table & Toolbar Card */}
       <div className="rounded-xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs overflow-hidden">
