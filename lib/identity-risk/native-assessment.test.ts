@@ -998,7 +998,7 @@ test('DTO reason maps preserve independent uninterpreted and not-yet-cited total
     uninterpretedEvents: 0, notYetCitedEvents: 0,
   } }] }))
   assert.ok(adapted?.available)
-  assert.deepEqual(adapted.coverage, [{ stream: 'GRAPH_SIGN_INS', applies: 9, uninterpretedEvents: 5, notYetCitedEvents: 7 }])
+  assert.deepEqual(adapted.coverage.map(({ stream, applies, uninterpretedEvents, notYetCitedEvents }) => ({ stream, applies, uninterpretedEvents, notYetCitedEvents })), [{ stream: 'GRAPH_SIGN_INS', applies: 9, uninterpretedEvents: 5, notYetCitedEvents: 7 }])
   const count = nativeRiskyUserCount(adapted)
   assert.match(count.caption, /5 events could not be interpreted/)
   assert.match(count.caption, /7 events held pending a citation/)
@@ -1048,4 +1048,44 @@ test('cross-stream overflow and a missing component cannot produce complete-zero
     assert.match(nativeRiskyUserCount(adapted).caption, /number of uninterpreted events is unknown/)
     assert.doesNotMatch(nativeRiskyUserCount(adapted).caption, /Every event/)
   }
+})
+
+
+test('diagnostic categories preserve closed buckets, combine future keys safely, and keep totals unchanged', () => {
+  const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+    applies: 5, unknown: { UNRECOGNIZED_ERROR_CODE: 1, 'secret@example.invalid': 2, '<script>private</script>': 3 },
+    unprocessable: { SUBJECT_NOT_IN_DIRECTORY: 4, EVENT_TIMESTAMP_INVALID: 2 }, notYetCited: { EXCLUSION_NOT_YET_CITED: 7 },
+  } }] }))
+  assert.ok(adapted?.available)
+  const coverage = adapted.coverage[0]
+  assert.equal(coverage.uninterpretedEvents, 12)
+  assert.equal(coverage.notYetCitedEvents, 7)
+  assert.deepEqual(coverage.categories?.unknown, { state: 'KNOWN', entries: [{ reason: 'UNRECOGNIZED_ERROR_CODE', count: 1 }, { reason: 'OTHER', count: 5 }] })
+  assert.deepEqual(coverage.categories?.unprocessable.entries, [{ reason: 'SUBJECT_NOT_IN_DIRECTORY', count: 4 }, { reason: 'EVENT_TIMESTAMP_INVALID', count: 2 }])
+  assert.doesNotMatch(JSON.stringify(coverage.categories), /secret@|<script>/)
+})
+
+test('diagnostic maps distinguish zero, absent, legacy, malformed and overflow without fallback', () => {
+  for (const [map, state] of [[{}, 'KNOWN'], [undefined, 'NOT_REPORTED'], [null, 'NOT_REPORTED'], [[], 'UNREADABLE'], [{ X: -1 }, 'UNREADABLE'], [{ X: 1.5 }, 'UNREADABLE'], [{ X: '1' }, 'UNREADABLE'], [{ X: Number.MAX_SAFE_INTEGER, Y: 1 }, 'UNREADABLE'], [Object.fromEntries(Array.from({ length: 65 }, (_, i) => [String(i), 0])), 'UNREADABLE']] as const) {
+    const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+      applies: 1, unknown: map, unprocessable: {}, notYetCited: {}, uninterpretedEvents: 0,
+    } }] }))
+    assert.ok(adapted?.available)
+    assert.equal(adapted.coverage[0].categories?.unknown.state, state)
+    assert.deepEqual(adapted.coverage[0].categories?.unknown.entries, [])
+  }
+  const legacy = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: { applies: 1, uninterpretedEvents: 3, notYetCitedEvents: 2 } }] }))
+  assert.ok(legacy?.available)
+  assert.equal(legacy.coverage[0].uninterpretedEvents, 3)
+  assert.equal(legacy.coverage[0].notYetCitedEvents, 2)
+  assert.equal(legacy.coverage[0].categories?.unknown.state, 'NOT_REPORTED')
+})
+
+
+test('prototype-like and wrong-category keys remain OTHER without exposing supplied labels', () => {
+  const adapted = adaptNativeAssessment(available({ coverage: [{ stream: 'GRAPH_SIGN_INS', coverage: {
+    applies: 1, unknown: JSON.parse('{"__proto__":1,"constructor":2,"toString":3,"SUBJECT_NOT_IN_DIRECTORY":4}'), unprocessable: {}, notYetCited: {},
+  } }] }))
+  assert.ok(adapted?.available)
+  assert.deepEqual(adapted.coverage[0].categories?.unknown, { state: 'KNOWN', entries: [{ reason: 'OTHER', count: 10 }] })
 })
