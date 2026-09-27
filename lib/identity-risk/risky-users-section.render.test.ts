@@ -191,3 +191,74 @@ test('POSITIVE CONTROL: AN ASSESSED, EMPTY TENANT STILL RENDERS ITS ZERO', () =>
   assert.match(text, /0 detected by HawkView/, 'an assessed empty tenant must still show its zero')
   assert.doesNotMatch(text, /Users requiring review: Not available/, 'and must not read as unknown')
 })
+
+const badCopy=/Some Microsoft risk records could not be matched to HawkView identities/;
+function source(reason:string|null=null,partial=false){
+ const dto:any=syntheticRiskResponses().microsoftRiskyUsers;
+ if(reason)Object.assign(dto,unavailableMeta('Synthetic source unavailable'),{reasonCode:reason});
+ dto.microsoftRiskSummary={source:'MICROSOFT_IDENTITY_PROTECTION',availability:reason?'UNAVAILABLE':partial?'PARTIAL':'AVAILABLE',completeness:reason?'UNKNOWN':partial?'PARTIAL':'COMPLETE',rawRecordCount:reason?null:0,observedActiveDistinctUserCount:reason?null:0,activeDistinctUserCount:reason||partial?null:0,snapshotObservedAt:reason?null:dto.observedAt,collectionSucceededAt:reason?null:dto.observedAt,reasonCode:reason?'SOURCE_UNAVAILABLE':partial?'PARTIAL_RECORDS':null};
+ return dto;
+}
+for(const [label,reason,partial] of [['generic unavailable','SOURCE_UNAVAILABLE',false],['license unavailable','LICENSE_REQUIRED',false],['partial records',null,true]] as const){
+ test('source limitation does not invent a matching failure: '+label,()=>{
+  const ms=adapter.adaptMicrosoftRiskyUsersResponse(source(reason,partial));
+  assert.equal(ms.users?.length,0);assert.ok(ms.microsoftRiskSummary);assert.equal(ms.microsoftRiskSummary.availability,partial?'PARTIAL':'UNAVAILABLE');
+  const html=render(assessedAndEmpty,ms);
+  assert.match(html,/Microsoft/);
+  assert.match(html, partial ? /Some Microsoft Identity Protection records could not be evaluated/ : reason === 'LICENSE_REQUIRED' ? /requires.*licen|requires Entra ID P2/i : /Microsoft Entra risk detection is unavailable/);
+  assert.match(html, partial ? /Microsoft risk status incomplete/ : /Microsoft risk status unavailable/);
+  const retained=render(nativePositive(),ms);
+  assert.match(retained,/Synthetic user/);assert.match(retained,/1 detected by HawkView/);
+  assert.doesNotMatch(retained,badCopy);
+  assert.doesNotMatch(html,badCopy,'No supplied records or directory-match attempt supports this matching-specific diagnosis');
+ });
+}
+const key=(ref:string)=>({available:true as const,shape:'DIRECTORY_OBJECT_ID' as const,ref});
+function nativePositive(){return {...assessedAndEmpty,count:{...assessedAndEmpty.count,value:1},findings:[{detectorId:'repeated-credential-failure',subject:{kind:'DIRECTORY_USER',ref:'native-1',displayName:'Synthetic user',userPrincipalName:'synthetic@example.invalid',correlation:key('key-a')},signals:[{signal:'PASSWORD_REJECTED',count:1,capped:false,latest:null}]}]};}
+for(const match of [true,false])test('supplied comparable keys '+(match?'match':'differ'),()=>{
+ const dto=source();dto.users=[{id:'ms-1',identityLabel:'Synthetic Microsoft user',riskLevel:'high',riskState:'atRisk',riskDetail:null,observedAt:dto.observedAt,correlation:key(match?'key-a':'key-b')}];
+ Object.assign(dto.microsoftRiskSummary,{rawRecordCount:1,observedActiveDistinctUserCount:1,activeDistinctUserCount:1});
+ const ms=adapter.adaptMicrosoftRiskyUsersResponse(dto);assert.equal(ms.users?.length,1);
+ const native=nativePositive();const rows=require('./native-view.ts').nativeRiskyUserList(native,riskyUsersView.microsoftChannel(ms),ms.users).rows;
+ assert.equal(rows[0].detection.microsoft,match?'REPORTED':'NOT_REPORTED');assert.equal(rows[0].detection.because,null);
+ const html=render(native,ms);assert.doesNotMatch(html,badCopy);assert.match(html,/Synthetic user/);
+});
+test('absent Microsoft correlation is unprovided comparison, not a failed directory lookup',()=>{
+ const dto=source();dto.users=[{id:'ms-1',identityLabel:'Synthetic Microsoft user',riskLevel:'high',riskState:'atRisk',riskDetail:null,observedAt:dto.observedAt}];
+ Object.assign(dto.microsoftRiskSummary,{rawRecordCount:1,observedActiveDistinctUserCount:1,activeDistinctUserCount:1});
+ const ms=adapter.adaptMicrosoftRiskyUsersResponse(dto);assert.equal(ms.users?.[0].correlation,null);
+ const native=nativePositive();const rows=require('./native-view.ts').nativeRiskyUserList(native,riskyUsersView.microsoftChannel(ms),ms.users).rows;
+ assert.equal(rows[0].detection.microsoft,'NOT_COMPARABLE');
+ assert.match(rows[0].detection.because!, /lack usable comparison keys/);
+ assert.doesNotMatch(rows[0].detection.because!, /could not be matched/);
+ const html=render(native,ms);assert.match(html,/Cross-source comparison is not established/);assert.match(html,/Synthetic user/);assert.match(html,/1 detected by HawkView/);assert.match(html,/1 active Microsoft risk identity/);assert.doesNotMatch(html,badCopy,'Absent comparison key is not proof a directory match failed');
+});
+
+
+test('missing native comparison evidence stays NOT_COMPARABLE without claiming a lookup failed', () => {
+  const ms = adapter.adaptMicrosoftRiskyUsersResponse(source())
+  const native = nativePositive()
+  const detection = riskyUsersView.detectionFromCorrelation(null, riskyUsersView.microsoftChannel(ms), ms.users)
+  assert.equal(detection.microsoft, 'NOT_COMPARABLE')
+  assert.match(detection.because!, /Comparison evidence was not provided/)
+  assert.doesNotMatch(detection.because!, /cannot be matched|could not be matched/)
+  const html = render({ ...native, findings: native.findings.map((finding) => ({ ...finding, subject: { ...finding.subject, correlation: null } })) }, ms)
+  assert.match(html, /Cross-source comparison is not established/)
+  assert.match(html, /Synthetic user/)
+})
+
+test('explicit Microsoft error and stale source retain truthful warning copy and native positives', () => {
+  const failed = source('COLLECTION_FAILED')
+  failed.status = 'ERROR'
+  const ms = adapter.adaptMicrosoftRiskyUsersResponse(failed)
+  assert.equal(riskyUsersView.microsoftChannel(ms).state, 'INTERRUPTED')
+  const text = render(nativePositive(), ms)
+  assert.match(text, /Microsoft Entra risk detection could not be read/)
+  assert.match(text, /Synthetic user/)
+  assert.doesNotMatch(text, badCopy)
+  const stale = source()
+  stale.status = 'STALE'; stale.freshness = 'STALE'; stale.limitation = 'Retained evidence'
+  const retained = adapter.adaptMicrosoftRiskyUsersResponse(stale)
+  assert.equal(riskyUsersView.microsoftChannel(retained).state, 'INTERRUPTED')
+  assert.match(render(nativePositive(), retained), /Microsoft Entra risk detection is out of date/)
+})

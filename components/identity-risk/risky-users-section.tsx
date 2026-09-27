@@ -290,16 +290,17 @@ function CompactSummaryStrip({
   const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
   const additionalReasons = count.reasons.filter((reason) => reason !== count.caption)
 
-  const isUnmatchedOrPartial =
-    rows.some(
-      (r) =>
-        Boolean(r.detection.because) ||
-        r.detection.microsoft === 'UNAVAILABLE' ||
-        r.detection.microsoft === 'NOT_COMPARABLE'
-    ) ||
-    microsoftView?.meta?.status === 'UNAVAILABLE' ||
-    (microsoftSummary !== null && microsoftSummary.availability !== 'AVAILABLE') ||
-    channel?.state === 'CONTRADICTORY'
+  // Source availability and comparison readiness are different observations.
+  // Neither a partial source nor an absent key proves a failed identity lookup.
+  const sourceLimitation = channel.state !== 'REPORTING'
+    ? channel.headline
+    : microsoftSummary !== null && microsoftSummary.availability !== 'AVAILABLE'
+      ? serverMicrosoftSummary.detail
+      : null
+  const comparisonLimitation = rows.some((row) => row.detection.microsoft === 'NOT_COMPARABLE')
+    ? 'Cross-source comparison is not established for some users from this response. Available findings remain visible.'
+    : null
+  const microsoftLimitations = [sourceLimitation, comparisonLimitation].filter(Boolean)
 
   return (
     <div className="space-y-2">
@@ -380,11 +381,11 @@ function CompactSummaryStrip({
         )}
       </div>
 
-      {isUnmatchedOrPartial && (
+      {microsoftLimitations.length > 0 && (
         <div className="rounded-lg border border-amber-200/80 bg-amber-50/80 p-3 dark:border-amber-900/60 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
           <ShieldOff className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
           <span>
-            Some Microsoft risk records could not be matched to HawkView identities. Microsoft coverage may be incomplete.
+            {microsoftLimitations.join(' ')}
           </span>
         </div>
       )}

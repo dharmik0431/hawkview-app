@@ -476,7 +476,7 @@ export function detectionFromCorrelation(
       microsoft: 'NOT_COMPARABLE',
       microsoftRecord: null,
       because:
-        'HawkView and Microsoft cannot be matched for this user, so neither agreement nor disagreement can be shown.',
+        'Comparison evidence was not provided for this user, so neither agreement nor disagreement can be established.',
     }
   }
 
@@ -508,7 +508,7 @@ export function detectionFromCorrelation(
       microsoft: 'NOT_COMPARABLE',
       microsoftRecord: null,
       because:
-        'Some Microsoft records could not be matched to a HawkView identity, so an absence here is not evidence that Microsoft cleared this user.',
+        'Some Microsoft records lack usable comparison keys, so comparison is not established for this user. This is not evidence that Microsoft cleared this user.',
     }
   }
 
