@@ -395,9 +395,16 @@ export class ChangesService {
     const records: T[] = []
     let cursor: string | undefined
     for (;;) {
-      const page = await loadPage(cursor)
+      let page: T[]
+      try {
+        page = await loadPage(cursor)
+      } catch {
+        // Only query rejection becomes partial evidence. Cursor-safety errors
+        // below must reject the investigation rather than certify a subset.
+        return { records, status: records.length ? 'partial' as const : 'unavailable' as const }
+      }
       records.push(...page)
-      if (page.length < 1000) return records
+      if (page.length < 1000) return { records, status: 'available' as const }
       const nextCursor = page.at(-1)?.id
       if (!nextCursor || nextCursor === cursor) throw new Error('Change investigation pagination could not advance safely.')
       cursor = nextCursor
@@ -416,22 +423,25 @@ export class ChangesService {
     const tenantIds = scopedTenants.map((tenant) => tenant.id)
     const names = new Map(allTenants.map((tenant) => [tenant.id, tenant.displayName ?? tenant.primaryDomain ?? 'Microsoft tenant']))
     const where = { organizationId: { in: organizationIds }, customerTenantId: { in: tenantIds }, eventDateTime: { gte: from, lte: to } }
-    const [auditLogs, evidenceEvents] = await Promise.all([
+    const [auditRead, evidenceRead] = await Promise.all([
       this.loadAllPages((cursor) => this.prisma.directoryAuditLog
-        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }))
-        .catch((error) => {
-          this.logger.warn(`Unable to load directory audit source records: ${error instanceof Error ? error.message : String(error)}`)
-          return []
-        }),
+        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
       this.loadAllPages((cursor) => this.prisma.changeEvidenceEvent
-        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) }))
-        .catch((error) => {
-          // The source logs remain the canonical fallback while a newly
-          // deployed projection table is unavailable or being backfilled.
-          this.logger.warn(`Unable to load normalized change evidence; falling back to source logs: ${error instanceof Error ? error.message : String(error)}`)
-          return []
-        }),
+        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
     ])
+    const sourceAvailability = {
+      directoryAudit: { status: auditRead.status, evidenceClasses: ['DIRECTORY_AUDIT'] },
+      normalizedEvidence: { status: evidenceRead.status, evidenceClasses: ['DIRECTORY_AUDIT', 'M365_UNIFIED_AUDIT', 'SNAPSHOT_DIFFERENCE'] },
+    }
+    for (const [source, availability] of Object.entries(sourceAvailability)) {
+      if (availability.status !== 'available') this.logger.warn(`Change evidence source ${source} is ${availability.status}.`)
+    }
+    // Raw directory logs can replace matching directory projections only.
+    // Raw M365 audit records exist separately, but this endpoint does not read
+    // that store; missing projections leave unified audit and snapshot gaps.
+    const auditLogs = auditRead.records
+    const evidenceEvents = evidenceRead.records
+    const readsAvailable = auditRead.status === 'available' && evidenceRead.status === 'available'
 
     const changes = auditLogs
       .map((log) => ({ log, ...directoryAuditProjection(log) }))
@@ -535,6 +545,8 @@ export class ChangesService {
     const pageSize = Number.isInteger(requestedPageSize) && requestedPageSize > 0 ? Math.min(requestedPageSize, 250) : 0
     const total = events.length
     const summary = {
+      // Counts describe observed retained evidence, never upstream completeness.
+      countStatus: readsAvailable ? 'observed' as const : total > 0 ? 'observed_partial' as const : 'unknown' as const,
       total,
       changes: total,
       // Retained sign-in telemetry is intentionally excluded from the
@@ -547,7 +559,7 @@ export class ChangesService {
       apps: new Set(events.filter((event) => event.category === 'Apps').map((event) => event.target).filter(Boolean)).size,
     }
     if (pageSize) events = events.slice((page - 1) * pageSize, page * pageSize)
-    return { changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary, range: { from: from.toISOString(), to: to.toISOString() }, ...(pageSize ? { pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } } : {}) }
+    return { sourceAvailability, collectionCompleteness: 'unknown' as const, changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary, range: { from: from.toISOString(), to: to.toISOString() }, ...(pageSize ? { pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } } : {}) }
   }
 
   async detail(identity: AuthenticatedIdentity, sourceId: string, requestedTenantId: unknown) {
