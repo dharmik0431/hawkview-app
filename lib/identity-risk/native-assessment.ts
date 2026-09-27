@@ -90,9 +90,9 @@ export type NativeCount = {
  */
 export type NativeStreamCoverage = {
   stream: string
-  applies: number
-  uninterpretedEvents: number
-  notYetCitedEvents: number
+  applies: number | null
+  uninterpretedEvents: number | null
+  notYetCitedEvents: number | null
 }
 
 export type NativeAssessment =
@@ -135,6 +135,22 @@ function record(value: unknown): Record<string, unknown> | null {
     Object.getPrototypeOf(value) === Object.prototype
     ? (value as Record<string, unknown>)
     : null
+}
+
+/** Missing or invalid coverage is unknown, never an invented zero. */
+function coverageCount(value: unknown): number | null {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : null
+}
+function coverageTotal(value: unknown): number | null {
+  const counts = record(value)
+  if (!counts) return null
+  let sum = 0
+  for (const value of Object.values(counts)) {
+    const count = coverageCount(value)
+    if (count === null || !Number.isSafeInteger(sum + count)) return null
+    sum += count
+  }
+  return sum
 }
 
 function has(value: Record<string, unknown>, keys: readonly string[]) {
@@ -399,15 +415,20 @@ export function adaptNativeAssessment(value: unknown): NativeAssessment | null {
     const stream = text(item.stream, 120)
     if (!stream) continue
     const split = record(item.coverage) ?? {}
-    const whole = (value: unknown) =>
-      Number.isSafeInteger(value) && (value as number) >= 0
-        ? (value as number)
-        : 0
+    // The current DTO carries reason maps, not precomputed numeric totals.
+    // Once any map is present, incomplete/malformed maps cannot fall back to
+    // legacy totals that would hide an unknown component.
+    const mapsPresent = ['unknown', 'unprocessable', 'notYetCited'].some((key) =>
+      Object.prototype.hasOwnProperty.call(split, key))
+    const unknown = coverageTotal(split.unknown)
+    const unprocessable = coverageTotal(split.unprocessable)
+    const uninterpreted = unknown !== null && unprocessable !== null
+      ? coverageCount(unknown + unprocessable) : null
     coverage.push({
       stream,
-      applies: whole(split.applies),
-      uninterpretedEvents: whole(split.uninterpretedEvents),
-      notYetCitedEvents: whole(split.notYetCitedEvents),
+      applies: coverageCount(split.applies),
+      uninterpretedEvents: mapsPresent ? uninterpreted : coverageCount(split.uninterpretedEvents),
+      notYetCitedEvents: mapsPresent ? coverageTotal(split.notYetCited) : coverageCount(split.notYetCitedEvents),
     })
   }
 

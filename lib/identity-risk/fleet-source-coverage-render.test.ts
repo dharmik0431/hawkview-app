@@ -209,7 +209,8 @@ async function mounted(
     render: () => Promise<void>
     body: () => string
     dom: any
-  }) => Promise<void>
+  }) => Promise<void>,
+  expandEvidence = true
 ) {
   reset()
   const dom = new JSDOM('<div id="root"></div>', {
@@ -238,6 +239,8 @@ async function mounted(
     await run({
       render: async () => {
         await React.act(async () => root.render(React.createElement(Page)))
+        const toggle = dom.window.document.querySelector('button[aria-controls="fleet-evidence-availability"]')
+        if (expandEvidence && toggle?.getAttribute('aria-expanded') === 'false') await React.act(async () => toggle.click())
       },
       body: () => dom.window.document.body.textContent,
       dom,
@@ -378,6 +381,7 @@ test('retained positives, stale/unknown evidence and delivered-count gaps remain
     nativeQueries[4].data.count.value = 2
     await render()
     assert.match(body(), /Historical evidence/)
+    assert.match(dom.window.document.querySelector('[role="img"]').getAttribute('aria-label'), /tenant-a: Microsoft risk evidence is older/)
     assert.match(body(), /Microsoft-only synthetic identity/)
     assert.match(body(), /No assessment or collection result is available/)
     assert.match(body(), /Assessment is not enabled/)
@@ -467,3 +471,188 @@ test('reload guards rapid re-entry until settlement, then targets only remaining
     await React.act(async () => reload(dom).click())
     assert.deepEqual(calls, ['microsoft:tenant-b'])
   }))
+
+test('compact evidence disclosure defaults closed; button activation preserves details and Escape restores focus', async () => mounted(async ({ render, dom }) => {
+  nativeQueries[0].isError = true
+  microsoftQueries[1].data = unavailable('LICENSE_REQUIRED')
+  await render()
+  const document = dom.window.document
+  const toggle = document.querySelector('button[aria-controls="fleet-evidence-availability"]')
+  const panel = document.getElementById(toggle.getAttribute('aria-controls'))
+  assert.equal(toggle.type, 'button') // Native Enter/Space and assistive activation semantics.
+  assert.equal(toggle.tabIndex, 0)
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false')
+  assert.match(toggle.getAttribute('aria-label'), /Show evidence availability and analysis limitations/)
+  assert.ok(toggle.className.includes('text-slate-600'))
+  assert.match(document.querySelector('[role="img"]').getAttribute('aria-label'), /HawkView assessment results could not be loaded/)
+  assert.equal(toggle.querySelector('svg').getAttribute('aria-hidden'), 'true')
+  assert.equal(panel.hidden, true)
+  assert.ok(panel.contains(reload(dom)))
+  assert.equal(panel.querySelector('h2').id, panel.getAttribute('aria-labelledby'))
+  const details = panel.textContent
+  assert.match(details, /HawkView assessments: 4 of 5/)
+  assert.match(details, /Microsoft risk evidence: 4 of 5/)
+  assert.match(details, /Results could not be loaded/)
+  assert.match(details, /Microsoft reports a license requirement/)
+  toggle.focus()
+  await React.act(async () => toggle.click())
+  assert.equal(panel.hidden, false)
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true')
+  assert.equal(document.activeElement, toggle)
+  assert.equal(panel.textContent, details)
+  assert.equal(calls.length, 0, 'Opening the disclosure never reloads or collects')
+  reload(dom).focus()
+  await React.act(async () => reload(dom).dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })))
+  assert.equal(panel.hidden, true)
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false')
+  assert.equal(document.activeElement, toggle)
+  // Keyboard/assistive activation reaches the native button's click handler.
+  await React.act(async () => toggle.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true, detail: 0 })))
+  assert.equal(panel.hidden, false)
+  assert.equal(panel.textContent, details)
+  await React.act(async () => reload(dom).click())
+  assert.deepEqual(calls, ['native:tenant-a'])
+  await React.act(async () => toggle.click())
+  assert.equal(panel.hidden, true)
+}, false))
+
+test('disclosure remains discoverable for complete, unknown and empty scope without inventing success', async () => mounted(async ({ render, dom }) => {
+  await render()
+  const toggle = dom.window.document.querySelector('button[aria-controls="fleet-evidence-availability"]')
+  const panel = dom.window.document.getElementById('fleet-evidence-availability')
+  assert.equal(panel.hidden, true)
+  assert.equal(toggle.getAttribute('aria-label'), 'Show evidence availability and analysis limitations')
+  assert.ok(toggle.querySelector('svg').classList.contains('lucide-info'))
+  tenantQuery.isError = true
+  await render()
+  assert.equal(panel.hidden, true)
+  assert.match(toggle.getAttribute('aria-label'), /analysis limitations/)
+  assert.ok(toggle.querySelector('svg').classList.contains('lucide-info'))
+  assert.match(dom.window.document.querySelector('[role="img"]').getAttribute('aria-label'), /tenant list could not be loaded/)
+  await React.act(async () => toggle.click())
+  assert.match(panel.textContent, /Coverage is unknown/)
+  assert.doesNotMatch(panel.textContent, /\d+ of \d+ tenants/)
+  tenantQuery.isError = false
+  tenantQuery.data = { tenants: [] }
+  await render()
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true')
+  assert.equal(toggle.getAttribute('aria-label'), 'Hide evidence availability and analysis limitations')
+  assert.equal(reload(dom), undefined)
+}, false))
+
+
+test('fresh connected lower bounds and unmatched records are informational; operational warnings remain independent', async () => mounted(async ({ render, dom, body }) => {
+  tenantQuery.data.tenants.forEach((tenant: any) => { tenant.status = 'active'; tenant.connectionStatus = 'connected' })
+  const n = nativeQueries[0].data
+  n.count.accuracy = 'AT_LEAST'; n.count.value = 5
+  n.claim = { permitted: false, withheld: [{ stream: 'GRAPH_SIGN_INS', because: 'UNINTERPRETED_EVENTS' }] }
+  n.findings.complete = false
+  microsoftQueries[0].data = microsoft(true)
+  Object.assign(microsoftQueries[0].data.microsoftRiskSummary, { availability: 'PARTIAL', completeness: 'PARTIAL', activeDistinctUserCount: null, reasonCode: 'PARTIAL_RECORDS' })
+  await render()
+  const warning = () => dom.window.document.querySelector('[role="img"]')
+  assert.equal(warning(), null)
+  assert.equal(hook.tenantStatuses[0].nativeSource, 'INCOMPLETE')
+  assert.match(body(), /At least 5/i)
+  assert.match(body(), /events HawkView did not interpret/)
+  assert.match(body(), /assessment completed 2026-09-23/)
+  assert.match(body(), /Microsoft risk records without a usable directory identity: 1/)
+  assert.match(body(), /Microsoft-only synthetic identity/)
+  assert.notEqual(hook.tenantStatuses[0].status, 'SUCCESS')
+  assert.equal(reload(dom), undefined)
+  for (const reason of ['LICENSE_REQUIRED', 'MISSING_PERMISSION', 'SOURCE_UNAVAILABLE']) {
+    microsoftQueries[1].data = unavailable(reason)
+    await render()
+    assert.equal(warning(), null)
+  }
+  tenantQuery.data.tenants[1].status = 'disconnected'
+  tenantQuery.data.tenants[2].connectionStatus = 'revoked'
+  nativeQueries[3].data.run.completedAt = '2026-09-01T12:00:00.000Z'
+  microsoftQueries[4].isError = true
+  await render()
+  assert.match(warning().getAttribute('aria-label'), /tenant-b: Tenant is disconnected/)
+  assert.match(warning().getAttribute('aria-label'), /tenant-c: Tenant connection is revoked/)
+  assert.match(warning().getAttribute('aria-label'), /tenant-d: HawkView evidence is older/)
+  assert.match(warning().getAttribute('aria-label'), /tenant-e: Microsoft risk results could not be loaded/)
+  assert.match(body(), /At least 5/i)
+  assert.match(body(), /Microsoft-only synthetic identity/)
+  assert.equal(calls.length, 0)
+}))
+
+test('pending, unconfirmed and generic unavailable states never imply operational failure or healthy connection', async () => mounted(async ({ render, dom, body }) => {
+  tenantQuery.data.tenants[0].connectionStatus = 'pending-consent'
+  nativeQueries[0].isLoading = true
+  nativeQueries[1].data = null
+  nativeQueries[2].data.collectors[0].lastSuccessfulCollectionAt = null
+  microsoftQueries[3].data = unavailable('SOURCE_UNAVAILABLE')
+  await render()
+  assert.equal(dom.window.document.querySelector('[role="img"]'), null)
+  assert.match(body(), /awaiting consent/)
+  assert.match(body(), /connection status is unconfirmed/)
+  assert.doesNotMatch(body(), /Tenant is disconnected|connection is reported connected|No users require review/)
+  assert.equal(reload(dom), undefined)
+}))
+
+
+test('explicit collection and connection failures warn outside the collapsed disclosure without offering successful-read reloads', async () => mounted(async ({ render, dom }) => {
+  const warning = () => dom.window.document.querySelector('[role="img"]')
+  const panel = () => dom.window.document.getElementById('fleet-evidence-availability')
+  microsoftQueries[0].data = unavailable('COLLECTION_FAILED')
+  await render()
+  assert.equal(panel().hidden, true)
+  assert.match(warning().getAttribute('aria-label'), /tenant-a: Microsoft risky-user collection reports failure/)
+  assert.equal(warning().closest('[hidden]'), null)
+  assert.equal(reload(dom), undefined)
+  microsoftQueries[0].data = microsoft()
+  nativeQueries[1].data.collectors[0].status = 'FAILED'
+  await render()
+  assert.match(warning().getAttribute('aria-label'), /tenant-b: A selected HawkView evidence collector reports failure/)
+  assert.equal(panel().hidden, true)
+  nativeQueries[1].data.collectors[0].status = 'SUCCESS'
+  tenantQuery.data.tenants[2].connectionStatus = 'error'
+  await render()
+  assert.match(warning().getAttribute('aria-label'), /tenant-c: Tenant connection reports an error; its cause is not established here/)
+  assert.equal(panel().hidden, true)
+  assert.equal(reload(dom), undefined)
+  assert.equal(calls.length, 0)
+}, false))
+
+test('collection-not-succeeded needs a validated failure status; pending, unknown, licensing and malformed data do not invent failure', async () => mounted(async ({ render, dom }) => {
+  const warning = () => dom.window.document.querySelector('[role="img"]')
+  for (const status of ['UNAVAILABLE', 'NOT_EVALUATED', 'ERROR']) {
+    const dto = unavailable('SOURCE_UNAVAILABLE')
+    delete dto.reasonCode
+    dto.status = status
+    dto.microsoftRiskSummary.reasonCode = 'COLLECTION_NOT_SUCCEEDED'
+    microsoftQueries[0].data = dto
+    await render()
+    assert.equal(dom.window.document.getElementById('fleet-evidence-availability').hidden, true)
+    if (status === 'ERROR') assert.match(warning().getAttribute('aria-label'), /Microsoft risky-user collection reports failure/)
+    else assert.equal(warning(), null)
+    assert.equal(reload(dom), undefined)
+  }
+  for (const reason of ['LICENSE_REQUIRED', 'MISSING_PERMISSION', 'WAITING_FOR_COLLECTION', 'SOURCE_UNAVAILABLE']) {
+    microsoftQueries[0].data = unavailable(reason)
+    for (const status of ['RUNNING', 'PENDING', 'UNKNOWN']) {
+      nativeQueries[0].data.collectors[0].status = status
+      await render()
+      assert.equal(warning(), null)
+    }
+  }
+  for (const reason of ['LICENSE_REQUIRED', 'MISSING_PERMISSION']) {
+    microsoftQueries[0].data = { ...unavailable(reason), status: 'ERROR' }
+    await render()
+    assert.equal(warning(), null, 'A named optional availability limitation remains informational')
+  }
+  microsoftQueries[0].data = { ...unavailable('SOURCE_UNAVAILABLE'), status: 'ERROR' }
+  await render()
+  assert.match(warning().getAttribute('aria-label'), /Microsoft risk source reports an error; its cause is not established here/)
+  assert.doesNotMatch(warning().getAttribute('aria-label'), /collection reports failure/)
+  const malformed = unavailable('COLLECTION_FAILED')
+  malformed.catalogVersion = 'unsupported'
+  microsoftQueries[0].data = malformed
+  nativeQueries[0].data.collectors.push({ ...nativeQueries[0].data.collectors[0], status: 'FAILED' })
+  await render()
+  assert.equal(warning(), null, 'Malformed envelopes and ambiguous duplicate collectors do not establish a collection failure')
+  assert.equal(calls.length, 0)
+}, false))

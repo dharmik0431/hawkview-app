@@ -153,16 +153,19 @@ function reasonsOf(finding: {
  * interpretation failure indistinguishable from one with a filing problem.
  */
 function scopeSentence(native: Extract<NativeAssessment, { available: true }>) {
-  const notYetCited = native.coverage.reduce(
-    (total, entry) => total + entry.notYetCitedEvents,
-    0
-  )
-  const uninterpreted = native.coverage.reduce(
-    (total, entry) => total + entry.uninterpretedEvents,
-    0
-  )
+  const sum = (field: 'notYetCitedEvents' | 'uninterpretedEvents') => {
+    let total = 0
+    for (const entry of native.coverage) {
+      const count = entry[field]
+      if (count === null || !Number.isSafeInteger(total + count)) return null
+      total += count
+    }
+    return total
+  }
+  const notYetCited = sum('notYetCitedEvents')
+  const uninterpreted = sum('uninterpretedEvents')
   const parts: string[] = []
-  if (notYetCited > 0) {
+  if (notYetCited !== null && notYetCited > 0) {
     parts.push(
       notYetCited.toLocaleString() +
         (notYetCited === 1
@@ -170,7 +173,7 @@ function scopeSentence(native: Extract<NativeAssessment, { available: true }>) {
           : ' events held pending a citation')
     )
   }
-  if (uninterpreted > 0) {
+  if (uninterpreted !== null && uninterpreted > 0) {
     parts.push(
       uninterpreted.toLocaleString() +
         (uninterpreted === 1
@@ -183,11 +186,17 @@ function scopeSentence(native: Extract<NativeAssessment, { available: true }>) {
     // a reading of the figure as covering anything in particular.
     return 'This response did not report what it examined, so the figure above cannot be read as covering any particular scope.'
   }
+  if (notYetCited === null) parts.push('the number of events held pending a citation is unknown')
+  if (uninterpreted === null) parts.push('the number of uninterpreted events is unknown')
+  if (native.coverage.some((entry) => entry.applies === null)) parts.push('the number of applicable events is unknown')
+  if (parts.length === 0 && (native.withheld.length > 0 || native.count.accuracy !== 'EXACT')) {
+    return 'Coverage details do not establish that every event was assessed or accounted for; the reported limitations still apply.'
+  }
   if (parts.length === 0) {
     return 'Every event this run examined was either assessed or accounted for.'
   }
   return (
-    'Exact over the events HawkView cited a basis for. Also on this tenant: ' +
+    (native.count.accuracy === 'EXACT' ? 'Exact over the events HawkView cited a basis for. Also on this tenant: ' : 'Reported event coverage: ') +
     parts.join(', ') +
     '.'
   )

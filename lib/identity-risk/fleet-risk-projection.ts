@@ -11,7 +11,11 @@ export const FLEET_EVIDENCE_MAX_AGE_MS = 2 * 60 * 60 * 1000
 export const MICROSOFT_EVIDENCE_MAX_AGE_MS = 36 * 60 * 60 * 1000
 export type FleetEvidenceState = 'CURRENT' | 'HISTORICAL' | 'UNKNOWN'
 export type FleetQuery = { data?: unknown; isError?: boolean; isLoading?: boolean; isFetching?: boolean }
-export type FleetTenant = { id: string; name?: string | null; domain?: string | null }
+export type FleetTenant = {
+  id: string; name?: string | null; domain?: string | null
+  status?: 'pending' | 'active' | 'suspended' | 'disconnected'
+  connectionStatus?: 'pending-consent' | 'connected' | 'error' | 'revoked' | null
+}
 export type FleetRiskyUserRow = RiskyUserRow & {
   tenantId: string; tenantName: string; tenantDomain?: string | null
   evidenceState?: FleetEvidenceState
@@ -125,6 +129,36 @@ export function projectFleetRisk(tenants: readonly FleetTenant[], nativeQueries:
         : ms.meta.reasonCode === 'COLLECTION_FAILED' || summary?.reasonCode === 'COLLECTION_NOT_SUCCEEDED' || summary?.availability === 'UNAVAILABLE' ? 'SOURCE_UNAVAILABLE'
         : msState !== 'CURRENT' ? 'UNCONFIRMED' : 'INCOMPLETE'
     )
+    // Presentation observations only: completeness is not operational health.
+    // A failed read says nothing about whether a collector itself failed.
+    const operationalWarnings: string[] = []
+    if (tenant.status === 'disconnected') operationalWarnings.push('Tenant is disconnected.')
+    if (tenant.connectionStatus === 'revoked') operationalWarnings.push('Tenant connection is revoked.')
+    if (tenant.connectionStatus === 'error') operationalWarnings.push('Tenant connection reports an error; its cause is not established here.')
+    if (rawCollectorsValid && selectedCollectors.some((collectors) => collectors.length === 1 && collectors[0].status === 'FAILED')) {
+      operationalWarnings.push('A selected HawkView evidence collector reports failure.')
+    }
+    // COLLECTION_NOT_SUCCEEDED also describes pending/unknown collection.
+    // Require a validated ERROR envelope before calling that reason a failure.
+    // Adapter-generated contract errors have users=null, not a validated DTO.
+    const microsoftAvailabilityLimitation = ms.meta.reasonCode === 'LICENSE_REQUIRED' || ms.meta.reasonCode === 'MISSING_PERMISSION'
+    if (ms.meta.reasonCode === 'COLLECTION_FAILED' ||
+      (!microsoftAvailabilityLimitation && ms.meta.status === 'ERROR' && ms.users !== null && summary?.reasonCode === 'COLLECTION_NOT_SUCCEEDED')) {
+      operationalWarnings.push('Microsoft risky-user collection reports failure.')
+    } else if (!microsoftAvailabilityLimitation && ms.meta.status === 'ERROR' && ms.users !== null) {
+      operationalWarnings.push('Microsoft risk source reports an error; its cause is not established here.')
+    }
+    if (query?.isError) operationalWarnings.push('HawkView assessment results could not be loaded.')
+    if (msQuery?.isError) operationalWarnings.push('Microsoft risk results could not be loaded.')
+    if (nativeSource === 'STALE') operationalWarnings.push('HawkView evidence is older than its freshness window.')
+    if (microsoftSource === 'STALE') operationalWarnings.push('Microsoft risk evidence is older than its freshness window.')
+    const connectionObservation = tenant.status === 'disconnected' ? 'Tenant is disconnected.'
+      : tenant.connectionStatus === 'revoked' ? 'Tenant connection is revoked.'
+      : tenant.connectionStatus === 'connected' ? 'Tenant connection is reported connected.'
+      : tenant.connectionStatus === 'pending-consent' ? 'Tenant connection is awaiting consent.'
+      : tenant.connectionStatus === 'error' ? 'Tenant connection reports an error; its cause is not established here.'
+      : 'Tenant connection status is unconfirmed.'
+    const microsoftUnmatchedRecords = microsoftRows.filter((record) => !key(record.correlation)).length
     const matched = new Set<string>()
     const rows = list.rows.map((row) => {
       const findings = native?.available ? native.findings.filter((finding) => finding.subject.kind === 'DIRECTORY_USER' && finding.subject.ref === row.reference) : []
@@ -157,6 +191,7 @@ export function projectFleetRisk(tenants: readonly FleetTenant[], nativeQueries:
       status: query?.isLoading || msQuery?.isLoading ? 'LOADING' as const : query?.isError ? 'FAILED' as const
         : nativeComplete && msComplete ? 'SUCCESS' as const : 'UNAVAILABLE' as const,
       count, channel, userCount: rows.length, nativeSource, microsoftSource,
+      operationalWarnings, connectionObservation, microsoftUnmatchedRecords,
     }
   })
   return { fleetRows, tenantStatuses, deliveryGaps, metrics: {
