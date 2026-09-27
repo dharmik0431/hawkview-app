@@ -111,3 +111,37 @@ test('the run it writes is invisible to the live reader', async () => {
   assert.notEqual(created[0]!.status, 'COMPLETED')
   assert.equal(created[0]!.status, 'COMPLETED_EVALUATION_CORE')
 })
+
+
+test('core-partial feed stays failed through retry without hiding ordinary retained complete evidence', async () => {
+  const completeAt = new Date('2026-09-10T21:00:00Z')
+  for (const scenario of [
+    { name: 'complete', status: 'SUCCEEDED', code: null, success: completeAt, expected: 'SUCCESS' },
+    { name: 'ordinary refresh', status: 'RUNNING', code: null, success: completeAt, expected: 'SUCCESS' },
+    { name: 'stale retained refresh', status: 'RUNNING', code: null, success: new Date('2026-08-01'), expected: 'STALE' },
+    { name: 'never complete', status: 'RUNNING', code: null, success: null, expected: 'RUNNING' },
+    { name: 'legacy core partial', status: 'RUNNING', code: 'sign-ins-record-validation-partial', success: completeAt, expected: 'FAILED' },
+    { name: 'settled core partial', status: 'FAILED', code: 'sign-ins-record-validation-partial', success: completeAt, expected: 'FAILED' },
+    { name: 'retry of core partial', status: 'RUNNING', code: 'sign-ins-record-validation-partial', success: completeAt, expected: 'FAILED' },
+    { name: 'core partial with no baseline', status: 'RUNNING', code: 'sign-ins-record-validation-partial', success: null, expected: 'FAILED' },
+    { name: 'valid fallback', status: 'RUNNING', code: 'sign-ins-non-premium-fallback-active-geolocation-partial', success: completeAt, expected: 'SUCCESS' },
+  ]) {
+    const { db, created } = client()
+    ;(db.syncState as any).findMany = async ({ where }: any) => {
+      assert.equal(where.organizationId, scope.organizationId); assert.equal(where.customerTenantId, scope.customerTenantId)
+      return [
+        { resourceType: 'SIGN_INS', status: scenario.status, lastSuccessfulAt: scenario.success, lastAttemptAt: now, lastErrorCode: scenario.code, lastErrorMessage: null },
+        { resourceType: 'M365_AUDIT', status: 'SUCCEEDED', lastSuccessfulAt: completeAt, lastAttemptAt: completeAt, lastErrorCode: null, lastErrorMessage: null },
+      ]
+    }
+    await evaluateAndPersistTenant(db as never, scope, { now })
+    const findings = created[0]!.evaluationFindings as any
+    assert.equal(findings.sources.find((s: any) => s.source === 'GRAPH_SIGN_INS').status, scenario.expected, scenario.name)
+    assert.equal(findings.sources.find((s: any) => s.source === 'M365_AUDIT_STS').status, scenario.expected, 'both feeds read SIGN_INS; unrelated M365_AUDIT state cannot override it')
+    assert.equal(findings.sources.find((s: any) => s.source === 'GRAPH_SIGN_INS').lastSuccessfulCollectionAt, scenario.success?.toISOString() ?? null)
+    if (scenario.expected === 'FAILED') {
+      assert.equal(findings.claim.permitted, false, scenario.name + ' cannot certify a clean empty assessment')
+      assert.notEqual(findings.count.accuracy, 'EXACT', scenario.name + ' unknown coverage is not exact zero')
+    }
+  }
+})

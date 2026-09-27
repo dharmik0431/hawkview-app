@@ -990,7 +990,8 @@ test('the real snapshot wrapper records only its failed operational state when b
     })
     assert.ok(upsert.create.lastAttemptAt instanceof Date)
     assert.deepEqual({ ...upsert.update, lastAttemptAt: 'DATE' }, {
-      status: 'RUNNING', lastAttemptAt: 'DATE', lastErrorCode: null, lastErrorMessage: null,
+      status: 'RUNNING', lastAttemptAt: 'DATE',
+      ...(resourceType === 'SIGN_INS' ? {} : { lastErrorCode: null, lastErrorMessage: null }),
     })
     assert.ok(upsert.update.lastAttemptAt instanceof Date)
     assert.deepEqual(stateUpdates[index], {

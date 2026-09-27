@@ -1,3 +1,4 @@
+import { isCoreAuthenticationPartial } from '../tenants/authentication-collection-outcome.js'
 import { IDENTITY_RISK_RUN_RETENTION_MS } from '../identity-risk/identity-risk.contract.js'
 import { collectorStatus } from '../tenants/service-sync-freshness.js'
 import { credentialFailureDetector } from './detectors/credential-failure.js'
@@ -109,10 +110,17 @@ async function syncStatusPerFeed(
   //
   // RUNNING with NO prior success still means never collected, which is the
   // reading that was right all along for the case the label was written for.
-  const settled = (state: (typeof states)[number] | undefined) =>
-    state !== undefined && String(state.status) === 'RUNNING' && state.lastSuccessfulAt !== null
+  const settled = (state: (typeof states)[number] | undefined) => {
+    // A retry cannot turn the last core-incomplete outcome into complete
+    // evidence. This also handles legacy RUNNING partial rows from before
+    // the collector preserved the last complete-success clock.
+    if (state && isCoreAuthenticationPartial(String(state.resourceType), state.lastErrorCode)) {
+      return { ...state, status: 'FAILED' }
+    }
+    return state !== undefined && String(state.status) === 'RUNNING' && state.lastSuccessfulAt !== null
       ? { ...state, status: 'IDLE' }
       : state
+  }
 
   const read = (source: NormalizationSource): CollectorSyncStatus =>
     collectorStatus(COLLECTOR_FOR[source], settled(byResource.get(COLLECTOR_FOR[source])) as never, now)

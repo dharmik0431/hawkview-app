@@ -78,7 +78,7 @@ test('real nonpremium sync pages scoped history, resumes committed work and repo
   assert.deepEqual(observations.takes, [3, 2]); assert.deepEqual(observations.cursors, [historyId(0).replace('4000-8000', '0000-0000'), historyId(2)])
   const partial = observations.states.at(-1)
   assert.deepEqual(Object.keys(partial).sort(), ['consecutiveFailures', 'lastErrorCode', 'lastErrorMessage', 'lastSuccessfulAt', 'status'])
-  assert.deepEqual(observations.starts[0].update, { status: 'RUNNING', lastAttemptAt: observations.starts[0].update.lastAttemptAt, lastErrorCode: null, lastErrorMessage: null })
+  assert.deepEqual(observations.starts[0].update, { status: 'RUNNING', lastAttemptAt: observations.starts[0].update.lastAttemptAt })
   assert.ok(observations.starts[0].update.lastAttemptAt instanceof Date)
   assert.equal(partial.status, 'RUNNING'); assert.equal(partial.lastErrorCode, 'sign-ins-non-premium-fallback-active-geolocation-partial')
   assert.ok(partial.lastSuccessfulAt instanceof Date); assert.equal(Object.hasOwn(partial, 'deltaLink'), false)
