@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle,
   Building2,
@@ -9,6 +9,7 @@ import {
   Clock3,
   Filter,
   Globe,
+  Info,
   RefreshCw,
   AlertTriangle,
   Search,
@@ -115,6 +116,8 @@ function DataStateBadge({ row }: { row: FleetRiskyUserRow }) {
 }
 
 export default function FleetRiskyUsersPage() {
+  const [evidenceOpen, setEvidenceOpen] = useState(false)
+  const evidenceToggle = useRef<HTMLButtonElement>(null)
   const [selectedTenant, setSelectedTenant] = useState<string>('ALL')
   const {
     tenants,
@@ -268,6 +271,11 @@ export default function FleetRiskyUsersPage() {
     return fleetRows.reduce((acc, r) => acc + r.reasons.length, 0)
   }, [fleetRows])
 
+  const operationalWarnings = !enumerationKnown
+    ? (isError ? ['The tenant list could not be loaded.'] : [])
+    : tenantStatuses.flatMap((tenant) => tenant.operationalWarnings.map((message) => `${tenant.tenantName}: ${message}`))
+  const evidenceLabel = 'Evidence availability and analysis limitations'
+
   const isFilterActive =
     searchQuery !== '' ||
     selectedTenant !== 'ALL' ||
@@ -283,9 +291,26 @@ export default function FleetRiskyUsersPage() {
             <ShieldAlert className="h-6 w-6" />
           </div>
           <div>
-            <h1 className="text-2xl sm:text-[26px] font-bold tracking-tight text-slate-900 dark:text-slate-100">
-              Risky Users
-            </h1>
+            <div className="flex items-center gap-2">
+              <h1 className="text-2xl sm:text-[26px] font-bold tracking-tight text-slate-900 dark:text-slate-100">
+                Risky Users
+              </h1>
+              <button
+                ref={evidenceToggle}
+                type="button"
+                aria-label={`${evidenceOpen ? 'Hide' : 'Show'} ${evidenceLabel.toLowerCase()}`}
+                aria-expanded={evidenceOpen}
+                aria-controls="fleet-evidence-availability"
+                title={evidenceLabel}
+                onClick={() => setEvidenceOpen((open) => !open)}
+                className="inline-flex h-11 w-11 sm:h-9 sm:w-9 shrink-0 items-center justify-center rounded-full border border-slate-300 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+              >
+                <Info aria-hidden="true" className="h-4 w-4" />
+              </button>
+              {operationalWarnings.length > 0 && <span role="img" aria-label={operationalWarnings.join(' ')} title={operationalWarnings.join(' ')} className="inline-flex text-amber-700 dark:text-amber-300">
+                <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+              </span>}
+            </div>
             <p className="text-13px sm:text-sm text-slate-500 dark:text-slate-400 mt-0.5">
               Review users requiring investigation across the Microsoft 365 tenants you manage.
             </p>
@@ -295,18 +320,6 @@ export default function FleetRiskyUsersPage() {
               <span>Native and Microsoft evidence are evaluated separately</span>
             </div>
           </div>
-        </div>
-
-        <div className="flex items-center gap-3 shrink-0 self-start sm:self-center">
-          {hasFailedRequests && <Button
-            variant="outline"
-            size="sm"
-            onClick={reloadFailedResults}
-            className="h-9 px-3.5 text-xs font-medium"
-          >
-            <RefreshCw className="h-3.5 w-3.5 mr-2" />
-            Reload results
-          </Button>}
         </div>
       </div>
 
@@ -448,14 +461,26 @@ export default function FleetRiskyUsersPage() {
             <p className="text-xs text-slate-500">
               {combinedComplete ? 'Both sources have complete current evidence for every tenant in scope.'
                 : enumerationKnown && fleetWide.inScope === 0 ? 'No tenants are in scope.'
-                : enumerationKnown ? 'See each source’s availability below.' : 'The tenant list must be confirmed before coverage can be counted.'}
+                : enumerationKnown ? 'Open the evidence availability icon beside the page title for details.' : 'The tenant list must be confirmed before coverage can be counted.'}
             </p>
           </div>
         </div>
       </div>
 
-      <section aria-label="Evidence availability" className="rounded-xl border border-slate-200 dark:border-slate-700 p-4 space-y-3">
-        <h2 className="text-sm font-semibold">Evidence availability</h2>
+      <section id="fleet-evidence-availability" aria-labelledby="fleet-evidence-title" hidden={!evidenceOpen}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            setEvidenceOpen(false)
+            evidenceToggle.current?.focus()
+          }
+        }}
+        className="rounded-xl border border-slate-200 dark:border-slate-700 p-4 space-y-3 break-words">
+        <h2 id="fleet-evidence-title" className="text-sm font-semibold">Evidence availability</h2>
+        {operationalWarnings.length > 0 && <div className="text-sm text-amber-800 dark:text-amber-300">
+          <h3 className="font-medium">Connection, freshness and read warnings</h3>
+          <ul className="ml-5 list-disc">{operationalWarnings.map((message) => <li key={message}>{message}</li>)}</ul>
+        </div>}
         {!enumerationKnown ? <p role="status" className="text-sm">
           {isError ? 'The tenant list could not be loaded.' : 'Confirming the tenant list.'} Coverage is unknown. Retained findings are not proof of current coverage.
         </p> : sourceCoverage.map((source) => <div key={source.label} className="space-y-2">
@@ -465,6 +490,27 @@ export default function FleetRiskyUsersPage() {
             <ul className="ml-5 list-disc">{group.tenants.map((tenant) => <li key={tenant.tenantId}>{tenant.tenantName}</li>)}</ul>
           </details>)}
         </div>)}
+        {enumerationKnown && <div className="space-y-2 text-sm">
+          <h3 className="font-medium">Analysis limitations and connection observations</h3>
+          {tenantStatuses.map((tenant) => <details key={tenant.tenantId}>
+            <summary>{tenant.tenantName}</summary>
+            <p>{tenant.connectionObservation}</p>
+            <p>HawkView assessment: {tenant.count.accessibleValue}{tenant.count.asOf ? `; assessment completed ${tenant.count.asOf}` : ''}.</p>
+            {tenant.count.reasons.map((reason, index) => <p key={index}>{reason}</p>)}
+            {tenant.microsoftUnmatchedRecords > 0 && <p>Microsoft risk records without a usable directory identity: {tenant.microsoftUnmatchedRecords}. These records remain visible; identity comparison is limited.</p>}
+          </details>)}
+        </div>}
+        <div className="flex items-center gap-3 shrink-0 self-start sm:self-center">
+          {hasFailedRequests && <Button
+            variant="outline"
+            size="sm"
+            onClick={reloadFailedResults}
+            className="h-9 px-3.5 text-xs font-medium"
+          >
+            <RefreshCw className="h-3.5 w-3.5 mr-2" />
+            Reload results
+          </Button>}
+        </div>
         <p className="text-xs text-slate-500">Available findings remain visible. Missing or limited evidence does not mean no risk. Reloading failed reads does not start collection or change licensing or permissions.</p>
       </section>
 
