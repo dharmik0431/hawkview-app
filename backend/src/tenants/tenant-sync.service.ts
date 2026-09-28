@@ -1,4 +1,5 @@
 import { validatedLicenseRows } from './license-validation.js'
+import { advanceScheduledSyncPosition } from './scheduled-sync-position.js'
 import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
   BadRequestException,
@@ -1918,17 +1919,18 @@ export class TenantSyncService {
     const now = new Date()
     const limit = Math.max(
       1,
-      Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10)
+      Math.floor(Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10))
     )
-    // Read a bounded fair-candidate window, then rank it by the due resource
-    // state below.  `updatedAt` is intentionally not a scheduling signal:
-    // a noisy tenant must not starve 1,000 other due tenants.
-    const candidateLimit = Math.max(limit, Math.min(1_000, Number(process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT ?? 1_000) || 1_000))
+    // Durable consideration order precedes LIMIT, including candidates that
+    // the more precise in-memory retry policy will reject. Evidence clocks
+    // and CustomerTenant.updatedAt are never used as this admission cursor.
+    const candidateLimit = Math.max(limit, Math.floor(Math.min(1_000, Number(process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT ?? 1_000) || 1_000)))
     const candidateTenants = await this.prisma.customerTenant.findMany({
       where: scheduledSyncTenantWhere(now),
-      orderBy: { id: 'asc' },
+      orderBy: [{ scheduledSyncPosition: 'asc' }, { id: 'asc' }],
       take: candidateLimit,
       select: {
+        scheduledSyncPosition: true,
         id: true,
         organizationId: true,
         microsoftTenantId: true,
@@ -1972,13 +1974,14 @@ export class TenantSyncService {
 
     const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit)
     const selectedById = new Map(selectedWork.map((work) => [work.tenantId, work]))
-    const tenants = candidateTenants
-      .filter((tenant) => selectedById.has(tenant.id))
-      .sort((left, right) => {
-        const leftWork = selectedById.get(left.id)!
-        const rightWork = selectedById.get(right.id)!
-        return leftWork.dueAt.getTime() - rightWork.dueAt.getTime() || left.id.localeCompare(right.id)
-      })
+    const tenants = candidateTenants.sort((left, right) => {
+      if (left.scheduledSyncPosition !== right.scheduledSyncPosition) {
+        return left.scheduledSyncPosition < right.scheduledSyncPosition ? -1 : 1
+      }
+      const leftDue = selectedById.get(left.id)?.dueAt.getTime() ?? 0
+      const rightDue = selectedById.get(right.id)?.dueAt.getTime() ?? 0
+      return leftDue - rightDue || left.id.localeCompare(right.id)
+    })
 
     const results: Array<Record<string, unknown>> = []
     // A lock loser is not useful work. Continue through the fair candidate
@@ -1988,6 +1991,12 @@ export class TenantSyncService {
       // the preceding collector, whose own inherited timeout can exceed this.
       if (!canAdmit()) break
       if (results.filter((result) => result.status !== 'SKIPPED').length >= limit) break
+      // CAS protects shared progress from stale overlapping scans. Advance
+      // before collection: crashes, pre-lease failures and policy rejections
+      // must also yield to peers. This is opportunity, never source success.
+      if (!await advanceScheduledSyncPosition(this.prisma, tenant)) continue
+      if (!selectedById.has(tenant.id)) continue
+      if (!canAdmit()) break
       try {
         // Keep the five-minute run lightweight, but run a full inventory once
         // per day (or retry a failed daily inventory anchor after an hour).
@@ -2015,7 +2024,7 @@ export class TenantSyncService {
 
     const summary = {
       checkedAt: new Date().toISOString(),
-      due: tenants.length,
+      due: selectedWork.length,
       succeeded: results.filter((result) => result.status === 'SUCCEEDED')
         .length,
       partial: results.filter((result) => result.status === 'PARTIAL').length,

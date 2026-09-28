@@ -51,9 +51,9 @@ test('expired/invalid admission performs no DB work; a slow first collector prev
   let scans = 0; const attempted: string[] = []; let completed = false
   const service = new TenantSyncService({ customerTenant: { findMany: async () => {
     scans++
-    return [1,2].map(id => ({ id: `synthetic-${id}`, organizationId: 'synthetic-org',
+    return [1,2].map(id => ({ scheduledSyncPosition: 0n, id: `synthetic-${id}`, organizationId: 'synthetic-org',
       microsoftTenantId: `synthetic-ms-${id}`, status: 'ACTIVE', connection: { status: 'CONNECTED' }, syncStates: [] }))
-  } } } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  } }, $executeRaw: async () => 1 } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
   ;(service as any).logger = { log() {} }
   ;(service as any).syncConnectedTenant = async (tenant: { id: string }) => {
     attempted.push(tenant.id); now += 600_000; completed = true

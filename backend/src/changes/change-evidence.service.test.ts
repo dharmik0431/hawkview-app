@@ -1662,6 +1662,7 @@ test('retires historic privileged SharePoint access fields without fabricating e
 
 function scheduledTenant(id: number) {
   return {
+    scheduledSyncPosition: 0n,
     id: `tenant-${String(id).padStart(4, '0')}`,
     organizationId: 'org-1',
     microsoftTenantId: `microsoft-${id}`,
@@ -1683,6 +1684,7 @@ test('actual scheduled service excludes active leases before its 1,000-candidate
   const queries: any[] = []
   const prisma = {
     customerTenant: { findMany: async (query: any) => { queries.push(query); return candidates } },
+    $executeRaw: async () => 1,
   }
   const service = new TenantSyncService(prisma as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   const attempted: string[] = []
@@ -1723,7 +1725,7 @@ test('production scheduled sync invokes the approved identity-risk scheduler con
     },
   }
   const service = new TenantSyncService(
-    { customerTenant: { findMany: async () => [tenant] } } as never,
+    { customerTenant: { findMany: async () => [tenant] }, $executeRaw: async () => 1 } as never,
     {} as never,
     {} as never,
     {} as never,
@@ -1795,7 +1797,7 @@ test('targeted retry maps Named Locations to its exact tenant-level Graph collec
 
 test('two actual scheduled service runs share leases without duplicate productive tenants and advance beyond the first batch', async () => {
   const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
-  const prisma = { customerTenant: { findMany: async () => candidates } }
+  const prisma = { customerTenant: { findMany: async () => candidates }, $executeRaw: async () => 1 }
   const active = new Set<string>()
   const completed = new Set<string>()
   const executed: string[] = []

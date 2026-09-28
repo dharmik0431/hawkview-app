@@ -671,6 +671,8 @@ model WorkspaceAdminAuditLog {
 }
 
 model CustomerTenant {
+  // Durable collection admission order, independent of evidence/freshness clocks.
+  scheduledSyncPosition BigInt @default(0) @map("scheduled_sync_position")
   id                 String                     @id @default(uuid()) @db.Uuid
   organizationId     String                     @map("organization_id") @db.Uuid
   microsoftTenantId  String                     @unique @map("microsoft_tenant_id") @db.Uuid
@@ -710,6 +712,7 @@ model CustomerTenant {
   identityRiskAttemptHeads IdentityRiskAttemptHead[]
   identityRiskHistoryCursors IdentityRiskHistoryTenantCursor[]
   @@index([organizationId, status])
+  @@index([scheduledSyncPosition, id])
   @@map("customer_tenants")
 }
 
