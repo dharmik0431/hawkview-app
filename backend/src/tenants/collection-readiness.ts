@@ -410,9 +410,9 @@ function fromSyncState(
   if (state.status === 'SUCCEEDED') {
     return {
       ...base,
-      state: base.freshness === 'STALE' ? 'STALE' : base.freshness === 'UNKNOWN' ? 'UNVERIFIED' : 'READY',
-      reasonCode: base.freshness === 'STALE' ? 'STALE_COLLECTION' : base.freshness === 'UNKNOWN' ? 'INVALID_COLLECTION_TIMESTAMP' : null,
-      reason: base.freshness === 'STALE' ? 'The last successful collection is outside its scheduled freshness window.' : base.freshness === 'UNKNOWN' ? 'HawkView cannot safely verify the collection timestamp.' : null,
+      state: base.freshness === 'STALE' ? 'STALE' : (base.freshness === 'UNKNOWN' || base.freshness === 'NEVER_SUCCEEDED') ? 'UNVERIFIED' : 'READY',
+      reasonCode: base.freshness === 'STALE' ? 'STALE_COLLECTION' : (base.freshness === 'UNKNOWN' || base.freshness === 'NEVER_SUCCEEDED') ? 'INVALID_COLLECTION_TIMESTAMP' : null,
+      reason: base.freshness === 'STALE' ? 'The last successful collection is outside its scheduled freshness window.' : (base.freshness === 'UNKNOWN' || base.freshness === 'NEVER_SUCCEEDED') ? 'HawkView cannot safely verify the collection timestamp.' : null,
     }
   }
   return { ...base, state: 'NEVER_SUCCEEDED', freshness: 'NEVER_SUCCEEDED', reasonCode: 'COLLECTOR_NOT_STARTED', reason: 'The collector has not completed successfully.' }
