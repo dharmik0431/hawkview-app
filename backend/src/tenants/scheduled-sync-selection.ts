@@ -69,9 +69,8 @@ export type ScheduledTenantCandidate = {
 export type ScheduledTenantWork = {
   tenantId: string
   /**
-   * The resource work timestamp, not CustomerTenant.updatedAt.  Every
-   * collection attempt advances this durable state, so repeatedly attempted
-   * tenants naturally yield to other due tenants on the next scheduler run.
+   * The tenant-wide USERS attempt, falling back to its success clock. This
+   * breaks ties within durable scheduling positions; it is not freshness.
    */
   dueAt: Date
   fullInventoryDue: boolean
@@ -133,15 +132,19 @@ function validPastTime(value: Date | null | undefined, now: Date) {
   return value instanceof Date && Number.isFinite(value.getTime()) && value <= now
 }
 
-function earliestDue(values: Array<Date | null | undefined>, now: Date) {
-  const valid = values.filter((value): value is Date => validPastTime(value, now))
-  return valid.sort((left, right) => left.getTime() - right.getTime())[0] ?? new Date(0)
+function tenantOpportunityTime(users: DailyInventoryState | undefined, now: Date) {
+  // USERS is the tenant-wide lease: even a failed full inventory advances
+  // this attempt. Optional/daily resources may never execute, so their old
+  // success must not pin the tenant ahead of peers indefinitely.
+  if (validPastTime(users?.lastAttemptAt, now)) return users!.lastAttemptAt!
+  if (validPastTime(users?.lastSuccessfulAt, now)) return users!.lastSuccessfulAt!
+  return new Date(0)
 }
 
 /**
- * Produces one durable due-work record per tenant and orders it fairly.  This
- * stays pure so the DB query can be broad enough to find due tenants while the
- * scheduler uses the resource timestamps that actually govern eligibility.
+ * Produces due-work records and retry-aware ordering within a candidate set.
+ * Cross-window fairness belongs to the durable scheduler position, advanced
+ * even for candidates that this more precise eligibility check rejects.
  */
 export function selectScheduledTenantWork(
   candidates: ScheduledTenantCandidate[],
@@ -163,15 +166,10 @@ export function selectScheduledTenantWork(
     const targetedDue = candidate.syncStates.some((state) => shouldRunTargetedTransientRetry(state, now))
 
     if (!fullInventoryDue && !userDue && !targetedDue) return []
-    const dueStates = candidate.syncStates.filter((state) => {
-      if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) return fullInventoryDue
-      if (state.resourceType === SyncResourceType.USERS) return userDue
-      return shouldRunTargetedTransientRetry(state, now)
-    })
     return [{
       tenantId: candidate.id,
       fullInventoryDue,
-      dueAt: earliestDue(dueStates.flatMap((state) => [state.lastAttemptAt, state.lastSuccessfulAt]), now),
+      dueAt: tenantOpportunityTime(users, now),
     }]
   })
 
