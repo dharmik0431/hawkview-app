@@ -88,11 +88,31 @@ export type NativeCount = {
  * paperwork gap would become indistinguishable, which is the collapse this
  * module exists to prevent.
  */
+export type NativeCoverageCategories = {
+  state: 'KNOWN' | 'NOT_REPORTED' | 'UNREADABLE'
+  entries: { reason: string; count: number }[]
+}
+
+const diagnosticReasons = {
+  unknown: new Set(['ERROR_CODE_ABSENT', 'ERROR_CODE_SHAPE_UNRECOGNIZED', 'UNRECOGNIZED_ERROR_CODE',
+    'AMBIGUOUS_BY_PROVIDER_STATEMENT', 'AMBIGUOUS_FAILURE_REASON_TEXT', 'RESULT_CODE_NOT_AN_AZURE_CODE',
+    'SUCCESS_WITH_UNRECOGNIZED_FAILURE_REASON', 'FAILURE_REASON_NOT_REPORTED', 'PROVIDER_DECLARED_UNCLASSIFIED',
+    'UNRECOGNIZED_REASON_NAME', 'INCONSISTENT_OPERATION_AND_CODE']),
+  unprocessable: new Set(['RAW_PAYLOAD_MALFORMED', 'SCOPE_MISMATCH', 'SOURCE_UNRECOGNIZED', 'TENANT_BINDING_MISMATCH',
+    'EVENT_ID_ABSENT_OR_MALFORMED', 'EVENT_TIMESTAMP_INVALID', 'INGESTION_TIMESTAMP_INVALID', 'INGESTION_PRECEDES_EVENT',
+    'INTEGRITY_DISPUTED', 'UNSUPPORTED_AUDIT_OPERATION', 'SUBJECT_ID_ABSENT_OR_MALFORMED', 'SUBJECT_NOT_IN_DIRECTORY',
+    'SUBJECT_AMBIGUOUS_IN_DIRECTORY', 'SUBJECT_UPN_ABSENT_OR_MALFORMED', 'SUBJECT_UPN_NOT_IN_DIRECTORY',
+    'SUBJECT_UPN_AMBIGUOUS_IN_DIRECTORY', 'APPLICATION_ID_ABSENT_OR_MALFORMED', 'REFERENCE_UNAVAILABLE',
+    'REFERENCE_BUDGET_EXCEEDED', 'BATCH_LIMIT_EXCEEDED']),
+  notYetCited: new Set(['EXCLUSION_NOT_YET_CITED']),
+}
+
 export type NativeStreamCoverage = {
   stream: string
   applies: number | null
   uninterpretedEvents: number | null
   notYetCitedEvents: number | null
+  categories?: Record<keyof typeof diagnosticReasons, NativeCoverageCategories>
 }
 
 export type NativeAssessment =
@@ -151,6 +171,24 @@ function coverageTotal(value: unknown): number | null {
     sum += count
   }
   return sum
+}
+
+function coverageCategories(value: unknown, allowed: Set<string>): NativeCoverageCategories {
+  if (value === undefined || value === null) return { state: 'NOT_REPORTED', entries: [] }
+  const counts = record(value)
+  // Reuse aggregate validation, but bound the diagnostic record independently.
+  if (!counts || Object.keys(counts).length > 64 || coverageTotal(counts) === null) {
+    return { state: 'UNREADABLE', entries: [] }
+  }
+  const entries: NativeCoverageCategories['entries'] = []
+  let other = 0
+  for (const [reason, count] of Object.entries(counts)) {
+    if (allowed.has(reason)) {
+      if ((count as number) > 0) entries.push({ reason, count: count as number })
+    } else other += count as number
+  }
+  if (other > 0) entries.push({ reason: 'OTHER', count: other })
+  return { state: 'KNOWN', entries }
 }
 
 function has(value: Record<string, unknown>, keys: readonly string[]) {
@@ -426,6 +464,11 @@ export function adaptNativeAssessment(value: unknown): NativeAssessment | null {
       ? coverageCount(unknown + unprocessable) : null
     coverage.push({
       stream,
+      categories: {
+        unknown: coverageCategories(split.unknown, diagnosticReasons.unknown),
+        unprocessable: coverageCategories(split.unprocessable, diagnosticReasons.unprocessable),
+        notYetCited: coverageCategories(split.notYetCited, diagnosticReasons.notYetCited),
+      },
       applies: coverageCount(split.applies),
       uninterpretedEvents: mapsPresent ? uninterpreted : coverageCount(split.uninterpretedEvents),
       notYetCitedEvents: mapsPresent ? coverageTotal(split.notYetCited) : coverageCount(split.notYetCitedEvents),
