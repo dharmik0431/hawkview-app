@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import * as adapter from './adapter.ts'
+import { adaptNativeAssessment } from './native-assessment.ts'
 import * as presentation from './presentation.ts'
 import * as riskyUsersView from './risky-users-view.ts'
 import { syntheticRiskResponses, unavailableMeta } from './test-fixtures.ts'
@@ -90,20 +91,19 @@ const uiMocks: Record<string, unknown> = {
 
 
 /** One render of the real mounted section against a given hook state. */
-function render(nativeView: unknown, microsoftView: unknown): string {
+function sectionFor(read: () => Record<string, unknown>) {
   const hooks = compile('../api/risky-users-hooks.ts', {
     ...uiMocks,
     './risky-users-assessment-hooks': {
       useNativeRiskyUsersRead: () => ({
         cacheScope: 'probe-session',
-        nativeView,
         assessmentLoading: false,
         assessmentRequestError: false,
         assessmentContractError: false,
-        microsoftView,
         microsoftLoading: false,
         retryAssessment: () => undefined,
         retryMicrosoft: () => undefined,
+        ...read(),
       }),
     },
   })
@@ -117,9 +117,13 @@ function render(nativeView: unknown, microsoftView: unknown): string {
     },
   })
 
+  return (section as any).default
+}
+function render(nativeView: unknown, microsoftView: unknown): string {
+  const Section = sectionFor(() => ({ nativeView, microsoftView }))
   const dom = new JSDOM(
     renderToStaticMarkup(
-      React.createElement((section as any).default, { tenantId: 'synthetic-tenant' })
+      React.createElement(Section, { tenantId: 'synthetic-tenant' })
     )
   )
   return ((dom.window.document.body.textContent ?? '') as string).replace(/\s+/g, ' ')
@@ -262,3 +266,185 @@ test('explicit Microsoft error and stale source retain truthful warning copy and
   assert.equal(riskyUsersView.microsoftChannel(retained).state, 'INTERRUPTED')
   assert.match(render(nativePositive(), retained), /Microsoft Entra risk detection is out of date/)
 })
+
+
+function diagnosticNative(coverage: Record<string, unknown> = { applies: 10, unknown: { UNRECOGNIZED_ERROR_CODE: 1 }, unprocessable: {}, notYetCited: {} }) {
+  const stamp = '2026-09-27T01:00:00.000Z'
+  const dto = {
+    version: 'hawkview-risky-users/v1', available: true, subjectsNamed: true,
+    run: { windowStart: stamp, windowEnd: stamp, completedAt: stamp },
+    collectors: [{ source: 'GRAPH_SIGN_INS', status: 'SUCCESS', lastSuccessfulCollectionAt: stamp }],
+    coverage: [{ stream: 'GRAPH_SIGN_INS', coverage }],
+    count: { accuracy: 'AT_LEAST', value: 5, scope: { evidenceRequested: ['GRAPH_SIGN_INS'], covered: ['repeated-credential-failure'], notCovered: [] } },
+    claim: { permitted: false, withheld: [{ stream: 'GRAPH_SIGN_INS', because: 'UNINTERPRETED_EVENTS' }] },
+    findings: { complete: true, items: Array.from({ length: 5 }, (_, i) => ({ detectorId: 'repeated-credential-failure',
+      subject: { kind: 'DIRECTORY_USER', userRef: `private-user-${i}`, correlation: { available: false, because: 'NOT_RESOLVED' } },
+      displayName: `Private Person ${i}`, userPrincipalName: `private${i}@example.invalid`,
+      signals: ['PASSWORD_REJECTED', 'LOCKED_OUT_AFTER_REPEATED_FAILURES'].map((signal) => ({ signal, count: 1, capped: false, latest: { at: stamp, kind: 'EVENT_OCCURRED' } })),
+    })) },
+  }
+  const native = adaptNativeAssessment(dto)
+  assert.ok(native?.available)
+  return native
+}
+function diagnosticText(nativeView: unknown, ms: unknown, flags = {}) {
+  const Section = sectionFor(() => ({ nativeView, microsoftView: ms, ...flags }))
+  const dom = new JSDOM(renderToStaticMarkup(React.createElement(Section, { tenantId: 'synthetic' })))
+  const details = dom.window.document.querySelector('[data-evidence-details]')!
+  assert.equal(details.hasAttribute('open'), false)
+  const text = details.textContent!
+  dom.window.close()
+  return text
+}
+
+test('actual evidence disclosure shows real DTO category and source clocks without identity data or altered lower bounds', () => {
+  const native = diagnosticNative()
+  const ms = adapter.adaptMicrosoftRiskyUsersResponse(source(null, true))
+  const text = diagnosticText(native, ms)
+  assert.match(text, /UNRECOGNIZED_ERROR_CODE: 1/)
+  assert.match(text, /Count accuracy: AT_LEAST; count value: 5/)
+  assert.match(text, /UNINTERPRETED_EVENTS/)
+  assert.match(text, /2026-09-27T01:00:00.000Z/)
+  assert.match(text, /Collector status: SUCCESS/)
+  assert.match(text, /summary reason: PARTIAL_RECORDS/)
+  assert.match(text, /active identities: Not reported/)
+  assert.doesNotMatch(text, /Private Person|private-user|@example.invalid|could not be matched|P2/)
+  const list = require('./native-view.ts').nativeRiskyUserList(native, riskyUsersView.microsoftChannel(ms), ms.users)
+  assert.equal(list.rows.length, 5)
+  assert.equal(list.rows.reduce((n: number, row: any) => n + row.reasons.length, 0), 10)
+  assert.match(render(native, ms), /at least 5/i)
+})
+
+test('diagnostics preserve Microsoft summary reasons, unknown clocks and complete zero without license inference', () => {
+  for (const reason of ['PARTIAL_RECORDS', 'CONFLICTING_RECORDS']) {
+    const dto = source(null, true)
+    dto.microsoftRiskSummary.reasonCode = reason
+    dto.microsoftRiskSummary.completeness = reason === 'PARTIAL_RECORDS' ? 'PARTIAL' : 'CONFLICTING'
+    const ms = adapter.adaptMicrosoftRiskyUsersResponse(dto)
+    assert.ok(ms.microsoftRiskSummary)
+    assert.match(diagnosticText(null, ms), new RegExp('summary reason: ' + reason))
+  }
+  const missing = diagnosticText(null, adapter.adaptMicrosoftRiskyUsersResponse(source('SOURCE_UNAVAILABLE')))
+  assert.match(missing, /Snapshot observed \(UTC\): Not reported/)
+  assert.match(missing, /Raw record count: Not reported/)
+  assert.doesNotMatch(missing, /LICENSE_REQUIRED|P2|unlicensed/)
+  const zero = diagnosticText(null, adapter.adaptMicrosoftRiskyUsersResponse(source()))
+  assert.match(zero, /Availability: AVAILABLE; completeness: COMPLETE/)
+  assert.match(zero, /Raw record count: 0; observed active identities: 0; active identities: 0/)
+})
+
+test('failed unreadable and loading native responses never certify retained diagnostics', () => {
+  for (const flags of [{ assessmentRequestError: true }, { assessmentContractError: true }, { assessmentLoading: true }]) {
+    const text = diagnosticText(diagnosticNative(), microsoftView, flags)
+    assert.doesNotMatch(text, /UNRECOGNIZED_ERROR_CODE|Count accuracy:|2026-09-27T01:00/)
+    assert.match(text, /not confirmed|cannot yet be confirmed/)
+  }
+})
+
+test('disclosure toggles request-free and tenant/org rerenders remove previous diagnostic values', async () => {
+  const { createRoot } = require('react-dom/client')
+  const dom = new JSDOM('<div id="root"></div>', { url: 'https://synthetic.invalid' })
+  const saved = new Map(['window', 'document', 'navigator', 'fetch', 'IS_REACT_ACT_ENVIRONMENT'].map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator, fetch: () => { requests++; throw new Error('Unexpected network') }, IS_REACT_ACT_ENVIRONMENT: true })) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
+  let requests = 0
+  let state: Record<string, unknown> = { nativeView: diagnosticNative(), microsoftView, cacheScope: 'org-a', retryAssessment: () => { requests++ }, retryMicrosoft: () => { requests++ } }
+  const Section = sectionFor(() => state)
+  const root = createRoot(dom.window.document.getElementById('root'))
+  try {
+    await React.act(async () => root.render(React.createElement(Section, { tenantId: 'tenant-a' })))
+    let details = dom.window.document.querySelector('[data-evidence-details]') as HTMLDetailsElement
+    assert.equal(details.open, false)
+    await React.act(async () => details.querySelector('summary')!.click())
+    assert.equal(details.open, true)
+    await React.act(async () => details.querySelector('summary')!.click())
+    assert.equal(details.open, false)
+    assert.equal(requests, 0)
+    state = { ...state, nativeView: null, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(null), cacheScope: 'org-b' }
+    await React.act(async () => root.render(React.createElement(Section, { tenantId: 'tenant-b' })))
+    details = dom.window.document.querySelector('[data-evidence-details]') as HTMLDetailsElement
+    assert.doesNotMatch(details.textContent!, /UNRECOGNIZED_ERROR_CODE|2026-09-27T01:00/)
+    assert.match(details.textContent!, /Native diagnostic details: Not available/)
+    assert.equal(requests, 0)
+    state = { ...state, nativeView: diagnosticNative(), cacheScope: 'org-b' }
+    await React.act(async () => root.render(React.createElement(Section, { tenantId: 'tenant-b' })))
+    assert.match(dom.window.document.querySelector('[data-evidence-details]').textContent, /UNRECOGNIZED_ERROR_CODE/)
+    state = { ...state, nativeView: null, cacheScope: 'org-c', assessmentLoading: true }
+    await React.act(async () => root.render(React.createElement(Section, { tenantId: 'tenant-b' })))
+    assert.doesNotMatch(dom.window.document.querySelector('[data-evidence-details]').textContent, /UNRECOGNIZED_ERROR_CODE|2026-09-27T01:00/)
+    assert.match(dom.window.document.querySelector('[data-evidence-details]').textContent, /Loading evidence/)
+    assert.equal(requests, 0)
+  } finally {
+    await React.act(async () => root.unmount())
+    dom.window.close()
+    for (const [key, descriptor] of Array.from(saved)) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key]
+  }
+})
+
+
+test('diagnostic category rendering separates gaps and safely handles legacy, absent, malformed and future metadata', () => {
+  const native = diagnosticNative({ applies: 10, unknown: { UNRECOGNIZED_REASON_NAME: 2, 'private@secret.invalid': 3 },
+    unprocessable: { SUBJECT_NOT_IN_DIRECTORY: 4, EVENT_TIMESTAMP_INVALID: 1 }, notYetCited: { EXCLUSION_NOT_YET_CITED: 6 } })
+  native.coverage[0].stream = '<private-stream>'
+  native.withheld = [{ stream: '<private-stream>', because: 'private-reason' }]
+  const text = diagnosticText(native, microsoftView)
+  assert.match(text, /Unknown stream/)
+  assert.match(text, /Unrecognized reason/)
+  assert.match(text, /UNRECOGNIZED_REASON_NAME: 2/)
+  assert.match(text, /OTHER: 3/)
+  assert.match(text, /SUBJECT_NOT_IN_DIRECTORY: 4/)
+  assert.match(text, /EVENT_TIMESTAMP_INVALID: 1/)
+  assert.match(text, /Not yet citedEXCLUSION_NOT_YET_CITED: 6/)
+  assert.doesNotMatch(text, /private@|private-stream|private-reason/)
+  for (const coverage of [{ applies: 1, uninterpretedEvents: 3, notYetCitedEvents: 2 }, { applies: 1, unknown: {}, unprocessable: {} }]) {
+    assert.match(diagnosticText(diagnosticNative(coverage), microsoftView), /Category breakdown: Not reported/)
+  }
+  const invalid = diagnosticText(diagnosticNative({ applies: 1, unknown: { BAD: -1 }, unprocessable: {}, notYetCited: {} }), microsoftView)
+  assert.match(invalid, /Unknown interpretationCategory breakdown: Unreadable/)
+  assert.match(invalid, /uninterpreted events: Not reported/)
+  const zero = diagnosticText(diagnosticNative({ applies: 1, unknown: {}, unprocessable: {}, notYetCited: {} }), microsoftView)
+  assert.match(zero, /Unknown interpretation0 events in the reported category map/)
+})
+
+
+test('diagnostic clocks stay UTC and uniquely source-matched; native read failure leaves independent Microsoft evidence', () => {
+  const native = diagnosticNative()
+  native.run.windowStart = '2026-09-26T20:00:00-04:00'
+  native.collectors.unshift({ source: 'M365_AUDIT_STS', status: 'FAILED', lastSuccessfulCollectionAt: '2026-09-20T00:00:00.000Z' })
+  let text = diagnosticText(native, microsoftView)
+  assert.match(text, /Window start \(UTC\): 2026-09-27T00:00:00.000Z/)
+  assert.match(text, /Collector status: SUCCESS/)
+  assert.doesNotMatch(text, /2026-09-20T00:00/)
+  native.collectors.push({ ...native.collectors[1], status: 'FAILED' })
+  text = diagnosticText(native, microsoftView)
+  assert.match(text, /Collector status: Not reported or ambiguous/)
+  assert.match(text, /Collector last success \(UTC\): Not reported/)
+  const ms = adapter.adaptMicrosoftRiskyUsersResponse(source())
+  text = diagnosticText(native, ms, { assessmentRequestError: true })
+  assert.match(text, /The native read failed/)
+  assert.doesNotMatch(text, /Collector status:|UNRECOGNIZED_ERROR_CODE/)
+  assert.match(text, /Availability: AVAILABLE; completeness: COMPLETE/)
+  assert.match(text, /active identities: 0/)
+})
+
+
+for (const status of ['STALE', 'UNSUPPORTED', 'NOT_LICENSED', 'PERMISSION_REQUIRED', 'NOT_CONFIGURED']) {
+  test(`diagnostic disclosure retains current collector status ${status}`, () => {
+    const native = diagnosticNative()
+    native.collectors[0].status = status
+    const text = diagnosticText(native, microsoftView)
+    assert.match(text, new RegExp(`Collector status: ${status}`))
+    assert.doesNotMatch(text, /Collector status: Unrecognized status/)
+    assert.match(text, /Count accuracy: AT_LEAST; count value: 5/)
+    assert.doesNotMatch(text, /user.*P2|P2.*user/i)
+  })
+}
+for (const because of ['COLLECTION_SCOPE_UNDECLARED', 'NO_CHECK_EXAMINED_EVIDENCE']) {
+  test(`diagnostic disclosure retains current withheld reason ${because}`, () => {
+    const native = diagnosticNative()
+    native.withheld = [{ stream: 'GRAPH_SIGN_INS', because }]
+    const text = diagnosticText(native, microsoftView)
+    assert.match(text, new RegExp(`Withheld reasons: Graph sign-ins: ${because}`))
+    assert.doesNotMatch(text, /Unrecognized reason/)
+    assert.match(text, /Count accuracy: AT_LEAST; count value: 5/)
+  })
+}

@@ -42,6 +42,7 @@ import {
   mapRuleToPresentation,
 } from '@/lib/identity-risk/risk-presentation-mapper'
 import type { MicrosoftChannel, RiskyUserCount, RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
+import type { NativeAssessment, NativeCoverageCategories } from '@/lib/identity-risk/native-assessment'
 import type { MicrosoftEntraRiskyUsersView } from '@/lib/identity-risk/types'
 import { presentMicrosoftRiskSummary } from '@/lib/identity-risk/microsoft-risk-summary'
 
@@ -393,6 +394,76 @@ function CompactSummaryStrip({
   )
 }
 
+const diagnosticWithheldReasons = new Set(['NEVER_COLLECTED', 'UNREADABLE_NOW', 'UNINTERPRETED_EVENTS',
+  'NOTHING_APPLICABLE', 'CAPACITY_EXCEEDED', 'DETECTOR_FAILED', 'UNRESOLVED_SUBJECT_IDENTITY',
+  'COLLECTION_SCOPE_UNDECLARED', 'NO_CHECK_EXAMINED_EVIDENCE'])
+const diagnosticCollectorStates = new Set(['SUCCESS', 'EMPTY', 'FAILED', 'RUNNING', 'PENDING', 'NEVER_COLLECTED', 'UNKNOWN',
+  'STALE', 'UNSUPPORTED', 'NOT_LICENSED', 'PERMISSION_REQUIRED', 'NOT_CONFIGURED'])
+function diagnosticUtc(value: string | null | undefined) {
+  return value && Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : 'Not reported'
+}
+function diagnosticStream(stream: string | null) {
+  return stream === 'GRAPH_SIGN_INS' ? 'Graph sign-ins' : stream === 'M365_AUDIT_STS' ? 'Microsoft 365 audit sign-ins' : 'Unknown stream'
+}
+function DiagnosticCategories({ label, categories }: { label: string; categories?: NativeCoverageCategories }) {
+  return <div>
+    <p className="font-medium">{label}</p>
+    {!categories || categories.state === 'NOT_REPORTED' ? <p>Category breakdown: Not reported</p>
+      : categories.state === 'UNREADABLE' ? <p>Category breakdown: Unreadable</p>
+      : categories.entries.length === 0 ? <p>0 events in the reported category map</p>
+      : <ul className="ml-4 list-disc">{categories.entries.map((entry) => <li key={entry.reason}>{entry.reason}: {entry.count}</li>)}</ul>}
+  </div>
+}
+function EvidenceDetails({ native, microsoftView, loading, requestFailed, contractFailed }: {
+  native: NativeAssessment | null; microsoftView: MicrosoftEntraRiskyUsersView
+  loading: boolean; requestFailed: boolean; contractFailed: boolean
+}) {
+  const summary = microsoftView.microsoftRiskSummary
+  return <details className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700" data-evidence-details>
+    <summary className="cursor-pointer font-medium">Evidence details</summary>
+    <div className="mt-3 space-y-3 break-words">
+      <p>Recorded response evidence. These timestamps do not by themselves establish freshness or complete coverage. Times are UTC.</p>
+      {loading ? <p>Loading evidence. Diagnostic details cannot yet be confirmed.</p> : <>
+        <section aria-label="Native evidence details" className="space-y-2">
+          <h3 className="font-semibold">HawkView native assessment</h3>
+          {requestFailed || contractFailed ? <p>{requestFailed ? 'The native read failed.' : 'The native response is unreadable.'} Retained diagnostic details are not confirmed.</p>
+            : !native?.available ? <p>Native diagnostic details: Not available</p> : <>
+              <p>Assessment completed (UTC): {diagnosticUtc(native.run.completedAt)}</p>
+              <p>Window start (UTC): {diagnosticUtc(native.run.windowStart)}; window end (UTC): {diagnosticUtc(native.run.windowEnd)}</p>
+              <p>Count accuracy: {native.count.accuracy}; count value: {native.count.value ?? 'Not reported'}; delivered findings complete: {native.complete ? 'Yes' : 'No'}</p>
+              <p>Withheld reasons: {native.withheld.length === 0 ? 'None reported' : native.withheld.map((entry) => `${diagnosticStream(entry.stream)}: ${diagnosticWithheldReasons.has(entry.because) ? entry.because : 'Unrecognized reason'}`).join('; ')}</p>
+              {native.coverage.length === 0 && <p>Stream coverage: Not reported</p>}
+              {native.coverage.map((stream, index) => {
+                const collectors = native.collectors.filter((collector) => collector.source === stream.stream)
+                const collector = collectors.length === 1 ? collectors[0] : null
+                return <div key={index} className="space-y-1 border-l-2 pl-3">
+                  <h4 className="font-medium">{diagnosticStream(stream.stream)}</h4>
+                  <p>Collector status: {collector ? diagnosticCollectorStates.has(collector.status) ? collector.status : 'Unrecognized status' : 'Not reported or ambiguous'}</p>
+                  <p>Collector last success (UTC): {diagnosticUtc(collector?.lastSuccessfulCollectionAt)}</p>
+                  <p>Applicable events: {stream.applies ?? 'Not reported'}; uninterpreted events: {stream.uninterpretedEvents ?? 'Not reported'}; events pending citation: {stream.notYetCitedEvents ?? 'Not reported'}</p>
+                  <DiagnosticCategories label="Unknown interpretation" categories={stream.categories?.unknown} />
+                  <DiagnosticCategories label="Unprocessable records" categories={stream.categories?.unprocessable} />
+                  <DiagnosticCategories label="Not yet cited" categories={stream.categories?.notYetCited} />
+                </div>
+              })}
+            </>}
+        </section>
+        <section aria-label="Microsoft evidence details" className="space-y-1">
+          <h3 className="font-semibold">Microsoft Identity Protection</h3>
+          <p>Source status: {microsoftView.meta.status}; source reason: {microsoftView.meta.reasonCode ?? 'Not reported'}</p>
+          {!summary ? <p>Microsoft summary: Not reported</p> : <>
+            <p>Availability: {summary.availability}; completeness: {summary.completeness}; summary reason: {summary.reasonCode ?? 'None reported'}</p>
+            <p>Snapshot observed (UTC): {diagnosticUtc(summary.snapshotObservedAt)}</p>
+            <p>Collection succeeded (UTC): {diagnosticUtc(summary.collectionSucceededAt)}</p>
+            <p>Raw record count: {summary.rawRecordCount ?? 'Not reported'}; observed active identities: {summary.observedActiveDistinctUserCount ?? 'Not reported'}; active identities: {summary.activeDistinctUserCount ?? 'Not reported'}</p>
+          </>}
+          <p>More result pages: {microsoftView.pageInfo ? microsoftView.pageInfo.hasMore ? 'Yes' : 'No' : 'Not reported'}</p>
+        </section>
+      </>}
+    </div>
+  </details>
+}
+
 export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
   const { tenant } = useTenantOperationalProjection(tenantId)
   const {
@@ -490,6 +561,7 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
 
   return (
     <div className="space-y-4" key={`${cacheScope}:${tenantId}`}>
+      <EvidenceDetails native={native} microsoftView={microsoftView} loading={loading} requestFailed={requestFailed} contractFailed={contractFailed} />
       {loading ? (
         <div className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-600 shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 flex items-center gap-2">
           <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
