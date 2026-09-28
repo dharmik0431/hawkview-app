@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { authenticationCollectorTransaction } from './authentication-collector.test-fixtures.js'
 import test from 'node:test'
 import { BadGatewayException } from '@nestjs/common'
+import { IpGeolocationService } from './ip-geolocation.service.js'
 import { deriveCollectionReadiness } from './collection-readiness.js'
 import {
   CollectionInitializingError,
@@ -58,9 +59,9 @@ function locationFixture(count = 6) {
       return result
     },
   }
-  const service = new TenantSyncService(prisma, {} as any, { lookup: async () => {
+  const service = new TenantSyncService(prisma, {} as any, { ensureReady: async () => ({ ready: true }), lookupReady: () => {
     observations.lookups++; observations.lookupActive++; observations.maximumLookups = Math.max(observations.maximumLookups, observations.lookupActive)
-    await new Promise<void>(resolve => setImmediate(resolve)); observations.lookupActive--; return inferredLocation
+    observations.lookupActive--; return { kind: 'FOUND', location: inferredLocation }
   } } as any, { resolveIncident: async () => { observations.resolved++ }, publishIncident: async () => { observations.incidents++ } } as any, { pruneExpired: async () => undefined } as any, {} as any)
   ;(service as any).logger = { log: (line: string) => observations.logs.push(line), warn: (line: string) => observations.logs.push(line) }
   ;(service as any).signInEntitlement = async () => 'NON_PREMIUM'
@@ -147,7 +148,7 @@ test('current-IP enrichment bounds workers, unique IPs, retained locations and p
   const { service, observations } = locationFixture(0)
   const rows = () => Array.from({ length: 10 }, (_, index) => ({ ipAddress: `192.0.2.${index + 1}` }))
   const exact = await (service as any).enrichLimitedSignInLocations(rows(), { ...LIMITED_SIGN_IN_ENRICHMENT_LIMITS, uniqueIps: 10, lookupWorkers: 2 })
-  assert.equal(exact.partial, false); assert.equal(exact.locations.size, 10); assert.equal(observations.maximumLookups, 2)
+  assert.equal(exact.partial, false); assert.equal(exact.locations.size, 10); assert.ok(observations.maximumLookups > 0 && observations.maximumLookups <= 2)
   const overflow = await (service as any).enrichLimitedSignInLocations(rows(), { ...LIMITED_SIGN_IN_ENRICHMENT_LIMITS, uniqueIps: 9 })
   assert.equal(overflow.partial, true); assert.equal(overflow.locations.size, 9)
   const bytes = Buffer.byteLength(JSON.stringify(['192.0.2.1', inferredLocation]))
@@ -161,18 +162,57 @@ test('current-IP enrichment bounds workers, unique IPs, retained locations and p
   }
 })
 
-test('stalled local lookup cannot accumulate workers across repeated runs and late results do not mutate rows', async () => {
-  const { service } = locationFixture(0)
-  const releases: Array<(value: any) => void> = []
-  ;(service as any).ipGeolocation = { lookup: () => new Promise(resolve => releases.push(resolve)) }
-  const rows = Array.from({ length: 20 }, (_, index) => ({ ipAddress: `192.0.2.${index + 1}` }))
-  const limits = { ...LIMITED_SIGN_IN_ENRICHMENT_LIMITS, deadlineMs: 10 }
-  assert.equal((await (service as any).enrichLimitedSignInLocations(rows, limits)).partial, true)
-  assert.equal((await (service as any).enrichLimitedSignInLocations(rows, limits)).partial, true)
-  assert.equal(releases.length, 8)
-  releases.forEach(resolve => resolve(inferredLocation))
+test('stalled reader leaves no tenant lookup slots; late readiness cannot mutate returned rows and ready B progresses', async () => {
+  const geo = new IpGeolocationService()
+  let opens = 0; let release!: (reader: any) => void
+  ;(geo as any).openReader = () => { opens++; return new Promise(resolve => { release = resolve }) }
+  const { service: a } = locationFixture(0)
+  const { service: b } = locationFixture(0)
+  ;(a as any).ipGeolocation = geo
+  ;(b as any).ipGeolocation = geo
+  const rows = () => Array.from({ length: 8 }, (_, index) => ({ ipAddress: `192.0.2.${index + 1}` }))
+  const abandoned = rows()
+  const limits = { ...LIMITED_SIGN_IN_ENRICHMENT_LIMITS, deadlineMs: 5 }
+  for (const service of [a, b, a, b]) {
+    const result = await (service as any).enrichLimitedSignInLocations(abandoned, limits)
+    assert.deepEqual([...result.reasons], ['GEOIP_INITIALIZING'])
+    assert.equal(result.locations.size, 0)
+    assert.equal((geo as any).readinessWaiters.size, 0)
+  }
+  assert.equal(opens, 1)
+  release({ get: () => ({ city: { names: { en: 'Synthetic' } }, country: { iso_code: 'ZZ' }, location: { latitude: 1, longitude: 2 } }) })
   await new Promise<void>(resolve => setImmediate(resolve))
-  assert.ok(rows.every(row => !Object.hasOwn(row, 'location')))
+  assert.ok(abandoned.every(row => !Object.hasOwn(row, 'location')))
+  const result = await (b as any).enrichLimitedSignInLocations(rows(), { ...limits, deadlineMs: 100 })
+  assert.equal(result.locations.size, 8); assert.equal(result.partial, false); assert.equal(opens, 1)
+})
+
+test('named optional causes preserve primary rows, distinguish no-match from unavailable, and aggregate bounds', async () => {
+  for (const [ready, expected] of [[false, 'GEOIP_UNAVAILABLE'], [true, 'LOCATION_NOT_FOUND']] as const) {
+    const { service, observations } = locationFixture(0)
+    ;(service as any).ipGeolocation = { ensureReady: async () => ready ? { ready: true } : { ready: false, reason: 'GEOIP_UNAVAILABLE' }, lookupReady: () => ({ kind: 'NO_MATCH' }) }
+    await (service as any).syncSignInLogs(signInTenant, 'token')
+    assert.equal(observations.creates, 1)
+    assert.equal(observations.states.at(-1).lastErrorCode, 'sign-ins-non-premium-fallback-active-geolocation-partial')
+    assert.match(observations.states.at(-1).lastErrorMessage, new RegExp(expected))
+  }
+  const { service } = locationFixture(0)
+  ;(service as any).ipGeolocation = { ensureReady: async () => ({ ready: true }), lookupReady: () => ({ kind: 'NO_MATCH' }) }
+  const result = await (service as any).enrichLimitedSignInLocations([{ ipAddress: '192.0.2.1' }, { ipAddress: '192.0.2.2' }], { ...LIMITED_SIGN_IN_ENRICHMENT_LIMITS, uniqueIps: 1 })
+  assert.deepEqual([...result.reasons].sort(), ['ENRICHMENT_IP_LIMIT', 'LOCATION_NOT_FOUND'])
+})
+
+test('empty and already complete locations require no reader initialization', async () => {
+  const { service, observations } = locationFixture(0)
+  ;(service as any).ipGeolocation = { ensureReady: () => { throw new Error('Unexpected initialization') } }
+  for (const rows of [[], [{ ipAddress: '192.0.2.1', location: inferredLocation }]]) {
+    const result = await (service as any).enrichLimitedSignInLocations(rows)
+    assert.equal(result.partial, false); assert.equal(result.reasons.size, 0)
+  }
+  ;(service as any).fetchLimitedLoginActivity = async () => []
+  await (service as any).syncSignInLogs(signInTenant, 'token')
+  assert.equal(observations.creates, 0)
+  assert.equal(observations.states.at(-1).lastErrorCode, 'sign-ins-non-premium-fallback-active')
 })
 
 test('actual sign-in collection rejects malformed continuation before any persistence or successful baseline', async () => {
@@ -412,7 +452,7 @@ function signInCollectorFixture(servicePlans: unknown) {
   const service = new TenantSyncService(
     prisma,
     {} as never,
-    { lookup: async () => null } as never,
+    { ensureReady: async () => ({ ready: true }), lookupReady: () => ({ kind: 'NO_MATCH' }) } as never,
     {
       resolveIncident: async () => undefined,
       publishIncident: async () => undefined,

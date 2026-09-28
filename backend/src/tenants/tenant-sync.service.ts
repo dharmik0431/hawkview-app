@@ -49,6 +49,7 @@ import {
 import {
   IpGeolocationService,
   type SignInLocation,
+  type GeoIpReadinessReason,
 } from './ip-geolocation.service.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreResponseError } from './secure-score-collection.js'
@@ -732,9 +733,10 @@ export const LIMITED_SIGN_IN_ENRICHMENT_LIMITS = Object.freeze({
   statementTimeoutMs: 1000,
 })
 type LimitedSignInEnrichmentLimits = { [K in keyof typeof LIMITED_SIGN_IN_ENRICHMENT_LIMITS]: number }
-// GeoIP is local and its initial file-open promise cannot be cancelled. Keep a
-// process-wide ceiling even if an open stalls across multiple scheduled runs.
-let optionalLocationLookupsInFlight = 0
+type LimitedSignInEnrichmentReason = GeoIpReadinessReason |
+  'LOCATION_NOT_FOUND' | 'GEOIP_LOOKUP_FAILED' | 'GEOIP_INVALID_LOCATION' |
+  'ENRICHMENT_IP_LIMIT' | 'ENRICHMENT_LOCATION_BYTES' | 'ENRICHMENT_ROW_BYTES' |
+  'ENRICHMENT_DEADLINE' | 'ENRICHMENT_WORKER_LIMIT' | 'HISTORY_INCOMPLETE'
 
 function projectInferredLocation(value: unknown): SignInLocation | null {
   if (!plainRecord(value)) return null
@@ -4202,7 +4204,7 @@ export class TenantSyncService {
       const enrichmentDeadline = Date.now() + enrichmentLimits.deadlineMs
       const enrichment = limited
         ? await this.enrichLimitedSignInLocations(rows, enrichmentLimits, enrichmentDeadline)
-        : { locations: new Map<string, SignInLocation>(), partial: false }
+        : { locations: new Map<string, SignInLocation>(), partial: false, reasons: new Set<LimitedSignInEnrichmentReason>() }
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -4274,6 +4276,7 @@ export class TenantSyncService {
       if (limited && enrichment.locations.size > 0) {
         const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline)
         enrichment.partial ||= history.partial
+        if (history.partial) enrichment.reasons.add('HISTORY_INCOMPLETE')
       }
       await this.prisma.signInLog.deleteMany({
         where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
@@ -4300,7 +4303,7 @@ export class TenantSyncService {
         // collection/persistence failures never reach this partial outcome.
         if (enrichment.partial) throw new CollectionPartialError(
           `${limitedReason.code}-geolocation-partial`,
-          `${limitedReason.message} Optional geographic enrichment is incomplete and will be retried within bounded limits; some locations may remain unknown.`,
+          `${limitedReason.message} Optional geographic enrichment is incomplete (reasons: ${[...enrichment.reasons].join(', ')}). It will be retried within bounded limits; some locations may remain unknown.`,
         )
         throw limitedReason
       }
@@ -4360,62 +4363,60 @@ export class TenantSyncService {
     deadlineAt = Date.now() + limits.deadlineMs,
   ) {
     const locations = new Map<string, SignInLocation>()
+    const reasons = new Set<LimitedSignInEnrichmentReason>()
+    const outcome = () => ({ locations, partial: reasons.size > 0, reasons })
     const ips = new Set<string>()
-    let partial = false
     for (const row of rows) {
       if (this.hasCompleteSignInLocation(row?.location)) continue
       const ip = typeof row?.ipAddress === 'string' ? row.ipAddress.trim() : ''
       if (!isIP(ip) || ips.has(ip)) continue
-      if (ips.size >= limits.uniqueIps) { partial = true; continue }
+      if (ips.size >= limits.uniqueIps) { reasons.add('ENRICHMENT_IP_LIMIT'); continue }
       ips.add(ip)
     }
     const uniqueIps = [...ips]
+    if (!uniqueIps.length) return outcome()
+    const workers = Math.floor(Math.min(limits.lookupWorkers, LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers, uniqueIps.length))
+    if (!Number.isFinite(workers) || workers < 1) { reasons.add('ENRICHMENT_WORKER_LIMIT'); return outcome() }
+    // Await the single shared reader once, not once per IP. Expired callers are
+    // removed by the service; no per-IP promise can hold another sync's budget.
+    const readiness = await this.ipGeolocation.ensureReady(deadlineAt)
+    if (!readiness.ready) { reasons.add(readiness.reason); return outcome() }
     let index = 0; let retainedBytes = 0
-    const workers = Math.min(limits.lookupWorkers, LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers, uniqueIps.length)
     await Promise.all(Array.from({ length: workers }, async () => {
       while (index < uniqueIps.length) {
-        if (Date.now() >= deadlineAt || optionalLocationLookupsInFlight >= LIMITED_SIGN_IN_ENRICHMENT_LIMITS.lookupWorkers) { partial = true; return }
+        if (Date.now() >= deadlineAt) { reasons.add('ENRICHMENT_DEADLINE'); return }
         const ip = uniqueIps[index++]!
-        optionalLocationLookupsInFlight += 1
-        // Only the local lookup may outlive its caller. Its global slot is
-        // released when it settles, so repeated timeouts cannot fan out.
-        const request = Promise.resolve().then(() => this.ipGeolocation.lookup(ip))
-        const location = await new Promise<SignInLocation | null>((resolve) => {
-          const timer = setTimeout(() => { partial = true; resolve(null) }, Math.max(1, deadlineAt - Date.now()))
-          void request.then((value) => {
-            optionalLocationLookupsInFlight -= 1
-            clearTimeout(timer)
-            resolve(Date.now() < deadlineAt ? projectInferredLocation(value) : null)
-          }, () => {
-            optionalLocationLookupsInFlight -= 1
-            clearTimeout(timer)
-            resolve(null)
-          })
-        })
-        if (!location) { partial = true; continue }
+        let location: SignInLocation | null
+        try {
+          const lookup = this.ipGeolocation.lookupReady(ip)
+          if (lookup.kind !== 'FOUND') {
+            reasons.add(lookup.kind === 'NO_MATCH' ? 'LOCATION_NOT_FOUND' : lookup.kind === 'UNAVAILABLE' ? 'GEOIP_UNAVAILABLE' : 'GEOIP_LOOKUP_FAILED')
+            continue
+          }
+          location = projectInferredLocation(lookup.location)
+        } catch { reasons.add('GEOIP_LOOKUP_FAILED'); continue }
+        if (!location) { reasons.add('GEOIP_INVALID_LOCATION'); continue }
         const bytes = Buffer.byteLength(JSON.stringify([ip, location]), 'utf8')
-        if (retainedBytes + bytes > limits.locationBytes) { partial = true; return }
+        if (retainedBytes + bytes > limits.locationBytes) { reasons.add('ENRICHMENT_LOCATION_BYTES'); return }
         retainedBytes += bytes
         locations.set(ip, location)
+        // Local reads are synchronous; yield between them without retaining IO.
+        await Promise.resolve()
       }
     }))
     let addedBytes = 0
     for (const row of rows) {
-      if (
-        this.hasCompleteSignInLocation(row?.location) ||
-        typeof row?.ipAddress !== 'string'
-      ) {
-        continue
-      }
+      if (this.hasCompleteSignInLocation(row?.location) || typeof row?.ipAddress !== 'string') continue
       const location = locations.get(row.ipAddress.trim())
       if (!location) continue
       const merged = projectInferredLocation(this.mergeSignInLocations(row.location, location))
       const bytes = Buffer.byteLength(JSON.stringify(merged), 'utf8')
-      if (addedBytes + bytes > limits.addedRowBytes || Date.now() >= deadlineAt) { partial = true; break }
+      if (addedBytes + bytes > limits.addedRowBytes) { reasons.add('ENRICHMENT_ROW_BYTES'); break }
+      if (Date.now() >= deadlineAt) { reasons.add('ENRICHMENT_DEADLINE'); break }
       addedBytes += bytes
       row.location = merged
     }
-    return { locations, partial }
+    return outcome()
   }
 
   private hasCompleteSignInLocation(location: unknown) {

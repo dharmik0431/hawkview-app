@@ -89,9 +89,10 @@ test('complete limited source and optional geolocation preserve their source/win
   const h = harness()
   h.service.fetchGraphCollection = async () => { throw new Error('Authentication_RequestFromNonPremiumTenantOrB2CTenant') }
   h.service.fetchLimitedLoginActivity = async () => []
-  h.service.enrichLimitedSignInLocations = async () => ({ locations: new Map(), partial: true })
+  h.service.enrichLimitedSignInLocations = async () => ({ locations: new Map(), partial: true, reasons: new Set(['GEOIP_INITIALIZING']) })
   await h.run()
   assert.equal(h.state.status, 'RUNNING'); assert.match(h.state.lastErrorCode, /fallback-active-geolocation-partial$/)
+  assert.match(h.state.lastErrorMessage, /GEOIP_INITIALIZING/)
   assert.equal(selectedAuthenticationSource(h.state), 'M365_AUDIT_STS')
   assert.equal(h.snapshot.source, 'M365_AUDIT_STS'); assert.equal(h.snapshot.paginationComplete, true)
   assert.equal(h.snapshot.observedEvents, 0); assert.equal(+h.state.lastSuccessfulAt, +at)

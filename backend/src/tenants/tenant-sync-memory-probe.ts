@@ -317,10 +317,10 @@ const nonpremiumPrisma: any = {
     } },
   }),
 }
-const nonpremiumService = new TenantSyncService(nonpremiumPrisma, {} as any, { lookup: async () => {
+const nonpremiumService = new TenantSyncService(nonpremiumPrisma, {} as any, { ensureReady: async () => ({ ready: true }), lookupReady: () => {
   locationLookups++; activeLocationLookups++; maximumLocationLookups = Math.max(maximumLocationLookups, activeLocationLookups)
-  await new Promise<void>(resolve => setImmediate(resolve)); activeLocationLookups--
-  return { city: 'Synthetic', countryOrRegion: 'ZZ', geoCoordinates: { latitude: 1, longitude: 2 }, source: 'MAXMIND_GEOLITE2' }
+  activeLocationLookups--
+  return { kind: 'FOUND', location: { city: 'Synthetic', countryOrRegion: 'ZZ', geoCoordinates: { latitude: 1, longitude: 2 }, source: 'MAXMIND_GEOLITE2' } }
 } } as any, { resolveIncident: async () => undefined } as any, { pruneExpired: async () => undefined } as any, {} as any)
 ;(nonpremiumService as any).signInEntitlement = async () => 'NON_PREMIUM'
 ;(nonpremiumService as any).fetchGraphCollection = async () => { throw new Error('Authentication_RequestFromNonPremiumTenantOrB2CTenant') }
