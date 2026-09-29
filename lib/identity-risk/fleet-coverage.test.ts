@@ -113,37 +113,21 @@ test('a zero over unassessed tenants is not a zero over assessed ones', () => {
   assert.equal(partial.complete, false)
   assert.match(
     partial.empty!.detail,
-    /not a statement that those tenants have no risky users/
+    /does not establish that there are no risky users/
   )
 })
 
-test('the shortfall says WHY, because the remedies differ', () => {
-  // "Could not be reached" is a connection problem; "returned no assessment" is
-  // a collection problem; "still loading" is not a problem at all. Collapsing
-  // them into one number would send somebody to the wrong place.
-  const mixed: AssessmentCoverage = cov({
-    inScope: 6,
-    assessed: 1,
-    loading: 2,
-    failed: 1,
-    unavailable: 2,
-  })
-  const detail = riskyUsersSummary(0, mixed, false).empty!.detail
-  assert.match(detail, /1 could not be reached/)
-  assert.match(detail, /2 have incomplete or unavailable evidence/)
-  assert.match(detail, /2 still loading/)
-  assert.match(detail, /5 of 6 tenants have incomplete combined evidence/)
-
-  // Only the causes that actually occurred are named, or every screen would
-  // list three problems when it has one.
-  const onlyFailed = riskyUsersSummary(
-    0,
-    cov({ inScope: 2, assessed: 1, loading: 0, failed: 1, unavailable: 0 }),
-    false
-  ).empty!.detail
-  assert.match(onlyFailed, /1 could not be reached/)
-  assert.ok(!/still loading/.test(onlyFailed), 'named a cause that did not occur')
-  assert.ok(!/returned no assessment/.test(onlyFailed))
+test('empty availability is neutral while preserving unknown and directing users to source details', () => {
+  for (const state of ['FAILED', 'UNAVAILABLE', 'LOADING'] as const) {
+    const coverage = fleetCoverage(statuses(['a', 'SUCCESS'], ['b', state]), 'ALL')
+    const summary = riskyUsersSummary(0, coverage, false)
+    assert.equal(summary.complete, false)
+    assert.equal(summary.empty!.tone, 'UNKNOWN')
+    assert.equal(summary.empty!.title, 'No matching users shown')
+    assert.match(summary.empty!.detail, /does not establish that there are no risky users/)
+    assert.match(summary.empty!.detail, /source-specific details/)
+    assert.doesNotMatch(summary.headline + summary.empty!.detail, /sync fail|incomplete combined|could not be reached|opted out/i)
+  }
 })
 
 test('UNAVAILABLE counts against coverage, which failedTenants did not', () => {
@@ -199,30 +183,31 @@ test('coverage describes THIS view, not the whole fleet', () => {
   assert.equal(fleetCoverage(all, 'ALL').assessed, 1)
 })
 
-test('an incomplete count never travels alone, and a complete one is not hedged', () => {
+test('shown counts are neutral without changing completeness or positive rows', () => {
   const partial = riskyUsersSummary(
     7,
     cov({ inScope: 4, assessed: 2, loading: 0, failed: 2, unavailable: 0 }),
     false
   )
   assert.match(partial.headline, /7 users/)
-  assert.match(partial.headline, /2 of 4 tenants/)
+  assert.equal(partial.headline, '7 users shown')
+  assert.equal(partial.complete, false)
   assert.equal(partial.empty, null, 'a populated list rendered an empty state')
 
-  assert.equal(riskyUsersSummary(7, whole(4), false).headline, '7 users')
-  assert.equal(riskyUsersSummary(1, whole(4), false).headline, '1 user')
+  assert.equal(riskyUsersSummary(7, whole(4), false).headline, '7 users shown')
+  assert.equal(riskyUsersSummary(1, whole(4), false).headline, '1 user shown')
 })
 
 test('grammar survives the one-tenant fleet and the impossible coverage', () => {
   assert.match(
     riskyUsersSummary(0, cov({ inScope: 1, assessed: 0, loading: 0, failed: 1, unavailable: 0 }), false)
       .empty!.detail,
-    /1 of 1 tenant has incomplete combined evidence/
+    /source-specific details/
   )
   assert.match(
     riskyUsersSummary(0, cov({ inScope: 3, assessed: 1, loading: 0, failed: 2, unavailable: 0 }), false)
       .empty!.detail,
-    /2 of 3 tenants have incomplete combined evidence/
+    /source-specific details/
   )
 
   // `assessed` above `inScope` should be impossible; if a refactor makes it
@@ -313,7 +298,7 @@ test('the page actually uses this, and no longer hardcodes the shield', () => {
     'no reassuring shield remains, so the gate asserted nothing'
   )
 })
-test('the KPI tile is gated on the same coverage as the list', () => {
+test('source coverage and unknown enumeration remain wired without a combined KPI', () => {
   // I DIAGNOSED THIS TILE AND LEFT IT. The commit that fixed the badge and the
   // empty states said, in as many words, that "100% tenants synced" was derived
   // from failedTenants -- which counts only assessmentError -- and so claimed a
@@ -347,8 +332,8 @@ test('the KPI tile is gated on the same coverage as the list', () => {
     'a coverage claim still reads a count that ignores UNAVAILABLE'
   )
   assert.ok(
-    code.includes('enumerationKnown && fleetWide.inScope > 0 && notAssessed === 0'),
-    'the tile is not gated on assessment coverage'
+    code.includes('source.ready') && !code.includes('combinedComplete'),
+    'source detail must remain without an aggregate completeness KPI'
   )
 
   // The tile is a fleet KPI and must NOT be scoped to the tenant filter: the
@@ -463,32 +448,6 @@ test('every tone is reachable and only one of them reassures', () => {
   }
   // The control, kept explicit: being quiet IS worth saying when it is true.
   assert.equal(cases[0][1].empty!.tone, 'QUIET')
-})
-
-test('the shortfall says WHICH tenants, not only how many', () => {
-  // Somebody told three were missed cannot act without going to find which
-  // three, and the tenant filter beside the list shows all of them unmarked.
-  const detail = riskyUsersSummary(
-    0,
-    cov({ inScope: 4, assessed: 1, failed: 2, unavailable: 1, missed: ['Greentech', 'Northwind', 'Contoso'] }),
-    false
-  ).empty!.detail
-  assert.match(detail, /Greentech/)
-  assert.match(detail, /Northwind/)
-  assert.match(detail, /Contoso/)
-
-  // Capped, so a large fleet does not put forty names in one sentence.
-  const many = riskyUsersSummary(
-    0,
-    cov({
-      inScope: 40,
-      assessed: 0,
-      failed: 40,
-      missed: Array.from({ length: 40 }, (_, i) => 'Tenant' + i),
-    }),
-    false
-  ).empty!.detail
-  assert.match(many, /Tenant0, Tenant1, Tenant2, and 37 more/)
 })
 
 test('fleetCoverage names the missed tenants and carries the fleet size', () => {

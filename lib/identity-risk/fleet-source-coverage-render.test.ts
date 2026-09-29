@@ -656,3 +656,66 @@ test('collection-not-succeeded needs a validated failure status; pending, unknow
   assert.equal(warning(), null, 'Malformed envelopes and ambiguous duplicate collectors do not establish a collection failure')
   assert.equal(calls.length, 0)
 }, false))
+
+test('optional availability has no aggregate warning or opt-out claim; unavailable zero stays unknown on desktop and mobile', async () => mounted(async ({ render, dom, body }) => {
+  const document = dom.window.document
+  for (const reason of ['MISSING_PERMISSION', 'LICENSE_REQUIRED', 'WAITING_FOR_COLLECTION', 'SOURCE_UNAVAILABLE']) {
+    microsoftQueries = ids.map(() => ({ data: unavailable(reason) }))
+    await render()
+    assert.equal(document.getElementById('fleet-evidence-availability').hidden, true)
+    assert.equal(document.querySelector('[role="img"]'), null)
+    assert.doesNotMatch(body(), /Evidence Incomplete|complete evidence for \d+ of|Complete evidence from both sources|incomplete combined evidence|coverage is incomplete|opted out|Not enabled/i)
+    assert.match(body(), /0 users shown/)
+    assert.match(body(), /HawkView assessments: 5 of 5 tenants/)
+    assert.match(body(), /Microsoft risk evidence: 0 of 5 tenants/)
+    assert.ok(hook.tenantStatuses.every((tenant: any) => tenant.status === 'UNAVAILABLE'))
+    assert.doesNotMatch(body(), /No users require review|Both sources have complete/)
+    const emptyTitles = [...document.querySelectorAll('h3, p')].filter((node: any) => node.textContent === 'No matching users shown') as any[]
+    assert.equal(emptyTitles.length, 2, 'Desktop and mobile retain the same unknown empty state')
+    for (const title of emptyTitles) {
+      const container = title.closest('td') ?? title.parentElement
+      assert.ok(container.querySelector('.lucide-info'))
+      assert.equal(container.querySelector('.lucide-triangle-alert, .lucide-shield-check'), null)
+      assert.match(container.textContent, /does not establish that there are no risky users/)
+    }
+    assert.equal(reload(dom), undefined)
+  }
+  assert.equal(calls.length, 0)
+}, false))
+
+test('explicit disabled assessment stays informational; a 403 read is never inferred to be chosen opt-out', async () => mounted(async ({ render, dom, body }) => {
+  nativeQueries[0].data = { version: 'hawkview-risky-users/v1', available: false, because: 'NOT_ENABLED_FOR_TENANT' }
+  await render()
+  assert.equal(hook.tenantStatuses[0].nativeSource, 'DISABLED')
+  assert.match(body(), /Assessment is not enabled/)
+  assert.equal(dom.window.document.querySelector('[role="img"]'), null)
+  assert.doesNotMatch(body(), /opted out|user chose|sync fail/i)
+  nativeQueries[0].data = native()
+  microsoftQueries[1] = { isError: true, error: { status: 403 }, refetch: () => calls.push('microsoft:tenant-b') }
+  await render()
+  assert.equal(hook.tenantStatuses[1].microsoftSource, 'READ_FAILED')
+  assert.match(dom.window.document.querySelector('[role="img"]').getAttribute('aria-label'), /tenant-b: Microsoft risk results could not be loaded/)
+  assert.doesNotMatch(body(), /Assessment is not enabled|opted out|user chose|collection reports failure/i)
+  await React.act(async () => reload(dom).click())
+  assert.deepEqual(calls, ['microsoft:tenant-b'])
+}))
+
+test('tenant switching changes the empty-result claim without changing fleet source coverage', async () => mounted(async ({ render, dom, body }) => {
+  microsoftQueries[1].data = unavailable('MISSING_PERMISSION')
+  await render()
+  const select = dom.window.document.querySelector('select')
+  const choose = async (value: string) => React.act(async () => {
+    select.value = value
+    select.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+  })
+  await choose('tenant-a')
+  assert.match(body(), /No users match the selected filters/)
+  assert.match(body(), /Microsoft risk evidence: 4 of 5 tenants/)
+  await choose('tenant-b')
+  assert.match(body(), /No matching users shown/)
+  assert.match(body(), /does not establish that there are no risky users/)
+  assert.doesNotMatch(body(), /No users match the selected filters|No users require review|coverage is incomplete/)
+  assert.match(body(), /Microsoft reports missing permission: 1 tenanttenant-b/)
+  assert.equal(dom.window.document.querySelector('[role="img"]'), null)
+  assert.equal(calls.length, 0)
+}))
