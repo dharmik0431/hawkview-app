@@ -260,7 +260,11 @@ test('stored conflicts are sticky, exclude witnesses, preserve Microsoft risk an
   assert.equal((await persistAuthenticationRecords(f.prisma,f.scope,[conflicting])).hasConflicts,true)
   assert.equal((await persistAuthenticationRecords(f.prisma,f.scope,[f.records[9]])).hasConflicts,true)
   const old=await f.prisma.signInLog.findFirst({where:{customerTenantId:f.scope.customerTenantId,microsoftSignInId:'failure-9'}})
-  assert.equal(old.raw.status.errorCode,50126);assert.equal(old.raw.hawkviewAuthenticationIntegrity,'CONFLICT');assert.equal(old.riskLevel,'high')
+  assert.equal(old.raw.status.errorCode,50126);assert.equal(old.riskLevel,'high')
+  // The second call re-asserted the conflict off the stored marker alone, so the
+  // recorded cause must still be the first one, from the fingerprint difference.
+  assert.deepEqual({...old.raw.hawkviewAuthenticationIntegrity,at:null},{state:'CONFLICT',because:'STORED_FINGERPRINT_MISMATCH',at:null})
+  assert.ok(Number.isFinite(Date.parse(old.raw.hawkviewAuthenticationIntegrity.at)),'a real marked-at clock survives the jsonb round trip')
   await f.evaluate()
   const dto=await f.service.assessment(f.scope.identity,f.scope.customerTenantId)
   assert.equal(dto.sources.find((source:any)=>source.source==='GRAPH_SIGN_INS').status,'PARTIAL')
