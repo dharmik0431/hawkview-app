@@ -139,7 +139,7 @@ test('creates exactly one action for an actionable selected sign-in source', () 
 
   assert.equal(display.issueCount, 1)
   assert.equal(display.issues[0]?.title, 'Selected sign-in evidence is stale')
-  assert.equal(display.issues[0]?.action, 'Retry synchronization')
+  assert.equal(display.issues[0]?.action, 'Review collection details')
 })
 
 test('uses an authoritative core permission finding instead of a healthy-looking detail bundle', () => {
@@ -318,10 +318,10 @@ test('stored error text does not infer permissions, token expiry, partial outcom
   for (const message of ['403 Forbidden', '401 token expired', 'CollectionPartialError', 'intentionally disabled']) {
     const entry = { ...sync('UNKNOWN'), lastError: message }
     const display = deriveTenantWorkspaceDisplay(current({ users: entry }))
-    assert.equal(display.state, 'needs-attention')
-    assert.equal(display.issues[0].technicalDetails, message)
-    assert.equal(display.issues[0].title, 'Entra Users collection needs review')
-    assert.equal(display.issues[0].action, 'Retry synchronization')
+    assert.equal(display.state, 'unverified')
+    assert.equal(display.issueCount, 0)
+    assert.equal(display.syncObservations[0].diagnostic, message)
+    assert.notEqual(display.state, 'healthy')
     assert.match(display.syncObservations[0].detail, /outcome unknown/)
   }
 })
@@ -333,8 +333,9 @@ test('independent authoritative warnings and raw failures outrank unknown execut
   const data = current({ users: sync('UNKNOWN'), teams: { ...sync('FAILED', 'failed'), lastError: '403' } })
   const display = deriveTenantWorkspaceDisplay(data, true, null, health)
   assert.equal(display.state, 'needs-attention')
-  assert.equal(display.issueCount, 1)
+  assert.equal(display.issueCount, 2)
   assert.equal(display.issues[0].title, 'Required permission missing')
+  assert.match(display.issues[1].technicalDetails!, /403/)
   assert.equal(display.syncRequestPending, true)
   assert.match(display.syncObservations[1].detail, /failure recorded/)
 })
@@ -461,7 +462,7 @@ test('absent and malformed actionable health never certify zero; legacy diagnost
     const failure = deriveTenantWorkspaceDisplay(current({ users: { ...sync('FAILED', 'failed'), lastError: 'Retained diagnostic' } }), false, null, health as any)
     assert.equal(failure.attentionVerified, false)
     assert.equal(failure.state, 'needs-attention')
-    assert.equal(failure.issues[0].technicalDetails, 'Retained diagnostic')
+    assert.match(failure.issues[0].technicalDetails!, /Retained diagnostic/)
   }
   assert.equal(deriveTenantWorkspaceDisplay(current({ users: sync('SUCCEEDED', 'succeeded') }), false, null, verifiedHealth).attentionVerified, true)
 })
