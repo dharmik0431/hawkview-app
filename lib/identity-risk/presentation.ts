@@ -543,9 +543,9 @@ const signalCopy: Record<
   { title: string; singular: string; plural: string }
 > = {
   LOCKED_OUT_AFTER_REPEATED_FAILURES: {
-    title: 'Locked out after repeated failures',
-    singular: 'lockout',
-    plural: 'lockouts',
+    title: 'Account lockout reported',
+    singular: 'sign-in record reporting lockout',
+    plural: 'sign-in records reporting lockout',
   },
   PASSWORD_REJECTED: {
     title: 'Password rejected',

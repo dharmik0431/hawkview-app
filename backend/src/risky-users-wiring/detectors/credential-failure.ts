@@ -4,24 +4,16 @@ import type { FeedBoundDetector } from '../feed-capability.js'
 import type { SourceEventReference } from '../../evaluation-core/contract.js'
 import { latestSourceReference, sourceEventReference } from '../incident-source-reference.js'
 
-/** Somebody is trying passwords against this account.
+/** Reports provider-classified lockout or a configured volume of rejections.
  *
- * The first detector bound to real evidence, and deliberately the simplest
- * defensible one rather than the cleverest available.
+ * A recognized lockout reason reports a refusal, not validated credentials or
+ * proven compromise. It does not universally imply varied passwords: Microsoft
+ * excludes pass-through authentication from hash tracking and genuine users can
+ * be locked out. See https://learn.microsoft.com/en-us/entra/identity/authentication/howto-password-smart-lockout
  *
- * TWO SIGNALS, and the first is the strong one:
- *
- * A LOCKOUT is Microsoft telling us smart lockout fired, which it does only
- * after repeated failures — and Microsoft documents that it ignores repeats of
- * the SAME wrong password specifically so a stale-credential client does not
- * trigger it. So a lockout implies VARIED attempts, which is the difference
- * between a phone with an old password saved and somebody guessing. One is
- * enough to report.
- *
- * REJECTIONS in volume are attack evidence in aggregate and nothing on their
- * own: a person mistyping twice is not a finding. The threshold is a product
- * judgement rather than a measurement, so it is a parameter and the finding
- * says which value produced it.
+ * The rejection threshold is a product judgement, not a measured attack
+ * probability or short-window burst threshold. Counts alone do not distinguish
+ * password guessing from typing errors or outdated saved credentials.
  *
  * Presence-keyed and therefore monotonic: more events can only add findings,
  * never remove one. That is what lets it run on a truncated window — and it is

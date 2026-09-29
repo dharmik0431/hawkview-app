@@ -569,7 +569,7 @@ test('native contracts R34: raw native subject references stay private while fin
       assert.ok(text.includes(subjectsNamed ? 'Identity not resolved' : 'Name not shown for your role'))
       assert.ok(!text.includes(ref))
       assert.ok(!text.includes(ref.slice(0, 10)))
-      assert.match(text, /Repeated unsuccessful sign-in activity/)
+      assert.match(text, /Rejected password attempts observed/)
     }
   }
 })
@@ -1173,7 +1173,7 @@ test('native contracts S73: two reasons with different dates never share one', (
   const items = findingItems(drawer.document)
   assert.equal(items.length, 2)
   assert.match(items[0]!.textContent ?? '', /12 rejected sign-ins/)
-  assert.match(items[1]!.textContent ?? '', /462 matching events/)
+  assert.match(items[1]!.textContent ?? '', /462 sign-in records reporting lockout/)
   const dates = native.findings[0]!.signals.map(signal => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(signal.latest!.at)))
   assert.notEqual(dates[0], dates[1])
   assert.ok(items[0]!.textContent?.includes(dates[0]!))
@@ -1208,7 +1208,7 @@ test('native contracts N76: an unrecognised rule never lets its identifier becom
   native.findings[0]!.signals = [nativeSignal('FUTURE_SIGNAL', 9)]
   const result = renderNative(native)
   const drawer = result.openNativeDrawer()
-  assert.match(primaryText(drawer.document), /Security activity needs review/)
+  assert.match(primaryText(drawer.document), /Finding explanation unavailable/)
   assert.doesNotMatch(primaryText(drawer.document), /FUTURE_DETECTOR|FUTURE_SIGNAL|9 records/)
   const technical = [...drawer.document.querySelectorAll('details')].find(detail => detail.querySelector('summary')?.textContent === 'Technical details')
   assert.ok(technical)
@@ -1320,7 +1320,7 @@ test('native contracts S81: one finding resting on two signals renders two reaso
   const drawer = renderNative(native).openNativeDrawer()
   const items = findingItems(drawer.document)
   assert.equal(items.length, 2)
-  assert.match(items[0]!.textContent ?? '', /462 matching events/)
+  assert.match(items[0]!.textContent ?? '', /462 sign-in records reporting lockout/)
   assert.match(items[1]!.textContent ?? '', /12 rejected sign-ins/)
   assert.doesNotMatch(drawer.text, /474/)
   assert.equal(drawer.document.querySelectorAll('h4').length, 2)
@@ -1483,4 +1483,29 @@ test('native truthfulness: compact summary shows supplied withholding explanatio
   for (const reason of expected.reasons) {
     assert.ok(!healthy.text.includes(reason), 'a healthy control must not inherit a withheld reason')
   }
+})
+
+
+test('zero-lockout rejection finding uses positive evidence in tenant desktop, mobile and drawer', () => {
+  const native = nativeRiskyUsersFixture()
+  native.findings[0]!.signals = [
+    nativeSignal('LOCKED_OUT_AFTER_REPEATED_FAILURES', 0, 'EVENT_OCCURRED', null),
+    nativeSignal('PASSWORD_REJECTED', 7),
+  ]
+  const result = renderNative(native)
+  for (const text of [result.text]) {
+    assert.match(text, /Rejected password attempts observed/)
+    assert.doesNotMatch(text, /Account lockout reported|account was locked|automatic account lockout/)
+  }
+  assert.equal((result.text.match(/Rejected password attempts observed/g) ?? []).length, 2, 'Tenant desktop and mobile select the positive reason')
+  const drawer = result.openNativeDrawer()
+  const headings = Array.from(drawer.document.querySelectorAll('h4')).map((h: any) => h.textContent)
+  assert.deepEqual(headings, ['No lockout records observed', 'Rejected password attempts observed'])
+  assert.match(drawer.text, /outdated saved password/)
+  assert.match(drawer.text, /If unauthorized successful access or credential exposure is corroborated/)
+  assert.doesNotMatch(drawer.text, /account was locked|automatic account lockout/)
+  native.findings[0]!.signals = [nativeSignal('PASSWORD_REJECTED', 7)]
+  const absent = renderNative(native).openNativeDrawer()
+  assert.equal(findingItems(absent.document).length, 1)
+  assert.doesNotMatch(absent.text, /No lockout records observed/)
 })

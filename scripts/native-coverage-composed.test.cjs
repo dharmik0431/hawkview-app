@@ -52,6 +52,7 @@ const { RiskyUsersController } = load(
 const { adaptNativeAssessment } = load('lib/identity-risk/native-assessment.ts')
 const { nativeRiskyUserCount } = load('lib/identity-risk/native-view.ts')
 const { projectFleetRisk } = load('lib/identity-risk/fleet-risk-projection.ts')
+const { primaryReasonFor, mapRuleToPresentation } = load('lib/identity-risk/risk-presentation-mapper.ts')
 const end = new Date('2026-09-27T12:00:00Z'),
   start = new Date('2026-09-01T00:00:00Z')
 const scope = {
@@ -94,6 +95,7 @@ async function run(label, n, opts = {}) {
       ? [graph(u, 0, i)]
       : [graph(u, 50053, i * 2), graph(u, 50126, i * 2 + 1)]
   )
+  if (opts.rejectionsOnly) rows = directory.flatMap((u, i) => Array.from({ length: 7 }, (_, j) => graph(u, 50126, i * 7 + j)))
   if (opts.empty) rows = []
   if (opts.missingSubject) {
     const bad = graph(user(999), 50053, 999)
@@ -234,6 +236,17 @@ async function run(label, n, opts = {}) {
     [{}],
     end.getTime() + 1000
   )
+  if (opts.rejectionsOnly) {
+    assert.equal(projected.fleetRows.length, n)
+    for (const row of projected.fleetRows) {
+      assert.equal(row.reasons[0].signal, 'LOCKED_OUT_AFTER_REPEATED_FAILURES')
+      assert.equal(row.reasons[0].evidenceCount, 0)
+      assert.equal(row.reasons[0].lastSeen, null)
+      assert.equal(primaryReasonFor(row.reasons).signal, 'PASSWORD_REJECTED')
+      assert.equal(mapRuleToPresentation(primaryReasonFor(row.reasons)).plainTitle, 'Rejected password attempts observed')
+      assert.equal(mapRuleToPresentation(row.reasons[0]).plainTitle, 'No lockout records observed')
+    }
+  }
   const status = projected.tenantStatuses[0]
   const summary = {
     label,
@@ -261,6 +274,8 @@ async function run(label, n, opts = {}) {
 }
 test('persisted producer coverage survives controller serialization and frontend count explanations', async () => {
   const results = []
+  results.push(await run('graph-rejections-only', 2, { rejectionsOnly: true, expected: 'READY' }))
+  results.push(await run('audit-rejections-only', 2, { rejectionsOnly: true, audit: true, expected: 'READY' }))
   for (const n of [0, 1, 2, 6, 25, 101])
     results.push(await run('graph-complete-' + n, n, { expected: 'READY' }))
   results.push(
