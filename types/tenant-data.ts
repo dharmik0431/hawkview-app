@@ -66,4 +66,21 @@ export type TenantSyncStatus = {
   lastSuccessfulAt: string | null
   lastError: string | null
   resourceType?: string
+  outcomeProjection?: SyncOutcomeProjection
+}
+
+/** Recorded outcomes do not attest that a collector is executing now. */
+export type SyncOutcomeProjection = {
+  version: 1
+  resourceType: string
+  recordedOutcome: {
+    kind: 'SUCCEEDED' | 'FAILED' | 'NOT_STARTED_OR_IDLE' | 'AWAITING_EXECUTION' |
+      'LIMITED_COLLECTION_RECORDED' | 'INITIALIZATION_WAIT_RECORDED' |
+      'DEFERRED_WORK_RECORDED' | 'UNKNOWN'
+    basis: 'STORED_STATUS' | 'RECOGNIZED_RETURN_PATH' | 'LEGACY_LABEL' | 'UNCLASSIFIED'
+    relation: 'LATEST_RECORDED' | 'PREDATES_ATTEMPT' | 'RETAINED_OR_CURRENT' | 'UNKNOWN'
+  }
+  execution: 'UNKNOWN'
+  lastAttemptAt: string | null
+  reasonCode: string | null
 }

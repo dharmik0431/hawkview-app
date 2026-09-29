@@ -270,12 +270,13 @@ export default function ExchangePage({
   const exchangeSync = bundle?.exchange?.sync ?? bundle?.sync?.exchange ?? {}
   const freshness = bundle?.syncFreshness?.services?.exchange ?? bundle?.tenant?.syncFreshness?.services?.exchange ?? null
 
-  const isSyncing = syncState === 'syncing' || freshness?.status === 'RUNNING'
+  const isSyncing = syncState === 'syncing'
 
   // Last Attempt Timestamp & Formatting
   const lastAttemptRaw =
     freshness?.lastAttemptCompletedAt ||
     freshness?.lastAttemptStartedAt ||
+    exchangeSync?.outcomeProjection?.lastAttemptAt ||
     exchangeSync?.lastAttemptAt ||
     null
 
@@ -298,34 +299,38 @@ export default function ExchangePage({
   const rawStatus = freshness?.status || exchangeSync?.status || (syncState === 'fail' ? 'FAILED' : syncState === 'syncing' ? 'RUNNING' : 'UNKNOWN')
 
   const syncStatusLabel = (() => {
-    if (isSyncing || rawStatus === 'RUNNING') return 'Syncing...'
     if (syncState === 'fail' || rawStatus === 'FAILED') return 'Sync failed'
     if (rawStatus === 'PARTIAL') return 'Partial sync'
     if (rawStatus === 'STALE' || freshness?.freshnessStatus === 'STALE') return 'Sync stale'
+    if (rawStatus === 'RUNNING') return 'Collector activity not verified'
+    if (rawStatus === 'PENDING') return 'Collection pending'
     if (rawStatus === 'NOT_COLLECTED' || freshness?.freshnessStatus === 'NEVER_SYNCED' || !lastSuccessRaw) return 'Awaiting first sync'
-    if (rawStatus === 'SUCCESS' || syncState === 'success' || lastSuccessRaw) return 'Synchronized'
+    if (rawStatus === 'SUCCESS') return 'Successful collection recorded'
+    if (lastSuccessRaw) return 'Retained data available'
     return 'Unavailable'
   })()
 
   const syncStatusDotColor = (() => {
-    if (isSyncing || rawStatus === 'RUNNING') return 'bg-amber-500 animate-pulse'
     if (syncState === 'fail' || rawStatus === 'FAILED') return 'bg-red-500'
     if (rawStatus === 'PARTIAL' || rawStatus === 'STALE') return 'bg-amber-500'
-    if (rawStatus === 'SUCCESS' || syncState === 'success' || lastSuccessRaw) return 'bg-emerald-500'
+    if (rawStatus === 'RUNNING' || rawStatus === 'PENDING') return 'bg-slate-400'
+    if (rawStatus === 'SUCCESS') return 'bg-emerald-500'
     return 'bg-slate-400'
   })()
 
   // Freshness / Coverage Label
   const freshnessLabel = (() => {
-    if (isSyncing || rawStatus === 'RUNNING') return 'Populating data...'
     if (syncState === 'fail' || rawStatus === 'FAILED') return 'Collection failed'
     if (rawStatus === 'PARTIAL') {
       const pCount = freshness?.partialFailures?.length ?? 1
       return `Partial data (${pCount} issue${pCount === 1 ? '' : 's'})`
     }
     if (rawStatus === 'STALE' || freshness?.freshnessStatus === 'STALE') return 'Stale dataset'
+    if (rawStatus === 'RUNNING') return 'Collector activity not verified'
+    if (rawStatus === 'PENDING') return 'Collection pending'
     if (rawStatus === 'NOT_COLLECTED' || freshness?.freshnessStatus === 'NEVER_SYNCED' || !lastSuccessRaw) return 'No data collected'
-    if (freshness?.freshnessStatus === 'CURRENT' || rawStatus === 'SUCCESS' || lastSuccessRaw) return 'Current dataset'
+    if (freshness?.freshnessStatus === 'CURRENT') return 'Current dataset'
+    if (lastSuccessRaw) return 'Retained dataset'
     return 'Unavailable'
   })()
 
@@ -587,7 +592,7 @@ export default function ExchangePage({
               aria-live="polite"
             >
               <RefreshCw className={cn("h-3.5 w-3.5", isSyncing && "animate-spin")} aria-hidden="true" />
-              <span>{isSyncing ? "Syncing..." : syncState === 'success' ? "Synced" : syncState === 'fail' ? "Sync failed" : "Sync Now"}</span>
+              <span>{isSyncing ? "Request pending..." : syncState === 'success' ? "Request completed" : syncState === 'fail' ? "Sync failed" : "Sync Now"}</span>
             </Button>
           )}
         </div>

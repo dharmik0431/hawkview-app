@@ -68,6 +68,9 @@ export function useRiskyUsers(tenantId: string, enabled = true) {
     count,
     list,
     microsoftView,
+    // Independent read states let compact summaries preserve the other source.
+    assessmentLoading,
+    microsoftLoading,
     loading: assessmentLoading || microsoftLoading,
     requestFailed: assessmentRequestError,
     contractFailed: assessmentContractError,

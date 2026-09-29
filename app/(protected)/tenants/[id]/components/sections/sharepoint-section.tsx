@@ -306,7 +306,7 @@ export default function SharePointPage({
   // Collection Status strip data
   const collectionInfo = sp?.collection ?? {}
   const sharePointSync = sharePointView.sync
-  const isSyncing = syncState === 'syncing' || sharePointSync?.status === 'running'
+  const isSyncing = syncState === 'syncing'
   const isLastKnownData = syncState === 'fail' || sharePointSync?.status === 'failed'
 
   const lastAttemptRaw = sharePointSync.lastAttemptAt || collectionInfo.lastAttemptAt || bundle?.lastSyncAt
@@ -319,22 +319,22 @@ export default function SharePointPage({
 
   // Fix Contradictory Status Logic: Never say "No Data" when valid legacy data/sites are present!
   const syncStatusDotColor = (() => {
-    if (isSyncing) return 'bg-blue-500 animate-pulse'
     if (syncState === 'fail' || sharePointSync.status === 'failed') return 'bg-red-500'
     if (sharePointSync?.status === 'partial') return 'bg-amber-500'
-    if (SP_SITES.length > 0 || lastSuccessRaw) return 'bg-emerald-500'
+    if (sharePointSync.status === 'success') return 'bg-emerald-500'
     return 'bg-slate-400'
   })()
 
   const syncStatusLabel = (() => {
-    if (isSyncing) return 'Syncing...'
     if (syncState === 'fail' || sharePointSync.status === 'failed') return 'Collection Needs Attention'
     if (sharePointSync?.status === 'partial') return 'Partial Data Available'
+    if (sharePointSync.status === 'running') return 'Collector activity not verified'
+    if (sharePointSync.status === 'pending') return 'Collection pending'
     if (SP_SITES.length > 0) {
-      if (lastSuccessRaw) return 'Current Dataset'
+      if (lastSuccessRaw) return 'Retained Dataset'
       return 'Legacy Data Available'
     }
-    if (lastSuccessRaw) return 'Current Dataset'
+    if (lastSuccessRaw) return 'Retained Dataset'
     return 'Awaiting First Successful Collection'
   })()
 
@@ -637,9 +637,9 @@ export default function SharePointPage({
                 <RefreshCw className={cn('h-3.5 w-3.5', isSyncing && 'animate-spin')} aria-hidden="true" />
                 <span>
                   {isSyncing
-                    ? 'Syncing...'
+                    ? 'Request pending...'
                     : syncState === 'success'
-                      ? 'Synced'
+                      ? 'Request completed'
                       : syncState === 'fail'
                         ? 'Sync failed'
                         : 'Sync Now'}

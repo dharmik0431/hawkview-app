@@ -3,7 +3,7 @@
 import React from 'react'
 import { Activity, Building2, Cloud, HardDrive, KeyRound, Mail, Settings, Users } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { formatTenantTimestamp, type TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
+import { serviceFreshnessDescription, type TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import { getServiceTheme } from './service-theme'
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
 
@@ -63,23 +63,13 @@ export function ModuleHeader({
   const Icon = meta.icon
   const theme = getServiceTheme(section)
 
-  const dataCoverage = display.isInitialSync
-    ? 'Populating progressively'
-    : display.state === 'partially-synchronized'
-      ? 'Partial dataset'
-      : display.isStale
-        ? 'Last known data'
-        : 'Current dataset'
+  const dataCoverage = display.isStale ? 'Last known data'
+    : display.state === 'partially-synchronized' ? 'Partial dataset'
+    : display.isInitialSync ? 'Initial collection incomplete'
+    : display.state !== 'healthy' ? 'Coverage not verified'
+    : 'Recorded dataset'
 
-  const freshnessText = (() => {
-    if (!freshness) return 'Freshness unavailable'
-    if (freshness.status === 'RUNNING') return 'Syncing'
-    if (freshness.status === 'NOT_COLLECTED' || freshness.freshnessStatus === 'NEVER_SYNCED') return 'Never synchronized'
-    if (freshness.status === 'PARTIAL') return `Partial — ${freshness.partialFailures.length} collector${freshness.partialFailures.length === 1 ? '' : 's'} need attention`
-    if (freshness.status === 'FAILED') return 'Collection failed'
-    if (freshness.status === 'STALE' || freshness.freshnessStatus === 'STALE') return 'Stale data'
-    return freshness.lastSuccessfulCollectionAt ? `Updated ${formatTenantTimestamp(freshness.lastSuccessfulCollectionAt)}` : 'Freshness unavailable'
-  })()
+  const freshnessText = serviceFreshnessDescription(freshness)
   const freshnessTitle = freshness?.lastSuccessfulCollectionAt ?? undefined
 
   return (

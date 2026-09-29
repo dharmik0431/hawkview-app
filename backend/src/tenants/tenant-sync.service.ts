@@ -1,3 +1,4 @@
+import { projectSyncOutcome } from './sync-outcome-projection.js'
 import { validatedLicenseRows } from './license-validation.js'
 import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
@@ -6379,6 +6380,7 @@ export class TenantSyncService {
     const exchangeSync = (resource: EntraSnapshotResource) => {
       const state = syncStateByResource.get(resource)
       return {
+        outcomeProjection: projectSyncOutcome(resource, state, mfaEvaluationNow),
         status: state?.status.toLowerCase() ?? 'never-synced',
         lastSuccessfulAt: state?.lastSuccessfulAt?.toISOString() ?? null,
         lastError: state?.lastErrorMessage ?? null,
@@ -7577,42 +7579,49 @@ export class TenantSyncService {
         syncedAt: lastSync?.toISOString() ?? null,
         sync: {
           users: {
+            outcomeProjection: projectSyncOutcome('USERS', userSyncState, mfaEvaluationNow),
             status: userSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               userSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: userSyncState?.lastErrorMessage ?? null,
           },
           licenses: {
+            outcomeProjection: projectSyncOutcome('LICENSES', licenseSyncState, mfaEvaluationNow),
             status: licenseSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               licenseSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: licenseSyncState?.lastErrorMessage ?? null,
           },
           domains: {
+            outcomeProjection: projectSyncOutcome('DOMAINS', domainSyncState, mfaEvaluationNow),
             status: domainSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               domainSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: domainSyncState?.lastErrorMessage ?? null,
           },
           groups: {
+            outcomeProjection: projectSyncOutcome('GROUPS', groupSyncState, mfaEvaluationNow),
             status: groupSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               groupSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: groupSyncState?.lastErrorMessage ?? null,
           },
           signIns: {
+            outcomeProjection: projectSyncOutcome('SIGN_INS', signInSyncState, mfaEvaluationNow),
             status: signInSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               signInSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: signInSyncState?.lastErrorMessage ?? null,
           },
           auditLogs: {
+            outcomeProjection: projectSyncOutcome('AUDIT_LOGS', auditLogSyncState, mfaEvaluationNow),
             status: auditLogSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               auditLogSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: auditLogSyncState?.lastErrorMessage ?? null,
           },
           m365Audit: {
+            outcomeProjection: projectSyncOutcome('M365_AUDIT', m365AuditSyncState, mfaEvaluationNow),
             status: m365AuditSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt:
               m365AuditSyncState?.lastSuccessfulAt?.toISOString() ?? null,
@@ -7668,16 +7677,19 @@ export class TenantSyncService {
             },
           },
           sharePointSites: {
+            outcomeProjection: projectSyncOutcome('SHAREPOINT_SITES', sharePointSitesSyncState, mfaEvaluationNow),
             status: sharePointSitesSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt: sharePointSitesSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: sharePointSitesSyncState?.lastErrorMessage ?? null,
           },
           sharePointSettings: {
+            outcomeProjection: projectSyncOutcome('SHAREPOINT_SETTINGS', sharePointSettingsSyncState, mfaEvaluationNow),
             status: sharePointSettingsSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt: sharePointSettingsSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: sharePointSettingsSyncState?.lastErrorMessage ?? null,
           },
           sharePointUsage: {
+            outcomeProjection: projectSyncOutcome('SHAREPOINT_USAGE', sharePointUsageSyncState, mfaEvaluationNow),
             status: sharePointUsageSyncState?.status.toLowerCase() ?? 'never-synced',
             lastSuccessfulAt: sharePointUsageSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: sharePointUsageSyncState?.lastErrorMessage ?? null,
