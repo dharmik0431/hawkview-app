@@ -1,5 +1,6 @@
 'use client'
 
+import { criticalFindingsSummary } from '@/lib/dashboard/critical-findings-summary'
 import { customerAttention, customerHealthScore } from '@/lib/attention/customer-attention'
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
@@ -11,7 +12,6 @@ import {
   AlertTriangle,
   ShieldAlert,
   ShieldCheck,
-  TrendingUp,
   Search,
   RotateCcw,
   ChevronRight,
@@ -532,10 +532,7 @@ export default function DashboardPage() {
         ? null
         : reportedRiskCounts.reduce((total, value) => total + value, 0)
 
-    const attentionPartial = tenants.some((tenant) => !tenant.attentionReported)
-    const criticalTenants = tenants.filter(
-      (t) => t.topSeverity === 'critical'
-    ).length
+    const criticalFindings = criticalFindingsSummary(tenants)
 
     const reportedMfa = tenants.filter((tenant) => tenant.mfaCoverage !== null)
     const mfaGaps =
@@ -544,28 +541,14 @@ export default function DashboardPage() {
         : reportedMfa.filter((tenant) => (tenant.mfaCoverage as number) < 85)
             .length
 
-    const reportedHealthScores = tenants
-      .map((tenant) => tenant.healthScore)
-      .filter((value): value is number => value !== null && value !== undefined)
-    const avgScore =
-      reportedHealthScores.length === 0
-        ? null
-        : Math.round(
-            reportedHealthScores.reduce((total, value) => total + value, 0) /
-              reportedHealthScores.length,
-          )
-
     return {
       riskyIdentities,
-      criticalTenants,
+      criticalFindings,
       mfaGaps,
-      avgScore,
       riskPartial:
         reportedRiskCounts.length < tenants.length ||
         tenants.some((tenant) => !tenant.identityExact),
-      attentionPartial,
       mfaPartial: reportedMfa.length < tenants.length,
-      healthPartial: reportedHealthScores.length < tenants.length,
     }
   }, [tenants])
 
@@ -574,7 +557,6 @@ export default function DashboardPage() {
       Boolean(data?.error) ||
       tenants.some(
         (tenant) =>
-          tenant.healthScore == null ||
           tenant.mfaCoverage == null ||
           !tenant.identityExact ||
           !tenant.attentionReported ||
@@ -666,25 +648,28 @@ export default function DashboardPage() {
           className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
         >
           <span className="font-semibold">Partial dashboard evidence.</span>{' '}
-          Unreported health, MFA, risk, or synchronization values remain visibly unavailable.
+          Missing or incomplete finding, MFA, risk, or synchronization evidence remains indicated.
         </div>
       ) : null}
       {/* KPI Cards */}
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+      <div className="grid gap-4 lg:grid-cols-3">
         {nativeRiskPanel}
 
         <Card className="rounded-2xl">
           <CardContent className="p-5">
             <div className="flex items-start justify-between gap-3">
               <div>
-                <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  Critical Tenants
+                <div className="text-[11px] font-semibold tracking-wider text-slate-500 dark:text-slate-400 uppercase">
+                  Tenants with reported critical findings
                 </div>
                 <div className="mt-1 text-3xl font-bold">
-                  {evidenceCount(kpis.criticalTenants, kpis.attentionPartial)}
+                  {kpis.criticalFindings.value}
                 </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  {kpis.attentionPartial ? 'Partial critical-signal evidence' : 'Current critical signals'}
+                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {kpis.criticalFindings.coverage}
+                </div>
+                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                  {kpis.criticalFindings.qualification}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-amber-50 border border-amber-100 flex items-center justify-center">
@@ -708,27 +693,6 @@ export default function DashboardPage() {
               </div>
               <div className="h-10 w-10 rounded-xl bg-blue-50 border border-blue-100 flex items-center justify-center">
                 <ShieldCheck className="h-5 w-5 text-blue-700" />
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="rounded-2xl">
-          <CardContent className="p-5">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  Tenant security score
-                </div>
-                <div className="mt-1 text-3xl font-bold">
-                  {kpis.avgScore === null ? 'Not reported' : `${kpis.avgScore}%`}
-                </div>
-                <div className="mt-1 text-xs text-slate-500">
-                  Tenant-only score not supplied
-                </div>
-              </div>
-              <div className="h-10 w-10 rounded-xl bg-green-50 border border-green-100 flex items-center justify-center">
-                <TrendingUp className="h-5 w-5 text-green-700" />
               </div>
             </div>
           </CardContent>
