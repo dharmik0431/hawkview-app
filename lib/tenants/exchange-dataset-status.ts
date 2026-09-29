@@ -61,7 +61,10 @@ export function exchangeDatasetStatus(
     return { state: 'STALE', label: `Stale${suffix}`, tone: 'warning', hasLastKnownRows, lastSuccessfulAt }
   }
   if (raw === 'running' || raw === 'starting') {
-    return { state: 'RUNNING', label: `Syncing${suffix}`, tone: 'warning', hasLastKnownRows, lastSuccessfulAt }
+    return { state: 'UNKNOWN', label: `Collector activity not verified${suffix}`, tone: 'warning', hasLastKnownRows, lastSuccessfulAt }
+  }
+  if (raw === 'pending' || raw === 'queued') {
+    return { state: 'UNKNOWN', label: `Collection queued${suffix}`, tone: 'neutral', hasLastKnownRows, lastSuccessfulAt }
   }
   return {
     state: 'UNKNOWN',

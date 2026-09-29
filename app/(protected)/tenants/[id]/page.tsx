@@ -22,12 +22,12 @@ import SignInActivitySection from './components/sections/signins-section'
 import ExchangePage from './components/sections/exchange-section'
 import SharePointPage from './components/sections/sharepoint-section'
 import RiskyUsersSection from '@/components/identity-risk/risky-users-section'
-import { RiskyUsersCountCard } from '@/components/identity-risk/risky-users-count-card'
+import { RiskyUsersOverviewRow } from '@/components/identity-risk/risky-users-overview-row'
 import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
 import TenantSettingsPage from './settings/page'
-import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
+import { deriveTenantWorkspaceDisplay, formatTenantTimestamp, serviceFreshnessDescription } from '@/lib/tenant-workspace-state'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
 import { investigateDestination } from '@/lib/tenants/investigate-navigation'
@@ -1362,6 +1362,14 @@ function formatUserDateTime(value?: string | null) {
 
 export default function TenantDetailsPage() {
   const { cacheScope } = useAuth()
+  const params = useParams<{ id: string }>()
+  // Remount tenant-local request and drawer state across navigation/account changes.
+  // A late response from the old instance cannot replace the new tenant's bundle.
+  return <TenantDetailsWorkspace key={JSON.stringify([cacheScope, params?.id])} />
+}
+
+function TenantDetailsWorkspace() {
+  const { cacheScope } = useAuth()
   const { identityRiskUi } = useFeatureFlags()
   const params = useParams<{ id: string }>()
   const pathname = usePathname()
@@ -1734,7 +1742,7 @@ export default function TenantDetailsPage() {
   const [tenantPickerOpen, setTenantPickerOpen] = useState(false)
   const [tenantSearch, setTenantSearch] = useState('')
 
-  // Refresh button state (fake)
+  // State of the explicit synchronization request
   const [syncState, setSyncState] = useState<
     'idle' | 'syncing' | 'success' | 'fail'
   >('idle')
@@ -2202,18 +2210,7 @@ export default function TenantDetailsPage() {
           : section === 'sharepoint' ? 'sharePointOneDrive'
             : null
   const serviceFreshness = freshnessKey ? bundle?.tenant?.syncFreshness?.services?.[freshnessKey] : null
-  const serviceFreshnessText = (() => {
-    if (!freshnessKey) return null
-    if (!serviceFreshness) return 'Freshness unavailable'
-    if (serviceFreshness.status === 'RUNNING') return 'Syncing'
-    if (serviceFreshness.status === 'NOT_COLLECTED' || serviceFreshness.freshnessStatus === 'NEVER_SYNCED') return 'Never synchronized'
-    if (serviceFreshness.status === 'PARTIAL') return `Partial — ${serviceFreshness.partialFailures.length} collector${serviceFreshness.partialFailures.length === 1 ? '' : 's'} need attention`
-    if (serviceFreshness.status === 'FAILED') return 'Collection failed'
-    if (serviceFreshness.status === 'STALE' || serviceFreshness.freshnessStatus === 'STALE') return 'Stale data'
-    return serviceFreshness.lastSuccessfulCollectionAt
-      ? `Updated ${formatTenantTimestamp(serviceFreshness.lastSuccessfulCollectionAt)}`
-      : 'Freshness unavailable'
-  })()
+  const serviceFreshnessText = freshnessKey ? serviceFreshnessDescription(serviceFreshness) : null
 
   const navItems = isMicrosoft
     ? [
@@ -4004,10 +4001,7 @@ export default function TenantDetailsPage() {
             isSyncing={syncState === 'syncing'}
             riskyUsers={
               identityRiskUi ? (
-                <RiskyUsersCountCard
-                  tenantId={resolvedTenantId}
-                  onOpen={() => handleSectionNavigate('risky-users')}
-                />
+                <RiskyUsersOverviewRow tenantId={resolvedTenantId} />
               ) : null
             }
           />
@@ -4798,9 +4792,9 @@ export default function TenantDetailsPage() {
                           className="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 shadow-xs hover:bg-slate-50 dark:hover:bg-slate-700 transition flex items-center gap-2 cursor-pointer"
                           title={
                             syncState === 'syncing'
-                              ? 'Syncing...'
+                              ? 'Request pending...'
                               : syncState === 'success'
-                                ? 'Sync complete'
+                                ? 'Request completed'
                                 : syncState === 'fail'
                                   ? 'Sync failed'
                                   : 'Refresh data'
@@ -4814,9 +4808,9 @@ export default function TenantDetailsPage() {
                           />
                           <span className="hidden sm:inline">
                             {syncState === 'syncing'
-                              ? 'Syncing'
+                              ? 'Request pending'
                               : syncState === 'success'
-                                ? 'Synced'
+                                ? 'Request completed'
                                 : 'Sync Now'}
                           </span>
                         </button>
@@ -4825,12 +4819,12 @@ export default function TenantDetailsPage() {
 
                     {syncState === 'fail' && (
                       <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:bg-red-950/40 dark:border-red-900/50 dark:text-red-300">
-                        Sync failed. Please try again.
+                        Synchronization request failed. Please try again.
                       </div>
                     )}
                     {syncState === 'success' && (
-                      <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-xs text-green-700 dark:bg-green-950/40 dark:border-green-900/50 dark:text-green-300">
-                        Sync completed successfully.
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">
+                        Synchronization request completed. Review the recorded collection results below.
                       </div>
                     )}
                   </>
