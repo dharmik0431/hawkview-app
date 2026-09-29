@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo } from 'react'
 import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { licensesAge } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -513,7 +514,6 @@ export default function LicensesSection({
 
   return (
     <div className="space-y-6 mt-4">
-      <SectionFreshness source={bundle} service="office365" />
       {/* 1. Page Summary Strip: 3 Operational Values */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
         {/* Card 1: Subscribed Products */}
@@ -562,7 +562,9 @@ export default function LicensesSection({
             )}
           </div>
           <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            Synchronized security defaults setting
+            {securityDefaultsState === 'Awaiting collection'
+              ? 'Security defaults evidence unavailable'
+              : 'Reported security defaults setting'}
           </div>
         </div>
 
@@ -588,7 +590,7 @@ export default function LicensesSection({
       </div>
 
       {/* 2. License Inventory Container */}
-      <Card className="rounded-2xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs">
+      <Card role="region" aria-labelledby="license-inventory-heading" className="rounded-2xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs">
         <CardContent className="p-6">
           {/* Header */}
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-slate-100 dark:border-slate-800/80">
@@ -600,13 +602,14 @@ export default function LicensesSection({
                 />
               </div>
               <div>
-                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">
+                <h3 id="license-inventory-heading" className="text-base font-bold text-slate-900 dark:text-slate-100">
                   License Inventory
                 </h3>
                 <p className="text-xs text-slate-500 dark:text-slate-400">
                   Subscribed Microsoft product licenses and unit utilization.
                   Click any row to inspect details.
                 </p>
+                <SectionFreshness evidence={licensesAge(bundle, licenseRows)} className="mt-1 mb-0" />
               </div>
             </div>
 

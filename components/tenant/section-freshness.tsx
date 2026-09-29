@@ -1,87 +1,39 @@
 'use client'
 
-/**
- * The freshness banner a tenant section shows above its data.
- *
- * One component rather than a label composed in each section. Eleven hand-built
- * variants would be eleven places for "collected and empty" and "could not
- * collect" to end up reading the same, and that pair is the distinction the
- * product exists for.
- *
- * Nothing here is a bare date. A timestamp with no judgement attached asks the
- * reader to work out whether seventeen days is a problem while they are
- * scanning, and they will not -- which is how a screen built on a collector
- * that stopped seventeen days ago came to look exactly like a screen built on
- * live data.
- */
-import { AlertTriangle, CheckCircle2, Clock3 } from 'lucide-react'
-import {
-  emptySectionMeaning,
-  freshnessPresentation,
-  serviceFreshness,
-  type ServiceFreshnessKey,
-} from '@/lib/tenants/service-freshness'
-import type { ServiceSyncFreshness } from '@/types/tenant-data'
+import { useEffect, useState } from 'react'
+import { Clock3 } from 'lucide-react'
+import { AGE_REFRESH_MS, datasetAge, datasetReportDate, type DatasetAgeEvidence } from '@/lib/tenants/dataset-age'
 import { cn } from '@/lib/utils'
 
-type Source = Parameters<typeof serviceFreshness>[0]
-
-const TONE = {
-  ok: {
-    wrap: 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-100',
-    Icon: CheckCircle2,
-  },
-  attention: {
-    wrap: 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100',
-    Icon: AlertTriangle,
-  },
-  unknown: {
-    wrap: 'border-slate-300 bg-slate-50 text-slate-800 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200',
-    Icon: Clock3,
-  },
-} as const
-
-/**
- * @param service which service's collectors feed this section
- * @param isEmpty whether the section has nothing to show, so the banner can say
- *   what that emptiness means rather than leaving the reader to assume
- */
-export function SectionFreshness({
-  source,
-  service,
-  isEmpty = false,
-  className,
-}: {
-  source: Source
-  service: ServiceFreshnessKey
+/** Compact dataset age. This never interprets worker status as live activity. */
+export function SectionFreshness({ evidence, isEmpty = false, className }: {
+  evidence: DatasetAgeEvidence
   isEmpty?: boolean
   className?: string
 }) {
-  const freshness: ServiceSyncFreshness | null = serviceFreshness(
-    source,
-    service
-  )
-  const shown = freshnessPresentation(freshness)
-  const emptiness = emptySectionMeaning(freshness, isEmpty)
-  const tone = TONE[shown.tone]
-
+  // A stable initial render avoids server/client clock and hydration differences.
+  const [now, setNow] = useState<number | null>(null)
+  useEffect(() => {
+    setNow(Date.now())
+    const timer = setInterval(() => setNow(Date.now()), AGE_REFRESH_MS)
+    return () => clearInterval(timer)
+  }, [])
+  const shown = datasetAge(evidence, now ?? NaN)
+  const reportDate = datasetReportDate(evidence, now ?? NaN)
+  const description = `${reportDate ? reportDate + '. ' : ''}${shown.label}${shown.outdated ? ', outdated' : ''}. ${evidence.source}: ${shown.timestamp ?? 'update time unavailable'}`
   return (
-    <div
-      className={cn(
-        'mb-4 rounded-lg border px-3 py-2 text-xs leading-relaxed',
-        tone.wrap,
-        className
-      )}
-    >
-      <p className="flex items-center gap-1.5 font-semibold">
-        <tone.Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        {shown.label}
+    <div className={cn('mb-4 text-xs text-slate-500 dark:text-slate-400', className)}>
+      <p className="flex flex-wrap items-center gap-1.5" title={description} aria-label={description}>
+        <Clock3 className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        {reportDate && <span>{reportDate} ·</span>}
+        {shown.timestamp ? <time dateTime={shown.timestamp}>{shown.label}</time> : <span>{shown.label}</span>}
+        {shown.outdated && <span className="font-medium text-amber-700 dark:text-amber-400">· Outdated</span>}
       </p>
-      <p className="mt-0.5">{shown.detail}</p>
-      {/* The emptiness is qualified where the emptiness is, not in a tooltip
-          somewhere else. A reader who sees no rows has already drawn their
-          conclusion by the time they would hover. */}
-      {emptiness && <p className="mt-1 font-medium">{emptiness}</p>}
+      {isEmpty && <p className="mt-1">
+        {evidence.emptyVerified && shown.timestamp
+          ? 'The recorded snapshot contains no records.'
+          : 'No records are shown. An empty result has not been verified.'}
+      </p>}
     </div>
   )
 }

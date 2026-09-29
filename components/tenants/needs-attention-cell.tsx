@@ -1,3 +1,4 @@
+import { customerAttention } from '@/lib/attention/customer-attention'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import { topAttention } from '@/lib/attention/topAttention'
 import { cn } from '@/lib/utils'
@@ -10,16 +11,18 @@ const severityStyles: Record<AttentionSeverity, string> = {
 }
 
 export function NeedsAttentionCell({ tenant }: { tenant: any }) {
+  const view = customerAttention(tenant)
   const attention = topAttention(
     computeTenantAttention(tenant)
   )
 
   if (!attention.length) {
-    return <span className="text-muted-foreground">—</span>
+    return <span className="text-muted-foreground">{view.incomplete ? 'Evidence incomplete' : 'No actions reported'}</span>
   }
 
   return (
     <div className="flex flex-wrap gap-1">
+      {view.incomplete && <span className="text-xs text-muted-foreground">Evidence incomplete</span>}
       {attention.map((a) => (
         <span
           key={a.key}

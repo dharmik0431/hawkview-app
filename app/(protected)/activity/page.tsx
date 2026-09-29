@@ -1,5 +1,8 @@
 'use client'
 
+import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { activityLogsAge } from '@/lib/tenants/dataset-age'
+
 import * as React from 'react'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -764,32 +767,18 @@ export default function ActivityPage() {
         tabIndex={0}
         className="space-y-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
       >
-      {filters.tenantId && activeSyncStatus === 'failed' && (
-        <div role="alert" className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
-          <div className="font-semibold">
-            {tab === 'signins' ? 'Sign-in' : 'Directory audit'} log sync failed
-          </div>
+      {filters.tenantId && bundleState === 'ready' && selectedBundle?.tenant?.id === filters.tenantId && (
+        <SectionFreshness evidence={activityLogsAge(selectedBundle, tab)} />
+      )}
+      {filters.tenantId && bundleState === 'ready' &&
+      ['failed', 'running', 'pending', 'in_progress', 'syncing'].includes(activeSyncStatus) && (
+        <div role="status" className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
+          <div className="font-semibold">Dataset completeness unverified</div>
           <div className="mt-1 text-xs leading-5">
-            HawkView could not refresh this dataset. Previously retained events,
-            when available, remain visible. Review the tenant connection and
-            permissions before retrying.
+            Available events may not represent a complete result. No empty-result finding is inferred.
           </div>
         </div>
       )}
-      {filters.tenantId &&
-      ['running', 'pending', 'in_progress', 'syncing'].includes(activeSyncStatus) ? (
-        <div
-          className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100"
-          role="status"
-          aria-live="polite"
-        >
-          <div className="font-semibold">Sync in progress</div>
-          <div className="mt-1 text-xs leading-5">
-            HawkView is collecting the latest {tab === 'signins' ? 'sign-in' : 'directory audit'} events.
-            Current results may be incomplete until this attempt finishes.
-          </div>
-        </div>
-      ) : null}
       {filters.tenantId &&
       bundleState === 'ready' &&
       (activityEvidencePartial || ['partial', 'stale'].includes(activeSyncStatus)) ? (
@@ -798,7 +787,7 @@ export default function ActivityPage() {
           role="status"
         >
           <div className="font-semibold">
-            {activeSyncStatus === 'stale' ? 'Stale log evidence' : 'Partial log evidence'}
+            Partial log evidence
           </div>
           <div className="mt-1 text-xs leading-5">
             Some event fields or collection evidence were not reported. HawkView

@@ -249,7 +249,7 @@ export function TenantRiskMatrix({
                     </button>
                   </th>
 
-                  {/* Col 2: Microsoft Secure Score, with HawkView Health shown alongside below. */}
+                  {/* Col 2: Microsoft Secure Score, with Tenant score shown alongside below. */}
                   <th scope="col" className="py-3 px-4 min-w-[190px]">
                     <button
                       type="button"
@@ -296,9 +296,9 @@ export function TenantRiskMatrix({
                       type="button"
                       onClick={() => handleHeaderSort('active_threats')}
                       className="group flex items-center gap-1.5 hover:text-slate-900 dark:hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1 -ml-1"
-                      title="Sort by Active Threats"
+                      title="Sort by Tenant Findings"
                     >
-                      <span>Threats & Alerts</span>
+                      <span>Reported Findings</span>
                       {renderSortIcon('active_threats')}
                     </button>
                   </th>
@@ -361,7 +361,7 @@ export function TenantRiskMatrix({
                         </div>
                       </td>
 
-                      {/* 2. Microsoft Secure Score and HawkView Health Score */}
+                      {/* 2. Microsoft Secure Score and HawkView Tenant Score */}
                       <td className="py-3.5 px-4 align-middle">
                         <div className="space-y-2 max-w-[170px]">
                           <div>
@@ -419,9 +419,9 @@ export function TenantRiskMatrix({
                             )}
                           </div>
                           <div className="border-t border-slate-100 dark:border-slate-800 pt-2 flex items-center justify-between gap-2">
-                            <span className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">HawkView Health</span>
+                            <span className="text-[10px] uppercase tracking-wide text-slate-400 font-semibold">Tenant score</span>
                             <span className="font-bold text-slate-700 dark:text-slate-200">
-                              {Number.isFinite(t.healthScore) ? `${t.healthScore}%` : 'Not reported'}
+                              <span title="A tenant-only score is not supplied">Unavailable</span>
                             </span>
                           </div>
                         </div>
@@ -521,7 +521,7 @@ export function TenantRiskMatrix({
                               ) : (
                                 <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
                                   <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
-                                  <span>No active threats</span>
+                                  <span>No findings reported</span>
                                 </span>
                               )}
                             </div>
@@ -635,7 +635,7 @@ export function TenantRiskMatrix({
 
                   {/* Compact Security Metrics Grid */}
                   <div className="grid grid-cols-2 gap-2 text-xs pt-1 border-t border-slate-100 dark:border-slate-800">
-                    {/* Microsoft Secure Score and HawkView Health Score */}
+                    {/* Microsoft Secure Score and HawkView Tenant Score */}
                     <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 space-y-1">
                       <span className="text-[10px] uppercase font-bold text-slate-400 block">
                         Microsoft Secure Score
@@ -665,9 +665,9 @@ export function TenantRiskMatrix({
                         </span>
                       )}
                       <div className="border-t border-slate-200 dark:border-slate-700 pt-1.5 mt-1.5 flex items-center justify-between gap-2">
-                        <span className="text-[10px] uppercase font-bold text-slate-400">HawkView Health</span>
+                        <span className="text-[10px] uppercase font-bold text-slate-400">Tenant score</span>
                         <span className="font-bold text-slate-700 dark:text-slate-200">
-                          {Number.isFinite(t.healthScore) ? `${t.healthScore}%` : 'Not reported'}
+                          <span title="A tenant-only score is not supplied">Unavailable</span>
                         </span>
                       </div>
                     </div>
@@ -707,7 +707,7 @@ export function TenantRiskMatrix({
                     {/* Threats */}
                     <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 space-y-1">
                       <span className="text-[10px] uppercase font-bold text-slate-400 block">
-                        Threats & Alerts
+                        Reported Findings
                       </span>
                       {threatsInfo.statusType === 'available' ? (
                         <span className={cn('font-bold block', threatsInfo.count! > 0 ? 'text-red-700 dark:text-red-400' : 'text-emerald-700 dark:text-emerald-400')}>

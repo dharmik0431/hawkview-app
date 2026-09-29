@@ -10,6 +10,7 @@ import {
   Info,
   LucideIcon,
 } from 'lucide-react'
+import { customerAttention, customerStatus } from '@/lib/attention/customer-attention'
 import type { Tenant } from '@/types/api'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import {
@@ -40,208 +41,29 @@ export interface MatrixOverallStateInfo {
 export function getTenantMatrixOverallState(
   tenant: Tenant
 ): MatrixOverallStateInfo {
-  const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
-  const tenantStatus = String(tenant.status || '').toLowerCase()
-  const missingPerms = tenant.missingPermissions || []
-
-  const attentionItems = computeTenantAttention(tenant)
-
-  const isDisconnected =
-    ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
-    ['suspended', 'disconnected'].includes(tenantStatus)
-
-  const isPending =
-    ['pending-consent', 'pending'].includes(connectionStatus) ||
-    tenantStatus === 'pending'
-  const hasExplicitConnection = ['connected', 'error', 'revoked', 'disconnected', 'pending-consent', 'pending'].includes(connectionStatus)
-  const microsoftRiskSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
-  const hasBaselineEvidence =
-    Number.isFinite(tenant.healthScore) &&
-    microsoftRiskSummary?.availability === 'AVAILABLE' &&
-    tenant.mfaCoverage != null &&
-    Array.isArray(tenant.attention)
-
-  const hasCriticalAttention = attentionItems.some(
-    (item) => item.severity === 'critical'
-  )
-
-  // 1. Critical
-  if (hasCriticalAttention) {
-    return {
-      key: 'critical',
-      label: 'Critical',
-      badgeClass:
-        'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-900/60',
-      icon: ShieldAlert,
-      rank: 1,
-    }
-  }
-
-  // 2. Disconnected
-  if (isDisconnected) {
-    return {
-      key: 'disconnected',
-      label: 'Disconnected',
-      badgeClass:
-        'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/50 dark:text-red-300 dark:border-red-900/60',
-      icon: XCircle,
-      rank: 2,
-    }
-  }
-
-  // 3. Needs Attention
-  if (
-    attentionItems.length > 0 ||
-    missingPerms.length > 0 ||
-    (tenant.mfaCoverage !== null && tenant.mfaCoverage !== undefined && tenant.mfaCoverage < 85)
-  ) {
-    return {
-      key: 'needs_attention',
-      label: 'Needs Attention',
-      badgeClass:
-        'bg-amber-50 text-amber-800 border-amber-200 dark:bg-amber-950/50 dark:text-amber-300 dark:border-amber-900/60',
-      icon: AlertTriangle,
-      rank: 3,
-    }
-  }
-
-  // 4. Pending and unknown evidence must be resolved before freshness.
-  if (isPending) {
-    return {
-      key: 'pending_setup',
-      label: 'Pending Setup',
-      badgeClass:
-        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
-      icon: Clock,
-      rank: 5,
-    }
-  }
-
-  if (!hasExplicitConnection || !hasBaselineEvidence) {
-    return {
-      key: 'unknown',
-      label: 'Partial Data',
-      badgeClass:
-        'bg-slate-100 text-slate-700 border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700',
-      icon: Info,
-      rank: 5,
-    }
-  }
-
-  // 5. Stale / Awaiting Sync
-  if (!tenant.lastSync) {
-    return {
-      key: 'stale',
-      label: 'Awaiting Sync',
-      badgeClass:
-        'bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/50 dark:text-violet-300 dark:border-violet-900/60',
-      icon: RefreshCw,
-      rank: 4,
-    }
-  }
-
-  const syncTime = new Date(tenant.lastSync).getTime()
-  const hoursOld = (Date.now() - syncTime) / (1000 * 60 * 60)
-  if (hoursOld > 24) {
-    return {
-      key: 'stale',
-      label: 'Stale Data',
-      badgeClass:
-        'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900/60',
-      icon: Clock,
-      rank: 4,
-    }
-  }
-
-  // 6. Healthy
+  const view = customerAttention(tenant)
+  const critical = view.findings.some(item => item.severity === 'critical')
+  const risk = getTenantRiskyUsersInfo(tenant)
+  const positive = view.findings.length > 0 || (risk.count ?? 0) > 0
   return {
-    key: 'healthy',
-    label: 'Healthy',
-    badgeClass:
-      'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-900/60',
-    icon: CheckCircle2,
-    rank: 6,
+    key: critical ? 'critical' : positive ? 'needs_attention' : view.accessActions.length ? 'pending_setup' : view.incomplete ? 'unknown' : 'healthy',
+    label: positive && !view.findings.length ? `Microsoft risk reported${view.incomplete ? ' · Evidence incomplete' : ''}` : customerStatus(view),
+    badgeClass: positive || view.accessActions.length ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-slate-100 text-slate-700 border-slate-200',
+    icon: critical ? ShieldAlert : positive ? AlertTriangle : Info,
+    rank: critical ? 1 : positive ? 3 : 5,
   }
 }
 
 export function getTenantActiveIssuesInfo(tenant: Tenant) {
-  const attentionItems = computeTenantAttention(tenant)
-  const evidenceAvailable = Array.isArray(tenant.attention)
-
-  const missingPerms = tenant.missingPermissions || []
-  const isDisconnected =
-    ['error', 'revoked', 'disconnected'].includes(
-      String(tenant.connectionStatus || '').toLowerCase()
-    ) ||
-    ['suspended', 'disconnected'].includes(
-      String(tenant.status || '').toLowerCase()
-    )
-
-  if (isDisconnected) {
-    return {
-      count: evidenceAvailable ? attentionItems.length : null,
-      highestSeverity: 'critical' as const,
-      summaryText: 'Microsoft connection lost',
-      evidenceAvailable,
-    }
-  }
-
-  const totalCount = attentionItems.length
-  if (!evidenceAvailable) {
-    return {
-      count: null,
-      highestSeverity: 'unknown' as const,
-      summaryText: 'Issue evidence not reported',
-      evidenceAvailable: false,
-    }
-  }
-  if (totalCount === 0) {
-    return {
-      count: 0,
-      highestSeverity: 'none' as const,
-      summaryText: 'No active issues',
-      evidenceAvailable: true,
-    }
-  }
-
-  const hasCritical = attentionItems.some((i) => i.severity === 'critical')
-  const hasHigh = attentionItems.some((i) => i.severity === 'high')
-  const highestSeverity = hasCritical
-    ? ('critical' as const)
-    : hasHigh
-    ? ('high' as const)
-    : ('medium' as const)
-
-  let summaryParts: string[] = []
-  if (missingPerms.length > 0) {
-    summaryParts.push('Missing permissions')
-  }
-  if (
-    tenant.mfaCoverage !== null &&
-    tenant.mfaCoverage !== undefined &&
-    tenant.mfaCoverage < 85
-  ) {
-    summaryParts.push(`MFA registration: ${tenant.mfaCoverage}% covered`)
-  }
-  const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
-  if (riskAttention) {
-    summaryParts.push(riskAttention.label)
-  }
-
-  if (summaryParts.length === 0 && attentionItems.length > 0) {
-    summaryParts.push(attentionItems[0].label)
-  }
-
-  const summaryText =
-    totalCount === 1
-      ? `1 issue · ${summaryParts[0] || 'Attention required'}`
-      : `${totalCount} issues · ${summaryParts.slice(0, 2).join(' & ')}`
-
+  const view = customerAttention(tenant)
+  const items = [...view.findings, ...view.accessActions]
+  const count = items.length || (view.incomplete ? null : 0)
   return {
-    count: totalCount,
-    highestSeverity,
-    summaryText,
-    evidenceAvailable: true,
+    count,
+    highestSeverity: items.some(i => i.severity === 'critical') ? 'critical' as const : items.some(i => i.severity === 'high') ? 'high' as const : items.length ? 'medium' as const : view.incomplete ? 'unknown' as const : 'none' as const,
+    summaryText: `${items.length ? `${items.length} reported customer actions` : view.incomplete ? 'Customer action total unavailable' : 'No customer actions reported'}${view.incomplete && items.length ? ' · Evidence incomplete' : ''}`,
+    evidenceAvailable: items.length > 0 || !view.incomplete,
+    incomplete: view.incomplete,
   }
 }
 
@@ -278,17 +100,7 @@ export function getTenantIdentityInfo(tenant: Tenant) {
   const riskPresentation = summary ? presentMicrosoftRiskSummary(summary) : null
   const riskyCount = riskPresentation?.count ?? null
 
-  if (isDisconnected) {
-    riskyText = 'Risk data unavailable'
-  } else if (isPending) {
-    riskyText = 'Awaiting synchronization'
-  } else if (tenant.missingPermissions && tenant.missingPermissions.some(p => p.toLowerCase().includes('identityrisk') || p.toLowerCase().includes('audit'))) {
-    riskyText = 'Permission required'
-  } else if (riskPresentation) {
-    riskyText = riskPresentation.headline
-  } else {
-    riskyText = 'Risk data not reported'
-  }
+  riskyText = riskPresentation?.headline ?? 'Risk data not reported'
 
   return {
     mfaText,
@@ -317,37 +129,9 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
     connectionState = 'pending'
   }
 
-  let dataText = 'Data: Not reported'
-  let dataStatus: 'current' | 'partial' | 'stale' | 'failed' | 'awaiting_sync' | 'unknown' = 'unknown'
-
-  if (connectionState === 'disconnected') {
-    dataText = 'Data: Failed'
-    dataStatus = 'failed'
-  } else if (connectionState === 'pending') {
-    dataText = 'Data: Awaiting Sync'
-    dataStatus = 'awaiting_sync'
-  } else if (connectionState === 'unknown') {
-    dataText = 'Data: Not reported'
-    dataStatus = 'unknown'
-  } else if (missingPerms.length > 0) {
-    dataText = 'Data: Partial · Permission required'
-    dataStatus = 'partial'
-  } else if (!tenant.lastSync) {
-    dataText = 'Data: Awaiting Sync'
-    dataStatus = 'awaiting_sync'
-  } else {
-    const syncTime = new Date(tenant.lastSync).getTime()
-    if (!Number.isFinite(syncTime)) {
-      dataText = 'Data: Timestamp not reported'
-      dataStatus = 'unknown'
-    } else if ((Date.now() - syncTime) / (1000 * 60 * 60) > 24) {
-      dataText = 'Data: Stale'
-      dataStatus = 'stale'
-    } else {
-      dataText = 'Data: Current'
-      dataStatus = 'current'
-    }
-  }
+  const view = customerAttention(tenant)
+  const dataText = view.incomplete ? 'Evidence: Incomplete' : 'Evidence: Supplied coverage complete'
+  const dataStatus = view.incomplete ? 'partial' as const : 'current' as const
 
   return {
     connectionText,
@@ -413,68 +197,12 @@ export function getTenantSyncTimeInfo(lastSync: string | null) {
 }
 
 export function getTenantRecommendedAction(tenant: Tenant) {
-  const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
-  const isDisconnected = ['error', 'revoked', 'disconnected'].includes(connectionStatus)
-  const isPending = ['pending-consent', 'pending'].includes(connectionStatus)
-  const missingPerms = tenant.missingPermissions || []
-
-  const attentionItems = computeTenantAttention(tenant)
-  const riskAttention = attentionItems.find((item) => item.key.toLowerCase().includes('risky'))
-  const riskInfo = getTenantRiskyUsersInfo(tenant)
-
-  if (isDisconnected) {
-    return {
-      label: 'Reconnect Microsoft 365',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}/settings`,
-      description: 'Re-authenticate the Microsoft 365 connector to restore synchronization.',
-    }
-  }
-
-  if (isPending) {
-    return {
-      label: 'Review permissions',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}/settings`,
-      description: 'Grant administrator consent to finalize tenant setup.',
-    }
-  }
-
-  if ((riskInfo.count ?? 0) > 0) {
-    return {
-      label: riskAttention?.actionLabel ?? 'Review Microsoft risk',
-      destinationUrl: tenantRiskyUsersPath(tenant.id),
-      description: riskAttention?.why ?? riskInfo.breakdownNote,
-    }
-  }
-
-  if (attentionItems.length > 0) {
-    return {
-      label: 'Review threats',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-      description: `${attentionItems.length} active security threat${attentionItems.length === 1 ? '' : 's'} require remediation.`,
-    }
-  }
-
-  if (tenant.secureScore !== null && tenant.secureScore !== undefined && tenant.secureScore < 70) {
-    return {
-      label: 'Improve Secure Score',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-      description: `Microsoft Secure Score is at ${tenant.secureScore}%, below 70% benchmark.`,
-    }
-  }
-
-  if (missingPerms.length > 0 || (typeof tenant.mfaCoverage === 'number' && tenant.mfaCoverage < 85)) {
-    return {
-      label: 'Review security posture',
-      destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-      description: 'Address permission gaps or sub-baseline MFA registration coverage.',
-    }
-  }
-
-  return {
-    label: 'View tenant',
-    destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`,
-    description: 'Inspect tenant security posture and directory configurations.',
-  }
+  const view = customerAttention(tenant)
+  const risk = getTenantRiskyUsersInfo(tenant)
+  if ((risk.count ?? 0) > 0) return { label: 'Review Microsoft risk', destinationUrl: tenantRiskyUsersPath(tenant.id), description: risk.breakdownNote }
+  if (view.findings.length) return { label: 'Review findings', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`, description: `${view.findings.length} reported findings for review. These can include configuration changes and registration gaps.` }
+  if (view.accessActions.length) return { label: 'Review access setup', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}/settings`, description: view.accessActions[0].why }
+  return { label: 'View tenant', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`, description: view.incomplete ? 'Evidence is incomplete; no customer action is inferred.' : 'Review the supplied tenant evidence.' }
 }
 
 export function getTenantSecureScoreInfo(tenant: Tenant) {
@@ -543,44 +271,7 @@ export function getTenantSecureScoreInfo(tenant: Tenant) {
   }
 }
 
-export function getTenantRiskyUsersInfo(tenant: Tenant) {
-  const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
-  const tenantStatus = String(tenant.status || '').toLowerCase()
-  const isDisconnected =
-    ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
-    ['suspended', 'disconnected'].includes(tenantStatus)
-  const isPending =
-    ['pending-consent', 'pending'].includes(connectionStatus) ||
-    tenantStatus === 'pending'
-
-  if (isDisconnected) {
-    return {
-      count: null,
-      label: 'Disconnected',
-      statusType: 'disconnected' as const,
-      breakdownNote: 'Connection lost',
-    }
-  }
-
-  if (isPending) {
-    return {
-      count: null,
-      label: 'Awaiting synchronization',
-      statusType: 'awaiting_sync' as const,
-      breakdownNote: 'Sync pending',
-    }
-  }
-
-  const missingPerms = tenant.missingPermissions || []
-  if (missingPerms.some((p) => p.toLowerCase().includes('identityrisk') || p.toLowerCase().includes('audit'))) {
-    return {
-      count: null,
-      label: 'Permission required',
-      statusType: 'permission_required' as const,
-      breakdownNote: 'Azure AD P2 required',
-    }
-  }
-
+export function getTenantRiskyUsersInfo(tenant: Tenant): {count: number | null; isExact?: boolean; label: string; statusType: 'available' | 'partial' | 'unavailable' | 'disconnected' | 'awaiting_sync' | 'permission_required'; breakdownNote: string} {
   const summary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
   if (summary) {
     const presentation = presentMicrosoftRiskSummary(summary)
@@ -606,172 +297,22 @@ export function getTenantRiskyUsersInfo(tenant: Tenant) {
   }
 }
 
-export function getTenantThreatsInfo(tenant: Tenant) {
-  const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
-  const tenantStatus = String(tenant.status || '').toLowerCase()
-  const isDisconnected =
-    ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
-    ['suspended', 'disconnected'].includes(tenantStatus)
-  const isPending =
-    ['pending-consent', 'pending'].includes(connectionStatus) ||
-    tenantStatus === 'pending'
-
-  if (isDisconnected) {
-    return {
-      count: null,
-      isConfirmedZero: false,
-      label: 'Disconnected',
-      statusType: 'disconnected' as const,
-      resolvedCount: null,
-    }
-  }
-
-  if (isPending) {
-    return {
-      count: null,
-      isConfirmedZero: false,
-      label: 'Awaiting synchronization',
-      statusType: 'awaiting_sync' as const,
-      resolvedCount: null,
-    }
-  }
-
-  const attentionItems = computeTenantAttention(tenant)
-
-  if (!Array.isArray(tenant.attention)) {
-    return {
-      count: null,
-      isConfirmedZero: false,
-      label: 'Threat evidence not reported',
-      statusType: 'unavailable' as const,
-      resolvedCount: null,
-    }
-  }
-
-  const count = attentionItems.length
+export function getTenantThreatsInfo(tenant: Tenant): {count: number | null; isConfirmedZero: boolean; label: string; statusType: 'available' | 'unavailable' | 'disconnected' | 'awaiting_sync'; resolvedCount: null} {
+  const view = customerAttention(tenant)
+  const count = view.findings.length || (view.incomplete ? null : 0)
   return {
-    count,
-    isConfirmedZero: count === 0,
-    label: count === 0 ? 'No active threats' : `${count} active threat${count === 1 ? '' : 's'}`,
-    statusType: 'available' as const,
+    count, isConfirmedZero: count === 0 && !view.incomplete,
+    label: count === null ? 'Finding total unavailable' : `${count} reported finding${count === 1 ? '' : 's'}${view.incomplete ? ' · Evidence incomplete' : ''}`,
+    statusType: count === null ? 'unavailable' as const : 'available' as const,
     resolvedCount: null,
   }
 }
 
 export function getPrimaryConcern(tenant: Tenant) {
-  const connectionStatus = String(tenant.connectionStatus || '').toLowerCase()
-  const tenantStatus = String(tenant.status || '').toLowerCase()
-
-  const isDisconnected =
-    ['error', 'revoked', 'disconnected'].includes(connectionStatus) ||
-    ['suspended', 'disconnected'].includes(tenantStatus)
-
-  const isPending =
-    ['pending-consent', 'pending'].includes(connectionStatus) ||
-    tenantStatus === 'pending'
-
-  if (isDisconnected) {
-    return {
-      title: 'Connection Lost',
-      detail: 'Microsoft 365 connector is disconnected. Re-authentication is required.',
-      severity: 'critical' as const,
-      icon: XCircle,
-    }
-  }
-
-  if (isPending) {
-    return {
-      title: 'Pending Consent',
-      detail: 'Tenant connector requires administrator consent to establish monitoring.',
-      severity: 'warning' as const,
-      icon: Clock,
-    }
-  }
-
-  const attentionItems = computeTenantAttention(tenant)
-
-  const criticalItem = attentionItems.find((i) => i.severity === 'critical')
-  if (criticalItem) {
-    return {
-      title: criticalItem.label,
-      detail: criticalItem.why || 'Critical security finding requiring immediate remediation.',
-      severity: 'critical' as const,
-      icon: ShieldAlert,
-    }
-  }
-
-  const missingPerms = tenant.missingPermissions || []
-  if (missingPerms.length > 0) {
-    return {
-      title: 'Missing API Permissions',
-      detail: `Missing permissions (${missingPerms.slice(0, 2).join(', ')}${missingPerms.length > 2 ? '...' : ''}) prevent full monitoring.`,
-      severity: 'warning' as const,
-      icon: AlertTriangle,
-    }
-  }
-
-  if (
-    tenant.mfaCoverage !== null &&
-    tenant.mfaCoverage !== undefined &&
-    tenant.mfaCoverage < 85
-  ) {
-    return {
-      title: 'Low MFA Registration Coverage',
-      detail: `Directory MFA registration coverage is at ${tenant.mfaCoverage}%, below 85% baseline. This does not establish MFA enforcement.`,
-      severity: 'warning' as const,
-      icon: AlertTriangle,
-    }
-  }
-
-  const highItem = attentionItems.find((i) => i.severity === 'high')
-  if (highItem) {
-    return {
-      title: highItem.label,
-      detail: highItem.why || 'High severity alert flagged for review.',
-      severity: 'warning' as const,
-      icon: AlertTriangle,
-    }
-  }
-
-  const syncTime = tenant.lastSync ? new Date(tenant.lastSync).getTime() : 0
-  const isStale = !tenant.lastSync || Date.now() - syncTime > 24 * 60 * 60 * 1000
-  if (isStale) {
-    return {
-      title: 'Stale Synchronization',
-      detail: tenant.lastSync ? 'Last successful sync was over 24 hours ago.' : 'Tenant has not completed initial synchronization.',
-      severity: 'warning' as const,
-      icon: RefreshCw,
-    }
-  }
-
-  const mediumItem = attentionItems[0]
-  if (mediumItem) {
-    return {
-      title: mediumItem.label,
-      detail: mediumItem.why || 'Active security issue recorded.',
-      severity: 'info' as const,
-      icon: Info,
-    }
-  }
-
-  if (
-    !Array.isArray(tenant.attention) ||
-    !Number.isFinite(tenant.healthScore) ||
-    normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)?.availability !== 'AVAILABLE' ||
-    tenant.mfaCoverage == null
-  ) {
-    return {
-      title: 'Partial Security Evidence',
-      detail: 'One or more posture signals were not reported. HawkView cannot confirm a healthy state.',
-      severity: 'info' as const,
-      icon: Info,
-    }
-  }
-
-  return {
-    title: 'Posture Healthy',
-    detail: 'All baseline security, MFA, and connection checks are passing.',
-    severity: 'success' as const,
-    icon: CheckCircle2,
-  }
+  const view = customerAttention(tenant)
+  const item = [...view.findings, ...view.accessActions].sort((a,b) => ({critical:0,high:1,medium:2}[a.severity] - {critical:0,high:1,medium:2}[b.severity]))[0]
+  if (item) return { title: item.label, detail: `${item.why}${view.incomplete ? ' Evidence incomplete.' : ''}`, severity: item.severity === 'critical' ? 'critical' as const : 'warning' as const, icon: AlertTriangle }
+  const risk = getTenantRiskyUsersInfo(tenant)
+  if ((risk.count ?? 0) > 0) return { title: 'Microsoft risk reported', detail: risk.breakdownNote, severity: 'warning' as const, icon: ShieldAlert }
+  return { title: customerStatus(view), detail: 'The summary is not an exhaustive security assessment. Review individual evidence sources for coverage.', severity: 'info' as const, icon: Info }
 }

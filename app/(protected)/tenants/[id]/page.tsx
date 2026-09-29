@@ -27,7 +27,7 @@ import { TenantBlade } from './components/tenant-blade'
 import { TenantOverview } from './components/tenant-overview'
 import TenantBreadcrumb from './components/tenant-breadcrumb'
 import TenantSettingsPage from './settings/page'
-import { deriveTenantWorkspaceDisplay, formatTenantTimestamp, serviceFreshnessDescription } from '@/lib/tenant-workspace-state'
+import { deriveTenantWorkspaceDisplay, formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { normalizeCollectionReadiness } from '@/lib/tenants/collection-readiness'
 import { investigateDestination } from '@/lib/tenants/investigate-navigation'
@@ -2203,15 +2203,6 @@ function TenantDetailsWorkspace() {
           ? `Identity security findings for ${tenant?.name ?? 'this tenant'} that may require investigation.`
           : 'Manage configuration and view reports.'
 
-  const freshnessKey =
-    section === 'home' ? 'office365'
-      : section === 'entra' ? 'entraId'
-        : section === 'exchange' ? 'exchange'
-          : section === 'sharepoint' ? 'sharePointOneDrive'
-            : null
-  const serviceFreshness = freshnessKey ? bundle?.tenant?.syncFreshness?.services?.[freshnessKey] : null
-  const serviceFreshnessText = freshnessKey ? serviceFreshnessDescription(serviceFreshness) : null
-
   const navItems = isMicrosoft
     ? [
         {
@@ -4028,7 +4019,6 @@ function TenantDetailsWorkspace() {
             bundle={bundle}
             onSync={runSync}
             syncState={syncState}
-            serviceFreshnessText={serviceFreshnessText}
             onOpenMobileNav={() => setIsMobileNavOpen(true)}
           />
         )
@@ -4669,7 +4659,6 @@ function TenantDetailsWorkspace() {
                         signIns={SIGNINS}
                         signInEvidence={collectionReadiness?.evidence.signIns ?? null}
                         syncStatus={bundle?.sync?.signIns}
-                        freshness={bundle?.tenant?.syncFreshness?.services?.signInLogs}
                         signInView={signInView}
                         onSignInViewChange={handleSignInViewChange}
                       />
@@ -4774,14 +4763,7 @@ function TenantDetailsWorkspace() {
                           <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
                             {subheading}
                           </p>
-                          {serviceFreshnessText && (
-                            <p
-                              className="mt-1 text-[11px] font-medium text-slate-500 dark:text-slate-400"
-                              title={serviceFreshness?.lastSuccessfulCollectionAt ?? undefined}
-                            >
-                              Freshness: {serviceFreshnessText}
-                            </p>
-                          )}
+
                         </div>
                       </div>
 

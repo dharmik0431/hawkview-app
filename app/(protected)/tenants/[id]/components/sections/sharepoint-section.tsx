@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState, useEffect, useRef } from 'react'
 import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { sharePointAge, sharePointReportAge, sharePointSettingsAge } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -45,7 +46,6 @@ import {
   Cloud,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
   buildSharePointViewModel,
   sharePointReportedDeletedState,
@@ -152,7 +152,6 @@ export default function SharePointPage({
   bundle,
   onSync,
   syncState = 'idle',
-  serviceFreshnessText,
   onOpenMobileNav,
 }: SharePointSectionProps) {
   const [activeTab, setActiveTab] = useState<TabKey>('overview')
@@ -303,40 +302,7 @@ export default function SharePointPage({
     : 0
   const selectedSiteIdentifiersConcealed = selectedSite?.activityDataStatus === 'identifiers-concealed'
 
-  // Collection Status strip data
-  const collectionInfo = sp?.collection ?? {}
-  const sharePointSync = sharePointView.sync
   const isSyncing = syncState === 'syncing'
-  const isLastKnownData = syncState === 'fail' || sharePointSync?.status === 'failed'
-
-  const lastAttemptRaw = sharePointSync.lastAttemptAt || collectionInfo.lastAttemptAt || bundle?.lastSyncAt
-  const lastSuccessRaw = sharePointSync.lastSuccessAt || collectionInfo.lastSuccessAt || bundle?.lastSuccessSyncAt
-  const reportRefreshedRaw = sharePointSync.reportRefreshedAt
-
-  const lastAttemptFormatted = formatTenantTimestamp(lastAttemptRaw)
-  const lastSuccessFormatted = formatTenantTimestamp(lastSuccessRaw)
-  const reportRefreshedFormatted = formatDate(reportRefreshedRaw)
-
-  // Fix Contradictory Status Logic: Never say "No Data" when valid legacy data/sites are present!
-  const syncStatusDotColor = (() => {
-    if (syncState === 'fail' || sharePointSync.status === 'failed') return 'bg-red-500'
-    if (sharePointSync?.status === 'partial') return 'bg-amber-500'
-    if (sharePointSync.status === 'success') return 'bg-emerald-500'
-    return 'bg-slate-400'
-  })()
-
-  const syncStatusLabel = (() => {
-    if (syncState === 'fail' || sharePointSync.status === 'failed') return 'Collection Needs Attention'
-    if (sharePointSync?.status === 'partial') return 'Partial Data Available'
-    if (sharePointSync.status === 'running') return 'Collector activity not verified'
-    if (sharePointSync.status === 'pending') return 'Collection pending'
-    if (SP_SITES.length > 0) {
-      if (lastSuccessRaw) return 'Retained Dataset'
-      return 'Legacy Data Available'
-    }
-    if (lastSuccessRaw) return 'Retained Dataset'
-    return 'Awaiting First Successful Collection'
-  })()
 
   // Derived metrics from real runtime fields
   const totalStorageUsedGB = useMemo(() => {
@@ -587,7 +553,7 @@ export default function SharePointPage({
 
   return (
     <div className="mt-1 space-y-4 text-slate-900 dark:text-slate-100">
-      <SectionFreshness source={bundle} service="sharePointOneDrive" />
+      <SectionFreshness evidence={sharePointAge()} />
       {/* ================= SINGLE MERGED PAGE HEADER ================= */}
       <div className="flex flex-col gap-2.5 pb-3 border-b border-slate-200 dark:border-slate-800">
         {/* Top Row: Title, Mobile Trigger, Tenant Context, Sync Now Button */}
@@ -648,69 +614,6 @@ export default function SharePointPage({
             </div>
           )}
         </div>
-
-        {/* Operational Status Ribbon */}
-        <div className="flex flex-wrap items-center gap-y-1.5 gap-x-3 sm:gap-x-4 text-xs text-slate-600 dark:text-slate-400 bg-slate-50/90 dark:bg-slate-800/60 px-3.5 py-2 rounded-xl border border-slate-200/80 dark:border-slate-800 shadow-2xs">
-          <div className="flex items-center gap-1.5 font-medium shrink-0">
-            <span className={cn('h-2 w-2 rounded-full shrink-0', syncStatusDotColor)} aria-hidden="true" />
-            <span className="text-slate-900 dark:text-slate-100 font-semibold">{syncStatusLabel}</span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Coverage: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200">
-              {serviceFreshnessText ?? 'Freshness unknown'}
-            </span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Last attempt: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200" title={lastAttemptRaw || undefined}>
-              {lastAttemptFormatted}
-            </span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Last success: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200" title={lastSuccessRaw || undefined}>
-              {lastSuccessFormatted}
-            </span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">MS report refreshed: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200">{reportRefreshedFormatted}</span>
-          </div>
-        </div>
-
-        {/* Sync Failure Banner */}
-        {isLastKnownData && (
-          <div className="text-xs px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 min-w-0">
-              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-              <span className="truncate">
-                Showing last successful collection from {lastSuccessFormatted}. Recent sync attempt failed.
-              </span>
-            </div>
-            {onSync && (
-              <button
-                type="button"
-                onClick={onSync}
-                className="underline hover:no-underline text-amber-900 dark:text-amber-200 font-medium shrink-0 cursor-pointer"
-              >
-                Retry
-              </button>
-            )}
-          </div>
-        )}
 
         {/* Microsoft usage-report privacy limitation. This is not a missing
             HawkView permission: Microsoft returned the report with Site IDs
@@ -1174,9 +1077,9 @@ export default function SharePointPage({
               <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
                 <div className="text-slate-500 flex items-center justify-between">
                   <span>SharePoint report</span>
-                  <span className={cn('h-2 w-2 rounded-full', reportRefreshedRaw ? 'bg-emerald-500' : 'bg-slate-400')} />
+
                 </div>
-                <div className="font-bold text-slate-900 dark:text-slate-100">{reportRefreshedFormatted}</div>
+                <SectionFreshness evidence={sharePointReportAge(sharePointView)} className="mb-0" />
               </div>
 
               <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
@@ -1187,13 +1090,7 @@ export default function SharePointPage({
                 <div className="font-bold text-slate-900 dark:text-slate-100">D30 (30 days)</div>
               </div>
 
-              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
-                <div className="text-slate-500 flex items-center justify-between">
-                  <span>HawkView sync</span>
-                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                </div>
-                <div className="font-bold text-slate-900 dark:text-slate-100">{lastSuccessFormatted}</div>
-              </div>
+
             </div>
           </div>
         </div>
@@ -1641,7 +1538,7 @@ export default function SharePointPage({
               {/* Source and Freshness Metadata */}
               <div className="text-[11px] text-slate-500 dark:text-slate-400 sm:text-right shrink-0">
                 <div>Source: <span className="font-medium text-slate-700 dark:text-slate-300">Microsoft Graph API</span></div>
-                <div>Refreshed: <span className="font-medium text-slate-700 dark:text-slate-300">{reportRefreshedFormatted || 'Current'}</span></div>
+                <SectionFreshness evidence={sharePointSettingsAge()} className="mb-0" />
               </div>
             </div>
 
@@ -1973,7 +1870,6 @@ export default function SharePointPage({
               <Info className="h-3.5 w-3.5 text-slate-400 shrink-0 mt-0.5" aria-hidden="true" />
               <span>
                 These are organization-wide tenant controls and may not represent the effective configuration of an individual site. HawkView currently displays these settings as read-only.
-                {reportRefreshedFormatted && ` (Collection source: Microsoft Graph API · Refreshed ${reportRefreshedFormatted})`}
               </span>
             </div>
 

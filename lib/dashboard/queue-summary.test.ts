@@ -6,7 +6,7 @@ import { queueSummary } from './queue-summary.ts'
 test('a zero over unread tenants is not a zero over read ones', () => {
   // THE TEST THE PM SET, APPLIED TO THIS SURFACE: can it distinguish an empty
   // list from an unreadable one, or does it have only a number? The old line
-  // had only `sortedQueueItems.length`, so both were "0 matching alerts".
+  // had only `sortedQueueItems.length`, so both were "0 matching findings".
   const allRead = queueSummary(0, { inScope: 14, read: 14 }, false)
   const someUnread = queueSummary(0, { inScope: 14, read: 10 }, false)
 
@@ -40,12 +40,12 @@ test('"try adjusting filters" is only said when filters could be the cause', () 
 })
 
 test('an incomplete count never travels alone', () => {
-  // "12 matching alerts" and "12 matching alerts across 10 of 14 tenants" are
+  // "12 matching findings" and "12 matching findings across 10 of 14 tenants" are
   // different claims and only the second is supported. The alerts found are
   // still real -- the number is a floor, not a fiction -- so it is qualified
   // rather than withheld.
   const partial = queueSummary(12, { inScope: 14, read: 10 }, false)
-  assert.match(partial.headline, /12 matching alerts/)
+  assert.match(partial.headline, /12 matching findings/)
   assert.match(partial.headline, /10 of 14 tenants/)
   assert.equal(partial.complete, false)
   assert.equal(partial.empty, null, 'a populated queue rendered an empty state')
@@ -53,7 +53,7 @@ test('an incomplete count never travels alone', () => {
   // The control: a complete count says the number plainly, with no hedge that
   // would make every screen read as doubtful.
   const whole = queueSummary(12, { inScope: 14, read: 14 }, false)
-  assert.equal(whole.headline, '12 matching alerts')
+  assert.equal(whole.headline, '12 matching findings')
   assert.equal(whole.complete, true)
 })
 
@@ -85,8 +85,8 @@ test('grammar follows the numbers, including the one-tenant fleet', () => {
   // A single-tenant MSP is the common case at the start, and "1 tenants" on the
   // first screen somebody sees is the kind of thing that makes the rest look
   // careless.
-  assert.match(queueSummary(1, { inScope: 3, read: 3 }, false).headline, /1 matching alert\b/)
-  assert.match(queueSummary(2, { inScope: 3, read: 3 }, false).headline, /2 matching alerts\b/)
+  assert.match(queueSummary(1, { inScope: 3, read: 3 }, false).headline, /1 matching finding\b/)
+  assert.match(queueSummary(2, { inScope: 3, read: 3 }, false).headline, /2 matching findings\b/)
   assert.match(
     queueSummary(0, { inScope: 1, read: 0 }, false).headline,
     /0 of 1 tenant\b/
@@ -114,7 +114,7 @@ test('coverage that cannot happen does not produce a negative shortfall', () => 
 
 test('the dashboard actually uses this, and no longer renders a bare length', () => {
   // A WIRING CHECK, ADDED BECAUSE THE MUTATION SWEEP ASKED FOR ONE. Replacing
-  // the heading with `{sortedQueueItems.length} matching alerts` again killed
+  // the heading with `{sortedQueueItems.length} matching findings` again killed
   // NOTHING -- every test above exercises queueSummary, and none of them can
   // see whether the page calls it. The bell needed the same check for the same
   // reason, and there it was the preview that misled me: a harness rendering
@@ -179,4 +179,25 @@ test('the dashboard actually uses this, and no longer renders a bare length', ()
     queueSummary(0, { inScope: 3, read: 3 }, true).empty!.detail,
     /Try adjusting filters/
   )
+})
+
+
+test('readable partial positive summaries are not described as findings across zero read tenants', () => {
+ const result=queueSummary(1,{inScope:1,read:1,incomplete:1},false)
+ assert.equal(result.complete,false);assert.match(result.headline,/1 reported finding/);assert.match(result.headline,/Evidence incomplete/)
+ assert.doesNotMatch(result.headline,/across 0/)
+ const empty=queueSummary(0,{inScope:1,read:1,incomplete:1},true)
+ assert.match(empty.empty!.detail,/does not establish zero findings/);assert.doesNotMatch(empty.empty!.detail,/adjusting filters/)
+})
+
+
+test('every complete empty branch is scoped to findings and preserves separate access setup', () => {
+ for (const filtersActive of [false, true]) {
+  const result = queueSummary(0, {inScope: 1, read: 1}, filtersActive)
+  assert.match(result.headline, /0 matching findings/)
+  assert.match(result.empty!.title, /tenant findings/)
+  assert.match(result.empty!.detail, /Customer access setup is shown separately/)
+  assert.match(result.empty!.detail, /not an exhaustive security assessment/)
+  assert.doesNotMatch(result.empty!.title + result.empty!.detail, /Nothing needs action|none raised|no actions|all.clear/i)
+ }
 })

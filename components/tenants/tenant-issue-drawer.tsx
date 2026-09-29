@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { customerAttention } from '@/lib/attention/customer-attention'
 import { computeTenantAttention } from '@/lib/attention/computeTenantAttention'
 import type { Tenant } from '@/types/api'
 import type { AttentionItem, AttentionSeverity } from '@/types/attention'
@@ -104,6 +105,7 @@ export function TenantIssueDrawer({
 
   if (!isOpen || !tenant) return null
 
+  const customer = customerAttention(tenant)
   const attentionItems: AttentionItem[] = computeTenantAttention(tenant)
 
   const copyTenantId = () => {
@@ -239,19 +241,20 @@ export function TenantIssueDrawer({
                 <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
                   <span>Detected Issues</span>
                   <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-0 text-xs px-2 py-0.5">
-                    {attentionItems.length}
+                    {attentionItems.length || (customer.incomplete ? 'Unavailable' : 0)}
                   </Badge>
                 </h3>
               </div>
 
+              {customer.incomplete && <p className="text-sm text-amber-800">Evidence incomplete. Known customer actions remain available.</p>}
               {attentionItems.length === 0 ? (
                 <div className="p-6 text-center rounded-2xl border border-emerald-200 bg-emerald-50/50 dark:border-emerald-900/40 dark:bg-emerald-950/20 space-y-2">
                   <CheckCircle2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400 mx-auto" />
                   <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-300">
-                    No active issues detected
+                    {customer.incomplete ? 'Evidence incomplete' : 'No customer actions reported'}
                   </p>
                   <p className="text-xs text-emerald-700 dark:text-emerald-400/80">
-                    This environment is connected and performing within healthy security parameters.
+                    This summary does not establish zero risk or exhaustive coverage.
                   </p>
                 </div>
               ) : (
@@ -272,7 +275,7 @@ export function TenantIssueDrawer({
                         <div className="flex items-start justify-between gap-2">
                           <div className="flex items-center gap-2 font-semibold text-sm text-slate-900 dark:text-white">
                             <IconComp className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                            <span>{item.label}</span>
+                            <span>{item.provenance?.origin === 'ACCESS_CONFIGURATION' ? 'Access setup: ' : 'Finding: '}{item.label}</span>
                           </div>
                           <Badge
                             className={cn(

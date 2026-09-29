@@ -18,7 +18,8 @@ const tenant = (id: string, organizationId: string, attention: unknown[]) => ({
   consentedPermissions: [],
   missingPermissions: [],
   connectionErrorCode: null,
-  attention,
+  data: { status: 'COMPLETE' },
+  attention: attention.map(row => ({ ...(row as object), provenance: {version:1, origin:'TENANT_FINDING', kind:'MFA_REGISTRATION_COVERAGE', remediationOwner:'CUSTOMER_ADMIN'} })),
   organization: { id: organizationId, name: organizationId, slug: organizationId },
 })
 
@@ -63,7 +64,7 @@ test('distinguishes an authoritative empty health result from malformed health e
     queryState: 'SUCCESS',
     response: { tenants: [tenant('tenant-a', 'org-a', [])] } as never,
   })
-  assert.deepEqual(healthy.actionableHealth, { status: 'VERIFIED', items: [] })
+  assert.equal(healthy.actionableHealth.status, 'VERIFIED'); assert.deepEqual(healthy.actionableHealth.items, [])
 
   const malformed = projectTenantOperationalHealth({
     tenantId: 'tenant-a',
@@ -72,5 +73,5 @@ test('distinguishes an authoritative empty health result from malformed health e
       tenants: [tenant('tenant-a', 'org-a', [{ key: 'unsafe', label: 'Unsafe', severity: 'high', why: 'line one\nline two' }])],
     } as never,
   })
-  assert.deepEqual(malformed.actionableHealth, { status: 'UNAVAILABLE', items: [] })
+  assert.equal(malformed.actionableHealth.status, 'UNAVAILABLE'); assert.deepEqual(malformed.actionableHealth.items, [])
 })
