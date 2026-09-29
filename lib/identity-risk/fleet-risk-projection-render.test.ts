@@ -67,7 +67,8 @@ test('actual payload → hook → page and drawer: clean, incomplete, Microsoft-
     assert.match(body(), /No users require review/)
     now += 2 * 60 * 60 * 1000 + 1
     await React.act(async () => tick())
-    assert.match(body(), /coverage is incomplete/)
+    assert.match(body(), /does not establish that there are no risky users/)
+    assert.match(body(), /HawkView assessments: 0 of 1 tenants have complete current evidence/)
     assert.doesNotMatch(body(), /No users require review/)
     now = Date.parse(stamp); await React.act(async () => tick())
     await render(null, microsoft(true))
@@ -75,8 +76,9 @@ test('actual payload → hook → page and drawer: clean, incomplete, Microsoft-
     assert.match(body(), /Current evidence/)
     const truncated = microsoft(); truncated.microsoftRiskSummary.rawRecordCount = 2; truncated.microsoftRiskSummary.activeDistinctUserCount = 2; truncated.microsoftRiskSummary.observedActiveDistinctUserCount = 2
     await render(native(), truncated)
-    assert.match(body(), /coverage is incomplete/)
-    assert.match(body(), /incomplete lists may omit other positives/)
+    assert.match(body(), /does not establish that there are no risky users/)
+    assert.match(body(), /Microsoft risk evidence: 0 of 1 tenants have complete current evidence/)
+    assert.match(body(), /Available evidence may not include every affected user/)
     assert.match(body(), /Microsoft reports 2 identities; 0 details shown/)
     const nativeTruncated = native(); nativeTruncated.count.value = 7
     await render(nativeTruncated, microsoft())

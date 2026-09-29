@@ -181,14 +181,6 @@ export default function FleetRiskyUsersPage() {
     [tenantStatuses, fleetSize]
   )
 
-  // EVERY COVERAGE CLAIM ON THIS PAGE CAME OFF `metrics.failedTenants`, which
-  // counts only assessmentError. Eight sites: the tile, the heading, the
-  // "N of M evaluated" lines, the styling, and the partial-coverage banner --
-  // which, because it renders only when failedTenants > 0, did not appear AT
-  // ALL for a fleet whose tenants came back UNAVAILABLE rather than errored.
-  // One derived number now, so the page cannot tell two coverage stories.
-  const notAssessed = fleetWide.inScope - fleetWide.assessed
-  const combinedComplete = enumerationKnown && fleetWide.inScope > 0 && notAssessed === 0
   const sourceCoverage = useMemo(() => (['nativeSource', 'microsoftSource'] as const).map((source) => ({
     label: source === 'nativeSource' ? 'HawkView assessments' : 'Microsoft risk evidence',
     ready: tenantStatuses.filter((tenant) => tenant[source] === 'READY').length,
@@ -315,7 +307,7 @@ export default function FleetRiskyUsersPage() {
               Review users requiring investigation across the Microsoft 365 tenants you manage.
             </p>
             <div className="flex items-center gap-2 mt-1.5 text-xs text-slate-500 dark:text-slate-400 font-medium">
-              <span>{enumerationKnown ? `${fleetWide.assessed} of ${fleetWide.inScope} tenants have complete current evidence from both sources` : 'Tenant scope unconfirmed'}</span>
+              <span>{enumerationKnown ? `${fleetWide.inScope} ${fleetWide.inScope === 1 ? 'tenant' : 'tenants'} in scope` : 'Tenant scope unconfirmed'}</span>
               <span className="text-slate-300 dark:text-slate-700">•</span>
               <span>Native and Microsoft evidence are evaluated separately</span>
             </div>
@@ -337,7 +329,7 @@ export default function FleetRiskyUsersPage() {
           <div>
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">
-                {!combinedComplete ? 'Users Shown (Evidence Incomplete)' : 'Users Requiring Review'}
+                Users shown
               </span>
               <Users className="h-4 w-4 text-slate-400" />
             </div>
@@ -347,7 +339,7 @@ export default function FleetRiskyUsersPage() {
               </span>
             </div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-              observed identities shown; incomplete lists may omit other positives
+              Observed identities shown. Available evidence may not include every affected user.
             </p>
           </div>
 
@@ -398,8 +390,8 @@ export default function FleetRiskyUsersPage() {
           )}
         </div>
 
-        {/* 3 Metric Cards */}
-        <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {/* Independent source metrics */}
+        <div className="lg:col-span-7 grid grid-cols-1 sm:grid-cols-2 gap-3">
           {/* HawkView Findings */}
           <div className="p-4 rounded-xl border border-blue-200/70 dark:border-blue-900/40 bg-blue-50/30 dark:bg-blue-950/20 shadow-2xs flex flex-col justify-between space-y-3">
             <div className="flex items-center justify-between">
@@ -451,18 +443,6 @@ export default function FleetRiskyUsersPage() {
             <div className="text-2xs font-medium text-purple-700 dark:text-purple-300 pt-1 border-t border-purple-100 dark:border-purple-900/40">
               Independent Entra risk state
             </div>
-          </div>
-
-          <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 space-y-3">
-            <span className="text-xs font-semibold">Complete evidence from both sources</span>
-            <div className="text-2xl font-bold">
-              {enumerationKnown ? `${fleetWide.assessed} of ${fleetWide.inScope}` : 'Unknown'}
-            </div>
-            <p className="text-xs text-slate-500">
-              {combinedComplete ? 'Both sources have complete current evidence for every tenant in scope.'
-                : enumerationKnown && fleetWide.inScope === 0 ? 'No tenants are in scope.'
-                : enumerationKnown ? 'Open the evidence availability icon beside the page title for details.' : 'The tenant list must be confirmed before coverage can be counted.'}
-            </p>
           </div>
         </div>
       </div>
@@ -684,8 +664,8 @@ export default function FleetRiskyUsersPage() {
                           <ShieldCheck className="h-6 w-6" />
                         </div>
                       ) : summary.empty.tone === 'UNKNOWN' ? (
-                        <div className="p-3 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
-                          <AlertTriangle className="h-6 w-6" />
+                        <div className="p-3 rounded-full bg-slate-50 dark:bg-slate-900 text-slate-500 border border-slate-200 dark:border-slate-700">
+                          <Info className="h-6 w-6" />
                         </div>
                       ) : (
                         <Search className="h-6 w-6 text-slate-400" />
@@ -898,7 +878,7 @@ export default function FleetRiskyUsersPage() {
               {summary.empty.tone === 'QUIET' ? (
                 <ShieldCheck className="h-6 w-6 text-emerald-500 mx-auto" />
               ) : summary.empty.tone === 'UNKNOWN' ? (
-                <AlertTriangle className="h-6 w-6 text-amber-500 mx-auto" />
+                <Info className="h-6 w-6 text-slate-400 mx-auto" />
               ) : (
                 <Search className="h-6 w-6 text-slate-400 mx-auto" />
               )}
