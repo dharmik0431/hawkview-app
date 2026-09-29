@@ -1,5 +1,6 @@
 'use client'
 
+import { customerAttention, customerHealthScore } from '@/lib/attention/customer-attention'
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
 import { Badge } from '@/components/ui/badge'
@@ -49,15 +50,7 @@ import {
 export type Severity = 'critical' | 'high' | 'medium'
 type TabKey = 'queue' | 'matrix'
 
-type AttentionItem = {
-  key: string
-  label: string
-  severity: Severity
-  why?: string
-  detectedAt?: string
-  actionLabel?: string
-  actionUrl?: string
-}
+type AttentionItem = import('@/types/attention').AttentionItem
 
 function topAttention(items: AttentionItem[]) {
   const order: Record<Severity, number> = { critical: 0, high: 1, medium: 2 }
@@ -155,86 +148,9 @@ function SeverityBadge({ sev }: { sev: Severity }) {
 }
 
 function getKeyResult(q: QueueItem): string {
-  const item = q.item
-  const key = (item.key ?? '').toLowerCase()
-  const label = (item.label ?? '').toLowerCase()
-  const why = item.why ?? ''
-
-  // 1. MFA Coverage
-  if (key.includes('mfa') || label.includes('mfa')) {
-    const match = item.label.match(/(\d+%)|\((\d+%)\)/) || why.match(/(\d+%)|\((\d+%)\)/)
-    const pct = match ? (match[1] || match[2]) : (q.metricValue && q.metricValue !== '—' ? q.metricValue : null)
-    return `MFA registration coverage: ${pct ?? 'Not provided'}`
-  }
-
-  // 2. Missing Permissions
-  if (key.includes('permission') || label.includes('permission') || why.toLowerCase().includes('missing:')) {
-    const match = why.match(/missing:\s*([^.]+)/i)
-    if (match && match[1]) {
-      return `Missing permission: ${match[1].trim()}`
-    }
-    return 'Missing permissions'
-  }
-
-  // 3. Changed application / Audit findings
-  if (label.includes('application') || why.toLowerCase().includes('application') || label.includes('app registration')) {
-    const match = why.match(/affected:\s*([^.]+)/i) || why.match(/application\s*:?\s*([^.]+)/i)
-    if (match && match[1]) {
-      return `Changed application: ${match[1].trim()}`
-    }
-    if (why.includes('HawkView Tenant Connector') || label.includes('HawkView Tenant Connector')) {
-      return 'Changed application: HawkView Tenant Connector'
-    }
-    return 'Changed application'
-  }
-
-  // 4. Affected target in why text
-  if (why.toLowerCase().includes('affected:')) {
-    const match = why.match(/affected:\s*([^.]+)/i)
-    if (match && match[1]) {
-      return `Affected: ${match[1].trim()}`
-    }
-  }
-
-  // 5. Risky Identities
-  if (key.includes('risky') || label.includes('risky')) {
-    if (q.metricValue && q.metricValue !== '—') {
-      return `Risky users: ${q.metricValue}`
-    }
-    return 'Risky users: Not reported'
-  }
-
-  // 6. Connection / Auth required
-  if (key.includes('connection') || label.includes('connection') || label.includes('reconnect')) {
-    const normalized = `${label} ${why}`.toLowerCase()
-    return normalized.includes('disconnect') || normalized.includes('reconnect')
-      ? 'Connection: Disconnected'
-      : 'Connection: Not reported'
-  }
-  if (key.includes('authorization') || label.includes('authorization')) {
-    return 'Authorization: Required'
-  }
-
-  // 7. Sync issue
-  if (key.includes('sync') || label.includes('sync')) {
-    const normalizedWhy = why.toLowerCase()
-    if (normalizedWhy.includes('outside the acceptable window') || normalizedWhy.includes('outside the service freshness window')) {
-      return 'Collection overdue'
-    }
-    if (normalizedWhy.includes('awaiting execution') || normalizedWhy.includes('in progress')) {
-      return 'Sync in progress'
-    }
-    if (normalizedWhy.includes('permission') || normalizedWhy.includes('forbidden') || normalizedWhy.includes('unauthorized')) {
-      return 'Permission required'
-    }
-    return 'Sync needs attention'
-  }
-
-  if (why && why.length > 0 && why.length <= 45 && !why.includes('http')) {
-    return why
-  }
-
-  return 'Not provided'
+  if (q.item.provenance?.kind === 'MFA_REGISTRATION_COVERAGE') return `MFA registration coverage: ${q.metricValue}`
+  if (q.item.provenance?.kind === 'MICROSOFT_ACTIVE_RISK') return `Microsoft risk: ${q.metricValue}`
+  return q.item.why
 }
 
 function actionLabel(sev: Severity) {
@@ -293,8 +209,9 @@ type TenantRow = Tenant & {
 
 function buildTenants(source: any[]): TenantRow[] {
   return (source ?? []).map((t: any) => {
-    const attentionReported = Array.isArray(t.attention)
-    const attention = (attentionReported ? t.attention : []) as AttentionItem[]
+    const customer = customerAttention(t)
+    const attentionReported = !customer.incomplete
+    const attention = customer.findings
     const top = topAttention(attention)
 
     const topSeverity =
@@ -308,7 +225,7 @@ function buildTenants(source: any[]): TenantRow[] {
       .map((a) => a.detectedAt as string)
       .sort((a, b) => parseTime(b) - parseTime(a))[0]
 
-    const healthScore = numericEvidence(t.healthScore, 0, 100)
+    const healthScore = customerHealthScore(t)
     const mfaCoverage = numericEvidence(t.mfaCoverage, 0, 100)
     const normalizedRiskSummary = normalizeMicrosoftRiskSummary(t.microsoftRiskSummary)
     const riskPresentation = normalizedRiskSummary
@@ -319,7 +236,6 @@ function buildTenants(source: any[]): TenantRow[] {
 
     return {
       ...t,
-      attention,
       attentionReported,
       top,
       topSeverity,
@@ -344,9 +260,9 @@ export type QueueItem = {
 }
 
 function queueMetric(tenant: TenantRow, item: AttentionItem) {
-  const label = (item.label ?? '').toLowerCase()
+  const kind = item.provenance?.kind
 
-  if (label.includes('mfa')) {
+  if (kind === 'MFA_REGISTRATION_COVERAGE') {
     const val = tenant.mfaCoverage
     return {
       metricLabel: 'COVERAGE',
@@ -354,7 +270,7 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
     }
   }
 
-  if (label.includes('risky') || label.includes('risk')) {
+  if (kind === 'MICROSOFT_ACTIVE_RISK') {
     const normalizedSummary = normalizeMicrosoftRiskSummary(tenant.microsoftRiskSummary)
     const presentation = presentMicrosoftRiskSummary(normalizedSummary)
     return {
@@ -368,9 +284,6 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
     }
   }
 
-  if (label.includes('external')) {
-    return { metricLabel: 'EVIDENCE', metricValue: 'External access reported' }
-  }
 
   return { metricLabel: 'EVIDENCE', metricValue: 'Not reported' }
 }
@@ -491,7 +404,7 @@ export default function DashboardPage() {
         if (!hawkViewRisk.exact || hawkViewRisk.count !== 0) return false
       }
 
-      // 3. Has Active Threats
+      // 3. Has Reported Findings
       const threatsInfo = getTenantThreatsInfo(t)
       if (matrixHasThreats === 'yes') {
         if (typeof threatsInfo.count !== 'number' || threatsInfo.count <= 0) return false
@@ -506,7 +419,7 @@ export default function DashboardPage() {
       } else if (matrixDataAvailability === 'partial') {
         if (connData.dataStatus !== 'partial') return false
       } else if (matrixDataAvailability === 'unavailable') {
-        if (connData.connectionState === 'connected' && connData.dataStatus !== 'failed' && connData.dataStatus !== 'awaiting_sync') return false
+        if (customerAttention(t).sourceAvailable) return false
       }
 
       return true
@@ -592,7 +505,8 @@ export default function DashboardPage() {
   const queueCoverage = React.useMemo(
     () => ({
       inScope: filteredTenants.length,
-      read: filteredTenants.filter((t) => t.attentionReported).length,
+      read: filteredTenants.filter((t) => customerAttention(t).sourceAvailable).length,
+      incomplete: filteredTenants.filter((t) => customerAttention(t).sourceAvailable && !t.attentionReported).length,
     }),
     [filteredTenants]
   )
@@ -620,7 +534,7 @@ export default function DashboardPage() {
 
     const attentionPartial = tenants.some((tenant) => !tenant.attentionReported)
     const criticalTenants = tenants.filter(
-      (t) => t.attentionReported && t.topSeverity === 'critical'
+      (t) => t.topSeverity === 'critical'
     ).length
 
     const reportedMfa = tenants.filter((tenant) => tenant.mfaCoverage !== null)
@@ -804,13 +718,13 @@ export default function DashboardPage() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <div className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-                  Avg Health Score
+                  Tenant security score
                 </div>
                 <div className="mt-1 text-3xl font-bold">
                   {kpis.avgScore === null ? 'Not reported' : `${kpis.avgScore}%`}
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
-                  {kpis.healthPartial ? 'Average of reported scores only' : 'Derived from reported signals'}
+                  Tenant-only score not supplied
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-green-50 border border-green-100 flex items-center justify-center">
@@ -937,15 +851,15 @@ export default function DashboardPage() {
             </div>
 
             <div className="relative">
-              <label className="sr-only">Has Active Threats</label>
+              <label className="sr-only">Has Reported Findings</label>
               <select
                 value={matrixHasThreats}
                 onChange={(e) => setMatrixHasThreats(e.target.value)}
                 className="h-11 w-full rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-3 text-xs font-medium text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500/30"
               >
                 <option value="all">All Active Threat States</option>
-                <option value="yes">Has Active Threats (&gt;0)</option>
-                <option value="no">No Active Threats (0)</option>
+                <option value="yes">Has Reported Findings (&gt;0)</option>
+                <option value="no">No Reported Findings (0)</option>
               </select>
             </div>
 
@@ -985,7 +899,7 @@ export default function DashboardPage() {
       {tab === 'queue' ? (
         <div className="space-y-2.5">
           {/* Queue Header */}
-          <div className="flex items-center justify-between px-1">
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1">
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
               Priority Action Queue
             </h2>
@@ -1259,7 +1173,7 @@ export default function DashboardPage() {
         </div>
       ) : (
         <div className="space-y-2.5">
-          <div className="flex items-center justify-between px-1">
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1">
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
               Tenant Risk Matrix
             </h2>

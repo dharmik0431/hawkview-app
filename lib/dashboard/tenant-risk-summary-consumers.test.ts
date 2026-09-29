@@ -1,3 +1,4 @@
+import * as customerAttentionModule from '../attention/customer-attention.ts'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -26,6 +27,7 @@ function compileHelpers() {
   new Function('require', 'exports', compiled)(
     (name: string) => ({
       'lucide-react': icons,
+      '@/lib/attention/customer-attention': customerAttentionModule,
       '@/lib/attention/computeTenantAttention': {
         computeTenantAttention: (tenant: { attention?: unknown }) =>
           Array.isArray(tenant.attention) ? tenant.attention : [],
@@ -70,6 +72,7 @@ function compileMatrix(helpers: ReturnType<typeof compileHelpers>) {
       react: require('react'),
       'next/navigation': { useRouter: () => ({ push: () => undefined }) },
       'lucide-react': icons,
+      '@/lib/attention/customer-attention': customerAttentionModule,
       '@/components/ui/button': { Button: () => null },
       '@/components/ui/badge': { Badge: () => null },
       '@/components/ui/tooltip': {

@@ -1,5 +1,7 @@
 'use client'
 
+import { CustomerEvidenceDetails } from '@/components/tenant/customer-evidence-details'
+import { deriveTenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
@@ -786,7 +788,7 @@ export default function TenantSettingsPage() {
           <TabsTrigger value="collection" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
             <span>Collection</span>
             {collectionReadiness?.workloads.some((w) => isActionableReadinessState(w.state)) && (
-              <span className="inline-flex items-center">
+              <span className="relative inline-flex items-center">
                 <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" aria-hidden="true" />
                 <span className="sr-only">Needs attention</span>
               </span>
@@ -803,7 +805,7 @@ export default function TenantSettingsPage() {
           <TabsTrigger value="synchronization" className="rounded-lg text-xs font-semibold px-4 py-2 cursor-pointer flex items-center gap-1.5">
             <span>Synchronization</span>
             {synchronizationSummary && synchronizationSummary.attentionWorkloads > 0 && (
-              <span className="inline-flex items-center">
+              <span className="relative inline-flex items-center">
                 <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" aria-hidden="true" />
                 <span className="sr-only">Needs attention</span>
               </span>
@@ -857,8 +859,8 @@ export default function TenantSettingsPage() {
                 )}
               </div>
               <div className="text-[10px] text-slate-500 dark:text-slate-400 pt-1">
-                {tenantWideHealth.status === 'VERIFIED'
-                  ? `Tenant-wide actionable issues: ${tenantWideHealth.items.length}`
+                {tenantWideHealth.items.length > 0 || tenantWideHealth.status === 'VERIFIED'
+                  ? `Tenant-wide actionable issues: ${tenantWideHealth.items.length}${tenantWideHealth.status === 'UNAVAILABLE' ? ' reported · Evidence incomplete' : ' reported'}`
                   : 'Tenant-wide actionable status: Not verified'}
               </div>
             </div>
@@ -1091,6 +1093,7 @@ export default function TenantSettingsPage() {
 
         {/* TAB 2: COLLECTION */}
         <TabsContent value="collection" className="space-y-4 focus-visible:outline-none">
+          <CustomerEvidenceDetails display={deriveTenantWorkspaceDisplay(bundle, false, collectionReadiness?.evidence.signIns ?? null, tenantWideHealth)} />
           {/* Toolbar */}
           <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 sm:p-4 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 shadow-2xs">
             <div className="relative flex-1 max-w-md">

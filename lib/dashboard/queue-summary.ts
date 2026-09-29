@@ -1,35 +1,14 @@
-/**
- * What the Priority Action Queue's count line and empty state may claim.
- *
- * THE SAME SHAPE AS THE BELL, ONE SURFACE FURTHER OUT. The queue rendered
- * `{sortedQueueItems.length} matching alerts`, and that number is built by
- * walking every tenant's attention list. A tenant whose attention could not be
- * read contributes zero items -- `dashboard/page.tsx` sets
- * `attention = attentionReported ? t.attention : []` -- so the count silently
- * treats "we could not read this tenant" as "this tenant has nothing".
- *
- * A count has only a number. Asked whether it is looking at a quiet fleet or an
- * unread one, it cannot answer, and it will read zero and say so confidently.
- * That is the test this module exists to pass.
- *
- * THE EMPTY STATE WAS THE WORSE HALF. It said "No matching alerts found. Try
- * adjusting filters or search query." Two claims: that HawkView looked, and
- * that the reader's filters are why nothing came back. When tenants could not
- * be read, both are wrong, and the second actively sends somebody to adjust
- * filters that have nothing to do with it.
- *
- * The page already keeps `attentionReported` per tenant and warns about partial
- * evidence in a banner. But that banner sits in an else-if chain behind
- * `isError`, `isFetching` and `isStale`, so a background refresh suppresses it
- * -- and it is at the top of the page while the claim is several screens down.
- * A warning that a sentence contradicts has to travel with the sentence.
+/** Counts and empty states for the reported tenant-findings queue.
+ * Access setup and collection diagnostics belong to separate surfaces; an
+ * empty queue cannot establish that no customer action or risk exists.
  */
-
 export type QueueCoverage = {
   /** Tenants in scope after filtering. */
   inScope: number
   /** Of those, how many reported an attention list at all. */
   read: number
+  /** Readable summaries whose evidence remains incomplete or unclassified. */
+  incomplete?: number
 }
 
 export type QueueSummary = {
@@ -38,7 +17,7 @@ export type QueueSummary = {
   /**
    * Whether the number can be read as complete.
    *
-   * False does not make it useless -- the alerts it found are real. It makes it
+   * False does not make it useless -- the findings it found are real. It makes it
    * a floor rather than a total.
    */
   complete: boolean
@@ -60,25 +39,30 @@ export function queueSummary(
   filtersActive: boolean
 ): QueueSummary {
   const unread = Math.max(0, coverage.inScope - coverage.read)
+  const partial = Math.max(0, coverage.incomplete ?? 0)
+  if (partial > 0) return {
+    headline: `${matching} reported ${plural(matching, 'finding', 'findings')} · Evidence incomplete`,
+    complete: false,
+    empty: matching > 0 ? null : {
+      title: 'No classified findings match this view',
+      detail: 'Evidence is incomplete or unclassified. This does not establish zero findings; review tenant evidence details.',
+    },
+  }
   const complete = unread === 0
 
-  // THE COUNT NEVER TRAVELS ALONE WHEN IT IS INCOMPLETE. "12 matching alerts"
-  // and "12 matching alerts across 10 of 14 tenants" are different claims, and
-  // only the second is one this data supports.
   const headline = complete
-    ? `${matching} matching ${plural(matching, 'alert', 'alerts')}`
-    : `${matching} matching ${plural(matching, 'alert', 'alerts')} across ` +
+    ? `${matching} matching ${plural(matching, 'finding', 'findings')}`
+    : `${matching} matching ${plural(matching, 'finding', 'findings')} across ` +
       `${coverage.read} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')}`
 
   if (matching > 0) return { headline, complete, empty: null }
 
-  // ZERO IS WHERE THE MEANINGS COLLAPSE, exactly as it was on the bell.
   if (!complete) {
     return {
       headline,
       complete,
       empty: {
-        title: 'No matching alerts among the tenants HawkView could read',
+        title: 'No matching tenant findings among the tenants HawkView could read',
         detail:
           `${unread} of ${coverage.inScope} ${plural(coverage.inScope, 'tenant', 'tenants')} ` +
           'did not report an attention list, so this is not a complete answer. ' +
@@ -87,23 +71,22 @@ export function queueSummary(
     }
   }
 
-  // Only here -- everything read, nothing found -- may the emptiness be blamed
-  // on the filters, and only when there are filters to blame.
+  // This describes the findings visible in this view, never all customer actions.
   return {
     headline,
     complete,
     empty: filtersActive
       ? {
-          title: 'No matching alerts found',
+          title: 'No tenant findings match these filters',
           detail:
-            'Every tenant in scope reported its attention list, and none of the ' +
-            'items matched. Try adjusting filters or search query.',
+            'No reported tenant findings match the current filters. Try adjusting filters or search query. ' +
+            'Customer access setup is shown separately; this is not an exhaustive security assessment.',
         }
       : {
-          title: 'Nothing needs action',
+          title: 'No tenant findings reported in this view',
           detail:
-            'Every tenant in scope reported its attention list, and none raised ' +
-            'anything. No filters are narrowing this.',
+            'This queue lists reported tenant findings only. Customer access setup is shown separately; ' +
+            'this is not an exhaustive security assessment.',
         },
   }
 }

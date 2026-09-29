@@ -16,9 +16,10 @@ function load(path: string): any {
   const exports: any = {}
   cache.set(path, exports)
   const js = ts.transpileModule(readFileSync(path, 'utf8'), {
-    compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+    fileName: path, compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
   }).outputText
   new Function('require', 'exports', js)((name: string) => {
+    if (name === 'next/link') return { __esModule: true, default: ({children, ...props}: any) => React.createElement('a', props, children) }
     if (!name.startsWith('.') && !name.startsWith('@/')) return require(name)
     const target = name.startsWith('@/') ? resolve(base, name.slice(2)) : resolve(dirname(path), name)
     const file = [target, target + '.tsx', target + '.ts'].find(p => existsSync(p))!
@@ -50,7 +51,9 @@ function entry(kind: SyncOutcomeProjection['recordedOutcome']['kind'], status = 
 function bundle(sync: TenantBundle['sync'], id = 'tenant-a'): TenantBundle {
   return { tenant: { id, status: 'connected' }, users: [], signIns: [], exchange: {}, sharepoint: {}, teams: {}, sync }
 }
-const healthy = { status: 'VERIFIED', items: [] }
+const { tenantActionableHealthProjection } = load(resolve(base, 'lib/attention/computeTenantAttention.ts'))
+const { tenantFindingProvenance, collectorAttentionProvenance, accessProvenance } = load(resolve(base, 'backend/src/tenants/attention-provenance.ts'))
+const healthy = tenantActionableHealthProjection({data:{status:'COMPLETE'},attention:[]})
 async function mounted(run: (h: {
   render: (data: TenantBundle, options?: { manual?: boolean; health?: any; evidence?: any; freshness?: any }) => Promise<void>
   text: () => string; click: (label: string) => Promise<void>; document: any
@@ -90,103 +93,37 @@ function noActiveClaim(text: string) {
   assert.doesNotMatch(text, /Collecting Microsoft 365|Synchronization (?:is )?in progress|Initial sync in progress|Collecting now|Populating progressively|All Microsoft 365 services and permissions are operating normally|Syncing/i)
 }
 
-test('composed overview renders optional partial, queued, deferred and unknown distinctly without claiming execution', async () => mounted(async h => {
-  for (const [kind, state, phrase] of [
-    ['LIMITED_COLLECTION_RECORDED', 'Partially Synchronized', 'Limited collection recorded'],
-    ['AWAITING_EXECUTION', 'Health Not Verified', 'Collection queued'],
-    ['DEFERRED_WORK_RECORDED', 'Health Not Verified', 'Deferred work recorded'],
-    ['INITIALIZATION_WAIT_RECORDED', 'Health Not Verified', 'Initialization wait recorded'],
-    ['UNKNOWN', 'Health Not Verified', 'Collection outcome unknown'],
-  ] as const) {
-    await h.render(bundle({ [keyFor(kind)]: entry(kind) }))
-    assert.ok(h.text().includes(state))
-    assert.ok(h.text().includes(phrase))
-    assert.match(h.text(), /2 identities require review/)
-    assert.match(h.text(), /Last successful sync/)
-    noActiveClaim(h.text())
-  }
+
+const mixed = () => tenantActionableHealthProjection({data:{status:'PARTIAL'},attention:[
+ {key:'risk',label:'Microsoft risk reported',why:'Two identities have positive evidence; the total is unknown.',severity:'high',provenance:tenantFindingProvenance('MICROSOFT_ACTIVE_RISK')},
+ {key:'access',label:'Microsoft consent required',why:'Explicit required consent is missing.',severity:'high',provenance:accessProvenance('AUTHORIZATION_REQUIRED',true)},
+ {key:'ops',label:'INTERNAL_COLLECTOR_SENTINEL',why:'PRIVATE_DIAGNOSTIC_SENTINEL',severity:'critical',provenance:collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE')},
+ {key:'legacy',label:'UNKNOWN_SENTINEL',why:'Historical unclassified evidence',severity:'critical'},
+]})
+test('mixed customer overview shows positives and access separately without collector wall', async () => mounted(async h => {
+ await h.render(bundle({users:{status:'failed',lastError:'RAW_DIAGNOSTIC',lastSuccessfulAt:stamp}}),{health:mixed()})
+ assert.equal(h.document.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]')?.textContent.includes('View collection'),true)
+ assert.match(h.text(),/1 reported finding/);assert.match(h.text(),/Microsoft risk reported/);assert.match(h.text(),/Customer access setup/)
+ assert.match(h.text(),/Evidence incomplete/);assert.match(h.text(),/2 identities require review/)
+ assert.doesNotMatch(h.text(),/INTERNAL_COLLECTOR_SENTINEL|PRIVATE_DIAGNOSTIC_SENTINEL|UNKNOWN_SENTINEL|RAW_DIAGNOSTIC|Retry synchronization/)
+ assert.equal(h.document.querySelectorAll('[aria-label="Dataset update times"]').length,1)
+ noActiveClaim(h.text())
 }))
-
-test('composed overview keeps authoritative permission failure and manual request visible together', async () => mounted(async h => {
-  const data = bundle({ users: entry('UNKNOWN'), teams: { ...entry('FAILED', 'failed'), lastError: '403 Forbidden' } })
-  const health = { status: 'VERIFIED', items: [{ key: 'authorization-required', label: 'Required permission missing', severity: 'high', why: 'An independent permission verification failed.' }] }
-  await h.render(data, { manual: true, health })
-  assert.match(h.text(), /Needs Attention/)
-  assert.match(h.text(), /1 actionable issue/)
-  assert.match(h.text(), /Required permission missing/)
-  assert.match(h.text(), /Synchronization request pending/)
-  assert.match(h.text(), /Collection failure recorded/)
-  noActiveClaim(h.text())
+test('unknown and operations-only summaries never render clean or zero risk', async () => mounted(async h => {
+ for(const health of [null,tenantActionableHealthProjection({attention:[{key:'ops',label:'Operator failure',why:'Collector failed',severity:'critical',provenance:collectorAttentionProvenance('USERS',null)}]})]) {
+  await h.render(bundle({}),{health});assert.match(h.text(),/Finding total unavailable/);assert.match(h.text(),/Evidence incomplete/)
+  assert.doesNotMatch(h.text(),/Operator failure|No active issues|Posture Healthy|0 reported findings/)
+ }
 }))
-
-test('composed freshness preserves stale, partial, timestamps and unknown activity simultaneously', async () => mounted(async h => {
-  const data = bundle({ users: entry('UNKNOWN') })
-  data.tenant.isStale = true
-  const freshness = { service: 'office365', status: 'RUNNING', freshnessStatus: 'STALE',
-    partialFailures: [{ collector: 'users', status: 'FAILED', message: 'Retained failure' }], lastSuccessfulCollectionAt: stamp }
-  await h.render(data, { manual: true, freshness })
-  assert.match(h.text(), /Stale/)
-  assert.match(h.text(), /Last known data/)
-  assert.match(h.text(), /Partial — 1 collector need attention/)
-  assert.match(h.text(), /Stale data/)
-  assert.match(h.text(), /Collector activity not verified/)
-  assert.match(h.text(), /Updated/)
-  noActiveClaim(h.text())
+test('A to B to A does not retain findings or expose diagnostics from another tenant', async () => mounted(async h => {
+ await h.render(bundle({},'tenant-a'),{health:mixed(),manual:true});assert.match(h.text(),/Microsoft risk reported/)
+ await h.render(bundle({},'tenant-b'),{health:null});assert.doesNotMatch(h.text(),/Microsoft risk reported|Microsoft consent required|Synchronization request pending|tenant-a/)
+ await h.render(bundle({},'tenant-a'),{health:mixed()});assert.match(h.text(),/Microsoft risk reported/);assert.doesNotMatch(h.text(),/tenant-b|Synchronization request pending/)
 }))
-
-test('mounted A -> B -> A removes drawer diagnostics and request display while preserving each tenant evidence', async () => mounted(async h => {
-  const a = bundle({ users: { ...entry('FAILED', 'failed'), lastError: 'Tenant A diagnostic only' } })
-  await h.render(a, { manual: true, health: null })
-  // Use a verified actionable finding so the drawer follows the production health source.
-  const attention = { status: 'VERIFIED', items: [{ key: 'sync-users', label: 'Tenant A failure', severity: 'high', why: 'Tenant A diagnostic only' }] }
-  await h.render(a, { manual: true, health: attention })
-  await h.click('Resolve issue')
-  await h.click('Technical details')
-  assert.ok(h.document.querySelector('[aria-label="Close remediation drawer"]'))
-  assert.match(h.text(), /Tenant A diagnostic only/)
-  const b = bundle({}, 'tenant-b')
-  await h.render(b, { health: { status: 'UNAVAILABLE', items: [] } })
-  assert.ok(h.document.querySelector('[aria-label="Close remediation drawer"]') === null, 'Previous tenant drawer must be cleared')
-  assert.doesNotMatch(h.text(), /Tenant A|Synchronization request pending|tenant-a: 2/)
-  assert.match(h.text(), /Health Not Verified/)
-  assert.match(h.text(), /tenant-b: 2 identities require review/)
-  const signIn = entry('UNKNOWN')
-  signIn.outcomeProjection!.resourceType = 'SIGN_INS'
-  signIn.lastSuccessfulAt = null
-  a.sync = { signIns: signIn }
-  await h.render(a, { evidence: { availability: 'CURRENT_LIMITED', coverage: 'LIMITED', selectedSource: 'OFFICE_365_ACTIVITY_FEED', observedAt: stamp, reasonCode: 'SIGN_IN_FALLBACK_ACTIVE', reason: 'Current limited audit evidence.' } })
-  assert.match(h.text(), /Partially Synchronized/)
-  assert.doesNotMatch(h.text(), /Tenant A diagnostic only|Collection outcome unknown|tenant-b: 2|Synchronization request pending|Initial collection is incomplete/)
-  assert.ok(h.document.querySelector('[aria-label="Close remediation drawer"]') === null, 'Previous tenant drawer must be cleared')
-  noActiveClaim(h.text())
-}))
-
-test('a verified successful record preserves positive health without a blanket service claim', async () => mounted(async h => {
-  await h.render(bundle({ users: entry('SUCCEEDED', 'succeeded') }))
-  assert.match(h.text(), /Healthy/)
-  assert.match(h.text(), /Successful collection recorded/)
-  await h.click('Active issues (0)')
-  assert.match(h.text(), /No actionable issues reported/)
-  assert.match(h.text(), /2 identities require review/)
-  noActiveClaim(h.text())
-}))
-
-test('tenant page keys the entire workspace by account and tenant to isolate late requests', () => {
-  const source = readFileSync(resolve(base, 'app/(protected)/tenants/[id]/page.tsx'), 'utf8')
-  assert.match(source, /<TenantDetailsWorkspace key=\{JSON\.stringify\(\[cacheScope, params\?\.id\]\)\} \/>/)
-  assert.match(source, /function TenantDetailsWorkspace\(\)/)
-})
-
-test('missing or malformed health renders not verified instead of a zero count, without hiding legacy diagnostics', async () => mounted(async h => {
-  for (const health of [null, { status: 'BOGUS', items: [] }, { status: 'VERIFIED', items: null }, { status: 'VERIFIED', items: [{}] }]) {
-    await h.render(bundle({ users: entry('UNKNOWN') }), { health })
-    assert.match(h.text(), /Health Not Verified/)
-    assert.match(h.text(), /Active issues \(Not verified\)/)
-    assert.doesNotMatch(h.text(), /0 actionable issues|Active issues \(0\)|Active issues0/)
-    await h.render(bundle({ users: { ...entry('FAILED', 'failed'), lastError: 'Legacy collection diagnostic' } }), { health })
-    assert.match(h.text(), /collection needs review/)
-    assert.match(h.text(), /Legacy collection diagnostic/)
-    assert.match(h.text(), /Active issues \(Not verified\)/)
-    assert.doesNotMatch(h.text(), /0 actionable issues|Active issues \(0\)|Active issues0/)
-  }
+test('dataset clocks remain scoped and never use newest unrelated success', async () => mounted(async h => {
+ await h.render(bundle({users:{status:'succeeded',lastSuccessfulAt:stamp,lastError:null}}),{health:healthy})
+ const ages=h.document.querySelector('[aria-label="Dataset update times"]').textContent
+ assert.equal((ages.match(/Update time unavailable/g)||[]).length,3)
+ assert.doesNotMatch(ages,/Updated .*ago/)
+ assert.match(h.text(),/No findings reported/);assert.doesNotMatch(h.text(),/Healthy|0 risk/)
 }))

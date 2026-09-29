@@ -337,7 +337,7 @@ export function TenantRiskMatrixDrawer({
                       <TooltipTrigger asChild>
                         <span className="font-bold text-slate-700 dark:text-slate-300 cursor-help underline decoration-dotted flex items-center gap-1.5">
                           <Info className="h-3.5 w-3.5 text-slate-400 shrink-0" />
-                          <span>HawkView Health Score</span>
+                          <span>HawkView Tenant Score</span>
                         </span>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="max-w-xs">
@@ -346,9 +346,7 @@ export function TenantRiskMatrixDrawer({
                     </Tooltip>
 
                     <span className="font-bold text-base text-slate-900 dark:text-slate-100">
-                      {Number.isFinite(tenant.healthScore)
-                        ? `${tenant.healthScore} / 100`
-                        : 'Not reported'}
+                      <span title="A tenant-only score is not supplied">Unavailable</span>
                     </span>
                   </div>
                 </div>
@@ -383,23 +381,24 @@ export function TenantRiskMatrixDrawer({
                 <div className="text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-1.5 px-1">
                   <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
                   <span>
-                    Note: {activeIssues.count} active issue{activeIssues.count === 1 ? '' : 's'} require remediation regardless of score.
+                    Note: {activeIssues.count} reported customer action{activeIssues.count === 1 ? '' : 's'} are available for review.
                   </span>
                 </div>
               )}
 
-              {/* Section 5: Active Issues List */}
+              {/* Section 5: Customer Actions List */}
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                     <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
-                    <span>Active Issues</span>
+                    <span>Customer Actions</span>
                     <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-0 text-xs px-2 py-0.5">
                       {activeIssues.count ?? 'Not reported'}
                     </Badge>
                   </h3>
                 </div>
 
+                {activeIssues.incomplete && <p className="text-xs text-amber-800">Evidence incomplete. Known customer actions remain available.</p>}
                 {!activeIssues.evidenceAvailable ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-800 dark:bg-slate-800/30">
                     <Info className="mx-auto h-6 w-6 text-slate-500" aria-hidden="true" />
@@ -411,7 +410,7 @@ export function TenantRiskMatrixDrawer({
                   <div className="p-4 text-center rounded-xl border border-emerald-200 bg-emerald-50/50 dark:border-emerald-900/40 dark:bg-emerald-950/20 space-y-1">
                     <CheckCircle2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400 mx-auto" />
                     <p className="text-xs font-semibold text-emerald-900 dark:text-emerald-300">
-                      No active issues detected
+                      No customer actions reported
                     </p>
                   </div>
                 ) : (

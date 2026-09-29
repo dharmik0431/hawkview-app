@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { conditionalAccessAge } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -119,7 +120,7 @@ export default function EntraSection({
 
   return (
     <Card className="rounded-2xl mt-5 shadow-sm bg-white dark:bg-slate-900">
-      <SectionFreshness source={bundle} service="entraId" className="mx-6 mt-6" />
+      <SectionFreshness evidence={conditionalAccessAge(evidence)} className="mx-6 mt-6" />
       <CardContent className="p-0">
         <div className="px-6 pt-6">
           {evidence?.securityDefaults.enabled === true && (

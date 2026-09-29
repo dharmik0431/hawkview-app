@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo } from 'react'
 import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { applicationsAge } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -171,7 +172,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
 
   return (
     <div className="mt-5 space-y-5">
-      <SectionFreshness source={bundle} service="entraId" isEmpty={rawApps.length === 0} />
+      <SectionFreshness evidence={applicationsAge(bundle)} isEmpty={rawApps.length === 0} />
       {/* Summary Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
         <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs">

@@ -2,6 +2,7 @@
 
 import { useState, useMemo } from 'react'
 import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { dnsAge, selectedDnsRecord } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
@@ -55,31 +56,7 @@ export default function DnsSection({
   const activeDomain = domainSelected || domainList[0] || tenant?.domain || '—'
 
   // Get active DNS object (either byDomain or direct object)
-  const activeDns = useMemo(() => {
-    if (!dns) return null
-    if (dns.byDomain && typeof dns.byDomain === 'object') {
-      const key = String(activeDomain || '').toLowerCase()
-      return dns.byDomain[key] || dns.byDomain[activeDomain] || dns
-    }
-    return dns
-  }, [dns, activeDomain])
-
-  const lastCheckedText = useMemo(() => {
-    if (activeDns?.lastChecked) {
-      try {
-        const d = new Date(activeDns.lastChecked)
-        if (!isNaN(d.getTime())) {
-          return new Intl.DateTimeFormat(undefined, {
-            dateStyle: 'medium',
-            timeStyle: 'short',
-          }).format(d)
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return 'Synchronized'
-  }, [activeDns])
+  const activeDns = useMemo(() => selectedDnsRecord(dns, activeDomain), [dns, activeDomain])
 
   // Parse SPF, DKIM, DMARC check items
   const checks = useMemo<DnsCheckItem[]>(() => {
@@ -278,8 +255,7 @@ export default function DnsSection({
   return (
     <>
       <SectionFreshness
-        source={{ tenant }}
-        service="office365"
+        evidence={dnsAge(dns, activeDomain)}
         isEmpty={domains.length === 0}
       />
       <Card className="rounded-2xl shadow-xs border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 w-full">
@@ -461,7 +437,7 @@ export default function DnsSection({
 
                     {/* Last Checked */}
                     <div className="col-span-2 text-slate-500 dark:text-slate-400 font-normal">
-                      {lastCheckedText}
+                      <SectionFreshness evidence={dnsAge(dns, activeDomain)} className="mb-0" />
                     </div>
 
                     {/* Action Button */}

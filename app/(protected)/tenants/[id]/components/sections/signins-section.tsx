@@ -20,6 +20,8 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { signInsAge } from '@/lib/tenants/dataset-age'
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
@@ -115,7 +117,6 @@ export default function SignInActivitySection({
   signInView,
   onSignInViewChange,
   syncStatus,
-  freshness,
   signInEvidence,
 }: SignInActivitySectionProps) {
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
@@ -132,20 +133,6 @@ export default function SignInActivitySection({
   const selectedEvidenceFailed = signInEvidence?.selectedSource !== null &&
     ['FAILED_TRANSIENT', 'STALE', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence?.availability ?? '')
   const showCollectionFailure = selectedEvidenceFailed || (!signInEvidence?.selectedSource && syncStatus?.status === 'failed')
-  const freshnessLabel = !freshness
-    ? 'Freshness unavailable'
-    : freshness.status === 'RUNNING'
-      ? 'Syncing'
-      : freshness.status === 'PARTIAL'
-        ? `Partial — ${freshness.partialFailures.length} collector${freshness.partialFailures.length === 1 ? '' : 's'} need attention`
-        : freshness.status === 'STALE' || freshness.freshnessStatus === 'STALE'
-          ? 'Stale'
-          : freshness.status === 'NOT_COLLECTED' || freshness.freshnessStatus === 'NEVER_SYNCED'
-            ? 'Never synchronized'
-            : freshness.lastSuccessfulCollectionAt
-              ? `Updated ${formatSignInTime(freshness.lastSuccessfulCollectionAt)}`
-              : 'Freshness unavailable'
-
   // Filtered dataset shared between Table and Map
   const filteredSignIns = useMemo(() => {
     return signIns.filter((e) => {
@@ -365,7 +352,7 @@ export default function SignInActivitySection({
             <p className="text-sm font-semibold">Sign-in collection needs attention</p>
             <p className="mt-1 text-xs leading-5">
               {signIns.length
-                ? 'The selected sign-in source is stale or failed. Retained events remain visible with their original timestamps while HawkView awaits current evidence.'
+                ? 'Selected-source coverage is incomplete. Retained events remain visible with their original timestamps.'
                 : 'The selected sign-in source is stale, blocked, or failed and no retained events are available for this range.'}
             </p>
           </div>
@@ -377,7 +364,7 @@ export default function SignInActivitySection({
           <div>
             <p className="text-sm font-semibold">Limited login activity</p>
             <p className="mt-1 text-xs leading-5">
-              HawkView is using current login evidence from the Microsoft 365
+              HawkView is using login evidence from the Microsoft 365
               audit feed. This limited source does not include Conditional
               Access, risk, device, location, or authentication-step details.
             </p>
@@ -395,9 +382,7 @@ export default function SignInActivitySection({
             <p className="text-xs text-muted-foreground mt-0.5">
               Review sign-in evidence and the details supplied by the selected Microsoft source.
             </p>
-            <p className="mt-1 text-xs font-medium text-slate-600 dark:text-slate-300" title={freshness?.lastSuccessfulCollectionAt ?? undefined}>
-              {freshnessLabel}
-            </p>
+            <SectionFreshness evidence={signInsAge(signInEvidence)} className="mt-1 mb-0" />
           </div>
 
           {/* Filter Toolbar */}

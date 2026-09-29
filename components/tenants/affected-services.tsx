@@ -39,26 +39,7 @@ export function AffectedServices({ tenant, compact = true }: AffectedServicesPro
   }
 
   for (const item of items) {
-    if (
-      item.key.includes('mfa') ||
-      item.key.includes('microsoft_') ||
-      item.key.includes('permission') ||
-      item.key.includes('auth') ||
-      item.key.includes('sign_in') ||
-      item.key.includes('conditional_access') ||
-      item.key.includes('directory')
-    ) {
-      affectedMap.entra = true
-    }
-    if (item.key.includes('sharing') || item.key.includes('sharepoint')) {
-      affectedMap.sharepoint = true
-    }
-    if (item.key.includes('license') || item.key.includes('m365_audit') || item.key.includes('audit_log')) {
-      affectedMap.o365 = true
-    }
-    if (item.key.includes('exchange') || item.key.includes('mail')) {
-      affectedMap.exchange = true
-    }
+    if (item.provenance?.origin === 'TENANT_FINDING' || item.provenance?.origin === 'ACCESS_CONFIGURATION') affectedMap.entra = true
   }
 
   const hasAnyAffected = Object.values(affectedMap).some(Boolean)

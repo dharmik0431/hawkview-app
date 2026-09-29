@@ -31,6 +31,8 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { apiClient } from '@/lib/api/client'
 import { cn } from '@/lib/utils'
+import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { exchangeAge } from '@/lib/tenants/dataset-age'
 import { formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
   exchangeDatasetStatus,
@@ -60,6 +62,12 @@ export type ExchangeSectionProps = {
 
 type TabKey = 'overview' | 'mailboxes' | 'rules' | 'domains-groups'
 type DomainGroupSubtab = 'domains' | 'groups'
+
+function datasetEvidenceLabel(status: ExchangeDatasetStatus): string {
+  if (status.state === 'SUCCESS') return 'Recorded snapshot'
+  if (['FAILED', 'PARTIAL', 'STALE'].includes(status.state)) return 'Completeness unverified'
+  return status.hasLastKnownRows ? 'Retained records · unverified' : 'Evidence unavailable'
+}
 
 function datasetBadgeClass(status: ExchangeDatasetStatus): string {
   if (status.tone === 'success') {
@@ -266,73 +274,8 @@ export default function ExchangePage({
     return []
   }, [bundle])
 
-  // Sync Freshness & Status Metadata
   const exchangeSync = bundle?.exchange?.sync ?? bundle?.sync?.exchange ?? {}
-  const freshness = bundle?.syncFreshness?.services?.exchange ?? bundle?.tenant?.syncFreshness?.services?.exchange ?? null
-
   const isSyncing = syncState === 'syncing'
-
-  // Last Attempt Timestamp & Formatting
-  const lastAttemptRaw =
-    freshness?.lastAttemptCompletedAt ||
-    freshness?.lastAttemptStartedAt ||
-    exchangeSync?.outcomeProjection?.lastAttemptAt ||
-    exchangeSync?.lastAttemptAt ||
-    null
-
-  const lastAttemptFormatted = lastAttemptRaw
-    ? formatTenantTimestamp(lastAttemptRaw)
-    : 'Awaiting first sync'
-
-  // Last Successful Sync Timestamp & Formatting
-  const lastSuccessRaw =
-    freshness?.lastSuccessfulCollectionAt ||
-    exchangeSync?.lastSuccessfulAt ||
-    (tenant?.lastSync && freshness?.status !== 'FAILED' ? tenant.lastSync : null) ||
-    null
-
-  const lastSuccessFormatted = lastSuccessRaw
-    ? formatTenantTimestamp(lastSuccessRaw)
-    : 'No successful sync yet'
-
-  // Current Sync Status Label & Indicator
-  const rawStatus = freshness?.status || exchangeSync?.status || (syncState === 'fail' ? 'FAILED' : syncState === 'syncing' ? 'RUNNING' : 'UNKNOWN')
-
-  const syncStatusLabel = (() => {
-    if (syncState === 'fail' || rawStatus === 'FAILED') return 'Sync failed'
-    if (rawStatus === 'PARTIAL') return 'Partial sync'
-    if (rawStatus === 'STALE' || freshness?.freshnessStatus === 'STALE') return 'Sync stale'
-    if (rawStatus === 'RUNNING') return 'Collector activity not verified'
-    if (rawStatus === 'PENDING') return 'Collection pending'
-    if (rawStatus === 'NOT_COLLECTED' || freshness?.freshnessStatus === 'NEVER_SYNCED' || !lastSuccessRaw) return 'Awaiting first sync'
-    if (rawStatus === 'SUCCESS') return 'Successful collection recorded'
-    if (lastSuccessRaw) return 'Retained data available'
-    return 'Unavailable'
-  })()
-
-  const syncStatusDotColor = (() => {
-    if (syncState === 'fail' || rawStatus === 'FAILED') return 'bg-red-500'
-    if (rawStatus === 'PARTIAL' || rawStatus === 'STALE') return 'bg-amber-500'
-    if (rawStatus === 'RUNNING' || rawStatus === 'PENDING') return 'bg-slate-400'
-    if (rawStatus === 'SUCCESS') return 'bg-emerald-500'
-    return 'bg-slate-400'
-  })()
-
-  // Freshness / Coverage Label
-  const freshnessLabel = (() => {
-    if (syncState === 'fail' || rawStatus === 'FAILED') return 'Collection failed'
-    if (rawStatus === 'PARTIAL') {
-      const pCount = freshness?.partialFailures?.length ?? 1
-      return `Partial data (${pCount} issue${pCount === 1 ? '' : 's'})`
-    }
-    if (rawStatus === 'STALE' || freshness?.freshnessStatus === 'STALE') return 'Stale dataset'
-    if (rawStatus === 'RUNNING') return 'Collector activity not verified'
-    if (rawStatus === 'PENDING') return 'Collection pending'
-    if (rawStatus === 'NOT_COLLECTED' || freshness?.freshnessStatus === 'NEVER_SYNCED' || !lastSuccessRaw) return 'No data collected'
-    if (freshness?.freshnessStatus === 'CURRENT') return 'Current dataset'
-    if (lastSuccessRaw) return 'Retained dataset'
-    return 'Unavailable'
-  })()
 
   // Dataset level error / sync states
   const mailboxesSyncStatus = bundle?.sync?.mailboxes || exchangeSync?.mailboxes || bundle?.sync?.exchange
@@ -597,49 +540,14 @@ export default function ExchangePage({
           )}
         </div>
 
-        {/* Compact Secondary Metadata Status Group */}
-        <div className="flex flex-wrap items-center gap-y-1.5 gap-x-3 sm:gap-x-4 text-xs text-slate-600 dark:text-slate-400 bg-slate-50/80 dark:bg-slate-800/50 px-3 py-2 rounded-lg border border-slate-200/80 dark:border-slate-800">
-          {/* Status */}
-          <div className="flex items-center gap-1.5 font-medium shrink-0">
-            <span className={cn("h-2 w-2 rounded-full shrink-0", syncStatusDotColor)} aria-hidden="true" />
-            <span className="text-slate-900 dark:text-slate-100 font-semibold">{syncStatusLabel}</span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          {/* Coverage / Freshness */}
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Coverage: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200">{freshnessLabel}</span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          {/* Last Attempt */}
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Last attempt: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200" title={lastAttemptRaw || undefined}>
-              {lastAttemptFormatted}
-            </span>
-          </div>
-
-          <span className="text-slate-300 dark:text-slate-700 hidden sm:inline" aria-hidden="true">•</span>
-
-          {/* Last Success */}
-          <div className="shrink-0">
-            <span className="text-slate-500 dark:text-slate-400">Last success: </span>
-            <span className="font-medium text-slate-800 dark:text-slate-200" title={lastSuccessRaw || undefined}>
-              {lastSuccessFormatted}
-            </span>
-          </div>
-        </div>
+        <SectionFreshness evidence={exchangeAge()} className="mb-0" />
 
         {/* Sync Failure Warning Banner */}
         {syncState === 'fail' && (
           <div className="text-xs px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 min-w-0">
               <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" aria-hidden="true" />
-              <span className="truncate">Synchronization attempt failed. Showing last known dataset.</span>
+              <span className="truncate">The update request failed. Available data remains visible.</span>
             </div>
             {onSync && (
               <button
@@ -840,7 +748,7 @@ export default function ExchangePage({
             ) : (
               <div className="py-6 text-center text-xs text-slate-500 dark:text-slate-400 flex flex-col items-center gap-2">
                 <CheckCircle2 className="h-6 w-6 text-emerald-500" aria-hidden="true" />
-                <span>Exchange data is synchronized. No review findings were identified from the currently available dataset.</span>
+                <span>No review findings were identified in the available records.</span>
               </div>
             )}
           </div>
@@ -848,7 +756,7 @@ export default function ExchangePage({
           {/* Dataset Status Matrix */}
           <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 shadow-2xs space-y-3">
             <h2 className="text-sm font-semibold text-slate-900 dark:text-white">
-              Dataset Synchronization Status
+              Dataset Evidence
             </h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
               {/* Mailboxes dataset */}
@@ -856,7 +764,7 @@ export default function ExchangePage({
                 <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-between">
                   <span>Mailboxes</span>
                   <Badge className={datasetBadgeClass(mailboxDatasetStatus)}>
-                    {mailboxDatasetStatus.label}
+                    {datasetEvidenceLabel(mailboxDatasetStatus)}
                   </Badge>
                 </div>
                 <div className="mt-2 text-slate-500 dark:text-slate-400">
@@ -869,7 +777,7 @@ export default function ExchangePage({
                 <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-between">
                   <span>Inbox Rules</span>
                   <Badge className={datasetBadgeClass(ruleDatasetStatus)}>
-                    {ruleDatasetStatus.label}
+                    {datasetEvidenceLabel(ruleDatasetStatus)}
                   </Badge>
                 </div>
                 <div className="mt-2 text-slate-500 dark:text-slate-400">
@@ -882,7 +790,7 @@ export default function ExchangePage({
                 <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-between">
                   <span>Microsoft 365 Domains</span>
                   <Badge className={datasetBadgeClass(domainDatasetStatus)}>
-                    {domainDatasetStatus.label}
+                    {datasetEvidenceLabel(domainDatasetStatus)}
                   </Badge>
                 </div>
                 <div className="mt-2 text-slate-500 dark:text-slate-400">
@@ -895,7 +803,7 @@ export default function ExchangePage({
                 <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center justify-between">
                   <span>Distribution Groups</span>
                   <Badge className={datasetBadgeClass(groupDatasetStatus)}>
-                    {groupDatasetStatus.label}
+                    {datasetEvidenceLabel(groupDatasetStatus)}
                   </Badge>
                 </div>
                 <div className="mt-2 text-slate-500 dark:text-slate-400">

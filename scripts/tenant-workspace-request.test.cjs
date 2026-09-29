@@ -174,7 +174,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     const postA = requests.at(-1)
     assert.equal(postA.method, 'POST')
     assert.match(text(), /Synchronization request pending/)
-    assert.match(text(), /Partially Synchronized|Needs Attention/)
+    assert.match(text(), /Evidence incomplete/)
     tenant = 'b'
     await render()
     assert.doesNotMatch(text(), /Synchronization request pending|A tenant/)
@@ -187,7 +187,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     const postB = requests.at(-1)
     await resolve(postB, bundle('b', 'B refreshed'))
     const completedText = text()
-    assert.match(text(), /Partially Synchronized|Needs Attention/)
+    assert.match(text(), /Evidence incomplete/)
     for (const [name, sync, expected] of [
       [
         'partial',
@@ -210,7 +210,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
             },
           },
         },
-        /Partially Synchronized/,
+        /Evidence incomplete/,
       ],
       [
         'unknown',
@@ -233,7 +233,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
             },
           },
         },
-        /Health Not Verified/,
+        /Evidence incomplete/,
       ],
       [
         'failed',
@@ -244,7 +244,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
             lastError: 'Independent failure',
           },
         },
-        /Needs Attention/,
+        /Evidence incomplete/,
       ],
     ]) {
       tenant = 'post-' + name
@@ -328,8 +328,8 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     delete c.tenant.syncFreshness
     delete c.tenant.initialSync
     await resolve(requests.at(-1), c)
-    assert.match(text(), /Current limited sign-in evidence available/)
-    assert.match(text(), /Partially Synchronized/)
+    assert.match(text(), /Evidence incomplete/)
+    assert.match(text(), /Evidence incomplete/)
     assert.doesNotMatch(
       text(),
       /Nonselected Graph error|Collecting Microsoft 365|Synchronization in progress/

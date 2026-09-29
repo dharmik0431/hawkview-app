@@ -943,7 +943,7 @@ export default function TenantsPage() {
         <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
           <div>
             <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">
-              Healthy
+              No findings reported
             </p>
             <p className="text-2xl font-extrabold text-emerald-700 dark:text-emerald-400 mt-0.5">
               {counts.healthy}
@@ -971,7 +971,7 @@ export default function TenantsPage() {
         <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
           <div>
             <p className="text-xs font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">
-              Disconnected / Pending / Unverified
+              Access setup / Incomplete evidence
             </p>
             <p className="text-2xl font-extrabold text-red-700 dark:text-red-400 mt-0.5">
               {counts.disconnectedPending}
@@ -1447,7 +1447,7 @@ export default function TenantsPage() {
                   : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
               )}
             >
-              Healthy
+              No findings reported
             </button>
             <button
               type="button"
@@ -1471,7 +1471,7 @@ export default function TenantsPage() {
                   : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
               )}
             >
-              Offline/Pending/Unverified
+              Setup / Incomplete
             </button>
           </div>
 
@@ -1700,13 +1700,13 @@ export default function TenantsPage() {
                               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-900 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors text-xs font-semibold text-left"
                             >
                               <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
-                              <span>{attentionItems.length} issue{attentionItems.length > 1 ? 's' : ''}</span>
+                              <span>{attentionItems.length} action{attentionItems.length > 1 ? 's' : ''}{actionableHealth.status === 'UNAVAILABLE' ? ' · Evidence incomplete' : ''}</span>
                               <ChevronRight className="h-3.5 w-3.5 opacity-60 ml-0.5" />
                             </button>
                           ) : actionableHealth.status === 'UNAVAILABLE' ? (
                             <span className="inline-flex items-center gap-1 text-xs text-slate-500 dark:text-slate-400 font-medium">
                               <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                              <span>Not verified</span>
+                              <span>Evidence incomplete</span>
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 font-medium">
@@ -1815,17 +1815,17 @@ export default function TenantsPage() {
                           className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-bold hover:underline"
                         >
                           <AlertTriangle className="h-3.5 w-3.5" />
-                          <span>{attentionItems.length} Needs Review</span>
+                          <span>{attentionItems.length} to review{actionableHealth.status === 'UNAVAILABLE' ? ' · Evidence incomplete' : ''}</span>
                         </button>
                       ) : actionableHealth.status === 'UNAVAILABLE' ? (
                         <span className="text-slate-500 dark:text-slate-400 font-semibold flex items-center gap-1">
                           <AlertCircle className="h-3.5 w-3.5" />
-                          <span>Not verified</span>
+                          <span>Evidence incomplete</span>
                         </span>
                       ) : (
                         <span className="text-emerald-600 font-semibold flex items-center gap-1">
                           <CheckCircle2 className="h-3.5 w-3.5" />
-                          <span>Clean</span>
+                          <span>No actions reported</span>
                         </span>
                       )}
                     </div>

@@ -1,3 +1,4 @@
+import * as customerAttentionModule from '../attention/customer-attention.ts'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
@@ -27,6 +28,7 @@ function compile(path: string, mocks: Record<string, unknown>) {
   return exports
 }
 const shared = {
+  '@/lib/attention/customer-attention': customerAttentionModule,
   'lucide-react': icons,
   'next/navigation': { useRouter: () => ({ push: () => undefined }) },
   '@/components/ui/button': { Button: button },
