@@ -177,7 +177,7 @@ test('bounds non-success bodies and refuses redirects after URL validation', asy
         `https://manage.office.com/api/v1.0/${tenant.microsoftTenantId}/activity/feed/subscriptions/list`,
         { headers: {} },
         tenant.microsoftTenantId,
-        publisherIdentifier,
+        publisherIdentifier, Date.now() + 60_000,
       ),
       /HTTP 400: bad request/,
     )
@@ -242,7 +242,7 @@ test('starts at most one missing subscription and persists Microsoft\'s 15-minut
       tenant,
       'token',
       publisherIdentifier,
-      now,
+      now, Date.now() + 60_000,
     )
     assert.equal(enabled.size, 1)
     assert.equal(requests.filter((request) => request.method === 'POST').length, 1)
@@ -265,7 +265,7 @@ test('starts at most one missing subscription and persists Microsoft\'s 15-minut
       tenant,
       'token',
       publisherIdentifier,
-      new Date(now.getTime() + 5 * 60 * 1000),
+      new Date(now.getTime() + 5 * 60 * 1000), Date.now() + 60_000,
     )
     assert.equal(postCount, 0)
   } finally {
@@ -318,8 +318,8 @@ test('serializes concurrent subscription starts so only one POST occurs', async 
   try {
     const now = new Date('2026-08-17T12:00:00.000Z')
     await Promise.all([
-      (service as any).ensureSubscriptions(tenant, 'token', publisherIdentifier, now),
-      (service as any).ensureSubscriptions(tenant, 'token', publisherIdentifier, now),
+      (service as any).ensureSubscriptions(tenant, 'token', publisherIdentifier, now, Date.now() + 60_000),
+      (service as any).ensureSubscriptions(tenant, 'token', publisherIdentifier, now, Date.now() + 60_000),
     ])
     assert.equal(postCount, 1)
   } finally {
@@ -373,7 +373,7 @@ test('starts Azure AD audit first for the limited-license sign-in fallback and r
       tenant,
       'token',
       publisherIdentifier,
-      new Date('2026-08-17T12:00:00.000Z'),
+      new Date('2026-08-17T12:00:00.000Z'), Date.now() + 60_000,
     )
     assert.equal(first.size, 0)
     assert.equal(
@@ -385,7 +385,7 @@ test('starts Azure AD audit first for the limited-license sign-in fallback and r
       tenant,
       'token',
       publisherIdentifier,
-      new Date('2026-08-17T12:16:00.000Z'),
+      new Date('2026-08-17T12:16:00.000Z'), Date.now() + 60_000,
     )
     assert.deepEqual(starts, ['Audit.AzureActiveDirectory', 'Audit.Exchange'])
     assert.equal(second.has('Audit.Exchange'), true)
@@ -438,7 +438,7 @@ test('writes raw and normalized evidence and completes a content ledger in one t
     ]))
   }
   try {
-    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
+    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
     assert.equal(changes.length, 2)
     assert.equal(rawWrites.length, 3)
     assert.equal(evidenceWrites.length, 2)
@@ -487,7 +487,7 @@ test('rejects a cross-tenant content blob before evidence writes', async () => {
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify([record({ OrganizationId: 'other-tenant' })]))
   try {
-    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
+    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
     assert.deepEqual(changes, [])
     assert.deepEqual(states, ['PROCESSING', 'RETRY'])
     assert.equal(evidenceWrites.length, 0)
@@ -524,7 +524,7 @@ test('does not mark a blob complete when the evidence transaction fails', async 
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify([record()]))
   try {
-    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
+    const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
     assert.deepEqual(changes, [])
     assert.deepEqual(states, ['PROCESSING', 'RETRY'])
   } finally {
@@ -558,7 +558,7 @@ test('content ingestion operational logs never include provider identifiers or h
         hostile,
         publisherIdentifier,
         { remainingBytes: 1024 },
-        { ...content, id: 'content-private', microsoftContentId: 'provider-private' },
+        { ...content, id: 'content-private', microsoftContentId: 'provider-private' }, Date.now() + 60_000,
       ),
       [],
     )
@@ -618,8 +618,8 @@ test('rolls record quota reservation back with failed evidence storage so retrie
   const originalFetch = globalThis.fetch
   globalThis.fetch = async () => new Response(JSON.stringify([record(), record()]))
   try {
-    await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
-    await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content)
+    await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
+    await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
     assert.equal(committedRecords, 0)
     assert.deepEqual(states, ['PROCESSING', 'RETRY', 'PROCESSING', 'RETRY'])
   } finally {

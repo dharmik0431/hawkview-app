@@ -224,13 +224,60 @@ export function isRetryableMicrosoftStatus(status: number) {
   return RETRYABLE_STATUSES.has(status)
 }
 
+const HTTP_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const HTTP_LONG_WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+const HTTP_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+function httpDateMilliseconds(raw: string, now: number): number | null {
+  // Parse each HTTP-date grammar explicitly. Date.parse accepts invented
+  // weekdays and normalizes impossible dates, which can turn bad headers
+  // into past dates and therefore immediate retries.
+  const preferred = /^(?<weekday>Sun|Mon|Tue|Wed|Thu|Fri|Sat), (?<day>\d{2}) (?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?<year>\d{4}) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) GMT$/.exec(raw)
+  const obsolete = /^(?<weekday>Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), (?<day>\d{2})-(?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(?<year>\d{2}) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) GMT$/.exec(raw)
+  const asctime = /^(?<weekday>Sun|Mon|Tue|Wed|Thu|Fri|Sat) (?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?<day> \d|\d{2}) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) (?<year>\d{4})$/.exec(raw)
+  const parts = (preferred ?? obsolete ?? asctime)?.groups
+  if (!parts) return null
+  const month = HTTP_MONTHS.indexOf(parts.month)
+  const weekday = (obsolete ? HTTP_LONG_WEEKDAYS : HTTP_WEEKDAYS).indexOf(parts.weekday)
+  const day = Number(parts.day), hour = Number(parts.hour)
+  const minute = Number(parts.minute), second = Number(parts.second)
+  let year = Number(parts.year)
+  const atYear = (value: number) => {
+    const date = new Date(0)
+    // setUTCFullYear avoids Date.UTC's special interpretation of years 0–99.
+    date.setUTCFullYear(value, month, day)
+    date.setUTCHours(hour, minute, second, 0)
+    return date
+  }
+  if (obsolete) {
+    const currentYear = new Date(now).getUTCFullYear()
+    year = currentYear + (year - currentYear % 100 + 100) % 100
+    const latest = new Date(now)
+    latest.setUTCFullYear(currentYear + 50)
+    // HTTP's obsolete two-digit year is the most recent matching year no
+    // more than fifty years ahead, not Date.parse's fixed century pivot.
+    if (atYear(year).getTime() > latest.getTime()) year -= 100
+  }
+  const date = atYear(year)
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month ||
+      date.getUTCDate() !== day || date.getUTCHours() !== hour ||
+      date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second ||
+      date.getUTCDay() !== weekday) return null
+  return date.getTime()
+}
+
+/** HTTP delay-seconds or HTTP-date only; absent and invalid are not zero. */
 export function retryAfterMilliseconds(value: string | null, now = Date.now()) {
-  if (!value) return null
-  const seconds = Number(value)
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 10_000)
-  const date = Date.parse(value)
-  if (!Number.isFinite(date)) return null
-  return Math.max(0, Math.min(date - now, 10_000))
+  if (value === null) return null
+  const raw = value.trim()
+  if (/^\d+$/.test(raw)) {
+    const milliseconds = Number(raw) * 1000
+    return Number.isSafeInteger(milliseconds) && now + milliseconds <= 8.64e15
+      ? milliseconds
+      : null
+  }
+  const date = httpDateMilliseconds(raw, now)
+  return date === null ? null : Math.max(0, date - now)
 }
 
 export async function fetchMicrosoftWithRetry(
@@ -251,38 +298,62 @@ export async function fetchMicrosoftWithRetry(
   const attempts = mayRetry ? Math.max(1, Math.min(options.maxAttempts ?? 3, 3)) : 1
   const fetchImpl = options.fetchImpl ?? fetch
   const wait = options.wait ?? ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)))
+  const remainingBudget = () => options.deadlineAt === undefined
+    ? Number.POSITIVE_INFINITY
+    : options.deadlineAt - Date.now()
+  const deadlineError = () => new MicrosoftRequestError(
+    `${options.label} reached its bounded collection deadline.`, null, null, null,
+  )
+  const waitWithinBudget = async (delay: number) => {
+    // A retry needs time after the sleep too. Never shorten a server's wait.
+    if (delay >= remainingBudget()) throw deadlineError()
+    await wait(delay)
+  }
   const { signal: _discardedSignal, ...stableInit } = init
   let lastError: unknown
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const remaining = options.deadlineAt === undefined
-      ? Number.POSITIVE_INFINITY
-      : options.deadlineAt - Date.now()
-    if (remaining <= 0) {
-      throw new MicrosoftRequestError(
-        `${options.label} reached its bounded collection deadline.`, null, null, null,
-      )
-    }
-    const timeoutMs = Math.max(1, Math.min(options.timeoutMs ?? 30_000, remaining))
+    const remaining = remainingBudget()
+    if (remaining <= 0) throw deadlineError()
+    const timeoutMs = Math.max(1, Math.ceil(Math.min(options.timeoutMs ?? 30_000, remaining)))
     const headers = new Headers(stableInit.headers)
     if (!headers.has('client-request-id')) headers.set('client-request-id', randomUUID())
+    let response: Response
     try {
-      const response = await fetchImpl(url, {
+      response = await fetchImpl(url, {
         ...stableInit,
         headers,
         signal: AbortSignal.timeout(timeoutMs),
       })
-      if (!isRetryableMicrosoftStatus(response.status) || attempt === attempts - 1) {
-        return response
-      }
-      await response.body?.cancel().catch(() => undefined)
-      const retryAfter = retryAfterMilliseconds(response.headers.get('retry-after'))
-      await wait(retryAfter ?? (attempt + 1) * 500)
     } catch (error) {
       lastError = error
+      if (remainingBudget() <= 0) throw deadlineError()
       if (attempt === attempts - 1) break
-      await wait((attempt + 1) * 500)
+      await waitWithinBudget((attempt + 1) * 500)
+      continue
     }
+    if (remainingBudget() <= 0) {
+      await response.body?.cancel().catch(() => undefined)
+      throw deadlineError()
+    }
+    if (!isRetryableMicrosoftStatus(response.status) || attempt === attempts - 1) return response
+    const rawRetryAfter = response.headers.get('retry-after')
+    const retryAfter = retryAfterMilliseconds(rawRetryAfter)
+    if (rawRetryAfter !== null && retryAfter === null) {
+      console.warn(JSON.stringify({ event: 'microsoft_request_retry', reasonCode: 'INVALID_RETRY_AFTER' }))
+    }
+    const delay = retryAfter ?? (attempt + 1) * 500
+    if (delay >= remainingBudget()) {
+      await response.body?.cancel().catch(() => undefined)
+      throw deadlineError()
+    }
+    // Retain the existing ten-second inline wait bound without violating a
+    // longer server delay. Return the original response for caller handling.
+    if (delay > 10_000) return response
+    await response.body?.cancel().catch(() => undefined)
+    // Kept outside fetch's catch: a deadline refusal is never retried as a
+    // transport error. Recheck after cancellation consumed any time.
+    await waitWithinBudget(delay)
   }
 
   const message = lastError instanceof Error ? lastError.message : `${options.label} request failed.`
