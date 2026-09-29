@@ -19,6 +19,7 @@ import {
   getUserDisplayName,
   getUserEmailOrUpn,
   mapRuleToPresentation,
+  primaryReasonFor,
 } from '@/lib/identity-risk/risk-presentation-mapper'
 import { findingEvidenceSummary } from '@/lib/identity-risk/presentation'
 
@@ -94,9 +95,9 @@ export function FleetRiskAssessmentDrawer({
     row.detection.microsoft === 'UNAVAILABLE' ||
     row.detection.microsoft === 'NOT_COMPARABLE'
 
-  const primaryReason = row.reasons[0]
+  const primaryReason = primaryReasonFor(row.reasons)
   const primaryMapped = primaryReason
-    ? mapRuleToPresentation(primaryReason.ruleId, primaryReason.signal)
+    ? mapRuleToPresentation(primaryReason)
     : isMicrosoft
     ? {
         ruleId: 'microsoft-entra-risk',
@@ -285,16 +286,11 @@ export function FleetRiskAssessmentDrawer({
               ) : (
                 <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 p-4 sm:p-5 shadow-2xs space-y-4">
                   {row.reasons.map((reason, idx) => {
-                    const mapped = mapRuleToPresentation(reason.ruleId, reason.signal)
+                    const mapped = mapRuleToPresentation(reason)
                     const summary = findingEvidenceSummary(reason, (d) => formatTimestamp(d))
                     const isStateObserved = reason.kind === 'STATE_OBSERVED'
 
-                    let countText = summary.count
-                    if (countText && countText.toLowerCase().includes('lockout')) {
-                      countText = countText
-                        .replace(/lockouts/gi, 'matching events')
-                        .replace(/lockout/gi, 'matching event')
-                    }
+                    const countText = summary.count
 
                     const showExtraContext =
                       Boolean(mapped.evidenceContext) &&

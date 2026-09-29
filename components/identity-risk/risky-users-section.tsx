@@ -40,6 +40,7 @@ import {
   getUserDisplayName,
   getUserEmailOrUpn,
   mapRuleToPresentation,
+  primaryReasonFor,
 } from '@/lib/identity-risk/risk-presentation-mapper'
 import type { MicrosoftChannel, RiskyUserCount, RiskyUserRow } from '@/lib/identity-risk/risky-users-view'
 import type { NativeAssessment, NativeCoverageCategories } from '@/lib/identity-risk/native-assessment'
@@ -214,11 +215,11 @@ function FoundByBadges({ row }: { row: RiskyUserRow }) {
 }
 
 function WhyNeedsReviewCell({ row }: { row: RiskyUserRow }) {
-  const primaryReason = row.reasons[0]
+  const primaryReason = primaryReasonFor(row.reasons)
   const isMicrosoft = row.detection.microsoft === 'REPORTED'
 
   const mapped = primaryReason
-    ? mapRuleToPresentation(primaryReason.ruleId, primaryReason.signal)
+    ? mapRuleToPresentation(primaryReason)
     : isMicrosoft
     ? {
         plainTitle: 'Microsoft detected elevated identity risk',

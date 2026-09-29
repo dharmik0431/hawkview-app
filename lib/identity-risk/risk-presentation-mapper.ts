@@ -6,84 +6,88 @@ export type RiskMapperResult = {
   recommendedActions: readonly string[]
 }
 
-/**
-  Translates rule IDs and signal identifiers into clear, plain-English security explanations and guidance.
- */
-export function mapRuleToPresentation(ruleId: string, signal?: string | null): RiskMapperResult {
-  // If signal explicitly indicates account lockout
-  if (signal === 'LOCKED_OUT_AFTER_REPEATED_FAILURES') {
-    return {
-      ruleId,
-      plainTitle: 'Account lockout following failed sign-ins',
-      plainExplanation: 'The account was locked out after repeated unsuccessful sign-in attempts.',
-      evidenceContext: 'Multiple consecutive failed sign-in attempts triggered an automatic account lockout in Microsoft 365 logs.',
-      recommendedActions: [
-        'Review the user’s recent Microsoft sign-in activity and locations.',
-        'Confirm whether the attempts were expected with the user or tenant administrator.',
-        'Reset the account password if the activity is unexplained.',
-        'Revoke active sessions if unauthorized access is suspected.',
-        'Confirm MFA registration and effective Conditional Access coverage.',
-        'Escalate or temporarily disable the account if suspicious attempts continue.',
-      ],
-    }
-  }
+export type PresentationReason = {
+  ruleId: string
+  signal?: string | null
+  evidenceCount?: number | null
+  evidenceCountCapped?: boolean
+}
 
-  // Handle repeated-credential-failure rule or password rejection signals
-  if (
-    ruleId === 'repeated-credential-failure' ||
-    ruleId === 'HV-ID-AUTH-010.v1' ||
-    ruleId === 'HV-ID-AUTH-005.v2' ||
-    signal === 'PASSWORD_REJECTED'
-  ) {
-    return {
-      ruleId,
-      plainTitle: 'Repeated unsuccessful sign-in activity',
-      plainExplanation: 'HawkView observed repeated credential failures associated with this identity.',
-      evidenceContext: 'Multiple invalid password attempts were recorded for this account across evaluated sign-in logs.',
-      recommendedActions: [
-        'Review the user’s recent Microsoft sign-in activity and locations.',
-        'Confirm whether the attempts were expected with the user or tenant administrator.',
-        'Reset the account password if the activity is unexplained.',
-        'Revoke active sessions if unauthorized access is suspected.',
-        'Confirm MFA registration and effective Conditional Access coverage.',
-        'Escalate or temporarily disable the account if suspicious attempts continue.',
-      ],
-    }
-  }
+/** Keep all evidence, including evaluated zeros, but title a finding with a
+ * positive reason when one exists. Array order alone is not evidence. */
+export function primaryReasonFor<T extends PresentationReason>(reasons: readonly T[]): T | undefined {
+  return reasons.find(reason => Number.isSafeInteger(reason.evidenceCount) && reason.evidenceCount! > 0) ?? reasons[0]
+}
 
-  // Handle external mailbox forwarding rule or signal
-  if (
-    ruleId === 'external-mailbox-forwarding' ||
-    ruleId === 'HV-ID-MBX-001.v1' ||
-    signal === 'EXTERNAL_FORWARDING_CONFIGURED'
-  ) {
-    return {
-      ruleId,
-      plainTitle: 'External mailbox forwarding configured',
-      plainExplanation: 'HawkView observed an active email forwarding rule routing mail outside the organization.',
-      evidenceContext: 'Exchange Online inbox rules or mailbox configuration actively direct incoming messages to an external recipient.',
-      recommendedActions: [
-        'Confirm with the mailbox owner whether the forwarding was set up deliberately.',
-        'Review inbox and forwarding rules in Exchange Online to verify the external recipient address.',
-        'Check when the rule was created relative to the account’s recent password changes or sign-in logs.',
-        'Remove unauthorized forwarding rules and reset credentials if compromised.',
-        'Verify whether sensitive data may have been forwarded outside the domain.',
-      ],
-    }
-  }
+const investigation = [
+  'Confirm with the account owner whether the sign-in attempts were expected.',
+  'Check applications and devices for an outdated saved password.',
+  'Review the sign-in records and any successful authentication separately; these failures do not establish whether other access occurred.',
+  'If unauthorized successful access or credential exposure is corroborated, follow the incident-response procedure for password reset, session revocation or account containment.',
+] as const
 
-  // Safe fallback for unknown rule codes
-  return {
+/** A known identifier supplies vocabulary, not proof that an event occurred. */
+export function mapRuleToPresentation(reason: PresentationReason): RiskMapperResult {
+  const { ruleId, signal, evidenceCount, evidenceCountCapped } = reason
+  const unknown = (): RiskMapperResult => ({
     ruleId,
-    plainTitle: 'Security activity needs review',
-    plainExplanation: 'HawkView found activity associated with this identity that requires investigation.',
-    evidenceContext: 'Observed security indicators require manual verification in tenant logs.',
+    plainTitle: 'Finding explanation unavailable',
+    plainExplanation: 'HawkView returned a finding, but this view cannot interpret its evidence as a specific activity.',
+    evidenceContext: 'An unrecognized or missing explanation is not evidence of safety or compromise. Review the recorded finding and source details.',
+    recommendedActions: ['Review the finding and its source evidence before deciding what action is needed.'],
+  })
+  const knownSignal = signal === 'LOCKED_OUT_AFTER_REPEATED_FAILURES' || signal === 'PASSWORD_REJECTED' || signal === 'EXTERNAL_FORWARDING_CONFIGURED'
+  const knownLegacy = !signal && ['HV-ID-AUTH-010.v1', 'HV-ID-AUTH-005.v2', 'HV-ID-MBX-001.v1'].includes(ruleId)
+  if ((!knownSignal && !knownLegacy) || !Number.isSafeInteger(evidenceCount) || evidenceCount! < 0) return unknown()
+  if (evidenceCount === 0) {
+    if (evidenceCountCapped) return unknown()
+    const label = signal === 'LOCKED_OUT_AFTER_REPEATED_FAILURES' ? 'lockout records'
+      : signal === 'PASSWORD_REJECTED' ? 'password-rejection records'
+      : signal === 'EXTERNAL_FORWARDING_CONFIGURED' ? 'external forwarding destinations' : 'matching evidence'
+    return {
+      ruleId,
+      plainTitle: `No ${label} observed`,
+      plainExplanation: `This check reported zero ${label} in the evaluated evidence.`,
+      evidenceContext: 'An evaluated zero is different from an absent check. It does not establish that other activity or risk is absent.',
+      recommendedActions: ['Review any positive findings and source coverage separately.'],
+    }
+  }
+  if (signal === 'LOCKED_OUT_AFTER_REPEATED_FAILURES') return {
+    ruleId,
+    plainTitle: 'Account lockout reported',
+    plainExplanation: 'Microsoft reported sign-in requests blocked by account lockout after repeated failures.',
+    evidenceContext: 'The count describes sign-in records reporting lockout, not distinct lockout episodes. It does not prove varied passwords, unauthorized access, or that the account is locked now. Unexpected attempts and legitimate client activity both need investigation.',
+    recommendedActions: investigation,
+  }
+  if (signal === 'PASSWORD_REJECTED' || (!signal && ruleId === 'HV-ID-AUTH-010.v1')) return {
+    ruleId,
+    plainTitle: 'Rejected password attempts observed',
+    plainExplanation: 'The evaluated evidence contains sign-in attempts where the password was rejected.',
+    evidenceContext: 'These records do not by themselves prove a concentrated attack, exposed credentials or successful access. Typing mistakes and outdated saved passwords are possible explanations.',
+    recommendedActions: investigation,
+  }
+  if (!signal && ruleId === 'HV-ID-AUTH-005.v2') return {
+    ruleId,
+    plainTitle: 'Authentication failures followed by success',
+    plainExplanation: 'The finding reports qualified authentication failures followed by a successful authentication.',
+    evidenceContext: 'The sequence does not establish that the same actor made every attempt or that the successful access was unauthorized.',
     recommendedActions: [
-      'Review recent sign-in logs and directory activity for this identity.',
-      'Verify recent configuration or credential changes with the account owner.',
-      'Inspect Microsoft Entra ID Protection and audit logs for context.',
+      'Review the successful authentication and confirm with the account owner whether it was expected.',
+      ...investigation.slice(1),
     ],
   }
+  if (signal === 'EXTERNAL_FORWARDING_CONFIGURED' || (!signal && ruleId === 'HV-ID-MBX-001.v1')) return {
+    ruleId,
+    plainTitle: 'External mailbox forwarding observed',
+    plainExplanation: 'The finding reports mailbox forwarding configured to an external destination when the configuration was observed.',
+    evidenceContext: 'Configured forwarding does not establish that messages were delivered or data was exfiltrated. Check the observation time and whether the configuration is still present.',
+    recommendedActions: [
+      'Confirm with the mailbox owner whether the forwarding was authorized.',
+      'Review the forwarding configuration and destination in Exchange Online.',
+      'If unauthorized forwarding or account access is confirmed, follow the incident-response procedure.',
+    ],
+  }
+  return unknown()
 }
 
 /**

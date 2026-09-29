@@ -42,6 +42,7 @@ import {
   getUserDisplayName,
   getUserEmailOrUpn,
   mapRuleToPresentation,
+  primaryReasonFor,
 } from '@/lib/identity-risk/risk-presentation-mapper'
 import { cn } from '@/lib/utils'
 
@@ -709,9 +710,9 @@ export default function FleetRiskyUsersPage() {
                   const isHawkViewOnly = isHawkView && !isMicrosoft
                   const isMicrosoftOnly = !isHawkView && isMicrosoft
 
-                  const primaryReason = row.reasons[0]
+                  const primaryReason = primaryReasonFor(row.reasons)
                   const mappedPrimary = primaryReason
-                    ? mapRuleToPresentation(primaryReason.ruleId, primaryReason.signal)
+                    ? mapRuleToPresentation(primaryReason)
                     : null
 
                   const borderAccentClass = isBoth
@@ -892,9 +893,9 @@ export default function FleetRiskyUsersPage() {
 
               const isHawkView = row.reasons.length > 0
               const isMicrosoft = row.detection.microsoft === 'REPORTED'
-              const primaryReason = row.reasons[0]
+              const primaryReason = primaryReasonFor(row.reasons)
               const mappedPrimary = primaryReason
-                ? mapRuleToPresentation(primaryReason.ruleId, primaryReason.signal)
+                ? mapRuleToPresentation(primaryReason)
                 : null
 
               return (

@@ -63,6 +63,20 @@ test('actual payload → hook → page and drawer: clean, incomplete, Microsoft-
   const render = async (n: any, m: any) => { nativeQuery = { data: n }; microsoftQuery = { data: m }; await React.act(async () => root.render(React.createElement(Page))) }
   const body = () => dom.window.document.body.textContent ?? ''
   try {
+    const rejections = native()
+    rejections.count.value = 1
+    rejections.findings.items = [{ detectorId: 'repeated-credential-failure', subject: { kind: 'DIRECTORY_USER', userRef: 'subject:synthetic-user' }, signals: [
+      { signal: 'LOCKED_OUT_AFTER_REPEATED_FAILURES', count: 0, latest: null, capped: false },
+      { signal: 'PASSWORD_REJECTED', count: 7, latest: { at: stamp, kind: 'EVENT_OCCURRED' }, capped: false },
+    ] }]
+    await render(rejections, microsoft())
+    assert.equal((body().match(/Rejected password attempts observed/g) ?? []).length, 2, 'Desktop and mobile select the positive reason')
+    assert.doesNotMatch(body(), /Account lockout reported|account was locked|automatic account lockout/)
+    const investigateNative = Array.from(dom.window.document.querySelectorAll('button')).find((button: any) => /Investigate/.test(button.textContent)) as any
+    await React.act(async () => investigateNative.click())
+    assert.match(body(), /No lockout records observed/)
+    assert.match(body(), /outdated saved password/)
+    assert.doesNotMatch(body(), /account was locked|automatic account lockout/)
     await render(native(), microsoft())
     assert.match(body(), /No users require review/)
     now += 2 * 60 * 60 * 1000 + 1

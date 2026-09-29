@@ -837,12 +837,11 @@ export const FAILURE_REASON_MEANINGS: readonly FailureReasonPattern[] = [
         'measuring itself.',
     },
     note:
-      'Smart lockout "tracks the last three bad password hashes to avoid incrementing the lockout counter ' +
-      'for the same password", so a lockout implies VARIED password attempts. A misconfigured client ' +
-      'replaying one stale credential will NOT lock out, which removes the main false-positive objection ' +
-      'to treating a lockout as attack evidence. It gets its OWN outcome rather than being folded into ' +
-      'PASSWORD_REJECTED: a lockout is a refusal, not a credential that was validated and found wrong, and ' +
-      'calling it an invalid-credential attempt would assert something that did not happen on that event.',
+      'Microsoft documents password-hash tracking with a pass-through-authentication exception, and ' +
+      'genuine users can be locked out. A recognized repeated-failure lockout reason does not universally ' +
+      'prove varied passwords or an attack. Preserve the distinct malicious-IP branch and leave unknown ' +
+      '50053 reasons unclassified. A lockout is a refusal, not proof that credentials were validated or ' +
+      'that unauthorized access occurred. See https://learn.microsoft.com/en-us/entra/identity/authentication/howto-password-smart-lockout.',
   },
 ];
 
