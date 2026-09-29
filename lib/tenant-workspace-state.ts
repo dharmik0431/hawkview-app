@@ -6,7 +6,7 @@ import {
   tenantActionableHealthProjection,
   type TenantActionableHealthProjection,
 } from './attention/computeTenantAttention.ts'
-import type { PilotEvidenceView } from './tenants/collection-readiness'
+import type { CollectionReadinessView, PilotEvidenceView } from './tenants/collection-readiness'
 
 export type TenantWorkspaceState =
   | 'healthy'
@@ -244,6 +244,7 @@ export function deriveTenantWorkspaceDisplay(
   manualSyncing = false,
   signInEvidence: PilotEvidenceView['signIns'] | null = null,
   actionableHealth: TenantActionableHealthProjection | null = null,
+  collectionContext?: { readiness?: CollectionReadinessView | null; resourceHealth?: unknown },
 ): TenantWorkspaceDisplay {
   const tenant = bundle?.tenant as any
   const connection = connectionState(tenant)
@@ -268,94 +269,76 @@ export function deriveTenantWorkspaceDisplay(
   const backendInitialSyncInProgress = initialSyncStatus === 'in_progress'
   const backendInitialSyncDelayed = initialSyncStatus === 'delayed'
 
-  for (const [service, sync] of useLegacyIssueDerivation ? entries : []) {
-    const resourceType = resourceTypeForSyncEntry(service)
-    // Once readiness has selected an evidence source, its state is authoritative.
-    // A failed non-selected Graph attempt must not override current audit-feed
-    // evidence or create a duplicate retry action.
-    if (resourceType === 'SIGN_INS' && signInEvidence?.selectedSource) continue
-    const status = normalized(sync.status)
-    if (sync.lastError || ['failed', 'error', 'partial'].includes(status)) {
-      const sLower = service.toLowerCase()
-      const moduleKey = sLower.includes('entra') || sLower.includes('user') || sLower.includes('group') ? 'entra'
-        : sLower.includes('exchange') || sLower.includes('mailbox') ? 'exchange'
-        : sLower.includes('sharepoint') || sLower.includes('site') || sLower.includes('onedrive') ? 'sharepoint'
-        : sLower.includes('team') ? 'teams'
-        : sLower.includes('license') ? 'license-activity'
-        : 'settings'
-
-      const serviceName = sLower.includes('m365audit') ? 'Microsoft 365 audit'
-        : sLower.includes('signin') ? 'Sign-ins'
-        : sLower.includes('group') ? 'Entra Groups'
-        : sLower.includes('user') ? 'Entra Users'
-        : sLower.includes('entra') ? 'Entra ID'
-        : sLower.includes('exchange') || sLower.includes('mailbox') ? 'Exchange'
-        : sLower.includes('sharepoint') || sLower.includes('site') || sLower.includes('onedrive') ? 'SharePoint / OneDrive'
-        : sLower.includes('team') ? 'Teams'
-        : sLower.includes('license') ? 'License Activity'
-        : service.charAt(0).toUpperCase() + service.slice(1)
-
-      const severity = status === 'failed' || status === 'error' ? 'Error' : 'Warning'
-      const attemptedAt = outcomeProjection(service, sync)?.lastAttemptAt
-      const timestamp = attemptedAt && Number.isFinite(Date.parse(attemptedAt)) ? attemptedAt : null
-      const plainTitle = `${serviceName} collection needs review`
-      const explanation = `${serviceName} has a recorded collection error or limitation.`
-      const impact = `${serviceName} records and state may be incomplete or out of date.`
-      const technicalDetails = sync.lastError || `Recorded synchronization status: "${sync.status}"`
-      const recommendedSteps = [
-        'Review the recorded collection details.',
-        'Retry synchronization or review service settings if the issue persists.',
-      ]
-      const actionLabel = 'Retry synchronization'
-
-      issues.push({
-        id: `sync-${service}`,
-        service: serviceName,
-        severity,
-        title: plainTitle,
-        detail: explanation,
-        explanation,
-        impact,
-        technicalDetails,
-        recommendedSteps,
-        action: actionLabel,
-        lastDetectedAt: timestamp,
-        targetModule: moduleKey,
-      })
+  // Supplement silent health only with explicit failed/partial records. Unknown,
+  // queued, retained diagnostics and capability-limited evidence are not incidents.
+  const excludedResources = new Set<string>()
+  for (const workload of collectionContext?.readiness?.workloads ?? []) {
+    for (const dataset of workload.datasets) {
+      if (['NOT_LICENSED', 'UNSUPPORTED'].includes(dataset.state) ||
+        (dataset.tier === 'CAPABILITY_OPTIONAL' &&
+          (dataset.state === 'BLOCKED_PERMISSION' || dataset.permissionStatus === 'MISSING'))) {
+        dataset.resourceTypes.forEach(resource => excludedResources.add(resource))
+      }
     }
   }
-
-  if (
-    useLegacyIssueDerivation &&
-    signInEvidence?.selectedSource &&
-    ['STALE', 'FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability)
-  ) {
-    const blocked = signInEvidence.availability === 'BLOCKED_PERMISSION' ||
-      signInEvidence.availability === 'BLOCKED_TENANT_CONFIGURATION'
-    const stale = signInEvidence.availability === 'STALE'
-    issues.push({
-      id: 'sync-signIns',
-      service: 'Sign-ins',
-      severity: blocked || signInEvidence.availability === 'FAILED_TRANSIENT' ? 'Error' : 'Warning',
-      title: blocked
-        ? 'Selected sign-in source is blocked'
-        : stale
-          ? 'Selected sign-in evidence is stale'
-          : 'Selected sign-in collection failed',
-      detail: signInEvidence.reason ?? 'The selected Microsoft sign-in evidence source needs attention.',
-      explanation: signInEvidence.reason ?? 'The selected Microsoft sign-in evidence source needs attention.',
-      impact: stale
-        ? 'Retained sign-in evidence remains available but is outside the current freshness window.'
-        : 'Current sign-in evidence is unavailable from the selected source.',
-      technicalDetails: signInEvidence.reasonCode
-        ? `Selected evidence state: ${signInEvidence.availability} (${signInEvidence.reasonCode})`
-        : `Selected evidence state: ${signInEvidence.availability}`,
-      recommendedSteps: blocked
-        ? ['Review the selected sign-in source permissions in Tenant Settings.']
-        : ['Retry synchronization for the selected sign-in source.', 'Review Microsoft service health if the issue persists.'],
-      action: blocked ? 'Review permissions' : 'Retry synchronization',
+  if (Array.isArray(collectionContext?.resourceHealth)) {
+    for (const row of collectionContext.resourceHealth) {
+      if (row && typeof row.resourceType === 'string' &&
+        (['NOT_LICENSED', 'UNSUPPORTED'].includes(row.classification) ||
+          (row.required === false && ['PERMISSION_REQUIRED', 'NOT_CONFIGURED'].includes(row.classification)))) {
+        excludedResources.add(row.resourceType)
+      }
+    }
+  }
+  const sourceNames: Record<string, string> = {
+    USERS: 'User', LICENSES: 'License', DOMAINS: 'Domain', GROUPS: 'Group',
+    SIGN_INS: 'Sign-ins', AUDIT_LOGS: 'Directory audit', M365_AUDIT: 'Microsoft 365 audit',
+    SHAREPOINT_SITES: 'SharePoint site', SHAREPOINT_SETTINGS: 'SharePoint settings', SHAREPOINT_USAGE: 'SharePoint usage',
+    APPLICATIONS: 'Application', SERVICE_PRINCIPALS: 'Enterprise application', SECURITY_DEFAULTS: 'Security defaults',
+    EXCHANGE_MAILBOXES: 'Mailbox', EXCHANGE_MAILBOX_SETTINGS: 'Mailbox settings', EXCHANGE_MAILBOX_USAGE: 'Mailbox usage',
+    EXCHANGE_ACCEPTED_DOMAINS: 'Accepted email domain', EXCHANGE_MAILBOX_RULES: 'Inbox rule', EXCHANGE_MAILBOX_CONFIGURATION: 'Exchange configuration',
+  }
+  const addCollectionIssue = (resource: string, service: string, issue: TenantIssue) => {
+    const ids = new Set([`sync-${resource.toLowerCase()}`, `sync-${service}`])
+    const existing = issues.find(item => ids.has(item.id))
+    if (existing) {
+      // Keep the backend-owned wording and action; attach the source diagnostic
+      // to its existing details drawer instead of adding a duplicate issue.
+      existing.technicalDetails = [existing.technicalDetails, issue.technicalDetails].filter(Boolean).join('\n')
+    } else {
+      issues.push(issue)
+    }
+  }
+  for (const [service, sync] of entries) {
+    const resource = resourceTypeForSyncEntry(service) ?? service
+    if (excludedResources.has(resource) || (resource === 'SIGN_INS' && signInEvidence?.selectedSource)) continue
+    const status = normalized(sync.status)
+    if (!['failed', 'error', 'partial'].includes(status)) continue
+    const name = sourceNames[resource] ?? 'Tenant data'
+    const projection = outcomeProjection(service, sync)
+    addCollectionIssue(resource, service, {
+      id: `sync-${resource.toLowerCase()}`,
+      service: name,
+      severity: status === 'partial' ? 'Warning' : 'Error',
+      title: `${name} collection needs review`,
+      detail: status === 'partial' ? 'Some requested data was not collected.' : 'A collection attempt failed; the available data may be incomplete or out of date.',
+      technicalDetails: [recordedSyncOutcome(sync, service), sync.lastError].filter(Boolean).join('\n'),
+      lastDetectedAt: projection?.lastAttemptAt ?? null,
+      // Reviewing existing settings is known; retrying or resolving is not implied.
+      action: 'Review collection details',
+      targetModule: 'settings',
+    })
+  }
+  if (signInEvidence?.selectedSource && !excludedResources.has('SIGN_INS') &&
+    ['STALE', 'FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability)) {
+    addCollectionIssue('SIGN_INS', 'signIns', {
+      id: 'sync-sign_ins', service: 'Sign-ins',
+      severity: signInEvidence.availability === 'STALE' ? 'Warning' : 'Error',
+      title: signInEvidence.availability === 'STALE' ? 'Selected sign-in evidence is stale' : 'Selected sign-in collection needs review',
+      detail: signInEvidence.reason ?? 'Current evidence is unavailable from the selected sign-in source.',
+      technicalDetails: `Selected source: ${signInEvidence.selectedSource}\nState: ${signInEvidence.availability}\n${signInEvidence.reasonCode ?? ''}\n${signInEvidence.reason ?? ''}`,
       lastDetectedAt: signInEvidence.observedAt,
-      targetModule: blocked ? 'settings' : 'entra',
+      action: 'Review collection details', targetModule: 'settings',
     })
   }
 
@@ -427,7 +410,8 @@ export function deriveTenantWorkspaceDisplay(
     bundle,
     initialSync?.startedAt ?? null
   )
-  const relevantEntries = entries.filter(([service, sync]) =>
+  const relevantEntries = entries.filter(([service]) =>
+    !excludedResources.has(resourceTypeForSyncEntry(service) ?? service) &&
     !(resourceTypeForSyncEntry(service) === 'SIGN_INS' && signInEvidence?.selectedSource))
   const legacyInitialSync =
     connection === 'connected' &&
@@ -459,11 +443,11 @@ export function deriveTenantWorkspaceDisplay(
   const uncertain = relevantEntries.some(([service, sync], index) =>
     outcomes[index] !== 'SUCCEEDED' || outcomeProjection(service, sync)?.recordedOutcome.relation !== 'LATEST_RECORDED')
     || backendInitialSyncInProgress || backendInitialSyncDelayed
-    || (entries.length === 0 && !signInEvidence?.selectedSource)
+    || (relevantEntries.length === 0 && !signInEvidence?.selectedSource)
     || Boolean(signInEvidence && !['READY', 'CURRENT_LIMITED'].includes(signInEvidence.availability))
   const recordedFailures = relevantEntries.some(([, sync], index) =>
-    outcomes[index] === 'FAILED' || ['failed', 'error'].includes(normalized(sync.status)) || Boolean(sync.lastError)) ||
-    Boolean(signInEvidence?.selectedSource && ['FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability))
+    outcomes[index] === 'FAILED' || ['failed', 'error'].includes(normalized(sync.status))) ||
+    Boolean(!excludedResources.has('SIGN_INS') && signInEvidence?.selectedSource && ['FAILED_TRANSIENT', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence.availability))
 
   const serviceFreshness: ServiceSyncFreshness[] = Object.values(bundle?.syncFreshness?.services ?? tenant?.syncFreshness?.services ?? {})
   const explicitStale = Boolean(

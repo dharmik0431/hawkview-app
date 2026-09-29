@@ -223,7 +223,7 @@ export function TenantOverview({
   }, [selectedIssue])
 
   const connectionState = display.connection
-  const isHealthUnverified = !display.attentionVerified || display.state === 'unverified' || display.state === 'pending-setup'
+  const isHealthUnverified = !display.attentionVerified || display.state !== 'healthy'
 
   const connectionLabel = connectionState === 'connected'
       ? 'Connected'
@@ -282,6 +282,9 @@ export function TenantOverview({
 
           <span className="text-slate-300 dark:text-slate-700">•</span>
 
+          {display.syncRequestPending && <span role="status">Synchronization request pending</span>}
+          {display.isInitialSync && <span>Initial collection is incomplete.</span>}
+
           <span className={cn(
             display.issueCount > 0 && 'font-semibold text-amber-700 dark:text-amber-400'
           )}>
@@ -298,21 +301,6 @@ export function TenantOverview({
         </button>
       </div>
 
-      {(display.syncRequestPending || display.isInitialSync || display.syncObservations?.length > 0) && (
-        <section aria-label="Recorded synchronization results" className="rounded-md border border-slate-200 dark:border-slate-800 p-4 text-sm text-slate-600 dark:text-slate-300 space-y-2">
-          <h2 className="font-semibold text-slate-900 dark:text-white">Recorded synchronization results</h2>
-          {display.syncRequestPending && <p role="status">Synchronization request pending. Collector activity is not verified.</p>}
-          {display.isInitialSync && <p>Initial collection is incomplete.</p>}
-          <ul className="space-y-1">
-            {display.syncObservations?.map(({ resource, detail, diagnostic }) => (
-              <li key={resource}>
-                <span className="font-medium">{resource}: </span>{detail}
-                {diagnostic && <details className="mt-1"><summary className="cursor-pointer">Recorded diagnostic</summary><p className="break-words">{diagnostic}</p></details>}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
 
       {riskyUsers}
 
@@ -406,10 +394,10 @@ export function TenantOverview({
                         ) : (
                           <button
                             type="button"
-                            onClick={() => openIssue(issue)}
+                            onClick={() => issue.action ? openIssue(issue) : setSelectedIssue(issue)}
                             className="inline-flex items-center gap-1.5 rounded-md bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 hover:bg-slate-800 dark:hover:bg-white px-3.5 py-1.5 text-[14px] font-semibold shadow-2xs transition cursor-pointer"
                           >
-                            <span>{issue.action || 'Review permissions'}</span>
+                            <span>{issue.action || 'View details'}</span>
                             <ArrowRight className="h-3.5 w-3.5" />
                           </button>
                         )}
@@ -423,7 +411,7 @@ export function TenantOverview({
                           }}
                           className="text-[14px] font-semibold text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:underline transition cursor-pointer"
                         >
-                          Resolve issue
+                          Issue details
                         </button>
                       </div>
                     </div>
@@ -433,13 +421,13 @@ export function TenantOverview({
                 <div role="status" className="py-8 text-center text-[14px] text-slate-500 dark:text-slate-400 flex flex-col items-center justify-center gap-1">
                   <Info className="h-5 w-5 text-slate-400" />
                   <span className="font-semibold text-slate-900 dark:text-white">Actionable issue status unavailable</span>
-                  <span>Available health or collection evidence is incomplete. Review the recorded results above.</span>
+                  <span>Available health or collection evidence is incomplete. Review Tenant Settings for details.</span>
                 </div>
               ) : (
                 <div className="py-8 text-center text-[14px] text-slate-500 dark:text-slate-400 flex flex-col items-center justify-center gap-1">
                   <CheckCircle2 className="h-5 w-5 text-emerald-500" />
                   <span className="font-semibold text-slate-900 dark:text-white">No actionable issues reported</span>
-                  <span>Recorded collection results, limitations and freshness are shown separately.</span>
+                  <span>No actionable findings were returned by the latest tenant health assessment.</span>
                 </div>
               )}
             </div>
@@ -666,9 +654,7 @@ export function TenantOverview({
                     ))
                   ) : (
                     <>
-                      <li>Review tenant settings and consent permissions.</li>
-                      <li>Click &quot;Retry synchronization&quot; to attempt refreshing tenant datasets.</li>
-                      <li>Contact tenant admin if API scopes require re-consent in Entra ID.</li>
+                      <li>Review the recorded diagnostic and collection details in Tenant Settings.</li>
                     </>
                   )}
                 </ol>

@@ -13,6 +13,7 @@ const base = path.resolve(__dirname, '..'),
 let tenant = 'a',
   scope = 'account1'
 const readiness = {}
+const resourceHealth = {}
 const requests = []
 const refetch = async () => {}
 const router = { push() {}, replace() {} }
@@ -57,7 +58,7 @@ function load(file) {
       return {
         useTenantOperationalProjection: () => ({
           actionableHealth: { status: 'VERIFIED', items: [] },
-          tenant: { collectionReadiness: readiness[tenant] },
+          tenant: { collectionReadiness: readiness[tenant], resourceHealth: resourceHealth[tenant] },
           tenants: [],
           refetch,
         }),
@@ -155,6 +156,21 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     assert.ok(b)
     await React.act(async () => b.click())
   }
+  // Tenant-specific markers survive in the existing issue details drawer.
+  // Read the current tenant's diagnostic, then close it before every transition.
+  const diagnostic = async () => {
+    const details = [...document.querySelectorAll('button')].find(b => b.textContent === 'Issue details')
+    assert.ok(details, 'Current tenant has a recorded failure to inspect')
+    await React.act(async () => details.click())
+    const technical = [...document.querySelectorAll('button')].find(b => b.textContent === 'Technical details')
+    assert.ok(technical)
+    await React.act(async () => technical.click())
+    const result = text()
+    const close = document.querySelector('[aria-label="Close remediation drawer"]')
+    assert.ok(close)
+    await React.act(async () => close.click())
+    return result
+  }
   try {
     await render()
     const getA = requests.at(-1)
@@ -164,12 +180,13 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     const getB = requests.at(-1)
     assert.equal(getB.url, '/api/tenants/b')
     await resolve(getB, bundle('b', 'B tenant'))
-    assert.match(text(), /B tenant/)
+    assert.match(await diagnostic(), /B tenant/)
     await resolve(getA, bundle('a', 'A tenant'))
-    assert.doesNotMatch(text(), /A tenant/)
+    assert.doesNotMatch(await diagnostic(), /A tenant/)
+    assert.match(await diagnostic(), /B tenant/)
     tenant = 'a'
     await render()
-    assert.match(text(), /A tenant/)
+    assert.match(await diagnostic(), /A tenant/)
     await click()
     const postA = requests.at(-1)
     assert.equal(postA.method, 'POST')
@@ -177,10 +194,11 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     assert.match(text(), /Partially Synchronized|Needs Attention/)
     tenant = 'b'
     await render()
-    assert.doesNotMatch(text(), /Synchronization request pending|A tenant/)
+    assert.doesNotMatch(await diagnostic(), /Synchronization request pending|A tenant/)
+    assert.match(await diagnostic(), /B tenant/)
     await resolve(postA, bundle('a', 'A refreshed'))
     assert.doesNotMatch(
-      text(),
+      await diagnostic(),
       /A refreshed|Synchronization request pending|Sync completed successfully/
     )
     await click()
@@ -260,7 +278,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
       assert.match(text(), expected)
       assert.match(
         text(),
-        /Synchronization request completed\. Review the recorded collection results below\./
+        /Synchronization request completed\./
       )
       assert.doesNotMatch(
         text(),
@@ -328,7 +346,8 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     delete c.tenant.syncFreshness
     delete c.tenant.initialSync
     await resolve(requests.at(-1), c)
-    assert.match(text(), /Current limited sign-in evidence available/)
+    assert.doesNotMatch(text(), /Recorded synchronization results|Resolve issue/)
+    assert.match(text(), /Available health or collection evidence is incomplete/)
     assert.match(text(), /Partially Synchronized/)
     assert.doesNotMatch(
       text(),
@@ -343,10 +362,19 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     await resolve(newAccountGet, bundle('c', 'New account tenant'))
     await resolve(oldAccountPost, bundle('c', 'Old account completion'))
     assert.doesNotMatch(
-      text(),
+      await diagnostic(),
       /Old account completion|Synchronization request pending/
     )
-    assert.match(text(), /New account tenant/)
+    assert.match(await diagnostic(), /New account tenant/)
+    tenant = 'optional-source'
+    resourceHealth[tenant] = [{ resourceType: 'SHAREPOINT_SETTINGS', required: false, classification: 'PERMISSION_REQUIRED' }]
+    await render()
+    const optional = bundle(tenant, 'Optional tenant')
+    optional.sync = { sharePointSettings: { status: 'failed', lastSuccessfulAt: null, lastError: 'Synthetic optional permission' } }
+    await resolve(requests.at(-1), optional)
+    assert.match(text(), /Health Not Verified/)
+    assert.doesNotMatch(text(), /collection needs review|No actionable issues reported|Needs Attention/)
+    console.log('PASS actual page forwards optional capability context without inventing an incident')
     console.log(
       'PASS lifecycle checkpoints: late GET, A->B->A, fail+pending, late POST, selected audit precedence, account switch'
     )
@@ -357,7 +385,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     )
     assert.match(
       completedText,
-      /Synchronization request completed\. Review the recorded collection results below\./
+      /Synchronization request completed\./
     )
   } finally {
     await React.act(async () => root.unmount())

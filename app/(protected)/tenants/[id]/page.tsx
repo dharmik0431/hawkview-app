@@ -1753,8 +1753,9 @@ function TenantDetailsWorkspace() {
       syncState === 'syncing',
       collectionReadiness?.evidence.signIns ?? null,
       actionableHealth,
+      { readiness: collectionReadiness, resourceHealth: tenantListRecord?.tenantHealth?.resourceHealth ?? tenantListRecord?.resourceHealth },
     )
-  }, [actionableHealth, bundle, collectionReadiness, syncState])
+  }, [actionableHealth, bundle, collectionReadiness, syncState, tenantListRecord])
 
   // Domain selector (per tenant)
   const domains = tenant?.domains?.length
@@ -4824,7 +4825,7 @@ function TenantDetailsWorkspace() {
                     )}
                     {syncState === 'success' && (
                       <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">
-                        Synchronization request completed. Review the recorded collection results below.
+                        Synchronization request completed.
                       </div>
                     )}
                   </>

@@ -100,7 +100,8 @@ test('composed overview renders optional partial, queued, deferred and unknown d
   ] as const) {
     await h.render(bundle({ [keyFor(kind)]: entry(kind) }))
     assert.ok(h.text().includes(state))
-    assert.ok(h.text().includes(phrase))
+    assert.doesNotMatch(h.text(), /Recorded synchronization results|View .*source details/)
+    assert.doesNotMatch(h.text(), /No actionable issues reported|Resolve issue/)
     assert.match(h.text(), /2 identities require review/)
     assert.match(h.text(), /Last successful sync/)
     noActiveClaim(h.text())
@@ -112,10 +113,13 @@ test('composed overview keeps authoritative permission failure and manual reques
   const health = { status: 'VERIFIED', items: [{ key: 'authorization-required', label: 'Required permission missing', severity: 'high', why: 'An independent permission verification failed.' }] }
   await h.render(data, { manual: true, health })
   assert.match(h.text(), /Needs Attention/)
-  assert.match(h.text(), /1 actionable issue/)
+  assert.match(h.text(), /2 actionable issues/)
   assert.match(h.text(), /Required permission missing/)
   assert.match(h.text(), /Synchronization request pending/)
-  assert.match(h.text(), /Collection failure recorded/)
+  assert.match(h.text(), /collection needs review/)
+  await h.click('Issue details')
+  await h.click('Technical details')
+  assert.match(h.text(), /independent permission verification failed/)
   noActiveClaim(h.text())
 }))
 
@@ -140,7 +144,7 @@ test('mounted A -> B -> A removes drawer diagnostics and request display while p
   // Use a verified actionable finding so the drawer follows the production health source.
   const attention = { status: 'VERIFIED', items: [{ key: 'sync-users', label: 'Tenant A failure', severity: 'high', why: 'Tenant A diagnostic only' }] }
   await h.render(a, { manual: true, health: attention })
-  await h.click('Resolve issue')
+  await h.click('Issue details')
   await h.click('Technical details')
   assert.ok(h.document.querySelector('[aria-label="Close remediation drawer"]'))
   assert.match(h.text(), /Tenant A diagnostic only/)
@@ -164,7 +168,7 @@ test('mounted A -> B -> A removes drawer diagnostics and request display while p
 test('a verified successful record preserves positive health without a blanket service claim', async () => mounted(async h => {
   await h.render(bundle({ users: entry('SUCCEEDED', 'succeeded') }))
   assert.match(h.text(), /Healthy/)
-  assert.match(h.text(), /Successful collection recorded/)
+  assert.doesNotMatch(h.text(), /Successful collection recorded|Recorded synchronization results/)
   await h.click('Active issues (0)')
   assert.match(h.text(), /No actionable issues reported/)
   assert.match(h.text(), /2 identities require review/)
@@ -185,7 +189,11 @@ test('missing or malformed health renders not verified instead of a zero count, 
     assert.doesNotMatch(h.text(), /0 actionable issues|Active issues \(0\)|Active issues0/)
     await h.render(bundle({ users: { ...entry('FAILED', 'failed'), lastError: 'Legacy collection diagnostic' } }), { health })
     assert.match(h.text(), /collection needs review/)
+    await h.click('Issue details')
+    await h.click('Technical details')
     assert.match(h.text(), /Legacy collection diagnostic/)
+    const close = h.document.querySelector('[aria-label="Close remediation drawer"]')
+    await React.act(async () => close.click())
     assert.match(h.text(), /Active issues \(Not verified\)/)
     assert.doesNotMatch(h.text(), /0 actionable issues|Active issues \(0\)|Active issues0/)
   }
