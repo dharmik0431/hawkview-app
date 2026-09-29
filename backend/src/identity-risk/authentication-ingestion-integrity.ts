@@ -6,6 +6,16 @@ import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 const MARKER = 'hawkviewAuthenticationIntegrity'
 const MAX_ROW_BYTES = 16_384
 const MAX_BATCH_BYTES = 2 * 1024 * 1024
+export type IntegrityConflictOrigin = 'FINGERPRINT_UNAVAILABLE' | 'INPUT_PRE_MARKED' | 'BATCH_DUPLICATE_MISMATCH' | 'STORED_FINGERPRINT_MISMATCH'
+/** Why a row was quarantined and when, so a later investigation can tell a
+ * spurious fingerprint difference from a real one. Every consumer gates on the
+ * key's presence, so the shape may widen but the key must never disappear.
+ * Records the branch and the clock only: no fingerprint, payload or identity.
+ * `at` is when WE observed the conflict. For INPUT_PRE_MARKED it is not the
+ * incoming marker's own time: a caller's claimed provenance is untrusted and
+ * must never be copied into ours. */
+export const integrityConflictMarker = (because: IntegrityConflictOrigin, at: Date) =>
+  ({ state: 'CONFLICT' as const, because, at: at.toISOString() })
 const plain = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value) &&
   [Object.prototype, null].includes(Object.getPrototypeOf(value)) && Reflect.ownKeys(value).every(key => typeof key === 'string' &&
     !['__proto__','prototype','constructor'].includes(key) && 'value' in Object.getOwnPropertyDescriptor(value,key)!)
@@ -43,25 +53,26 @@ export function authenticationFactFingerprint(raw: unknown): string | null {
  * integrity field; never replace its Microsoft risk/identity/retention columns.
  * A failed later chunk cannot publish a complete collection-window assertion. */
 export async function persistAuthenticationRecords(prisma: PrismaService, scope: {organizationId:string;customerTenantId:string},
-  records: readonly Prisma.SignInLogCreateManyInput[], deadlineAt = Date.now() + 30_000) {
+  records: readonly Prisma.SignInLogCreateManyInput[], deadlineAt = Date.now() + 30_000, markedAt = new Date()) {
   if (records.length > 100_000) throw new Error('IDENTITY_AUTH_CAPACITY')
   let inserted = 0, hasConflicts = false
   for (let offset = 0; offset < records.length; offset += 500) {
     if (deadlineAt - Date.now() < 100) throw new Error('IDENTITY_AUTH_DEADLINE')
     const chunk = records.slice(offset, offset + 500)
     let bytes = 0
-    const unique = new Map<string,{row:Prisma.SignInLogCreateManyInput;fingerprint:string|null;conflict:boolean}>()
+    const unique = new Map<string,{row:Prisma.SignInLogCreateManyInput;fingerprint:string|null;because:IntegrityConflictOrigin|null}>()
     for (const row of chunk) {
       if (row.organizationId !== scope.organizationId || row.customerTenantId !== scope.customerTenantId ||
         typeof row.microsoftSignInId !== 'string' || !row.microsoftSignInId || row.microsoftSignInId.length > 200 || !plain(row.raw)) throw new Error('IDENTITY_AUTH_RECORD_INVALID')
+      const fingerprint = authenticationFactFingerprint(row.raw)
+      const because: IntegrityConflictOrigin|null = fingerprint === null ? 'FINGERPRINT_UNAVAILABLE'
+        : (row.raw as Record<string,unknown>)[MARKER] !== undefined ? 'INPUT_PRE_MARKED' : null
       const size = Buffer.byteLength(JSON.stringify(canonical(row.raw)))
       bytes += size
       if (size > MAX_ROW_BYTES || bytes > MAX_BATCH_BYTES) throw new Error('IDENTITY_AUTH_CAPACITY')
-      const fingerprint = authenticationFactFingerprint(row.raw)
       const old = unique.get(row.microsoftSignInId)
-      const conflict = fingerprint === null || (row.raw as Record<string,unknown>)[MARKER] !== undefined
-      if (old) old.conflict ||= conflict || old.fingerprint !== fingerprint
-      else unique.set(row.microsoftSignInId,{row,fingerprint,conflict})
+      if (old) old.because ??= because ?? (old.fingerprint !== fingerprint ? 'BATCH_DUPLICATE_MISMATCH' : null)
+      else unique.set(row.microsoftSignInId,{row,fingerprint,because})
     }
     await prisma.$transaction(async transaction => {
       await enforceRiskUtcTransaction(transaction)
@@ -81,21 +92,39 @@ export async function persistAuthenticationRecords(prisma: PrismaService, scope:
         const pending = unique.get(old.id)
         if (!pending || !plain(old.raw)) throw new Error('IDENTITY_AUTH_RECORD_INVALID')
         seen.add(old.id)
-        const conflict = pending.conflict || old.raw[MARKER] !== undefined || authenticationFactFingerprint(old.raw) !== pending.fingerprint
-        if (conflict) {
+        /** A stored marker is the earliest record of why this row was quarantined,
+         * so re-asserting it would overwrite the only evidence of its own cause.
+         * Report the conflict and leave what is already stored untouched. */
+        if (old.raw[MARKER] !== undefined) { hasConflicts = true; continue }
+        const because = pending.because ?? (authenticationFactFingerprint(old.raw) !== pending.fingerprint ? 'STORED_FINGERPRINT_MISMATCH' : null)
+        if (because) {
           hasConflicts = true
-          await transaction.$executeRawUnsafe(`UPDATE sign_in_logs SET raw=jsonb_set(raw,'{hawkviewAuthenticationIntegrity}','"CONFLICT"'::jsonb,true)
-            WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND microsoft_sign_in_id=$3`,scope.organizationId,scope.customerTenantId,old.id)
+          await transaction.$executeRawUnsafe(`UPDATE sign_in_logs SET raw=jsonb_set(raw,'{hawkviewAuthenticationIntegrity}',$4::jsonb,true)
+            WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND microsoft_sign_in_id=$3`,scope.organizationId,scope.customerTenantId,old.id,JSON.stringify(integrityConflictMarker(because,markedAt)))
         }
       }
       const data = [...unique.values()].filter(value=>!seen.has(value.row.microsoftSignInId)).map(value=>{
-        hasConflicts ||= value.conflict
-        return value.conflict ? {...value.row,raw:{...value.row.raw as Prisma.InputJsonObject,[MARKER]:'CONFLICT'}} : value.row
+        hasConflicts ||= value.because !== null
+        return value.because ? {...value.row,raw:{...value.row.raw as Prisma.InputJsonObject,[MARKER]:integrityConflictMarker(value.because,markedAt)}} : value.row
       })
       if (data.length) {
         const result = await transaction.signInLog.createMany({data,skipDuplicates:false})
         inserted += result.count
       }
+      /** ONLY PostgreSQL knows what PostgreSQL stored. A numeric literal keeps its
+       *  written scale through jsonb_set, and JSON.parse destroys it, so any size
+       *  computed in JavaScript understates the row — by 502 bytes on a measured
+       *  500-digit case. Estimating after a lossy parse cannot bound the result.
+       *
+       *  So measure the rows this transaction actually wrote, under the same lock,
+       *  against the same bounds the reader applies, and fail before committing.
+       *  Refusal is the only safe outcome: truncating evidence or dropping the
+       *  quarantine to fit would both persist a lie. */
+      const [persisted] = await transaction.$queryRawUnsafe<Array<{maxRow:bigint;total:bigint}>>(
+        `SELECT coalesce(max(octet_length(raw::text)),0) AS "maxRow",coalesce(sum(octet_length(raw::text)),0) AS total
+           FROM sign_in_logs WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid
+            AND microsoft_sign_in_id=ANY($3::text[])`,scope.organizationId,scope.customerTenantId,ids)
+      if (Number(persisted.maxRow) > MAX_ROW_BYTES || Number(persisted.total) > MAX_BATCH_BYTES) throw new Error('IDENTITY_AUTH_CAPACITY')
     },{maxWait:1000,timeout:Math.max(100,Math.min(6000,deadlineAt-Date.now()))})
   }
   return {inserted,hasConflicts}
