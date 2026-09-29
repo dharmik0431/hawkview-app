@@ -546,6 +546,9 @@ test('history: real maximum normal graph drains incrementally with evaluation OF
       reportedFailures+=result.failedBatches
       runs+=result.runs;children+=result.findings+result.matchedResults+result.coverage
     }
+    // Only the already-captured plan of this disposable synthetic fixture;
+    // emit before assertions so a failing plan shape remains diagnosable.
+    console.info(JSON.stringify({syntheticRetentionExplainPlan:inspectedPlan}))
     // A hard 1s transport budget can legitimately expire under test-host load.
     // It must be reported exactly, retry without lost/double-counted evidence,
     // and still drain this finite synthetic graph within the bounded attempts.

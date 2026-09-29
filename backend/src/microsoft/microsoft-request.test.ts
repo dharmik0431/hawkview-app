@@ -91,11 +91,11 @@ test('customer transient copy retains baseline and never blames tenant configura
   assert.doesNotMatch(message, /review policies|permission|redacted|diagnostic/i)
 })
 
-test('Retry-After accepts bounded seconds or HTTP dates', () => {
+test('Retry-After accepts uncapped seconds or HTTP dates', () => {
   assert.equal(retryAfterMilliseconds('4', 0), 4000)
   assert.equal(retryAfterMilliseconds(new Date(7000).toUTCString(), 1000), 6000)
   assert.equal(retryAfterMilliseconds('invalid', 0), null)
-  assert.equal(retryAfterMilliseconds('999', 0), 10_000)
+  assert.equal(retryAfterMilliseconds('999', 0), 999_000)
 })
 
 test('projects only bounded Microsoft error code and request identity', async () => {

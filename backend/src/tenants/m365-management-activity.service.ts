@@ -1,5 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
 import { createHash } from 'node:crypto'
+import { retryAfterMilliseconds } from '../microsoft/microsoft-request.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { redactSensitiveValues } from '../changes/change-evidence.service.js'
@@ -85,9 +86,17 @@ export class ManagementActivityHttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
-    readonly retryAfterSeconds: number | null = null
+    readonly retryAfterSeconds: number | null = null,
+    readonly retryAt: Date | null = retryAfterSeconds === null
+      ? null : new Date(Date.now() + retryAfterSeconds * 1000),
   ) {
     super(message)
+  }
+}
+
+export class M365ActivityDeadlineError extends Error {
+  constructor(readonly retryAt: Date | null = null) {
+    super('Microsoft 365 activity feed reached its bounded collection deadline.')
   }
 }
 
@@ -156,7 +165,7 @@ export function retryDelayMs(
   random = Math.random
 ) {
   if (retryAfterSeconds !== null && retryAfterSeconds >= 0) {
-    return Math.min(retryAfterSeconds * 1_000, 15 * 60 * 1_000)
+    return retryAfterSeconds * 1_000
   }
   const base = Math.min(1_000 * 2 ** Math.max(0, attempt), 60_000)
   return Math.round(base * (0.8 + random() * 0.4))
@@ -387,7 +396,8 @@ export class M365ManagementActivityService {
     url: string,
     init: RequestInit,
     microsoftTenantId: string,
-    publisherIdentifier: string
+    publisherIdentifier: string,
+    deadlineAt: number
   ) {
     const requestUrl = validateManagementUrl(url, microsoftTenantId)
     requestUrl.searchParams.set('PublisherIdentifier', publisherIdentifier)
@@ -397,35 +407,58 @@ export class M365ManagementActivityService {
     // timeout; the durable subscription state schedules a later verification.
     const maximumAttempts = init.method?.toUpperCase() === 'POST' ? 1 : 3
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+      const remaining = deadlineAt - Date.now()
+      if (!Number.isFinite(remaining) || remaining <= 0) throw new M365ActivityDeadlineError()
       try {
         const response = await fetch(requestUrl, {
           ...init,
           redirect: 'error',
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(30_000, remaining)))),
         })
-        if (response.ok) return response
-        const retryAfter = Number(response.headers.get('Retry-After'))
-        const retryAfterSeconds = Number.isFinite(retryAfter) ? retryAfter : null
-        const body = (await readBoundedText(response, MAX_ERROR_RESPONSE_BYTES)).slice(0, 500)
+        if (response.ok) {
+          if (Date.now() >= deadlineAt) {
+            await response.body?.cancel().catch(() => undefined)
+            throw new M365ActivityDeadlineError()
+          }
+          return response
+        }
+        const receivedAt = Date.now()
+        const rawRetryAfter = response.headers.get('Retry-After')
+        const retryAfter = retryAfterMilliseconds(rawRetryAfter, receivedAt)
+        if (rawRetryAfter !== null && retryAfter === null) {
+          this.logger.warn(JSON.stringify({ event: 'm365_activity_retry', reasonCode: 'INVALID_RETRY_AFTER' }))
+        }
+        const retryAfterSeconds = retryAfter === null ? null : retryAfter / 1000
+        const retryAt = retryAfter === null ? null : new Date(receivedAt + retryAfter)
+        let body = ''
+        try {
+          body = (await readBoundedText(response, MAX_ERROR_RESPONSE_BYTES)).slice(0, 500)
+        } catch {
+          // The status and server not-before are already known. An interrupted
+          // diagnostic body must not turn them into an earlier transport retry.
+          this.logger.warn(JSON.stringify({ event: 'm365_activity_retry', reasonCode: 'ERROR_BODY_UNAVAILABLE' }))
+        }
         const error = new ManagementActivityHttpError(
           `Microsoft 365 activity feed returned HTTP ${response.status}${body ? `: ${body}` : '.'}`,
           response.status,
-          retryAfterSeconds
+          retryAfterSeconds,
+          retryAt
         )
         throw error
       } catch (error) {
         if (error instanceof ManagementActivityHttpError && error.status < 500 && error.status !== 429) throw error
+        if (error instanceof M365ActivityDeadlineError) throw error
         lastError = error
+        const retryAt = error instanceof ManagementActivityHttpError ? error.retryAt : null
+        if (Date.now() >= deadlineAt) throw new M365ActivityDeadlineError(retryAt)
         if (attempt >= maximumAttempts - 1) break
-        const delay = retryDelayMs(
-          attempt,
-          error instanceof ManagementActivityHttpError
-            ? error.retryAfterSeconds
-            : null
-        )
-        // The Render cron caller has a four-minute deadline for an entire
-        // tenant batch. Honor long Retry-After values by deferring to the next
-        // scheduled run instead of sleeping through the worker lease.
+        const delay = retryAt
+          ? Math.max(0, retryAt.getTime() - Date.now())
+          : retryDelayMs(attempt, null)
+        if (delay >= deadlineAt - Date.now()) throw new M365ActivityDeadlineError(retryAt)
+        // Bound inline waits without retrying earlier than the server allows.
+        // Content ingestion persists retryAt; subscription/discovery callers
+        // still need durable cross-run deferral (they have no such field).
         if (delay > 5_000) break
         await wait(delay)
       }
@@ -543,7 +576,8 @@ export class M365ManagementActivityService {
     tenant: TenantTarget,
     token: string,
     publisherIdentifier: string,
-    now: Date
+    now: Date,
+    deadlineAt: number
   ) {
     const stored = await this.prisma.m365ActivitySubscription.findMany({
       where: { organizationId: tenant.organizationId, customerTenantId: tenant.id },
@@ -563,7 +597,8 @@ export class M365ManagementActivityService {
       `${baseUrl}/subscriptions/list`,
       { headers: this.headers(token) },
       tenant.microsoftTenantId,
-      publisherIdentifier
+      publisherIdentifier,
+      deadlineAt
     )
     const subscriptions = (await this.readMeteredJson(
       tenant,
@@ -596,7 +631,8 @@ export class M365ManagementActivityService {
           `${baseUrl}/subscriptions/start?contentType=${encodeURIComponent(contentTypeToStart)}`,
           { method: 'POST', headers: this.headers(token) },
           tenant.microsoftTenantId,
-          publisherIdentifier
+          publisherIdentifier,
+          deadlineAt
         )
         enabled.add(contentTypeToStart)
       } catch (error) {
@@ -608,7 +644,8 @@ export class M365ManagementActivityService {
           `${baseUrl}/subscriptions/list`,
           { headers: this.headers(token) },
           tenant.microsoftTenantId,
-          publisherIdentifier
+          publisherIdentifier,
+          deadlineAt
         )
         const current = (await this.readMeteredJson(
           tenant,
@@ -735,7 +772,8 @@ export class M365ManagementActivityService {
           nextUrl,
           { headers: this.headers(token) },
           tenant.microsoftTenantId,
-          publisherIdentifier
+          publisherIdentifier,
+          deadline
         )
         const items = (await this.readMeteredJson(
           tenant,
@@ -1001,7 +1039,8 @@ export class M365ManagementActivityService {
     token: string,
     publisherIdentifier: string,
     downloadBudget: { remainingBytes: number },
-    content: any
+    content: any,
+    deadlineAt: number
   ) {
     const claimed = await this.prisma.m365ActivityContent.updateMany({
       where: {
@@ -1019,7 +1058,8 @@ export class M365ManagementActivityService {
         content.contentUri,
         { headers: this.headers(token) },
         tenant.microsoftTenantId,
-        publisherIdentifier
+        publisherIdentifier,
+        deadlineAt
       )
       // Reserve the maximum possible body before reading it. Content-Length
       // is not trusted for enforcement because a lying or missing header could
@@ -1240,6 +1280,8 @@ export class M365ManagementActivityService {
       const attempts = Number(content.attemptCount ?? 0) + 1
       const permanent = error instanceof ManagementActivityHttpError && [400, 401, 403, 404].includes(error.status)
       const budgetLimited = error instanceof M365AuditBudgetError
+      const serverRetryAt = error instanceof ManagementActivityHttpError || error instanceof M365ActivityDeadlineError
+        ? error.retryAt : null
       await this.prisma.m365ActivityContent.updateMany({
         where: {
           id: content.id,
@@ -1252,7 +1294,10 @@ export class M365ManagementActivityService {
             ? null
             : budgetLimited
               ? error.retryAt
-              : new Date(Date.now() + retryDelayMs(Math.min(attempts, 8), null)),
+              : new Date(Math.max(
+                  Date.now() + retryDelayMs(Math.min(attempts, 8), null),
+                  serverRetryAt?.getTime() ?? 0,
+                )),
           lastError: safeMessage(error),
           ...(permanent
             ? { ledgerExpiresAt: evidenceExpiration(new Date()) }
@@ -1341,7 +1386,8 @@ export class M365ManagementActivityService {
         tenant,
         token,
         publisherIdentifier,
-        now
+        now,
+        processingDeadline
       )
       const subscriptionStates = await this.prisma.m365ActivitySubscription.findMany({
         where: {
@@ -1390,7 +1436,8 @@ export class M365ManagementActivityService {
           token,
           publisherIdentifier,
           downloadBudget,
-          content
+          content,
+          processingDeadline
         )))
       }
       const [pendingBacklog, processingBacklog, retryBacklog, failedBacklog] = await Promise.all([
