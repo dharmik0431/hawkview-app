@@ -184,7 +184,7 @@ export function deriveTenantWorkspaceDisplay(
   const source = actionableHealth?.customer ?? customerAttention(bundle)
   const hasRecordedGap = syncEntries(bundle).some(([resource, sync]) =>
     !(resourceTypeForSyncEntry(resource) === 'SIGN_INS' && signInEvidence?.selectedSource) &&
-    (Boolean(sync.lastError) || ['failed', 'error', 'partial', 'stale'].includes(normalized(sync.status))))
+    (Boolean(sync.lastError) || outcomeProjection(resource, sync)?.recordedOutcome.kind !== 'SUCCEEDED'))
   const customer = { ...source, incomplete: source.incomplete || hasRecordedGap ||
     Boolean(signInEvidence && !['READY'].includes(signInEvidence.availability)) }
   const issues = [...customer.findings, ...customer.accessActions].map(workspaceIssueFromAttention)

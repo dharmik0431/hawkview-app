@@ -241,14 +241,14 @@ export function TenantRiskMatrixDrawer({
                 </div>
                 <p className="text-xs leading-normal opacity-90">
                   {overallState.key === 'critical'
-                    ? 'Critical security signals or lost tenant connector connectivity require urgent administrator investigation.'
+                    ? 'Critical tenant findings are reported. Review the supplied findings and their evidence.'
                     : overallState.key === 'needs_attention'
-                    ? 'Security gaps, missing API permissions, or incomplete MFA registration coverage require administrative action.'
-                    : overallState.key === 'disconnected'
-                    ? 'The Microsoft 365 consent or connection was revoked or disconnected. Re-authentication is required.'
-                    : overallState.key === 'stale'
-                    ? 'Data synchronization has passed the 24-hour freshness threshold.'
-                    : 'Tenant environment is synchronized and operating within healthy posture baselines.'}
+                    ? 'Tenant findings or positive Microsoft risk evidence are reported and available for review.'
+                    : overallState.key === 'pending_setup'
+                    ? 'An explicit customer access setup action is reported. Review the required setup separately from tenant findings.'
+                    : overallState.key === 'healthy'
+                    ? 'No tenant findings are reported in the supplied summary. This is not an exhaustive security assessment or confirmation of synchronization.'
+                    : 'Evidence is incomplete or unavailable. The supplied summary cannot establish the tenant’s security posture or synchronization state.'}
                 </p>
               </div>
 

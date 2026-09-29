@@ -125,5 +125,6 @@ test('dataset clocks remain scoped and never use newest unrelated success', asyn
  const ages=h.document.querySelector('[aria-label="Dataset update times"]').textContent
  assert.equal((ages.match(/Update time unavailable/g)||[]).length,3)
  assert.doesNotMatch(ages,/Updated .*ago/)
- assert.match(h.text(),/No findings reported/);assert.doesNotMatch(h.text(),/Healthy|0 risk/)
+ assert.match(h.text(),/Evidence incomplete/);assert.doesNotMatch(h.text(),/Healthy|0 risk/)
+ assert.ok(h.document.querySelector('a[href*="tab=collection"]'), 'legacy success without a valid outcome keeps diagnostics reachable')
 }))

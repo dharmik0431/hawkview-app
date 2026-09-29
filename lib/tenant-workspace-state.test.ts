@@ -31,7 +31,7 @@ function keyFor(kind: SyncOutcomeProjection['recordedOutcome']['kind']) {
 function current(syncEntries: TenantBundle['sync']): TenantBundle {
   return bundle({ tenant: { id: 'tenant-1', status: 'connected' }, sync: syncEntries })
 }
-const verifiedHealth = tenantActionableHealthProjection({ attention: [] })
+const verifiedHealth = tenantActionableHealthProjection({ data: { status: 'COMPLETE' }, attention: [] })
 
 test('queued, initialization, deferred and unknown records describe distinct outcomes without attesting execution', () => {
   for (const [kind, label] of [
@@ -167,4 +167,26 @@ test('silent complete health cannot hide an independent recorded collection fail
  const d=deriveTenantWorkspaceDisplay(current({users:{status:'failed',lastError:'Retained diagnostic',lastSuccessfulAt:null}}),false,null,health)
  assert.equal(d.state,'unverified');assert.equal(d.customer?.incomplete,true);assert.equal(d.issueCount,0)
  assert.equal(d.syncObservations[0].diagnostic,'Retained diagnostic')
+})
+
+
+test('verified successful records preserve complete coverage without asserting current execution', () => {
+ const d=deriveTenantWorkspaceDisplay(current({users:sync('SUCCEEDED','succeeded')}),false,null,verifiedHealth)
+ assert.equal(verifiedHealth.customer?.incomplete,false)
+ assert.equal(d.customer?.incomplete,false);assert.equal(d.attentionVerified,true)
+ assert.equal(d.stateLabel,'No findings reported');assert.equal(d.issueCount,0)
+ assert.match(d.syncObservations[0].detail,/Successful collection recorded/)
+ assert.match(d.syncObservations[0].detail,/activity is not verified/)
+})
+
+
+test('complete selected source excludes failed nonselected Graph while preserving known findings', () => {
+ const health=tenantActionableHealthProjection({data:{status:'COMPLETE'},attention:[{key:'risk',label:'Known risk',why:'Positive evidence',severity:'high',provenance:tenantFindingProvenance('MICROSOFT_ACTIVE_RISK')}]})
+ const selected={availability:'READY',coverage:'FULL',selectedSource:'OFFICE_365_ACTIVITY_FEED',observedAt:null,reasonCode:null,reason:null} as any
+ const d=deriveTenantWorkspaceDisplay(current({signIns:{status:'failed',lastError:'Nonselected Graph 403',lastSuccessfulAt:null}}),false,selected,health)
+ assert.equal(d.customer?.incomplete,false);assert.equal(d.attentionVerified,true)
+ assert.equal(d.issueCount,1);assert.equal(d.issues[0].title,'Known risk')
+ assert.equal(d.syncObservations[0].diagnostic,'Nonselected Graph 403')
+ const limited=deriveTenantWorkspaceDisplay(current({users:sync('SUCCEEDED','succeeded')}),false,{...selected,availability:'CURRENT_LIMITED'},verifiedHealth)
+ assert.equal(limited.customer?.incomplete,true);assert.equal(limited.issueCount,0)
 })
