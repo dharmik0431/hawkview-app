@@ -27,7 +27,7 @@ import {
   deriveTenantSyncFreshness,
   type TenantSyncFreshness,
 } from './service-sync-freshness.js'
-import { getMicrosoftSecureScore } from './secure-score.util.js'
+import { getMicrosoftSecureScoreDetails } from './secure-score.util.js'
 import { buildExchangeReadOnlyRbacSetup } from './exchange-rbac-setup.js'
 import type { MicrosoftUsageSourceProjectionEvidence } from './sharepoint-data-contract.js'
 import {
@@ -316,6 +316,10 @@ export class TenantsService {
       lastError: string | null
     }>
   }, auditEvents: TenantAuditEvent[] = []) {
+    const secureScoreDetails = getMicrosoftSecureScoreDetails(
+      tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES),
+      tenant.syncStates.find((state) => state.resourceType === SyncResourceType.SECURE_SCORES)?.lastSuccessfulAt,
+    )
     const requiredPermissions = this.microsoftConsent.getRequiredPermissions()
     const consentedPermissions = tenant.connection?.consentedPermissions ?? []
     const connectionStatus = tenant.connection?.status ?? null
@@ -436,11 +440,8 @@ export class TenantsService {
       connectionErrorCode: legacyOptionalPermissionError
         ? null
         : tenant.connection?.lastErrorCode ?? null,
-      secureScore: getMicrosoftSecureScore(
-        tenant.entraSnapshots.find(
-          (snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES,
-        )?.payload,
-      ),
+      secureScore: secureScoreDetails.percentage,
+      secureScoreDetails,
       ...health,
       // Service-level freshness is additive. The legacy lastSync remains for
       // callers that have not yet moved to the per-service contract.

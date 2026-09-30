@@ -1,6 +1,15 @@
 import { z } from 'zod'
 import { MicrosoftRiskSummarySchema } from '../lib/identity-risk/microsoft-risk-summary.ts'
 
+/** Independent source clocks; none establishes score freshness or a live job. */
+export const MicrosoftSecureScoreDetailsSchema = z.object({
+  version: z.literal(1),
+  percentage: z.number().int().min(0).max(100).nullable(),
+  scoreCreatedAt: z.string().datetime().nullable(),
+  snapshotObservedAt: z.string().datetime().nullable(),
+  lastSuccessfulCollectionAt: z.string().datetime().nullable(),
+}).strict()
+
 export const TenantSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -19,6 +28,7 @@ export const TenantSchema = z.object({
   }).strict().optional(),
   lastSync: z.string().nullable(),
   secureScore: z.number().nullable(),
+  secureScoreDetails: MicrosoftSecureScoreDetailsSchema.optional(),
   healthScore: z.number().min(0).max(100).nullish(),
   mfaCoverage: z.number().min(0).max(100).nullish(),
   riskyIdentityCount: z.number().int().nonnegative().nullish(),

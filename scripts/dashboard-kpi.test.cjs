@@ -25,9 +25,23 @@ const high=row('Registration gap','high',prov.tenantFindingProvenance('MFA_REGIS
 const ops=row('Unrelated SharePoint collection gap','critical',prov.collectorAttentionProvenance('SHAREPOINT_SITES','HAWKVIEW_INTERNAL_FAILURE'))
 const microsoftSummary={source:'MICROSOFT_IDENTITY_PROTECTION',availability:'AVAILABLE',completeness:'COMPLETE',rawRecordCount:0,observedActiveDistinctUserCount:0,activeDistinctUserCount:0,snapshotObservedAt:new Date(Date.now()).toISOString(),collectionSucceededAt:new Date(Date.now()).toISOString(),reasonCode:null}
 const base={microsoftRiskSummary:microsoftSummary,id:'tenant-a',name:'Synthetic tenant',provider:'microsoft',domain:'example.invalid',connectionStatus:'connected',status:'active',data:{status:'COMPLETE'},attention:[],healthScore:93,secureScore:null,mfaCoverage:5,lastSync:at,missingPermissions:[]}
+const scoreDetails=(percentage,snapshotObservedAt=at)=>({version:1,percentage,snapshotObservedAt,scoreCreatedAt:'2026-09-25T00:00:00.000Z',lastSuccessfulCollectionAt:'2026-09-29T17:59:00.000Z'})
 const results=[]
 const summaryMissing={...base,attention:undefined,data:undefined}
 const cases=[
+ ['score-dated',[{...base,secureScore:0,secureScoreDetails:scoreDetails(0)}],'0 reported',false],
+ ['score-oldest',[{...base,secureScore:20,secureScoreDetails:scoreDetails(20)},{...base,id:'tenant-b',secureScore:80,secureScoreDetails:scoreDetails(80,'2026-09-29T17:00:00.000Z')}],'0 reported',false],
+ ['score-missing-date',[{...base,secureScore:20,secureScoreDetails:scoreDetails(20)},{...base,id:'tenant-b',secureScore:80}],'0 reported',false],
+ ['score-date-conflict',[{...base,secureScore:20,secureScoreDetails:scoreDetails(20)},{...base,secureScore:20,secureScoreDetails:scoreDetails(20,'2026-09-29T17:00:00.000Z')}],'0 reported',false],
+ ['score-zero',[{...base,secureScore:0}],'0 reported',false],
+ ['score-average',[{...base,secureScore:20},{...base,id:'tenant-b',secureScore:80}],'0 reported',false],
+ ['score-partial',[{...base,secureScore:64},{...base,id:'tenant-b',secureScore:null}],'0 reported',false],
+ ['score-duplicate',[{...base,secureScore:20},{...base,secureScore:20},{...base,id:'tenant-b',secureScore:80}],'0 reported',false],
+ ['score-conflict',[{...base,secureScore:20},{...base,secureScore:80}],'0 reported',false],
+ ['score-missing-conflict',[{...base,secureScore:20},{...base,secureScore:null}],'0 reported',false],
+ ['score-malformed',Array.from([NaN,Infinity,-1,101,'80'],(secureScore,i)=>({...base,id:'score-'+i,secureScore})),'0 reported',false],
+ ['score-invalid-id',[{...base,id:' ',secureScore:100},{...base,id:null,secureScore:100}],'Unavailable',false],
+ ['score-no-health-fallback',[{...base,secureScore:null,healthScore:100}],'0 reported',false],
  ['critical-with-collection-gap',[{...base,attention:[critical,ops]}],'1 reported',true],
  ['no-observed-critical-with-gap',[{...base,attention:[high,ops]}],'0 reported',true],
  ['complete-empty',[base],'0 reported',false],
@@ -68,14 +82,25 @@ for(const [name,tenants,expected,partial,state={}]of cases)test('actual Dashboar
   assert.equal(criticalCard.value,expected)
   assert.doesNotMatch(document.body.textContent,/Tenant security score|Tenant-only score not supplied|Current critical signals|Partial critical-signal evidence/)
   assert.equal(/Partial dashboard evidence/.test(document.body.textContent),partial)
-  assert.match(criticalCard.detail,/loaded tenant summaries readable/)
-  assert.equal(criticalCard.title.closest('.grid').children.length,3,'three KPI cards')
-  if(['duplicate-positive-id','duplicate-unread-id'].includes(name))assert.match(criticalCard.detail,/1 of 1 loaded tenant summaries readable/)
-  if(name==='critical-plus-unread-tenant')assert.match(criticalCard.detail,/1 of 2 loaded tenant summaries readable/)
-  if(name==='invalid-ids')assert.match(criticalCard.detail,/2 rows without usable tenant IDs/)
-  if(expected==='Unavailable')assert.match(criticalCard.detail,/No readable tenant findings summary/)
-  else if(tenants.some(t=>customerAttention(t).incomplete))assert.match(criticalCard.detail,/Evidence incomplete; additional findings may be missing/)
-  else assert.match(criticalCard.detail,/not an exhaustive security assessment/)
+  assert.equal(criticalCard.title.closest('.grid').children.length,4,'four KPI cards')
+  // The requested compact card keeps its reported value, with no generic
+  // coverage/uncertainty paragraphs. Independent page warnings stay tested.
+  assert.equal(criticalCard.title.parentElement.children.length,2,'card contains its label and value only')
+  assert.doesNotMatch(criticalCard.detail,/loaded tenant summaries|Evidence incomplete|additional findings|No readable tenant|exhaustive security assessment/)
+  const scoreCard=card('Microsoft Secure Score')
+  const scoreExpected={ 'score-dated':['0%','Average across 1 tenant'],'score-oldest':['50%','Average across 2 tenants'],'score-missing-date':['50%','Average across 2 tenants'],'score-date-conflict':['20%','Average across 1 tenant'], 'score-zero':['0%','Average across 1 tenant'], 'score-average':['50%','Average across 2 tenants'],
+   'score-partial':['64%','Average across 1 of 2 tenants'], 'score-duplicate':['50%','Average across 2 tenants'],
+   'score-conflict':['Unavailable','Scores available for 0 of 1 tenant'], 'score-missing-conflict':['Unavailable','Scores available for 0 of 1 tenant'],
+   'score-malformed':['Unavailable','Scores available for 0 of 5 tenants'], 'score-invalid-id':['Unavailable','Scores available for 0 of 0 tenants'],
+   'score-no-health-fallback':['Unavailable','Scores available for 0 of 1 tenant'] }[name]
+  assert.equal(scoreCard.value,scoreExpected?.[0]??'Unavailable')
+  if(scoreExpected)assert.ok(scoreCard.detail.includes(scoreExpected[1]),scoreCard.detail)
+  assert.doesNotMatch(scoreCard.detail,/health score|security score|Updated|current|last sync|evidence incomplete/i)
+  if(['score-dated','score-oldest'].includes(name)) {
+   assert.match(scoreCard.detail,/Oldest collection: 6 hours ago/)
+   assert.match(scoreCard.title.parentElement.querySelector('p').getAttribute('aria-label'),/Oldest Microsoft score date: 2026-09-25T00:00:00.000Z/)
+  } else if(scoreCard.value!=='Unavailable') assert.match(scoreCard.detail,/Collection date unavailable/)
+  else assert.doesNotMatch(scoreCard.detail,/Collection date|Oldest collection/)
   if(nativeData){assert.match(document.body.textContent,/≥6/);assert.equal(mfa.value,'5')}
   if(name==='stale')assert.match(document.body.textContent,/Stale dashboard evidence/)
   if(name==='refresh-error')assert.match(document.body.textContent,/Dashboard refresh failed/)
@@ -103,4 +128,19 @@ for(const [name,state,rows,expected] of [
  for(const [key,value]of Object.entries({window:dom.window,document:dom.window.document,navigator:dom.window.navigator,IS_REACT_ACT_ENVIRONMENT:true}))Object.defineProperty(globalThis,key,{configurable:true,value})
  const rr=createRoot(document.getElementById('root'))
  try{currentTenants=rows;queryState=state;nativeData=undefined;await React.act(async()=>rr.render(h(Dashboard)));assert.match(document.body.textContent,expected);assert.doesNotMatch(document.body.textContent,/0 reported|Tenant security score/)}finally{await React.act(async()=>rr.unmount());dom.window.close()}
+})
+
+test('actual Dashboard collection age ticks and clears its timer on unmount',async()=>{
+ const dom=new JSDOM('<div id="root"></div>',{url:'https://fixture.invalid'})
+ for(const [key,value]of Object.entries({window:dom.window,document:dom.window.document,navigator:dom.window.navigator,IS_REACT_ACT_ENVIRONMENT:true}))Object.defineProperty(globalThis,key,{configurable:true,value})
+ const oldNow=Date.now,oldSet=global.setInterval,oldClear=global.clearInterval
+ let clock=Date.parse('2026-09-29T18:00:00.000Z'),tick,cleared=false
+ Date.now=()=>clock;global.setInterval=(fn,ms)=>{assert.equal(ms,60000);tick=fn;return 91};global.clearInterval=id=>{assert.equal(id,91);cleared=true}
+ const rr=createRoot(document.getElementById('root'))
+ try{
+  currentTenants=[{...base,secureScore:0,secureScoreDetails:scoreDetails(0)}];queryState={};nativeData=undefined
+  await React.act(async()=>rr.render(h(Dashboard)));assert.match(document.body.textContent,/Oldest collection: 6 hours ago/)
+  clock+=3600000;await React.act(async()=>tick());assert.match(document.body.textContent,/Oldest collection: 7 hours ago/)
+ }finally{await React.act(async()=>rr.unmount());Date.now=oldNow;global.setInterval=oldSet;global.clearInterval=oldClear;dom.window.close()}
+ assert.equal(cleared,true)
 })
