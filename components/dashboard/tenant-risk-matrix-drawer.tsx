@@ -236,7 +236,7 @@ export function TenantRiskMatrixDrawer({
                 <div className="font-semibold flex items-center gap-2">
                   <StateIcon className="h-4 w-4 shrink-0" />
                   <span>
-                    Why this tenant is categorized as &ldquo;{overallState.label}&rdquo;
+                    Tenant summary
                   </span>
                 </div>
                 <p className="text-xs leading-normal opacity-90">
@@ -247,8 +247,8 @@ export function TenantRiskMatrixDrawer({
                     : overallState.key === 'pending_setup'
                     ? 'An explicit customer access setup action is reported. Review the required setup separately from tenant findings.'
                     : overallState.key === 'healthy'
-                    ? 'No tenant findings are reported in the supplied summary. This is not an exhaustive security assessment or confirmation of synchronization.'
-                    : 'Evidence is incomplete or unavailable. The supplied summary cannot establish the tenant’s security posture or synchronization state.'}
+                    ? 'No tenant findings are reported in this summary.'
+                    : 'Finding total unavailable. Review any reported findings and access actions below.'}
                 </p>
               </div>
 
@@ -271,7 +271,7 @@ export function TenantRiskMatrixDrawer({
 
                   <div>
                     <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 block mb-1">
-                      Data Freshness
+                      Finding summary
                     </span>
                     <span className="font-semibold text-slate-900 dark:text-slate-100 block">
                       {connData.dataText}
@@ -393,17 +393,16 @@ export function TenantRiskMatrixDrawer({
                     <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
                     <span>Customer Actions</span>
                     <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-0 text-xs px-2 py-0.5">
-                      {activeIssues.count ?? 'Not reported'}
+                      {activeIssues.count === null ? 'Unavailable' : `${activeIssues.count} reported`}
                     </Badge>
                   </h3>
                 </div>
 
-                {activeIssues.incomplete && <p className="text-xs text-amber-800">Evidence incomplete. Known customer actions remain available.</p>}
                 {!activeIssues.evidenceAvailable ? (
                   <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 text-center dark:border-slate-800 dark:bg-slate-800/30">
                     <Info className="mx-auto h-6 w-6 text-slate-500" aria-hidden="true" />
                     <p className="mt-1 text-xs font-semibold text-slate-800 dark:text-slate-200">
-                      Active issue evidence not reported
+                      Customer action total unavailable
                     </p>
                   </div>
                 ) : attentionItems.length === 0 ? (

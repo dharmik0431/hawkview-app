@@ -102,16 +102,16 @@ const mixed = () => tenantActionableHealthProjection({data:{status:'PARTIAL'},at
 ]})
 test('mixed customer overview shows positives and access separately without collector wall', async () => mounted(async h => {
  await h.render(bundle({users:{status:'failed',lastError:'RAW_DIAGNOSTIC',lastSuccessfulAt:stamp}}),{health:mixed()})
- assert.equal(h.document.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]')?.textContent.includes('View collection'),true)
+ assert.equal(h.document.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]')?.textContent.includes('Collection details'),true)
  assert.match(h.text(),/1 reported finding/);assert.match(h.text(),/Microsoft risk reported/);assert.match(h.text(),/Customer access setup/)
- assert.match(h.text(),/Evidence incomplete/);assert.match(h.text(),/2 identities require review/)
+ assert.doesNotMatch(h.text(),/Evidence incomplete/);assert.match(h.text(),/2 identities require review/)
  assert.doesNotMatch(h.text(),/INTERNAL_COLLECTOR_SENTINEL|PRIVATE_DIAGNOSTIC_SENTINEL|UNKNOWN_SENTINEL|RAW_DIAGNOSTIC|Retry synchronization/)
  assert.equal(h.document.querySelectorAll('[aria-label="Dataset update times"]').length,1)
  noActiveClaim(h.text())
 }))
 test('unknown and operations-only summaries never render clean or zero risk', async () => mounted(async h => {
  for(const health of [null,tenantActionableHealthProjection({attention:[{key:'ops',label:'Operator failure',why:'Collector failed',severity:'critical',provenance:collectorAttentionProvenance('USERS',null)}]})]) {
-  await h.render(bundle({}),{health});assert.match(h.text(),/Finding total unavailable/);assert.match(h.text(),/Evidence incomplete/)
+  await h.render(bundle({}),{health});assert.match(h.text(),/Finding total unavailable/);assert.doesNotMatch(h.text(),/Evidence incomplete/)
   assert.doesNotMatch(h.text(),/Operator failure|No active issues|Posture Healthy|0 reported findings/)
  }
 }))
@@ -125,6 +125,6 @@ test('dataset clocks remain scoped and never use newest unrelated success', asyn
  const ages=h.document.querySelector('[aria-label="Dataset update times"]').textContent
  assert.equal((ages.match(/Update time unavailable/g)||[]).length,3)
  assert.doesNotMatch(ages,/Updated .*ago/)
- assert.match(h.text(),/Evidence incomplete/);assert.doesNotMatch(h.text(),/Healthy|0 risk/)
+ assert.doesNotMatch(h.text(),/Evidence incomplete/);assert.doesNotMatch(h.text(),/Healthy|0 risk/)
  assert.ok(h.document.querySelector('a[href*="tab=collection"]'), 'legacy success without a valid outcome keeps diagnostics reachable')
 }))

@@ -1700,18 +1700,18 @@ export default function TenantsPage() {
                               className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-900 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors text-xs font-semibold text-left"
                             >
                               <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
-                              <span>{attentionItems.length} action{attentionItems.length > 1 ? 's' : ''}{actionableHealth.status === 'UNAVAILABLE' ? ' · Evidence incomplete' : ''}</span>
+                              <span>{attentionItems.length} reported action{attentionItems.length === 1 ? '' : 's'}</span>
                               <ChevronRight className="h-3.5 w-3.5 opacity-60 ml-0.5" />
                             </button>
                           ) : actionableHealth.status === 'UNAVAILABLE' ? (
                             <span className="inline-flex items-center gap-1 text-xs text-slate-500 dark:text-slate-400 font-medium">
                               <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                              <span>Evidence incomplete</span>
+                              <span>Customer action total unavailable</span>
                             </span>
                           ) : (
                             <span className="inline-flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 font-medium">
                               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
-                              <span>No issues</span>
+                              <span>No actions reported</span>
                             </span>
                           )}
                         </td>
@@ -1815,12 +1815,12 @@ export default function TenantsPage() {
                           className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-bold hover:underline"
                         >
                           <AlertTriangle className="h-3.5 w-3.5" />
-                          <span>{attentionItems.length} to review{actionableHealth.status === 'UNAVAILABLE' ? ' · Evidence incomplete' : ''}</span>
+                          <span>{attentionItems.length} reported action{attentionItems.length === 1 ? '' : 's'}</span>
                         </button>
                       ) : actionableHealth.status === 'UNAVAILABLE' ? (
                         <span className="text-slate-500 dark:text-slate-400 font-semibold flex items-center gap-1">
                           <AlertCircle className="h-3.5 w-3.5" />
-                          <span>Evidence incomplete</span>
+                          <span>Customer action total unavailable</span>
                         </span>
                       ) : (
                         <span className="text-emerald-600 font-semibold flex items-center gap-1">
