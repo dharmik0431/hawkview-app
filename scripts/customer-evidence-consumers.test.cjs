@@ -63,9 +63,9 @@ for(const compact of [true,false])for(const [name,value,affected,label,unattribu
 }))
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],
- ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Evidence is incomplete or unavailable/],
- ['unknown',[row(undefined)],/Evidence is incomplete or unavailable/],
- ['empty',[],/not an exhaustive security assessment or confirmation of synchronization/],
+ ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Finding total unavailable/],
+ ['unknown',[row(undefined)],/Finding total unavailable/],
+ ['empty',[],/No tenant findings are reported in this summary/],
  ['finding',[row(prov.tenantFindingProvenance('MICROSOFT_ACTIVE_RISK'))],/Critical tenant findings are reported/],
 ])test('mounted matrix drawer '+name,()=>mount('drawer-'+name,h(TenantRiskMatrixDrawer,{tenant:{...tenant,attention},isOpen:true,onClose(){}}),doc=>{
  assert.match(doc.body.textContent,expected)
@@ -83,7 +83,7 @@ for(const name of ['success','future','mismatched','deferred','positive-deferred
  assert.equal(display.customer.incomplete,name!=='success');assert.equal(display.attentionVerified,name==='success')
  await mount('overview-'+name,h(TenantOverview,{bundle,display,onOpenModule(){}}),doc=>{
   assert.equal(!!doc.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]'),name!=='success')
-  if(name!=='success')assert.match(doc.body.textContent,/Evidence incomplete/)
+  if(name!=='success'){assert.doesNotMatch(doc.body.textContent,/Evidence incomplete/);assert.match(doc.body.textContent,attention.length?/1 reported finding/:/Finding total unavailable/)}
   if(attention.length)assert.match(doc.body.textContent,/Known positive finding/)
   assert.doesNotMatch(doc.body.textContent,/Deferred work recorded|m365-audit-backlog|Collection outcome not verified/)
  })

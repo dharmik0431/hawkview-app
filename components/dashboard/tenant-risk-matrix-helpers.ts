@@ -47,7 +47,7 @@ export function getTenantMatrixOverallState(
   const positive = view.findings.length > 0 || (risk.count ?? 0) > 0
   return {
     key: critical ? 'critical' : positive ? 'needs_attention' : view.accessActions.length ? 'pending_setup' : view.incomplete ? 'unknown' : 'healthy',
-    label: positive && !view.findings.length ? `Microsoft risk reported${view.incomplete ? ' · Evidence incomplete' : ''}` : customerStatus(view),
+    label: positive && !view.findings.length ? 'Microsoft risk reported' : customerStatus(view),
     badgeClass: positive || view.accessActions.length ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-slate-100 text-slate-700 border-slate-200',
     icon: critical ? ShieldAlert : positive ? AlertTriangle : Info,
     rank: critical ? 1 : positive ? 3 : 5,
@@ -61,7 +61,7 @@ export function getTenantActiveIssuesInfo(tenant: Tenant) {
   return {
     count,
     highestSeverity: items.some(i => i.severity === 'critical') ? 'critical' as const : items.some(i => i.severity === 'high') ? 'high' as const : items.length ? 'medium' as const : view.incomplete ? 'unknown' as const : 'none' as const,
-    summaryText: `${items.length ? `${items.length} reported customer actions` : view.incomplete ? 'Customer action total unavailable' : 'No customer actions reported'}${view.incomplete && items.length ? ' · Evidence incomplete' : ''}`,
+    summaryText: items.length ? `${items.length} reported customer action${items.length === 1 ? '' : 's'}` : view.incomplete ? 'Customer action total unavailable' : 'No customer actions reported',
     evidenceAvailable: items.length > 0 || !view.incomplete,
     incomplete: view.incomplete,
   }
@@ -130,7 +130,7 @@ export function getTenantConnectionDataInfo(tenant: Tenant) {
   }
 
   const view = customerAttention(tenant)
-  const dataText = view.incomplete ? 'Evidence: Incomplete' : 'Evidence: Supplied coverage complete'
+  const dataText = view.findings.length ? `${view.findings.length} reported finding${view.findings.length === 1 ? '' : 's'}` : view.incomplete ? 'Finding total unavailable' : 'No findings reported'
   const dataStatus = view.incomplete ? 'partial' as const : 'current' as const
 
   return {
@@ -202,7 +202,7 @@ export function getTenantRecommendedAction(tenant: Tenant) {
   if ((risk.count ?? 0) > 0) return { label: 'Review Microsoft risk', destinationUrl: tenantRiskyUsersPath(tenant.id), description: risk.breakdownNote }
   if (view.findings.length) return { label: 'Review findings', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`, description: `${view.findings.length} reported findings for review. These can include configuration changes and registration gaps.` }
   if (view.accessActions.length) return { label: 'Review access setup', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}/settings`, description: view.accessActions[0].why }
-  return { label: 'View tenant', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`, description: view.incomplete ? 'Evidence is incomplete; no customer action is inferred.' : 'Review the supplied tenant evidence.' }
+  return { label: 'View tenant', destinationUrl: `/tenants/${encodeURIComponent(tenant.id)}`, description: view.incomplete ? 'Customer action total unavailable. Open the tenant to review reported data.' : 'Open the tenant to review reported data.' }
 }
 
 export function getTenantSecureScoreInfo(tenant: Tenant) {
@@ -302,7 +302,7 @@ export function getTenantThreatsInfo(tenant: Tenant): {count: number | null; isC
   const count = view.findings.length || (view.incomplete ? null : 0)
   return {
     count, isConfirmedZero: count === 0 && !view.incomplete,
-    label: count === null ? 'Finding total unavailable' : `${count} reported finding${count === 1 ? '' : 's'}${view.incomplete ? ' · Evidence incomplete' : ''}`,
+    label: count === null ? 'Finding total unavailable' : `${count} reported finding${count === 1 ? '' : 's'}`,
     statusType: count === null ? 'unavailable' as const : 'available' as const,
     resolvedCount: null,
   }
@@ -311,8 +311,8 @@ export function getTenantThreatsInfo(tenant: Tenant): {count: number | null; isC
 export function getPrimaryConcern(tenant: Tenant) {
   const view = customerAttention(tenant)
   const item = [...view.findings, ...view.accessActions].sort((a,b) => ({critical:0,high:1,medium:2}[a.severity] - {critical:0,high:1,medium:2}[b.severity]))[0]
-  if (item) return { title: item.label, detail: `${item.why}${view.incomplete ? ' Evidence incomplete.' : ''}`, severity: item.severity === 'critical' ? 'critical' as const : 'warning' as const, icon: AlertTriangle }
+  if (item) return { title: item.label, detail: item.why, severity: item.severity === 'critical' ? 'critical' as const : 'warning' as const, icon: AlertTriangle }
   const risk = getTenantRiskyUsersInfo(tenant)
   if ((risk.count ?? 0) > 0) return { title: 'Microsoft risk reported', detail: risk.breakdownNote, severity: 'warning' as const, icon: ShieldAlert }
-  return { title: customerStatus(view), detail: 'The summary is not an exhaustive security assessment. Review individual evidence sources for coverage.', severity: 'info' as const, icon: Info }
+  return { title: customerStatus(view), detail: 'Open the tenant to review reported data.', severity: 'info' as const, icon: Info }
 }

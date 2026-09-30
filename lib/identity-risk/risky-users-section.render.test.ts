@@ -482,7 +482,7 @@ async function mountedStrip(initial: Record<string, unknown>, check: (ctx: any) 
   try { await ctx.update({}); await check(ctx) }
   finally {
     await React.act(async () => root.unmount()); dom.window.close()
-    for (const [key, descriptor] of saved) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key]
+    for (const [key, descriptor] of Array.from(saved)) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key]
   }
 }
 function withheldStripNative(positive = false) {

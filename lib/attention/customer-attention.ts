@@ -53,10 +53,9 @@ export function customerAttention(value: unknown): CustomerAttention {
 }
 
 export function customerStatus(view: CustomerAttention): string {
-  const suffix = view.incomplete ? ' · Evidence incomplete' : ''
-  if (view.findings.length) return `Findings to review${suffix}`
-  if (view.accessActions.length) return `Access setup required${suffix}`
-  return view.incomplete ? 'Evidence incomplete' : 'No findings reported'
+  if (view.findings.length) return `${view.findings.length} reported finding${view.findings.length === 1 ? '' : 's'}`
+  if (view.accessActions.length) return `${view.accessActions.length} reported access action${view.accessActions.length === 1 ? '' : 's'}`
+  return view.incomplete ? 'Finding total unavailable' : 'No findings reported'
 }
 
 export function customerTarget(provenance: AttentionProvenance | undefined): string {
