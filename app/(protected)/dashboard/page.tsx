@@ -1,5 +1,6 @@
 'use client'
 
+import { microsoftSecureScoreAge, microsoftSecureScoreSummary } from '@/lib/dashboard/microsoft-secure-score-summary'
 import { criticalFindingsSummary } from '@/lib/dashboard/critical-findings-summary'
 import { customerAttention, customerHealthScore } from '@/lib/attention/customer-attention'
 import * as React from 'react'
@@ -289,6 +290,12 @@ function queueMetric(tenant: TenantRow, item: AttentionItem) {
 }
 
 export default function DashboardPage() {
+  const [scoreClock, setScoreClock] = React.useState<number | null>(null)
+  React.useEffect(() => {
+    setScoreClock(Date.now())
+    const timer = setInterval(() => setScoreClock(Date.now()), 60_000)
+    return () => clearInterval(timer)
+  }, [])
   const router = useRouter()
   const tenantQuery = useTenants()
   const nativeRiskQuery = useNativeRiskSummary()
@@ -523,6 +530,8 @@ export default function DashboardPage() {
     queueFiltersActive
   )
 
+  const scoreAge = microsoftSecureScoreAge(tenants, scoreClock ?? NaN)
+
   const kpis = React.useMemo(() => {
     const reportedRiskCounts = tenants
       .map((tenant) => tenant.identityDetected)
@@ -544,6 +553,7 @@ export default function DashboardPage() {
     return {
       riskyIdentities,
       criticalFindings,
+      microsoftSecureScore: microsoftSecureScoreSummary(tenants),
       mfaGaps,
       riskPartial:
         reportedRiskCounts.length < tenants.length ||
@@ -652,7 +662,7 @@ export default function DashboardPage() {
         </div>
       ) : null}
       {/* KPI Cards */}
-      <div className="grid gap-4 lg:grid-cols-3">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         {nativeRiskPanel}
 
         <Card className="rounded-2xl">
@@ -664,12 +674,6 @@ export default function DashboardPage() {
                 </div>
                 <div className="mt-1 text-3xl font-bold">
                   {kpis.criticalFindings.value}
-                </div>
-                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {kpis.criticalFindings.coverage}
-                </div>
-                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  {kpis.criticalFindings.qualification}
                 </div>
               </div>
               <div className="h-10 w-10 rounded-xl bg-amber-50 border border-amber-100 flex items-center justify-center">
@@ -693,6 +697,23 @@ export default function DashboardPage() {
               </div>
               <div className="h-10 w-10 rounded-xl bg-blue-50 border border-blue-100 flex items-center justify-center">
                 <ShieldCheck className="h-5 w-5 text-blue-700" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="rounded-2xl">
+          <CardContent className="p-5">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <div className="text-[11px] font-semibold tracking-wider text-slate-500 dark:text-slate-400 uppercase">
+                  Microsoft Secure Score
+                </div>
+                <div className="mt-1 text-3xl font-bold">{kpis.microsoftSecureScore.value}</div>
+                <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">{kpis.microsoftSecureScore.detail}</div>
+                {scoreAge && <p className="mt-1 text-xs text-slate-500 dark:text-slate-400" title={scoreAge.description} aria-label={`${scoreAge.label}. ${scoreAge.description}`}>{scoreAge.label}</p>}
+              </div>
+              <div className="h-10 w-10 shrink-0 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-center dark:bg-slate-800 dark:border-slate-700">
+                <ShieldCheck className="h-5 w-5 text-slate-600 dark:text-slate-300" />
               </div>
             </div>
           </CardContent>

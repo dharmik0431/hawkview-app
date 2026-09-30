@@ -1,3 +1,4 @@
+import { microsoftSecureScoreAge, microsoftSecureScoreSummary } from './microsoft-secure-score-summary.ts'
 import { criticalFindingsSummary } from './critical-findings-summary.ts'
 import * as customerAttentionModule from '../attention/customer-attention.ts'
 import assert from 'node:assert/strict'
@@ -164,7 +165,7 @@ test('compact card uses adjacent KPI padding and natural height without clipping
   assert.match(source, /CardContent className="p-5"/)
   assert.match(source, /flex min-w-0 flex-col gap-2/)
   assert.match(source, /block flex-1 rounded-2xl/)
-  assert.match(dashboard, /grid gap-4 lg:grid-cols-3/)
+  assert.match(dashboard, /grid gap-4 md:grid-cols-2 lg:grid-cols-4/)
   assert.doesNotMatch(source, /overflow-hidden|line-clamp|truncate|(?:min-|max-)?h-\[/)
 })
 
@@ -317,6 +318,7 @@ test('dashboard renders native summary even when the independent tenant director
       '@/components/ui/input': { Input: () => null },
       '@/components/dashboard/alert-details-modal': { AlertDetailsModal: () => null },
       '@/lib/tenants/investigate-navigation': { investigateDestination: () => '/tenants' },
+      '@/lib/dashboard/microsoft-secure-score-summary': { microsoftSecureScoreAge, microsoftSecureScoreSummary },
       '@/lib/dashboard/critical-findings-summary': { criticalFindingsSummary },
       '@/lib/dashboard/queue-summary': { queueSummary: () => ({}) },
       '@/components/common/loading-state': { LoadingState: () => h('p', null, 'Directory loading') },
