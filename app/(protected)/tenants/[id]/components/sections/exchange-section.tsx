@@ -1,5 +1,6 @@
 'use client'
 
+import { DataFreshnessLink } from '@/components/tenant/data-freshness-link'
 import React, { useMemo, useState, useEffect, useRef } from 'react'
 import {
   Mail,
@@ -31,8 +32,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { apiClient } from '@/lib/api/client'
 import { cn } from '@/lib/utils'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { exchangeAge } from '@/lib/tenants/dataset-age'
+
 import { formatTenantTimestamp } from '@/lib/tenant-workspace-state'
 import {
   exchangeDatasetStatus,
@@ -419,37 +419,8 @@ export default function ExchangePage({
       })
     }
 
-    // 3. Synchronization / Permission issue
-    if (mailboxDatasetStatus.state === 'FAILED' || mailboxesSyncStatus?.lastError) {
-      findings.push({
-        id: 'finding-perm-error',
-        type: 'permission',
-        title: 'Exchange synchronization requires attention',
-        target: 'Exchange Graph API Collection',
-        reason: 'Exchange collection did not complete. Review Microsoft access and retry synchronization.',
-        onAction: () => {
-          if (onSync) onSync()
-        }
-      })
-    }
-
-    // 4. Tenant-associated Microsoft 365 domains state
-    if (EXCHANGE_DOMAINS.length === 0 && !isSyncing) {
-      findings.push({
-        id: 'finding-domains-empty',
-        type: 'domain',
-        title: 'Microsoft 365 domains dataset unavailable',
-        target: 'Tenant-associated domains collection',
-        reason: 'No tenant-associated Microsoft 365 domains have been synchronized for this tenant.',
-        onAction: () => {
-          setActiveTab('domains-groups')
-          setDomainGroupSubtab('domains')
-        }
-      })
-    }
-
     return findings
-  }, [EXCHANGE_RULES, EXCHANGE_DOMAINS, mailboxDatasetStatus.state, mailboxesSyncStatus, isSyncing, onSync])
+  }, [EXCHANGE_RULES])
 
   // Open Mailbox Drawer
   const openMailboxDrawer = (m: any, e: React.MouseEvent | React.KeyboardEvent) => {
@@ -523,6 +494,8 @@ export default function ExchangePage({
             </div>
           </div>
 
+          <div className="flex flex-wrap items-center gap-2">
+          <DataFreshnessLink tenantId={String(tenant.id)} />
           {/* Single Sync Now Button */}
           {onSync && (
             <Button
@@ -538,9 +511,8 @@ export default function ExchangePage({
               <span>{isSyncing ? "Request pending..." : syncState === 'success' ? "Request completed" : syncState === 'fail' ? "Sync failed" : "Sync Now"}</span>
             </Button>
           )}
+          </div>
         </div>
-
-        <SectionFreshness evidence={exchangeAge()} className="mb-0" />
 
         {/* Sync Failure Warning Banner */}
         {syncState === 'fail' && (

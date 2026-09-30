@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useState, useMemo } from 'react'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { licenseActivityAge } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -368,7 +368,7 @@ export default function LicenseActivitySection({
   return (
     <Card className="rounded-2xl border border-slate-200/80 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs mt-4">
       <CardContent className="p-6 space-y-4">
-      <SectionFreshness evidence={licenseActivityAge()} isEmpty={rawEvents.length === 0} />
+      <DatasetEmptyState evidence={licenseActivityAge()} isEmpty={rawEvents.length === 0} />
         {/* Filters and Search Bar */}
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pb-2 border-b border-slate-100 dark:border-slate-800/80">
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 flex-1 max-w-3xl">

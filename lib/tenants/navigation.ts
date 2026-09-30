@@ -188,3 +188,7 @@ export function parseTenantPath(
     canonicalPath: tenantSectionPath(tenantId, section),
   }
 }
+
+export function tenantDataFreshnessPath(tenantId: string) {
+  return `/tenants/${encodeURIComponent(tenantId)}/data-freshness`
+}

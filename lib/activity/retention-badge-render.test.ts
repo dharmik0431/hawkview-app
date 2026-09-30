@@ -26,6 +26,7 @@ function load(path: string): any {
   } }).outputText
   new Function('require', 'exports', js)((name: string) => {
     if (mocks[name]) return mocks[name]
+    if (name === 'next/link') return { __esModule: true, default: ({ children, ...props }: any) => React.createElement('a', props, children) }
     if (!name.startsWith('.') && !name.startsWith('@/')) return require(name)
     const target = name.startsWith('@/') ? resolve(base, name.slice(2)) : resolve(dirname(path), name)
     return load([target, target + '.tsx', target + '.ts'].find(p => existsSync(p))!)

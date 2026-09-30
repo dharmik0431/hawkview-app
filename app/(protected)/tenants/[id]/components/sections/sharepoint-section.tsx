@@ -1,8 +1,8 @@
 'use client'
 
+import { DataFreshnessLink } from '@/components/tenant/data-freshness-link'
 import React, { useMemo, useState, useEffect, useRef } from 'react'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { sharePointAge, sharePointReportAge, sharePointSettingsAge } from '@/lib/tenants/dataset-age'
+
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -553,7 +553,7 @@ export default function SharePointPage({
 
   return (
     <div className="mt-1 space-y-4 text-slate-900 dark:text-slate-100">
-      <SectionFreshness evidence={sharePointAge()} />
+
       {/* ================= SINGLE MERGED PAGE HEADER ================= */}
       <div className="flex flex-col gap-2.5 pb-3 border-b border-slate-200 dark:border-slate-800">
         {/* Top Row: Title, Mobile Trigger, Tenant Context, Sync Now Button */}
@@ -588,6 +588,8 @@ export default function SharePointPage({
             </div>
           </div>
 
+          <div className="flex flex-wrap items-center gap-2">
+          <DataFreshnessLink tenantId={tenantId} />
           {/* Action Header Group: Single Sync Now Button */}
           {onSync && (
             <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
@@ -613,6 +615,7 @@ export default function SharePointPage({
               </Button>
             </div>
           )}
+          </div>
         </div>
 
         {/* Microsoft usage-report privacy limitation. This is not a missing
@@ -1055,44 +1058,6 @@ export default function SharePointPage({
             </div>
           )}
 
-          {/* 3. Compact Data Coverage & Freshness Strip */}
-          <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3 shadow-2xs">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-100 dark:border-slate-800">
-              <div className="flex items-center gap-2">
-                <Database className="h-4 w-4 text-slate-500" />
-                <h2 className="text-sm font-bold text-slate-900 dark:text-slate-100">Data coverage & freshness</h2>
-              </div>
-              <span className="text-xs text-slate-400 font-mono">Collection Timeline</span>
-            </div>
-
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
-                <div className="text-slate-500 flex items-center justify-between">
-                  <span>Graph site inventory</span>
-                  <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                </div>
-                <div className="font-bold text-slate-900 dark:text-slate-100">{siteCountLabel} discovered</div>
-              </div>
-
-              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
-                <div className="text-slate-500 flex items-center justify-between">
-                  <span>SharePoint report</span>
-
-                </div>
-                <SectionFreshness evidence={sharePointReportAge(sharePointView)} className="mb-0" />
-              </div>
-
-              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-800 space-y-1">
-                <div className="text-slate-500 flex items-center justify-between">
-                  <span>OneDrive report window</span>
-                  <span className="h-2 w-2 rounded-full bg-slate-400" />
-                </div>
-                <div className="font-bold text-slate-900 dark:text-slate-100">D30 (30 days)</div>
-              </div>
-
-
-            </div>
-          </div>
         </div>
       )}
 
@@ -1538,7 +1503,7 @@ export default function SharePointPage({
               {/* Source and Freshness Metadata */}
               <div className="text-[11px] text-slate-500 dark:text-slate-400 sm:text-right shrink-0">
                 <div>Source: <span className="font-medium text-slate-700 dark:text-slate-300">Microsoft Graph API</span></div>
-                <SectionFreshness evidence={sharePointSettingsAge()} className="mb-0" />
+
               </div>
             </div>
 

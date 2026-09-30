@@ -71,7 +71,7 @@ test('activity normalization never invents timestamps, identities, outcomes, or 
   assert.doesNotMatch(activity, /lastError\s*\}/)
   assert.doesNotMatch(activity, /filters\.tenantId \? signInRows\.length : 0/)
   assert.match(normalize, /Not reported/)
-  assert.match(activity, /Partial log evidence/)
+  assert.match(activity, /DataFreshnessLink/); assert.doesNotMatch(activity, /Partial log evidence/)
   assert.doesNotMatch(drawer, /Copy JSON|Raw event \(JSON\)|event\.raw/)
   assert.doesNotMatch(csv, /event\.rowKey/)
   assert.match(drawer, /event\.eventId \?\? 'Not reported'/)

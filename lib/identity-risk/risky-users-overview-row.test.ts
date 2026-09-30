@@ -40,7 +40,7 @@ function read() {
     microsoftLoading: false, cacheScope: 'synthetic', retryAssessment() {}, retryMicrosoft() {},
   }
 }
-async function mounted(run: (h: { render: (id: string, value: any) => Promise<void>; row: () => any; text: () => string; dom: any }) => Promise<void>) {
+async function mounted(run: (h: { render: (id: string, value: any, details?: boolean) => Promise<void>; row: () => any; text: () => string; dom: any }) => Promise<void>) {
   const dom = new JSDOM('<div id="root"></div>', { url: 'https://synthetic.invalid' })
   const saved = new Map(['window', 'document', 'navigator', 'IS_REACT_ACT_ENVIRONMENT'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
   for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator, IS_REACT_ACT_ENVIRONMENT: true })) Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
@@ -48,12 +48,12 @@ async function mounted(run: (h: { render: (id: string, value: any) => Promise<vo
   const row = () => dom.window.document.querySelector('section[aria-labelledby="risky-users-overview-heading"]')
   try {
     await run({
-      render: async (id, value) => {
+      render: async (id, value, details = false) => {
         reads[id] = value
         const data = { tenant: { id, status: 'connected' }, users: [], signIns: [], exchange: {}, sharepoint: {}, teams: {}, sync: {} }
         const display = deriveTenantWorkspaceDisplay(data)
         await React.act(async () => root.render(React.createElement(TenantOverview, {
-          bundle: data, display, onOpenModule() {}, riskyUsers: React.createElement(RiskyUsersOverviewRow, { tenantId: id }),
+          bundle: data, display, onOpenModule() {}, riskyUsers: React.createElement(RiskyUsersOverviewRow, { tenantId: id, showCollectionDetails: details }),
         })))
       }, row, text: () => row().textContent, dom,
     })
@@ -91,13 +91,13 @@ test('compact overview keeps exact zero scoped and a positive count reviewable a
   assert.match(h.text(), /HawkView checks only/)
   assert.doesNotMatch(h.text(), /1 identified/)
   compact(h.row(), 'tenant b/c')
-  assert.ok(h.row().querySelector('time[datetime="2026-09-08T22:00:00.000Z"]'))
+  assert.equal(h.row().querySelector('time'), null)
 }))
 
 test('compact overview distinguishes unknown, withheld, loading, read failure and unreadable response', async () => mounted(async h => {
   for (const [name, setup, expected] of [
-    ['unknown', (r: any) => { r.nativeView = null }, /Not available — no current assessment/],
-    ['withheld', (r: any) => { r.nativeView.count.accuracy = 'NOT_AVAILABLE'; r.nativeView.count.value = null; r.nativeView.withheld = [{ stream: null, because: 'NEVER_COLLECTED' }] }, /Not counted — nothing has ever been collected/],
+    ['unknown', (r: any) => { r.nativeView = null }, /Finding total unavailable/],
+    ['withheld', (r: any) => { r.nativeView.count.accuracy = 'NOT_AVAILABLE'; r.nativeView.count.value = null; r.nativeView.withheld = [{ stream: null, because: 'NEVER_COLLECTED' }] }, /Finding total unavailable/],
     ['loading', (r: any) => { r.assessmentLoading = true; r.nativeView = null }, /Loading assessment/],
     ['read-error', (r: any) => { r.assessmentRequestError = true }, /Not available — assessment request failed/],
     ['contract-error', (r: any) => { r.assessmentContractError = true }, /Not available — assessment response unreadable/],
@@ -114,20 +114,20 @@ test('compact lower-bound and zero summaries retain coverage, findings and list 
   const lower = read(); lower.nativeView.count.accuracy = 'AT_LEAST'; lower.nativeView.count.value = 4
   await h.render('lower', lower)
   assert.match(h.text(), /At least 4 identified/)
-  assert.match(h.text(), /Coverage incomplete/)
-  assert.match(h.text(), /Partial findings list/)
+  assert.doesNotMatch(h.text(), /Coverage incomplete/)
+  assert.doesNotMatch(h.text(), /Partial findings list/)
   compact(h.row(), 'lower')
   const zero = read(); zero.nativeView.count.value = 0; zero.nativeView.findings[0].subject.kind = 'MAILBOX'
   zero.nativeView.count.notCovered = [{ detectorId: 'external-mailbox-forwarding', because: 'DETECTOR_FAILED' }]
   await h.render('zero', zero)
   assert.match(h.text(), /0 identified/)
   assert.match(h.text(), /Findings present/)
-  assert.match(h.text(), /Coverage incomplete/)
+  assert.doesNotMatch(h.text(), /Coverage incomplete/)
   compact(h.row(), 'zero')
   const missing = read(); missing.nativeView.findings = []
   await h.render('missing', missing)
   assert.match(h.text(), /1 identified/)
-  assert.match(h.text(), /Findings list unavailable/)
+  assert.doesNotMatch(h.text(), /Findings list unavailable/)
 }))
 
 test('compact row preserves explicit stale and error warnings without turning another source into the HawkView count', async () => mounted(async h => {
@@ -135,12 +135,12 @@ test('compact row preserves explicit stale and error warnings without turning an
   stale.microsoftView.meta.status = 'STALE'; stale.microsoftView.meta.freshness = 'STALE'
   await h.render('stale', stale)
   assert.match(h.text(), /0 identified/)
-  assert.match(h.text(), /Microsoft evidence stale/)
+  assert.doesNotMatch(h.text(), /Microsoft evidence stale/)
   compact(h.row(), 'stale')
   const failed = read(); failed.microsoftView.meta.status = 'ERROR'
   await h.render('failed', failed)
   assert.match(h.text(), /1 identified/)
-  assert.match(h.text(), /Microsoft evidence read failed/)
+  assert.doesNotMatch(h.text(), /Microsoft evidence read failed/)
   compact(h.row(), 'failed')
 }))
 
@@ -171,12 +171,12 @@ test('pending Microsoft read retains a settled native lower bound, coverage, lis
   value.nativeView.count.notCovered = [{ detectorId: 'external-mailbox-forwarding', because: 'DETECTOR_FAILED' }]
   await h.render('native-settled', value)
   assert.match(h.text(), /At least 3 identified/)
-  assert.match(h.text(), /Coverage incomplete/)
-  assert.match(h.text(), /Partial findings list/)
+  assert.doesNotMatch(h.text(), /Coverage incomplete/)
+  assert.doesNotMatch(h.text(), /Partial findings list/)
   assert.match(h.text(), /HawkView checks only/)
-  assert.match(h.text(), /Loading Microsoft evidence/)
+  assert.doesNotMatch(h.text(), /Loading Microsoft evidence/)
   assert.doesNotMatch(h.text(), /Loading assessment|Microsoft evidence unavailable/)
-  assert.ok(h.row().querySelector('time'))
+  assert.equal(h.row().querySelector('time'), null)
   compact(h.row(), 'native-settled')
 }))
 
@@ -190,7 +190,7 @@ test('pending native read retains settled Microsoft positive records and its exp
   await h.render('microsoft-settled', value)
   assert.match(h.text(), /Loading assessment/)
   assert.match(h.text(), /Microsoft risk records available/)
-  assert.match(h.text(), /Microsoft evidence stale/)
+  assert.doesNotMatch(h.text(), /Microsoft evidence stale/)
   assert.doesNotMatch(h.text(), /0 identified|1 identified|Loading Microsoft evidence/)
   compact(h.row(), 'microsoft-settled')
 }))
@@ -213,12 +213,26 @@ test('pending same-source retained data is not promoted to a current count or av
   pendingMicrosoft.microsoftView.meta.freshness = 'STALE'
   await h.render('pending-ms-cache', pendingMicrosoft)
   assert.match(h.text(), /1 identified/)
-  assert.match(h.text(), /Loading Microsoft evidence/)
+  assert.doesNotMatch(h.text(), /Loading Microsoft evidence/)
   assert.doesNotMatch(h.text(), /Microsoft risk records available|Microsoft evidence stale/)
 
   const both = read(); both.assessmentLoading = true; both.microsoftLoading = true
   await h.render('both-pending', both)
   assert.match(h.text(), /Loading assessment/)
-  assert.match(h.text(), /Loading Microsoft evidence/)
+  assert.doesNotMatch(h.text(), /Loading Microsoft evidence/)
   assert.doesNotMatch(h.text(), /identified|Microsoft risk records available/)
+}))
+
+test('opt-in freshness page retains coverage, list, source warnings and assessment time', async () => mounted(async h => {
+  const value = read(); value.nativeView.count.accuracy = 'AT_LEAST'; value.nativeView.count.value = 4
+  value.microsoftView.meta.status = 'STALE'; value.microsoftView.meta.freshness = 'STALE'
+  await h.render('details-tenant', value, true)
+  assert.match(h.text(), /At least 4 identified/)
+  assert.match(h.text(), /Coverage incomplete|Partial findings list/)
+  assert.match(h.text(), /Microsoft evidence stale/)
+  assert.ok(h.row().querySelector('time'))
+  compact(h.row(), 'details-tenant')
+  await h.render('details-tenant', value)
+  assert.doesNotMatch(h.text(), /Coverage incomplete|Partial findings list|Microsoft evidence stale/)
+  assert.equal(h.row().querySelector('time'), null)
 }))
