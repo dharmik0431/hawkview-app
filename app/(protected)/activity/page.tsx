@@ -803,7 +803,7 @@ export default function ActivityPage() {
       ) : directoryState === 'error' ? (
         <div className="rounded-lg border bg-background">
           <ErrorState
-            message="HawkView could not load the tenant directory. No activity status is being inferred."
+            message="Tenant directory could not be loaded. Try again."
             onRetry={() => setDirectoryReloadKey((value) => value + 1)}
           />
         </div>
@@ -835,7 +835,7 @@ export default function ActivityPage() {
       ) : bundleState === 'error' ? (
         <div className="rounded-lg border bg-background">
           <ErrorState
-            message="HawkView could not load activity evidence for this tenant. No success state is being shown."
+            message={`${tab === 'signins' ? 'Sign-in logs' : 'Audit logs'} could not be loaded for this tenant. Try again.`}
             onRetry={() => setBundleReloadKey((value) => value + 1)}
           />
         </div>

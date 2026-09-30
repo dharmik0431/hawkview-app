@@ -153,7 +153,7 @@ export function TenantOnboardingDialog({
       if (generation !== loadGeneration.current) return null
       setState(null)
       setExchangeSetup(null)
-      setError('HawkView could not load the authoritative tenant setup state. Check your connection and retry.')
+      setError('Tenant setup status could not be loaded. Retry confirmation.')
       return null
     } finally {
       if (generation === loadGeneration.current && showLoading) setBusy(null)
