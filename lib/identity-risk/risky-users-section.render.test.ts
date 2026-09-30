@@ -165,7 +165,7 @@ test('AN UNAVAILABLE ASSESSMENT ASSERTS NO EMPTINESS, IN ANY VOICE', () => {
   // tell.** Live for the two organisations with no collection configured.
   const text = render(null, microsoftView)
 
-  assert.match(text, /Users requiring review: Not available/, 'the count still says it cannot tell')
+  assert.match(text, /HawkView count: Not available/, 'the count still says it cannot tell')
 
   // EVERY VOICE, NAMED SEPARATELY. One assertion over the whole string would go green the moment
   // somebody reworded a line, and these are three independent sites that were fixed separately.
@@ -192,8 +192,8 @@ test('POSITIVE CONTROL: AN ASSESSED, EMPTY TENANT STILL RENDERS ITS ZERO', () =>
   // that proves it did.
   const text = render(assessedAndEmpty, microsoftView)
 
-  assert.match(text, /0 detected by HawkView/, 'an assessed empty tenant must still show its zero')
-  assert.doesNotMatch(text, /Users requiring review: Not available/, 'and must not read as unknown')
+  assert.match(text, /HawkView: 0 users requiring review in this assessment/, 'an assessed empty tenant must still show its zero')
+  assert.doesNotMatch(text, /HawkView count: Not available/, 'and must not read as unknown')
 })
 
 const badCopy=/Some Microsoft risk records could not be matched to HawkView identities/;
@@ -212,7 +212,7 @@ for(const [label,reason,partial] of [['generic unavailable','SOURCE_UNAVAILABLE'
   assert.match(html, partial ? /Some Microsoft Identity Protection records could not be evaluated/ : reason === 'LICENSE_REQUIRED' ? /requires.*licen|requires Entra ID P2/i : /Microsoft Entra risk detection is unavailable/);
   assert.match(html, partial ? /Microsoft risk status incomplete/ : /Microsoft risk status unavailable/);
   const retained=render(nativePositive(),ms);
-  assert.match(retained,/Synthetic user/);assert.match(retained,/1 detected by HawkView/);
+  assert.match(retained,/Synthetic user/);assert.match(retained,/HawkView: 1 users requiring review in this assessment/);
   assert.doesNotMatch(retained,badCopy);
   assert.doesNotMatch(html,badCopy,'No supplied records or directory-match attempt supports this matching-specific diagnosis');
  });
@@ -235,7 +235,7 @@ test('absent Microsoft correlation is unprovided comparison, not a failed direct
  assert.equal(rows[0].detection.microsoft,'NOT_COMPARABLE');
  assert.match(rows[0].detection.because!, /lack usable comparison keys/);
  assert.doesNotMatch(rows[0].detection.because!, /could not be matched/);
- const html=render(native,ms);assert.match(html,/Cross-source comparison is not established/);assert.match(html,/Synthetic user/);assert.match(html,/1 detected by HawkView/);assert.match(html,/1 active Microsoft risk identity/);assert.doesNotMatch(html,badCopy,'Absent comparison key is not proof a directory match failed');
+ const html=render(native,ms);assert.match(html,/Cross-source comparison is not established/);assert.match(html,/Synthetic user/);assert.match(html,/HawkView: 1 users requiring review in this assessment/);assert.match(html,/1 active Microsoft risk identity/);assert.doesNotMatch(html,badCopy,'Absent comparison key is not proof a directory match failed');
 });
 
 
@@ -435,7 +435,7 @@ for (const status of ['STALE', 'UNSUPPORTED', 'NOT_LICENSED', 'PERMISSION_REQUIR
     assert.match(text, new RegExp(`Collector status: ${status}`))
     assert.doesNotMatch(text, /Collector status: Unrecognized status/)
     assert.match(text, /Count accuracy: AT_LEAST; count value: 5/)
-    assert.doesNotMatch(text, /user.*P2|P2.*user/i)
+    assert.doesNotMatch(text.split('Microsoft Identity Protection')[0], /user.*P2|P2.*user/i)
   })
 }
 for (const because of ['COLLECTION_SCOPE_UNDECLARED', 'NO_CHECK_EXAMINED_EVIDENCE']) {
@@ -448,3 +448,191 @@ for (const because of ['COLLECTION_SCOPE_UNDECLARED', 'NO_CHECK_EXAMINED_EVIDENC
     assert.match(text, /Count accuracy: AT_LEAST; count value: 5/)
   })
 }
+
+// Primary-strip contract: exercise the actual component and real count/channel/list
+// projections. Only the transport read, unrelated drawer and primitive UI are mocked.
+async function mountedStrip(initial: Record<string, unknown>, check: (ctx: any) => Promise<void> | void) {
+  const { createRoot } = require('react-dom/client')
+  const dom = new JSDOM('<div id="root"></div>', { url: 'https://synthetic.invalid' })
+  const keys = ['window', 'document', 'navigator', 'fetch', 'IS_REACT_ACT_ENVIRONMENT']
+  const saved = new Map(keys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]))
+  let requests = 0
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator,
+    fetch: () => { throw new Error('Unexpected transport') }, IS_REACT_ACT_ENVIRONMENT: true })) {
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value })
+  }
+  let state = { cacheScope: 'org-a', retryAssessment: () => { requests++ }, retryMicrosoft: () => { requests++ }, ...initial }
+  const Section = sectionFor(() => state)
+  const root = createRoot(dom.window.document.getElementById('root'))
+  const ctx = {
+    document: dom.window.document,
+    strip: () => dom.window.document.querySelector('[data-risk-summary]'),
+    text: () => dom.window.document.querySelector('[data-risk-summary]')?.textContent ?? '',
+    requests: () => requests,
+    update: async (next: Record<string, unknown>, tenantId = 'tenant-a') => {
+      state = { ...state, ...next }
+      await React.act(async () => root.render(React.createElement(Section, { tenantId })))
+    },
+    capture: (name: string) => {
+      if (!process.env.HAW6_VISUAL_OUT) return
+      require('node:fs').writeFileSync(require('node:path').join(process.env.HAW6_VISUAL_OUT, name + '.html'),
+        '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="styles.css"></head><body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100"><main class="p-4">' + dom.window.document.getElementById('root').innerHTML + '</main></body></html>')
+    },
+  }
+  try { await ctx.update({}); await check(ctx) }
+  finally {
+    await React.act(async () => root.unmount()); dom.window.close()
+    for (const [key, descriptor] of Array.from(saved)) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else delete (globalThis as any)[key]
+  }
+}
+function withheldStripNative(positive = false) {
+  const native: any = positive ? nativePositive() : structuredClone(assessedAndEmpty)
+  native.count = { ...native.count, accuracy: 'NOT_AVAILABLE', value: null }
+  native.withheld = [{ stream: 'GRAPH_SIGN_INS', because: 'UNINTERPRETED_EVENTS' }]
+  return native
+}
+function stripMicrosoft(count: number | null, partial = false) {
+  const dto = source(count === null ? 'SOURCE_UNAVAILABLE' : null, partial)
+  if (count !== null) Object.assign(dto.microsoftRiskSummary, {
+    rawRecordCount: Math.max(count, 1), observedActiveDistinctUserCount: count,
+    activeDistinctUserCount: partial ? null : count,
+    snapshotObservedAt: '2026-09-08T20:00:00.000Z', collectionSucceededAt: '2026-09-08T21:00:00.000Z',
+  })
+  return dto
+}
+const stripNoise = /Users requiring review:|Not counted|not a complete count|Microsoft risk status unavailable|Evidence time not reported|Assessed |Assessment time:|Not covered by this number/
+for (const [label, native] of [['unavailable', null], ['withheld-empty', withheldStripNative()]] as const) {
+  test('mounted primary strip omits unsupported facts: ' + label, async () => {
+    await mountedStrip({ nativeView: native, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(stripMicrosoft(null)) }, async (ctx) => {
+      assert.equal(Boolean(ctx.strip()), false, 'no supported facts means no strip or empty container')
+      assert.doesNotMatch(ctx.document.body.textContent, /0 users requiring review|0 active Microsoft risk|No users requiring review found/)
+      assert.equal(ctx.document.querySelector('[data-evidence-details]').open, false)
+      assert.match(ctx.document.querySelector('[data-evidence-details]').textContent, /HawkView count: Not (available|counted)/)
+      assert.equal(ctx.document.querySelectorAll('tbody tr button').length, 0)
+      ctx.capture(label)
+    })
+  })
+}
+for (const [label, value, accuracy, rows, expected] of [
+  ['exact-zero', 0, 'EXACT', 0, /HawkView: 0 users requiring review in this assessment/],
+  ['exact-positive', 1, 'EXACT', 1, /HawkView: 1 users requiring review in this assessment/],
+  ['exact-partial', 9, 'EXACT', 1, /HawkView: 9 users requiring review in this assessment1 HawkView users shown in this response/],
+  ['exact-undelivered', 9, 'EXACT', 0, /HawkView: 9 users requiring review in this assessment0 HawkView users shown in this response/],
+  ['lower-bound', 9, 'AT_LEAST', 1, /HawkView: at least 9 users requiring review in this assessment/],
+] as const) {
+  test('mounted primary strip preserves count semantics: ' + label, async () => {
+    const native: any = rows ? nativePositive() : structuredClone(assessedAndEmpty)
+    native.count = { ...native.count, value, accuracy }
+    native.complete = rows === value
+    await mountedStrip({ nativeView: native, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(stripMicrosoft(null)) }, (ctx) => {
+      assert.match(ctx.text(), expected)
+      assert.doesNotMatch(ctx.text(), stripNoise)
+      assert.doesNotMatch(ctx.text(), /healthy|all-clear/i)
+      assert.equal(ctx.document.querySelectorAll('tbody tr button').length, rows)
+      if (value > 0 && rows === 0) assert.doesNotMatch(ctx.document.body.textContent, /No users requiring review found/)
+      ctx.capture(label)
+    })
+  })
+}
+test('mounted withheld positives remain scoped to shown users, and non-user known findings survive', async () => {
+  const native = withheldStripNative(true)
+  await mountedStrip({ nativeView: native, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(stripMicrosoft(null)) }, async (ctx) => {
+    assert.match(ctx.text(), /1 HawkView users shown/)
+    assert.match(ctx.text(), /What HawkView did find/)
+    assert.doesNotMatch(ctx.text(), /1 users requiring review|Not counted|complete total/)
+    assert.equal(ctx.document.querySelectorAll('tbody tr button').length, 1)
+    const mailbox = structuredClone(native)
+    mailbox.findings[0] = { ...mailbox.findings[0], detectorId: 'external-mailbox-forwarding', subject: { ...mailbox.findings[0].subject, kind: 'MAILBOX' }, signals: [{ signal: 'EXTERNAL_FORWARDING_CONFIGURED', count: 3, capped: false, latest: null }] }
+    await ctx.update({ nativeView: mailbox })
+    assert.match(ctx.text(), /What HawkView did find|forwarding/i)
+    assert.doesNotMatch(ctx.text(), /HawkView users shown|0 users requiring review/)
+  })
+})
+for (const [label, value, partial, expected] of [
+  ['microsoft-zero', 0, false, /0 active Microsoft risk identities in current evidence/],
+  ['microsoft-positive', 7, false, /7 active Microsoft risk identities/],
+  ['microsoft-partial-positive', 7, true, /7 identities have active Microsoft-risk evidence requiring review.*Observed identities; partial Microsoft evidence/],
+  ['microsoft-partial-empty', 0, true, null],
+] as const) {
+  test('mounted Microsoft source summary independent of native and page length: ' + label, async () => {
+    const dto = stripMicrosoft(value, partial)
+    dto.pageInfo = { hasMore: true, nextCursor: 'next.page' }
+    dto.users = []
+    const ms = adapter.adaptMicrosoftRiskyUsersResponse(dto)
+    assert.ok(ms.microsoftRiskSummary, 'fixture must pass the real envelope and summary validators')
+    await mountedStrip({ nativeView: null, microsoftView: ms }, (ctx) => {
+      if (expected) {
+        assert.match(ctx.text(), expected)
+        assert.match(ctx.text(), /Microsoft Identity Protection snapshot/)
+        assert.doesNotMatch(ctx.text(), /HawkView:|Assessed |Evidence observed|Evidence time not reported/)
+      } else assert.equal(Boolean(ctx.strip()), false)
+      ctx.capture(label)
+    })
+  })
+}
+for (const reason of ['LICENSE_REQUIRED', 'MISSING_PERMISSION']) {
+  test('mounted validated customer access action clears on reporting: ' + reason, async () => {
+    await mountedStrip({ nativeView: null, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(source(reason)) }, async (ctx) => {
+      assert.match(ctx.text(), reason === 'LICENSE_REQUIRED' ? /requires an Entra ID P2 license/ : /Grant IdentityRiskyUser.Read.All permission/)
+      assert.doesNotMatch(ctx.text(), stripNoise)
+      await ctx.update({ microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(stripMicrosoft(1)) })
+      assert.match(ctx.text(), /1 active Microsoft risk identity/)
+      assert.doesNotMatch(ctx.text(), /P2 license|Grant .* permission/)
+      await ctx.update({ microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(source('SOURCE_UNAVAILABLE')) })
+      assert.equal(Boolean(ctx.strip()), false)
+    })
+  })
+}
+for (const status of ['UNAVAILABLE', 'ERROR', 'STALE']) {
+  test('mounted contradictory/error/stale channel never infers licensing action: ' + status, async () => {
+    const dto = source('LICENSE_REQUIRED')
+    dto.status = status
+    if (status === 'UNAVAILABLE') dto.users = [{ id: 'ms-1', identityLabel: 'Reported user', riskLevel: 'high', riskState: 'atRisk', riskDetail: null, observedAt: dto.observedAt }]
+    const ms = adapter.adaptMicrosoftRiskyUsersResponse(dto)
+    assert.equal(riskyUsersView.microsoftChannel(ms).addressable, false)
+    await mountedStrip({ nativeView: nativePositive(), microsoftView: ms }, (ctx) => {
+      assert.match(ctx.text(), /HawkView: 1 users/)
+      assert.doesNotMatch(ctx.text(), /license|permission|0 active Microsoft risk|current evidence/i)
+      assert.equal(ctx.document.querySelectorAll('tbody tr button').length, 1)
+    })
+  })
+}
+for (const timestamp of [null, 'not-a-date', '2099-01-01T00:00:00.000Z']) {
+  test('mounted Microsoft invalid/absent/future date never replaced with assessment clock: ' + timestamp, async () => {
+    const dto = stripMicrosoft(1)
+    dto.microsoftRiskSummary.snapshotObservedAt = timestamp
+    const native = nativePositive()
+    native.run.completedAt = '2026-09-29T23:00:00.000Z'
+    await mountedStrip({ nativeView: native, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(dto) }, (ctx) => {
+      assert.match(ctx.text(), /HawkView: 1 users/)
+      assert.doesNotMatch(ctx.text(), /snapshot|Assessed|time not reported|2099|Sep 29/)
+    })
+  })
+}
+test('mounted recent native run cannot refresh old collector or Microsoft snapshot dates', async () => {
+  const native = diagnosticNative()
+  const dto = stripMicrosoft(1)
+  await mountedStrip({ nativeView: native, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(dto) }, (ctx) => {
+    assert.match(ctx.text(), /Microsoft Identity Protection snapshot/)
+    assert.doesNotMatch(ctx.text(), /Assessed|Sep 27|data updated|collection.*2026/i)
+    assert.match(ctx.document.querySelector('[data-evidence-details]').textContent, /2026-09-27T01:00:00.000Z/)
+    ctx.capture('mixed-sources')
+  })
+})
+test('mounted retry/tenant-org switch clears retained facts and actions without transport on evidence toggle', async () => {
+  await mountedStrip({ nativeView: nativePositive(), microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(source('MISSING_PERMISSION')) }, async (ctx) => {
+    assert.match(ctx.text(), /HawkView: 1 users|Grant IdentityRiskyUser.Read.All/)
+    const details = ctx.document.querySelector('[data-evidence-details]')
+    await React.act(async () => details.querySelector('summary').click())
+    assert.equal(details.open, true); assert.equal(ctx.requests(), 0)
+    await ctx.update({ nativeView: null, microsoftView: adapter.adaptMicrosoftRiskyUsersResponse(stripMicrosoft(null)), cacheScope: 'org-b', assessmentRequestError: true }, 'tenant-b')
+    assert.equal(Boolean(ctx.strip()), false)
+    assert.doesNotMatch(ctx.document.body.textContent, /Synthetic user|Grant IdentityRiskyUser.Read.All|HawkView: 1 users/)
+    assert.match(ctx.document.querySelector('[role="alert"]').textContent, /latest assessment could not be loaded/)
+    const retry = [...ctx.document.querySelectorAll('button')].find((button: any) => button.textContent.includes('Refresh assessment'))
+    assert.ok(retry); await React.act(async () => (retry as any).click()); assert.equal(ctx.requests(), 2)
+    await ctx.update({ nativeView: assessedAndEmpty, assessmentRequestError: false })
+    assert.match(ctx.text(), /HawkView: 0 users requiring review/)
+    assert.equal(ctx.document.querySelector('[role="alert"]'), null)
+  })
+})

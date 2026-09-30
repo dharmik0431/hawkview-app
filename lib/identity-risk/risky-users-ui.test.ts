@@ -356,7 +356,7 @@ function render(
 function compactSummary(document: Document) {
   const table = document.querySelector('[aria-labelledby="risky-users-table-heading"]')
   assert.ok(table, 'the current native table must exist')
-  const summary = table.previousElementSibling
+  const summary = document.querySelector('[data-risk-summary]')
   assert.ok(summary, 'the real compact summary must exist')
   return summary
 }
@@ -578,10 +578,11 @@ test('native contracts P35: the P2 gap is shown once as a first-class state, not
 
   const result = renderNative()
   const summary = compactSummary(result.document).textContent ?? ''
-  assert.equal((summary.match(/Microsoft risk status unavailable/g) ?? []).length, 1)
+  assert.equal((summary.match(/Microsoft Identity Protection requires an Entra ID P2 license/g) ?? []).length, 1)
+  assert.doesNotMatch(summary, /Microsoft risk status unavailable/)
   assert.doesNotMatch(summary, /0 active Microsoft risk/)
   assert.match(summary, /1 users requiring review/)
-  assert.match(summary, /1 detected by HawkView/)
+  assert.match(summary, /HawkView: 1 users requiring review in this assessment/)
   assert.equal(actionableRows(result.document).length, 1)
   // Tooltip detail may explain licensing; it is not a repeated visible badge.
   for (const row of actionableRows(result.document)) {
@@ -1141,7 +1142,7 @@ test('native contracts P71: an unavailable Microsoft channel adds no empty-count
 
   const result = renderNative(nativeRiskyUsersFixture(), { microsoft: microsoftWithoutP2() })
   const summary = compactSummary(result.document).textContent ?? ''
-  assert.match(summary, /Microsoft risk status unavailable/)
+  assert.match(summary, /Microsoft Identity Protection requires an Entra ID P2 license/)
   assert.doesNotMatch(summary, /0 active Microsoft risk/)
   assert.equal(actionableRows(result.document).length, 1)
 })
@@ -1408,7 +1409,7 @@ test('native contracts C87: a page of a list is never presented as the list', ()
     native.complete = !flag
     const result = renderNative(native)
     assert.match(nativeTable(result.document).textContent ?? '', /Showing 1 of 9 reported users/)
-    assert.match(compactSummary(result.document).textContent ?? '', /1 detected by HawkView shown; 9 reported users/)
+    assert.match(compactSummary(result.document).textContent ?? '', /HawkView: 9 users requiring review in this assessment1 HawkView users shown in this response/)
     assert.doesNotMatch(compactSummary(result.document).textContent ?? '', /total that is not available/)
     assert.match(result.cardText, /longer than what came back with it/)
   }
@@ -1446,10 +1447,10 @@ test('native truthfulness: unavailable reads never claim retained rows', () => {
   assert.equal(healthy.document.querySelectorAll(
     '[aria-labelledby="risky-users-table-heading"] tbody tr button'
   ).length, 1, 'the healthy control must still render its actionable row')
-  assert.match(healthy.text, /1 detected by HawkView/)
+  assert.match(healthy.text, /HawkView: 1 users requiring review in this assessment/)
 })
 
-test('native truthfulness: compact summary shows supplied withholding explanations', () => {
+test('native truthfulness: evidence details retain supplied withholding explanations', () => {
   const value = assessmentFixture(false)
   value.summary.currentUsers = {
     value: null,
@@ -1479,7 +1480,7 @@ test('native truthfulness: compact summary shows supplied withholding explanatio
     ))
   const healthy = render(healthyValue)
   assert.ok(healthy.text.includes(healthyCount.caption))
-  assert.match(healthy.text, /1 detected by HawkView/)
+  assert.match(healthy.text, /HawkView: 1 users requiring review in this assessment/)
   for (const reason of expected.reasons) {
     assert.ok(!healthy.text.includes(reason), 'a healthy control must not inherit a withheld reason')
   }
