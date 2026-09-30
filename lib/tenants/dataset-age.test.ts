@@ -23,7 +23,7 @@ test('dataset clocks ignore unrelated newer successes and worker statuses', () =
       applications: { lastSuccessfulAt: at(360), status }, servicePrincipals: { lastSuccessfulAt: at(10), status },
       groups: { lastSuccessfulAt: at(5), status }, users: { lastSuccessfulAt: at(0) },
     }, syncFreshness: { services: { entraId: { status: 'STALE', lastSuccessfulCollectionAt: at(0) } } } }
-    assert.equal(datasetAge(applicationsAge(bundle), now).outdated, true)
+    assert.equal(datasetAge(applicationsAge(bundle), now).outdated, false)
     assert.equal(datasetAge(servicePrincipalsAge(bundle), now).label, 'Updated 10 minutes ago')
     assert.equal(datasetAge(groupsAge(bundle), now).label, 'Updated 5 minutes ago')
   }
@@ -36,14 +36,14 @@ test('license props must match the dated bundle inventory', () => {
   assert.equal(datasetAge(licensesAge(bundle, []), now).timestamp, null)
 })
 test('Conditional Access uses the selected evidence observation', () => {
-  assert.equal(datasetAge(conditionalAccessAge({ conditionalAccess: { availability: 'READY', observedAt: at(360) }, observedAt: at(5) }), now).outdated, true)
+  assert.equal(datasetAge(conditionalAccessAge({ conditionalAccess: { availability: 'READY', observedAt: at(360) }, observedAt: at(5) }), now).outdated, false)
   assert.equal(datasetAge(conditionalAccessAge({ conditionalAccess: { availability: 'UNVERIFIED' }, observedAt: at(5) }), now).timestamp, null)
 })
 test('DNS switches both records and clock with domain; absent selection cannot borrow root', () => {
   const a = { domain: 'a.example', checkedAt: at(5) }, b = { domain: 'b.example', checkedAt: at(360) }
   const dns = { ...a, byDomain: { 'a.example': a, 'b.example': b } }
   assert.equal(selectedDnsRecord(dns, 'B.EXAMPLE'), b)
-  assert.equal(datasetAge(dnsAge(dns, 'b.example'), now).outdated, true)
+  assert.equal(datasetAge(dnsAge(dns, 'b.example'), now).outdated, false)
   assert.equal(selectedDnsRecord(dns, 'missing.example'), null)
   assert.equal(datasetAge(dnsAge(dns, 'missing.example'), now).timestamp, null)
   assert.equal(selectedDnsRecord(a, 'A.EXAMPLE'), a)
@@ -180,7 +180,7 @@ test('license age belongs only to the inventory region and security evidence sta
     const dom = new JSDOM(renderToStaticMarkup(React.createElement(Licenses, { licenseRows: rows, bundle: { licenses: { rows }, sync: { licenses: { status: 'succeeded', lastSuccessfulAt: at(360) } } }, securityDefaultsEvidence: { availability, enabled } })))
     const region = dom.window.document.querySelector('[role="region"][aria-labelledby="license-inventory-heading"]')
     assert.ok(region)
-    assert.match(region.textContent, /License Inventory.*Update time unavailable/)
+    assert.match(region.textContent, /License Inventory/); assert.doesNotMatch(region.textContent, /Update time unavailable|Outdated/)
     region.remove()
     assert.doesNotMatch(dom.window.document.body.textContent, /Update time unavailable|Updated .* ago/)
     assert.match(dom.window.document.body.textContent, new RegExp(caption))

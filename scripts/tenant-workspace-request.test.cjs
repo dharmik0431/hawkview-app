@@ -173,15 +173,15 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     await click()
     const postA = requests.at(-1)
     assert.equal(postA.method, 'POST')
-    assert.match(text(), /Synchronization request pending/)
+    assert.match(text(), /Request pending/)
     assert.match(text(), /Finding total unavailable/)
     tenant = 'b'
     await render()
-    assert.doesNotMatch(text(), /Synchronization request pending|A tenant/)
+    assert.doesNotMatch(text(), /Request pending|A tenant/)
     await resolve(postA, bundle('a', 'A refreshed'))
     assert.doesNotMatch(
       text(),
-      /A refreshed|Synchronization request pending|Sync completed successfully/
+      /A refreshed|Request pending|Sync completed successfully/
     )
     await click()
     const postB = requests.at(-1)
@@ -255,12 +255,12 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
       await click()
       const pending = requests.at(-1)
       assert.equal(pending.method, 'POST')
-      assert.match(text(), /Synchronization request pending/)
+      assert.match(text(), /Request pending/)
       await resolve(pending, data)
       assert.match(text(), expected)
       assert.match(
         text(),
-        /Synchronization request completed\. Review the recorded collection results below\./
+        /Synchronization request completed\. Open Data freshness to review collection results\./
       )
       assert.doesNotMatch(
         text(),
@@ -338,13 +338,13 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     const oldAccountPost = requests.at(-1)
     scope = 'account2'
     await render()
-    assert.doesNotMatch(text(), /Synchronization request pending|C tenant/)
+    assert.doesNotMatch(text(), /Request pending|C tenant/)
     const newAccountGet = requests.at(-1)
     await resolve(newAccountGet, bundle('c', 'New account tenant'))
     await resolve(oldAccountPost, bundle('c', 'Old account completion'))
     assert.doesNotMatch(
       text(),
-      /Old account completion|Synchronization request pending/
+      /Old account completion|Request pending/
     )
     assert.match(text(), /New account tenant/)
     console.log(
@@ -357,7 +357,7 @@ test('real page deferred GET/POST completion remains tenant scoped', async () =>
     )
     assert.match(
       completedText,
-      /Synchronization request completed\. Review the recorded collection results below\./
+      /Synchronization request completed\. Open Data freshness to review collection results\./
     )
   } finally {
     await React.act(async () => root.unmount())

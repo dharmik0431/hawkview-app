@@ -1,5 +1,6 @@
 'use client'
 
+import { DataFreshnessLink } from '@/components/tenant/data-freshness-link'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import {
@@ -2196,7 +2197,7 @@ function TenantDetailsWorkspace() {
 
   const subheading =
     section === 'overview'
-      ? 'Review Microsoft 365 connection health, synchronization status, and issues requiring action.'
+      ? 'Review tenant findings, access actions, and Microsoft 365 resources.'
       : section === 'settings'
         ? 'Tenant authorization, connection credentials, and Microsoft consent management.'
         : section === 'risky-users'
@@ -4768,6 +4769,7 @@ function TenantDetailsWorkspace() {
                       </div>
 
                       <div className="flex items-center gap-2 shrink-0">
+                        <DataFreshnessLink tenantId={String(tenantId)} />
                         <button
                           onClick={runSync}
                           type="button"
@@ -4806,7 +4808,7 @@ function TenantDetailsWorkspace() {
                     )}
                     {syncState === 'success' && (
                       <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700 dark:bg-slate-900 dark:border-slate-700 dark:text-slate-300">
-                        Synchronization request completed. Review the recorded collection results below.
+                        Synchronization request completed. Open Data freshness to review collection results.
                       </div>
                     )}
                   </>

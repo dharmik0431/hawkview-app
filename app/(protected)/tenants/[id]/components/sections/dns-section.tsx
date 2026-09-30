@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useMemo } from 'react'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
+import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { dnsAge, selectedDnsRecord } from '@/lib/tenants/dataset-age'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -254,7 +254,7 @@ export default function DnsSection({
 
   return (
     <>
-      <SectionFreshness
+      <DatasetEmptyState
         evidence={dnsAge(dns, activeDomain)}
         isEmpty={domains.length === 0}
       />
@@ -335,8 +335,7 @@ export default function DnsSection({
             <div className="hidden md:grid grid-cols-12 gap-3 py-2.5 text-[11px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 border-b border-slate-100 dark:border-slate-800">
               <div className="col-span-2">Check</div>
               <div className="col-span-2">Status</div>
-              <div className="col-span-5">Current Result</div>
-              <div className="col-span-2">Last Checked</div>
+              <div className="col-span-7">Current Result</div>
               <div className="col-span-1 text-right">Action</div>
             </div>
 
@@ -431,13 +430,8 @@ export default function DnsSection({
                     </div>
 
                     {/* Current Result */}
-                    <div className="col-span-5 text-slate-700 dark:text-slate-300 leading-snug font-normal break-words">
+                    <div className="col-span-7 text-slate-700 dark:text-slate-300 leading-snug font-normal break-words">
                       {check.resultSummary}
-                    </div>
-
-                    {/* Last Checked */}
-                    <div className="col-span-2 text-slate-500 dark:text-slate-400 font-normal">
-                      <SectionFreshness evidence={dnsAge(dns, activeDomain)} className="mb-0" />
                     </div>
 
                     {/* Action Button */}

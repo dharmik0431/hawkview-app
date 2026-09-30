@@ -1,12 +1,9 @@
 'use client'
 
-import Link from 'next/link'
 import { ArrowRight } from 'lucide-react'
 import type { TenantBundle } from '@/types/tenant-data'
 import type { TenantIssue, TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import { customerAttention, customerStatus } from '@/lib/attention/customer-attention'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { applicationsAge, groupsAge, licensesAge } from '@/lib/tenants/dataset-age'
 
 export function TenantOverview({ bundle, display, onOpenModule, onOpenIssue, riskyUsers = null }: {
   bundle: TenantBundle
@@ -28,16 +25,9 @@ export function TenantOverview({ bundle, display, onOpenModule, onOpenIssue, ris
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><h2 id="overview-context" className="text-lg font-semibold">{bundle.tenant?.name ?? 'Tenant overview'}</h2>
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">{customerStatus(view)}</p></div>
-        <span className="text-sm font-medium">{view.findings.length ? `${view.findings.length} reported finding${view.findings.length === 1 ? '' : 's'}` : view.incomplete ? 'Finding total unavailable' : 'No findings reported'}</span>
       </div>
-      <div className="mt-4 flex flex-wrap gap-x-6 gap-y-2 border-t border-slate-100 pt-3 text-xs dark:border-slate-800" aria-label="Dataset update times">
-        <div className="flex flex-wrap items-center gap-2"><span>Applications</span><SectionFreshness evidence={applicationsAge(bundle)} /></div>
-        <div className="flex flex-wrap items-center gap-2"><span>Groups</span><SectionFreshness evidence={groupsAge(bundle)} /></div>
-        <div className="flex flex-wrap items-center gap-2"><span>License inventory</span><SectionFreshness evidence={licensesAge(bundle, bundle.licenses?.rows)} /></div>
-      </div>
-      {view.incomplete && <Link href={`/tenants/${encodeURIComponent(String(bundle.tenant.id))}/settings?tab=collection`} className="mt-3 inline-flex items-center gap-1 text-sm font-medium text-blue-700 hover:underline dark:text-blue-300">Collection details<ArrowRight className="h-4 w-4" /></Link>}
+
     </section>
-    {display.syncRequestPending && <p role="status" className="text-sm text-slate-500">Synchronization request pending. This does not confirm collector activity.</p>}
     {riskyUsers}
     <section aria-labelledby="tenant-findings" className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
       <h2 id="tenant-findings" className="text-base font-semibold">Tenant findings</h2>

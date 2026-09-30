@@ -1,8 +1,7 @@
 'use client'
 
 import { useMemo } from 'react'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { entraOverviewAge } from '@/lib/tenants/dataset-age'
+
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
@@ -109,20 +108,6 @@ interface EntraOverviewSectionProps {
   ) => void
 }
 
-function formatSyncTimestamp(lastSyncIso?: string) {
-  if (!lastSyncIso) return 'Awaiting collection'
-  try {
-    const d = new Date(lastSyncIso)
-    if (isNaN(d.getTime())) return 'Awaiting collection'
-    return new Intl.DateTimeFormat(undefined, {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-    }).format(d)
-  } catch {
-    return 'Awaiting collection'
-  }
-}
-
 function formatSignInTime(dateStr: string) {
   try {
     const d = new Date(dateStr)
@@ -217,7 +202,6 @@ export default function EntraOverviewSection({
       ? Math.round((mfaRegisteredUsersCount / activeUsersCount) * 100)
       : 0
 
-  const formattedSyncTime = formatSyncTimestamp(tenant?.lastSync)
 
   // SIGN-INS CALCULATIONS FOR COMPACT SUMMARY ROW
   const totalSignInsCount = signIns.length
@@ -326,18 +310,7 @@ export default function EntraOverviewSection({
         status: failedSignInsCount > 0 ? 'warning' : 'healthy',
         action: () => onNavigateTab('security', 'sign-ins'),
       },
-      {
-        id: 'sync',
-        name: 'Synchronization health',
-        value:
-          formattedSyncTime !== 'Awaiting collection'
-            ? `Last sync: ${formattedSyncTime}`
-            : 'Awaiting collection',
-        detail: 'Directory data freshness',
-        status:
-          formattedSyncTime !== 'Awaiting collection' ? 'healthy' : 'neutral',
-        action: undefined,
-      },
+
     ]
   }, [
     caOverview,
@@ -350,13 +323,12 @@ export default function EntraOverviewSection({
     namedLocationsSynchronized,
     namedLocations.length,
     failedSignInsCount,
-    formattedSyncTime,
     onNavigateTab,
   ])
 
   return (
     <div className="mt-4 space-y-6">
-      <SectionFreshness evidence={entraOverviewAge()} />
+
       {/* UNIFIED SURFACE: ENTRA AT A GLANCE */}
       <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden shadow-2xs">
         {/* Header with subtle blue accent top gradient */}
@@ -371,15 +343,7 @@ export default function EntraOverviewSection({
                 Directory inventory and identity security posture
               </p>
             </div>
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-2.5 py-1 rounded-md">
-              <Clock className="h-3.5 w-3.5 text-slate-400" />
-              <span>
-                Synced:{' '}
-                <strong className="font-semibold text-slate-700 dark:text-slate-300">
-                  {formattedSyncTime}
-                </strong>
-              </span>
-            </div>
+
           </div>
         </div>
 

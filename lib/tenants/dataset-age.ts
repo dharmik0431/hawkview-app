@@ -4,9 +4,14 @@ export interface DatasetAgeEvidence {
   observedAt: unknown
   reportDate?: unknown
   emptyVerified?: boolean
+  outdatedAfterMs?: number | null
+  dueAfterMs?: number
 }
 
 export const OUTDATED_AFTER_MS = 6 * 60 * 60 * 1000
+export const DAILY_DUE_AFTER_MS = 24 * 60 * 60 * 1000
+// Daily inventory is due at 24h; older data exceeds the expected interval.
+export const DAILY_OUTDATED_AFTER_MS = 24 * 60 * 60 * 1000
 export const AGE_REFRESH_MS = 60 * 1000
 
 /** Check the supplied wall-clock components before Date.parse normalizes them.
@@ -34,7 +39,8 @@ export function datasetAge(evidence: DatasetAgeEvidence, now: number) {
   const unit = minutes < 60 ? 'minute' : minutes < 1440 ? 'hour' : 'day'
   return {
     label: minutes === 0 ? 'Updated less than a minute ago' : `Updated ${amount} ${unit}${amount === 1 ? '' : 's'} ago`,
-    outdated: now - at >= OUTDATED_AFTER_MS,
+    outdated: evidence.outdatedAfterMs !== null && (evidence.outdatedAfterMs === undefined
+      ? now - at >= OUTDATED_AFTER_MS : now - at > evidence.outdatedAfterMs),
     timestamp: new Date(at).toISOString(),
   }
 }
@@ -44,6 +50,7 @@ const unavailable = (source: string): DatasetAgeEvidence => ({ source, observedA
 function snapshot(bundle: Bundle, key: string, source: string, rows?: unknown): DatasetAgeEvidence {
   const entry = bundle?.sync?.[key]
   return { source, observedAt: entry?.lastSuccessfulAt,
+    ...(['applications', 'servicePrincipals', 'groups', 'licenses'].includes(key) ? { outdatedAfterMs: DAILY_OUTDATED_AFTER_MS, dueAfterMs: DAILY_DUE_AFTER_MS } : {}),
     emptyVerified: Array.isArray(rows) && ['success', 'succeeded'].includes(String(entry?.status).toLowerCase()) }
 }
 
@@ -64,7 +71,7 @@ export function licensesAge(bundle: Bundle, rows: unknown): DatasetAgeEvidence {
 }
 export function conditionalAccessAge(evidence: Bundle): DatasetAgeEvidence {
   const selected = evidence?.conditionalAccess
-  return { source: 'Conditional Access', observedAt: selected?.observedAt,
+  return { source: 'Conditional Access', observedAt: selected?.observedAt, outdatedAfterMs: DAILY_OUTDATED_AFTER_MS, dueAfterMs: DAILY_DUE_AFTER_MS,
     emptyVerified: selected?.availability === 'READY' && selected?.count === 0 }
 }
 export function selectedDnsRecord(dns: Bundle, domain: string): Bundle {
@@ -74,7 +81,7 @@ export function selectedDnsRecord(dns: Bundle, domain: string): Bundle {
   return typeof dns?.domain === 'string' && dns.domain.toLowerCase() === key ? dns : null
 }
 export function dnsAge(dns: Bundle, domain: string): DatasetAgeEvidence {
-  return { source: `DNS for ${domain}`, observedAt: selectedDnsRecord(dns, domain)?.checkedAt }
+  return { source: `DNS for ${domain}`, observedAt: selectedDnsRecord(dns, domain)?.checkedAt, outdatedAfterMs: DAILY_OUTDATED_AFTER_MS, dueAfterMs: DAILY_DUE_AFTER_MS }
 }
 // These contracts lack timestamps for every displayed dataset. Do not substitute
 // a recent service success, event occurrence date, or report download time.
@@ -109,4 +116,9 @@ export function activityLogsAge(bundle: Bundle, tab: 'signins' | 'audit'): Datas
   // The activity route lacks selected sign-in source metadata. A Graph success
   // must not date fallback rows. Directory audit has its own durable snapshot.
   return tab === 'signins' ? unavailable('Sign-in activity') : snapshot(bundle, 'auditLogs', 'Directory audit', bundle?.auditLogs)
+}
+
+/** Human-readable display; callers retain the canonical ISO in datetime/title. */
+export function formatDatasetTime(timestamp: string): string {
+  return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(new Date(timestamp))
 }

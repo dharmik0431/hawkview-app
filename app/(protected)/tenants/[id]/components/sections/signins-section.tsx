@@ -20,8 +20,7 @@ import {
   AlertTriangle,
 } from 'lucide-react'
 import type { TenantSyncStatus } from '@/types/tenant-data'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { signInsAge } from '@/lib/tenants/dataset-age'
+
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
@@ -345,32 +344,6 @@ export default function SignInActivitySection({
 
   return (
     <div className="mt-4 space-y-3">
-      {showCollectionFailure && (
-        <div role="alert" className="flex gap-3 rounded-xl border border-amber-300 bg-amber-50 p-4 text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
-            <p className="text-sm font-semibold">Sign-in collection needs attention</p>
-            <p className="mt-1 text-xs leading-5">
-              {signIns.length
-                ? 'Selected-source coverage is incomplete. Retained events remain visible with their original timestamps.'
-                : 'The selected sign-in source is stale, blocked, or failed and no retained events are available for this range.'}
-            </p>
-          </div>
-        </div>
-      )}
-      {!showCollectionFailure && hasLimitedActivity && (
-        <div role="status" aria-live="polite" className="flex gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-blue-950 dark:border-blue-900 dark:bg-blue-950/30 dark:text-blue-100">
-          <Info className="mt-0.5 h-5 w-5 shrink-0" />
-          <div>
-            <p className="text-sm font-semibold">Limited login activity</p>
-            <p className="mt-1 text-xs leading-5">
-              HawkView is using login evidence from the Microsoft 365
-              audit feed. This limited source does not include Conditional
-              Access, risk, device, location, or authentication-step details.
-            </p>
-          </div>
-        </div>
-      )}
       <Card className="rounded-2xl shadow-sm bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
         <CardContent className="p-0">
         {/* Header & Controls Toolbar */}
@@ -382,7 +355,7 @@ export default function SignInActivitySection({
             <p className="text-xs text-muted-foreground mt-0.5">
               Review sign-in evidence and the details supplied by the selected Microsoft source.
             </p>
-            <SectionFreshness evidence={signInsAge(signInEvidence)} className="mt-1 mb-0" />
+
           </div>
 
           {/* Filter Toolbar */}
@@ -473,7 +446,9 @@ export default function SignInActivitySection({
                         colSpan={6}
                         className="px-5 py-12 text-center text-muted-foreground"
                       >
-                        {hasLimitedActivity && signIns.length === 0
+                        {showCollectionFailure && signIns.length === 0
+                          ? 'Sign-in events are unavailable. Review Data freshness for the source issue.'
+                          : hasLimitedActivity && signIns.length === 0
                           ? 'No limited sign-in events were reported for this range.'
                           : 'No sign-in events match the selected filter criteria.'}
                       </td>

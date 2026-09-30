@@ -3,14 +3,14 @@
 import React from 'react'
 import { Activity, Building2, Cloud, HardDrive, KeyRound, Mail, Settings, Users } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { serviceFreshnessDescription, type TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
+import { type TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import { getServiceTheme } from './service-theme'
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
 
 const moduleMeta: Record<string, { label: string; purpose: string; icon: typeof Cloud }> = {
   overview: {
     label: 'Tenant Command Center',
-    purpose: 'Health, freshness, issues, and recent evidence across Microsoft 365.',
+    purpose: 'Findings and actions across Microsoft 365.',
     icon: Activity,
   },
   home: {
@@ -52,8 +52,6 @@ const moduleMeta: Record<string, { label: string; purpose: string; icon: typeof 
 
 export function ModuleHeader({
   section,
-  display,
-  freshness,
 }: {
   section: string
   display: TenantWorkspaceDisplay
@@ -62,15 +60,6 @@ export function ModuleHeader({
   const meta = moduleMeta[section] ?? moduleMeta.overview
   const Icon = meta.icon
   const theme = getServiceTheme(section)
-
-  const dataCoverage = display.isStale ? 'Last known data'
-    : display.state === 'partially-synchronized' ? 'Partial dataset'
-    : display.isInitialSync ? 'Initial collection incomplete'
-    : display.state !== 'healthy' ? 'Coverage not verified'
-    : 'Recorded dataset'
-
-  const freshnessText = serviceFreshnessDescription(freshness)
-  const freshnessTitle = freshness?.lastSuccessfulCollectionAt ?? undefined
 
   return (
     <div
@@ -94,17 +83,6 @@ export function ModuleHeader({
         </div>
       </div>
 
-      <div className="flex items-center gap-4 text-xs text-slate-500 dark:text-slate-400 sm:shrink-0 pr-1">
-        <div>
-          <span>Coverage: </span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">{dataCoverage}</span>
-        </div>
-        <div className="h-3.5 w-px bg-slate-200 dark:bg-slate-800" aria-hidden="true" />
-        <div title={freshnessTitle}>
-          <span>Freshness: </span>
-          <span className="font-semibold text-slate-800 dark:text-slate-200">{freshnessText}</span>
-        </div>
-      </div>
     </div>
   )
 }

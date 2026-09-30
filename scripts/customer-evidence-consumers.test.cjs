@@ -82,7 +82,7 @@ for(const name of ['success','future','mismatched','deferred','positive-deferred
  const display=deriveTenantWorkspaceDisplay(bundle,false,null,health)
  assert.equal(display.customer.incomplete,name!=='success');assert.equal(display.attentionVerified,name==='success')
  await mount('overview-'+name,h(TenantOverview,{bundle,display,onOpenModule(){}}),doc=>{
-  assert.equal(!!doc.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]'),name!=='success')
+  assert.equal(!!doc.querySelector('a[href="/tenants/tenant-a/settings?tab=collection"]'),false)
   if(name!=='success'){assert.doesNotMatch(doc.body.textContent,/Evidence incomplete/);assert.match(doc.body.textContent,attention.length?/1 reported finding/:/Finding total unavailable/)}
   if(attention.length)assert.match(doc.body.textContent,/Known positive finding/)
   assert.doesNotMatch(doc.body.textContent,/Deferred work recorded|m365-audit-backlog|Collection outcome not verified/)

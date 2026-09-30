@@ -1,7 +1,6 @@
 'use client'
 
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { activityLogsAge } from '@/lib/tenants/dataset-age'
+import { DataFreshnessLink } from '@/components/tenant/data-freshness-link'
 
 import * as React from 'react'
 import { Badge } from '@/components/ui/badge'
@@ -18,7 +17,6 @@ import { SignInLogsPage } from './components/signin-logs-page'
 import { AuditLogsPage } from './components/audit-logs-page'
 import type { ActivityTab, AuditEvent, SignInEvent } from './data/types'
 import {
-  hasIncompleteActivityEvidence,
   normalizeAuditEvent,
   normalizeSignInEvent,
 } from './data/normalize'
@@ -658,15 +656,6 @@ export default function ActivityPage() {
     bundleState === 'ready' ? String(signInRows.length) : 'Not reported'
   const auditCountLabel =
     bundleState === 'ready' ? String(auditRows.length) : 'Not reported'
-  const activeSyncState =
-    tab === 'signins'
-      ? selectedBundle?.sync?.signIns
-      : selectedBundle?.sync?.auditLogs
-  const activeSyncStatus = String(activeSyncState?.status ?? '').toLowerCase()
-  const activityEvidencePartial = hasIncompleteActivityEvidence(
-    rawSignInEvents,
-    rawAuditEvents,
-  )
 
   return (
     <div className="space-y-4">
@@ -767,35 +756,7 @@ export default function ActivityPage() {
         tabIndex={0}
         className="space-y-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
       >
-      {filters.tenantId && bundleState === 'ready' && selectedBundle?.tenant?.id === filters.tenantId && (
-        <SectionFreshness evidence={activityLogsAge(selectedBundle, tab)} />
-      )}
-      {filters.tenantId && bundleState === 'ready' &&
-      ['failed', 'running', 'pending', 'in_progress', 'syncing'].includes(activeSyncStatus) && (
-        <div role="status" className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100">
-          <div className="font-semibold">Dataset completeness unverified</div>
-          <div className="mt-1 text-xs leading-5">
-            Available events may not represent a complete result. No empty-result finding is inferred.
-          </div>
-        </div>
-      )}
-      {filters.tenantId &&
-      bundleState === 'ready' &&
-      (activityEvidencePartial || ['partial', 'stale'].includes(activeSyncStatus)) ? (
-        <div
-          className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-100"
-          role="status"
-        >
-          <div className="font-semibold">
-            Partial log evidence
-          </div>
-          <div className="mt-1 text-xs leading-5">
-            Some event fields or collection evidence were not reported. HawkView
-            preserves those values as “Not reported” and does not infer success,
-            identity, or timestamps.
-          </div>
-        </div>
-      ) : null}
+      {filters.tenantId && <DataFreshnessLink tenantId={filters.tenantId} />}
       {directoryState === 'loading' ? (
         <div className="rounded-lg border bg-background">
           <LoadingState message="Loading tenant directory…" />

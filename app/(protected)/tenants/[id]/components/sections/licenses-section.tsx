@@ -1,8 +1,7 @@
 'use client'
 
 import React, { useState, useMemo } from 'react'
-import { SectionFreshness } from '@/components/tenant/section-freshness'
-import { licensesAge } from '@/lib/tenants/dataset-age'
+
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -609,7 +608,7 @@ export default function LicensesSection({
                   Subscribed Microsoft product licenses and unit utilization.
                   Click any row to inspect details.
                 </p>
-                <SectionFreshness evidence={licensesAge(bundle, licenseRows)} className="mt-1 mb-0" />
+
               </div>
             </div>
 

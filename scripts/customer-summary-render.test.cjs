@@ -92,8 +92,8 @@ for(const surface of ['list','tile','matrix','matrix-drawer','tenant-drawer','ov
   if(surface==='tenant-drawer')assert.equal(h.doc.querySelector('.lucide-circle-check-2'),null)
  }else assert.match(text,/No (?:findings|actions|customer actions|tenant findings).*reported|0 reported/)
  if(surface==='overview'&&name==='consent-failure'){await h.click('Review access setup');assert.deepEqual(h.opened,['settings'])}
- if(surface==='overview')assert.equal(h.doc.querySelectorAll('[aria-label="Dataset update times"]').length,1)
- if(process.env.HAW38_VISUAL_OUT && ['list-positive-consent-failure','tile-missing','matrix-drawer-positive-consent-failure','tenant-drawer-missing'].includes(surface+'-'+name)) fs.writeFileSync(path.join(process.env.HAW38_VISUAL_OUT,surface+'-'+name+'.html'),'<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="styles.css"></head><body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100"><main class="mx-auto max-w-7xl p-4">'+h.doc.getElementById('root').innerHTML+'</main></body></html>')
+ if(surface==='overview')assert.equal(h.doc.querySelectorAll('[aria-label="Dataset update times"]').length,0)
+ if(process.env.HAW38_VISUAL_OUT && ['list-positive-consent-failure','tile-missing','matrix-drawer-positive-consent-failure','tenant-drawer-missing','overview-positive-consent-failure'].includes(surface+'-'+name)) fs.writeFileSync(path.join(process.env.HAW38_VISUAL_OUT,surface+'-'+name+'.html'),'<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="styles.css"></head><body class="bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100"><main class="mx-auto max-w-7xl p-4">'+h.doc.getElementById('root').innerHTML+'</main></body></html>')
 }))
 for(const surface of ['list','tile','matrix','matrix-drawer','tenant-drawer','overview'])test(`customer summary ${surface}: validated inputs clear unavailable and access states`,async()=>mounted(async h=>{
  await h.render(surface,{...baseline,attention:undefined});assert.match(h.text(),/total unavailable/)
@@ -125,6 +125,6 @@ test('named overview dates remain independent of unrelated collection failure',a
  }
  const display=await h.render('overview',{...baseline,attention:[finding]},null,sync)
  assert.equal(display.customer.incomplete,true);assert.match(h.text(),/1 reported finding/)
- assert.deepEqual([...h.doc.querySelectorAll('[aria-label="Dataset update times"] time')].map(e=>e.dateTime),['2026-09-29T12:00:00.000Z','2026-09-29T14:00:00.000Z','2026-09-29T16:00:00.000Z'])
+ assert.deepEqual([...h.doc.querySelectorAll('[aria-label="Dataset update times"] time')].map(e=>e.dateTime),[])
  assert.doesNotMatch(h.text(),/PRIVATE_DIAGNOSTIC|Evidence incomplete/)
 }))
