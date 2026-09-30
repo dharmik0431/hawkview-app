@@ -32,7 +32,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { useRiskyUsers } from '@/lib/api/risky-users-hooks'
-import { hawkViewDetectionSummary, riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
+import { riskyUsersEmptyState } from '@/lib/identity-risk/risky-users-view'
 import { useTenantOperationalProjection } from '@/lib/api/hooks'
 import { FleetRiskAssessmentDrawer } from '@/components/identity-risk/fleet-risk-assessment-drawer'
 import type { FleetRiskyUserRow } from '@/lib/api/fleet-risky-users-hooks'
@@ -252,146 +252,66 @@ function WhyNeedsReviewCell({ row }: { row: RiskyUserRow }) {
   )
 }
 
-function CompactSummaryStrip({
-  count,
-  rows,
-  microsoftView,
-  channel,
-  asOf,
-}: {
-  // TYPED, AND THIS IS THE ROOT ENABLER RATHER THAN A TIDY-UP. As `any` the props accepted a
-  // summary line that did its own arithmetic over the rows and never consulted accuracy or
-  // listCoverage — the compiler had nothing to object to.
+function CompactSummaryStrip({ count, rows, microsoftView, channel }: {
   count: RiskyUserCount
   rows: RiskyUserRow[]
   microsoftView: MicrosoftEntraRiskyUsersView
   channel: MicrosoftChannel
-  asOf: string | null
 }) {
-  // 1. Users requiring review
-  const usersRequiringReviewText =
-    count?.value !== null && count?.value !== undefined
-      ? `${count.display} users requiring review`
-      : `Users requiring review: ${count?.display || 'Not available'}`
-
-  // 2. HawkView detections
-  // NOT A BARE COUNT OF THE ROWS. The row list and the count go unavailable on the identical
-  // condition, so a zero here was guaranteed to appear beside "Not available" rather than merely
-  // able to. See hawkViewDetectionSummary.
-  const hawkViewUsers = rows.filter((r) => r.reasons.length > 0).length
-  const hawkViewText = hawkViewDetectionSummary(count, hawkViewUsers)
-
-  // 3. Active Microsoft risk detections
-  // The server summary is the only tenant-wide Microsoft count. Paginated
-  // records remain visible evidence but never become an aggregate fallback.
-  const microsoftSummary = microsoftView.microsoftRiskSummary ?? null
-  const serverMicrosoftSummary = presentMicrosoftRiskSummary(microsoftSummary)
-  const microsoftText = serverMicrosoftSummary.headline
-
-  // 4. Assessment date
-  const assessedText = asOf ? `Assessed ${formatTimestamp(asOf)}` : 'Assessment time: Not reported'
-  const additionalReasons = count.reasons.filter((reason) => reason !== count.caption)
-
-  // Source availability and comparison readiness are different observations.
-  // Neither a partial source nor an absent key proves a failed identity lookup.
-  const sourceLimitation = channel.state !== 'REPORTING'
-    ? channel.headline
-    : microsoftSummary !== null && microsoftSummary.availability !== 'AVAILABLE'
-      ? serverMicrosoftSummary.detail
+  const hawkViewUsers = rows.filter((row) => row.subjectType === 'USER' && row.reasons.length > 0).length
+  const hasTotal = (count.accuracy === 'EXACT' || count.accuracy === 'AT_LEAST') &&
+    count.value !== null && Number.isSafeInteger(count.value) && count.value >= 0
+  const nativeText = hasTotal
+    ? `HawkView: ${count.accuracy === 'AT_LEAST' ? `at least ${count.value?.toLocaleString()}` : count.display} users requiring review in this assessment`
+    : count.accuracy === 'WITHHELD' && hawkViewUsers > 0
+      ? `${hawkViewUsers} HawkView users shown`
       : null
-  const comparisonLimitation = rows.some((row) => row.detection.microsoft === 'NOT_COMPARABLE')
-    ? 'Cross-source comparison is not established for some users from this response. Available findings remain visible.'
+  const microsoftSummary = presentMicrosoftRiskSummary(microsoftView.microsoftRiskSummary)
+  const observedAt = microsoftSummary.observedAt
+  const snapshot = observedAt && Number.isFinite(Date.parse(observedAt)) && Date.parse(observedAt) <= Date.now()
+    ? observedAt : null
+  const accessAction = channel.addressable && channel.state === 'UNAVAILABLE'
+    ? channel.reasonCode === 'LICENSE_REQUIRED'
+      ? 'Microsoft Identity Protection requires an Entra ID P2 license for this tenant.'
+      : channel.reasonCode === 'MISSING_PERMISSION'
+        ? 'Grant IdentityRiskyUser.Read.All permission to enable Microsoft Identity Protection risk data.'
+        : null
     : null
-  const microsoftLimitations = [sourceLimitation, comparisonLimitation].filter(Boolean)
+
+  // Absence of a supported quantity is no summary, not a zero or a health verdict.
+  if (!nativeText && microsoftSummary.count === null && !accessAction && count.known.length === 0) return null
 
   return (
-    <div className="space-y-2">
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-2xs dark:border-slate-800 dark:bg-slate-900">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm">
-          {/* Fact 1 */}
-          <div className="flex items-center gap-2">
-            <Users className="h-4 w-4 text-slate-500 shrink-0" />
+    <section aria-label="Reported identity risk summary" data-risk-summary className="space-y-2">
+      {(nativeText || microsoftSummary.count !== null) && (
+        <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-4 shadow-2xs dark:border-slate-800 dark:bg-slate-900 sm:flex-row sm:flex-wrap sm:items-start text-xs sm:text-sm">
+          {nativeText && <div className="flex items-start gap-2">
+            <Users className="h-4 w-4 shrink-0 text-slate-500" />
             <span className="font-semibold text-slate-900 dark:text-slate-100">
-              {usersRequiringReviewText}
+              {nativeText}
+              {hasTotal && count.listCoverage !== 'COMPLETE' && <span className="mt-0.5 block text-2xs font-normal text-slate-500 dark:text-slate-400">
+                {hawkViewUsers} HawkView users shown in this response
+              </span>}
             </span>
-          </div>
-
-          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
-
-          {/* Fact 2 */}
-          <div className="flex items-center gap-2">
-            <ShieldAlert className="h-4 w-4 text-blue-600 dark:text-blue-400 shrink-0" />
-            <span className="font-medium text-slate-800 dark:text-slate-200">
-              {hawkViewText}
-            </span>
-          </div>
-
-          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
-
-          {/* Fact 3 */}
-          <div
-            id="microsoft-risk-summary"
-            className="flex items-start gap-2"
-            tabIndex={-1}
-          >
-            <ShieldCheck className="h-4 w-4 text-purple-600 dark:text-purple-400 shrink-0" />
+          </div>}
+          {microsoftSummary.count !== null && <div id="microsoft-risk-summary" tabIndex={-1} className="flex items-start gap-2">
+            <ShieldCheck className="h-4 w-4 shrink-0 text-purple-600 dark:text-purple-400" />
             <span>
-              <span className="block font-medium text-slate-800 dark:text-slate-200">
-                {microsoftText}
-              </span>
-              <span className="mt-0.5 block text-2xs text-slate-500 dark:text-slate-400">
-                Microsoft Identity Protection
-                {serverMicrosoftSummary.observedAt
-                  ? ` · Evidence observed ${formatTimestamp(serverMicrosoftSummary.observedAt)}`
-                  : ' · Evidence time not reported'}
-              </span>
+              <span className="block font-medium text-slate-800 dark:text-slate-200">{microsoftSummary.headline}</span>
+              {!microsoftSummary.exact && <span className="block text-2xs text-slate-500 dark:text-slate-400">Observed identities; partial Microsoft evidence</span>}
+              {snapshot && <span className="mt-0.5 block text-2xs text-slate-500 dark:text-slate-400">
+                Microsoft Identity Protection snapshot {formatTimestamp(snapshot)}
+              </span>}
             </span>
-          </div>
-
-          <div className="hidden sm:block h-4 w-px bg-slate-200 dark:bg-slate-800" />
-
-          {/* Fact 4 */}
-          <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400 text-xs">
-            <Clock3 className="h-4 w-4 shrink-0 text-slate-400" />
-            <span>{assessedText}</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="space-y-1 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
-        <p>{count.caption}</p>
-        {additionalReasons.length > 0 && (
-          <ul className="list-disc space-y-1 pl-4">
-            {additionalReasons.map((reason) => <li key={reason}>{reason}</li>)}
-          </ul>
-        )}
-        {(count.value === null || count.value === 0) && count.known.length > 0 && (
-          <div>
-            <p className="font-semibold">What HawkView did find</p>
-            <ul className="list-disc space-y-1 pl-4">
-              {count.known.map((finding) => <li key={finding}>{finding}</li>)}
-            </ul>
-          </div>
-        )}
-        {count.gaps.length > 0 && (
-          <div>
-            <p className="font-semibold">Not covered by this number</p>
-            <ul className="list-disc space-y-1 pl-4">
-              {count.gaps.map((gap) => <li key={gap}>{gap}</li>)}
-            </ul>
-          </div>
-        )}
-      </div>
-
-      {microsoftLimitations.length > 0 && (
-        <div className="rounded-lg border border-amber-200/80 bg-amber-50/80 p-3 dark:border-amber-900/60 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
-          <ShieldOff className="h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0" />
-          <span>
-            {microsoftLimitations.join(' ')}
-          </span>
+          </div>}
         </div>
       )}
-    </div>
+      {(count.value === null || count.value === 0) && count.known.length > 0 && <div className="text-xs text-slate-700 dark:text-slate-300">
+        <p className="font-semibold">What HawkView did find</p>
+        <ul className="list-disc space-y-1 pl-4">{count.known.map((finding) => <li key={finding}>{finding}</li>)}</ul>
+      </div>}
+      {accessAction && <p role="status" className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">{accessAction}</p>}
+    </section>
   )
 }
 
@@ -415,11 +335,13 @@ function DiagnosticCategories({ label, categories }: { label: string; categories
       : <ul className="ml-4 list-disc">{categories.entries.map((entry) => <li key={entry.reason}>{entry.reason}: {entry.count}</li>)}</ul>}
   </div>
 }
-function EvidenceDetails({ native, microsoftView, loading, requestFailed, contractFailed }: {
+function EvidenceDetails({ native, microsoftView, count, rows, channel, loading, requestFailed, contractFailed }: {
+  count: RiskyUserCount; rows: RiskyUserRow[]; channel: MicrosoftChannel
   native: NativeAssessment | null; microsoftView: MicrosoftEntraRiskyUsersView
   loading: boolean; requestFailed: boolean; contractFailed: boolean
 }) {
   const summary = microsoftView.microsoftRiskSummary
+  const microsoftPresentation = presentMicrosoftRiskSummary(summary)
   return <details className="rounded-lg border border-slate-200 p-3 text-xs dark:border-slate-700" data-evidence-details>
     <summary className="cursor-pointer font-medium">Evidence details</summary>
     <div className="mt-3 space-y-3 break-words">
@@ -427,6 +349,12 @@ function EvidenceDetails({ native, microsoftView, loading, requestFailed, contra
       {loading ? <p>Loading evidence. Diagnostic details cannot yet be confirmed.</p> : <>
         <section aria-label="Native evidence details" className="space-y-2">
           <h3 className="font-semibold">HawkView native assessment</h3>
+          <p>HawkView count: {count.display}</p>
+          <p>{count.caption}</p>
+          {count.reasons.filter((reason) => reason !== count.caption).map((reason) => <p key={reason}>{reason}</p>)}
+          {count.gaps.length > 0 && <div><p className="font-medium">Not covered by this number</p>
+            <ul className="ml-4 list-disc">{count.gaps.map((gap) => <li key={gap}>{gap}</li>)}</ul>
+          </div>}
           {requestFailed || contractFailed ? <p>{requestFailed ? 'The native read failed.' : 'The native response is unreadable.'} Retained diagnostic details are not confirmed.</p>
             : !native?.available ? <p>Native diagnostic details: Not available</p> : <>
               <p>Assessment completed (UTC): {diagnosticUtc(native.run.completedAt)}</p>
@@ -451,6 +379,10 @@ function EvidenceDetails({ native, microsoftView, loading, requestFailed, contra
         </section>
         <section aria-label="Microsoft evidence details" className="space-y-1">
           <h3 className="font-semibold">Microsoft Identity Protection</h3>
+          <p>{microsoftPresentation.headline}</p>
+          <p>{microsoftPresentation.detail}</p>
+          <p>{channel.headline}</p>
+          {rows.some((row) => row.detection.microsoft === 'NOT_COMPARABLE') && <p>Cross-source comparison is not established for some users from this response. Available findings remain visible.</p>}
           <p>Source status: {microsoftView.meta.status}; source reason: {microsoftView.meta.reasonCode ?? 'Not reported'}</p>
           {!summary ? <p>Microsoft summary: Not reported</p> : <>
             <p>Availability: {summary.availability}; completeness: {summary.completeness}; summary reason: {summary.reasonCode ?? 'None reported'}</p>
@@ -557,12 +489,9 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
     }
   }, [drawerRow, tenantId, tenant])
 
-  const nativeCompletedAt = native && 'run' in native && native.run ? native.run.completedAt : null
-  const asOf = count?.asOf || nativeCompletedAt || microsoftView?.meta?.observedAt
-
   return (
     <div className="space-y-4" key={`${cacheScope}:${tenantId}`}>
-      <EvidenceDetails native={native} microsoftView={microsoftView} loading={loading} requestFailed={requestFailed} contractFailed={contractFailed} />
+      <EvidenceDetails native={native} microsoftView={microsoftView} count={count} rows={list?.rows ?? []} channel={channel} loading={loading} requestFailed={requestFailed} contractFailed={contractFailed} />
       {loading ? (
         <div className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-600 shadow-2xs dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 flex items-center gap-2">
           <RefreshCw className="h-4 w-4 animate-spin text-blue-600" />
@@ -591,7 +520,6 @@ export default function RiskyUsersSection({ tenantId }: { tenantId: string }) {
             rows={list?.rows ?? []}
             microsoftView={microsoftView}
             channel={channel}
-            asOf={asOf}
           />
 
           <section
