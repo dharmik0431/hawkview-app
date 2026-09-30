@@ -239,22 +239,18 @@ export function TenantIssueDrawer({
             <div className="space-y-3">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                  <span>Detected Issues</span>
+                  <span>Customer Actions</span>
                   <Badge className="bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-0 text-xs px-2 py-0.5">
-                    {attentionItems.length || (customer.incomplete ? 'Unavailable' : 0)}
+                    {attentionItems.length ? `${attentionItems.length} reported` : customer.incomplete ? 'Unavailable' : '0 reported'}
                   </Badge>
                 </h3>
               </div>
 
-              {customer.incomplete && <p className="text-sm text-amber-800">Evidence incomplete. Known customer actions remain available.</p>}
               {attentionItems.length === 0 ? (
-                <div className="p-6 text-center rounded-2xl border border-emerald-200 bg-emerald-50/50 dark:border-emerald-900/40 dark:bg-emerald-950/20 space-y-2">
-                  <CheckCircle2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400 mx-auto" />
-                  <p className="text-sm font-semibold text-emerald-900 dark:text-emerald-300">
-                    {customer.incomplete ? 'Evidence incomplete' : 'No customer actions reported'}
-                  </p>
-                  <p className="text-xs text-emerald-700 dark:text-emerald-400/80">
-                    This summary does not establish zero risk or exhaustive coverage.
+                <div className="p-6 text-center rounded-2xl border border-slate-200 bg-slate-50/50 dark:border-slate-700 dark:bg-slate-800/20 space-y-2">
+                  <Info className="h-8 w-8 text-slate-500 dark:text-slate-400 mx-auto" />
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-300">
+                    {customer.incomplete ? 'Customer action total unavailable' : 'No customer actions reported'}
                   </p>
                 </div>
               ) : (

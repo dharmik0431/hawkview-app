@@ -23,7 +23,7 @@ for(const [name,rows,actions,findings] of [['mixed',[finding,access,ops,unknown]
   const tenant={...base,attention:rows};const v=customer.customerAttention(tenant)
   assert.equal(matrix.getTenantActiveIssuesInfo(tenant).count,actions);assert.equal(matrix.getTenantThreatsInfo(tenant).count,findings)
   assert.equal(directory.getTenantDisplayStatus(tenant).label,customer.customerStatus(v));assert.equal(matrix.getTenantMatrixOverallState(tenant).label,customer.customerStatus(v))
-  if(v.incomplete){assert.match(directory.getTenantDisplayStatus(tenant).label,/incomplete/);assert.match(matrix.getTenantActiveIssuesInfo(tenant).summaryText,/incomplete|unavailable/i)}
+  if(v.incomplete){assert.equal(matrix.getTenantActiveIssuesInfo(tenant).incomplete,true);assert.match(directory.getTenantDisplayStatus(tenant).label,/reported|unavailable/);assert.match(matrix.getTenantActiveIssuesInfo(tenant).summaryText,/reported|unavailable/i);assert.doesNotMatch(directory.getTenantDisplayStatus(tenant).label,/Evidence incomplete/)}
  })
 }
 for(const connectionStatus of ['error','disconnected','pending-consent'])test(`partial Microsoft positives survive ${connectionStatus} without becoming exact or native counts`,()=>{

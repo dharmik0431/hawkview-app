@@ -150,7 +150,7 @@ test('typed tenant findings and explicit access stay distinct while unknown evid
  {key:'unknown',label:'Unclassified',why:'Historical record.',severity:'critical'}]})
  const d=deriveTenantWorkspaceDisplay(bundle(),false,null,health)
  assert.equal(d.issueCount,2);assert.equal(d.issues[0].targetModule,'risky-users');assert.equal(d.issues[1].targetModule,'settings')
- assert.match(d.stateLabel,/Evidence incomplete/);assert.equal(d.customer?.findings.length,1);assert.equal(d.customer?.accessActions.length,1)
+ assert.equal(d.customer?.incomplete,true);assert.equal(d.stateLabel,'1 reported finding');assert.equal(d.customer?.findings.length,1);assert.equal(d.customer?.accessActions.length,1)
 })
 test('supplied empty coverage is described as no reported findings, never an exhaustive healthy claim', () => {
  const health=tenantActionableHealthProjection({data:{status:'COMPLETE'},attention:[]})
