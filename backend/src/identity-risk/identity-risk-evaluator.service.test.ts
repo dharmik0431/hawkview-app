@@ -559,7 +559,12 @@ test('hard disable precedes source reads and all risk persistence', async () => 
   }
 })
 
-test('alert delivery disable still evaluates and persists one matched result', async () => {
+for (const { name, platformNow, expired } of [
+  { name: 'alert delivery disable still evaluates and persists one matched result', platformNow: evaluationAt, expired: false },
+  { name: 'alert delivery disable persists evidence immediately before expiry', platformNow: new Date('2026-09-30T23:59:59.999Z'), expired: false },
+  { name: 'alert delivery disable excludes evidence exactly at expiry', platformNow: new Date('2026-10-01T00:00:00.000Z'), expired: true },
+  { name: 'alert delivery disable excludes evidence after expiry', platformNow: new Date('2026-10-01T00:00:00.001Z'), expired: true },
+]) test(name, async () => {
   const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
   process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
   try {
@@ -589,12 +594,18 @@ test('alert delivery disable still evaluates and persists one matched result', a
     const result = await new IdentityRiskEvaluatorService(
       store.prisma,
       mute.service,
+      { now: () => platformNow },
     ).evaluate(request(detector))
     assert.equal(result.status, 'COMPLETED')
     assert.equal(result.alertDeliveryDisabled, true)
-    assert.equal(store.calls.matches.length, 1)
-    assert.deepEqual(store.calls.matches[0]?.evidence, [evidenceReference])
-    assert.equal(store.calls.findings.length, 1)
+    if (expired) {
+      assert.equal(store.calls.matches.length, 0)
+      assert.equal(store.calls.findings.length, 0)
+    } else {
+      assert.equal(store.calls.matches.length, 1)
+      assert.deepEqual(store.calls.matches[0]?.evidence, [evidenceReference])
+      assert.equal(store.calls.findings.length, 1)
+    }
     assert.equal(store.calls.coverage.length, 1)
     assert.equal(store.calls.runUpdates[0]?.alertDeliveryDisabled, true)
   } finally {
