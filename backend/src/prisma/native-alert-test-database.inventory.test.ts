@@ -37,6 +37,7 @@ const expected = [
   "risky-users-wiring/native-alert-publication-lifecycle.database-integration.test.ts",
   "risky-users-wiring/native-finding-to-alert.database-integration.test.ts",
   "secrets/secret-store.database-integration.test.ts",
+  "tenants/directory-role-receipt-store.database-integration.test.ts",
   "tenants/tenant-directory.database-integration.test.ts",
   "workspace/workspace-audit.database-integration.test.ts"
 ] as const
