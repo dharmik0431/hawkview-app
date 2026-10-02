@@ -492,3 +492,84 @@ test('waits boundedly for the full grant projection without making nonconnection
     globalThis.setTimeout = originalSetTimeout
   }
 })
+
+// These tests execute the service and existing publisher; SQL doubles establish
+// ordering/error mapping only. Physical atomicity/races live in the DB suite.
+function managedConfigurationHarness(current: string | null = null) {
+  const events: string[] = []
+  let inTransaction = false, readCount = 0
+  const db = {
+    async $transaction(work: (tx: unknown) => Promise<unknown>) {
+      inTransaction = true
+      try {
+        return await work({
+          async $queryRawUnsafe(sql: string) {
+            if (sql.includes('FROM platform_microsoft_connectors')) {
+              events.push('capture-or-compare'); readCount++
+              return current ? [{ configurationRevision: current, operationId: null, fingerprint: null }] : []
+            }
+            return []
+          },
+          async $executeRawUnsafe(sql: string) { events.push(sql.includes('encrypted_secrets') ? 'secret-write' : 'write'); return 1 },
+        })
+      } finally { inTransaction = false }
+    },
+  }
+  const service = new MicrosoftConsentService(db as never, {
+    prepareManagedRevision: () => {
+      events.push('prepare')
+      return { ciphertext: Buffer.from('synthetic'), initializationVector: Buffer.alloc(12), authenticationTag: Buffer.alloc(16), keyVersion: 1 }
+    },
+  } as never)
+  ;(service as any).verifyTenantWithCredentials = async () => {
+    assert.equal(inTransaction, false)
+    assert.equal(readCount, 1)
+    events.push('verify')
+    return { missingRequiredPermissions: [], displayName: 'Synthetic organization' }
+  }
+  return { service, events, replace: (revision: string) => { current = revision } }
+}
+const configurationInput = () => ({
+  clientId: '11111111-2222-4333-8444-555555555555',
+  homeTenantId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', clientSecret: 'synthetic-secret',
+})
+test('managed configuration captures before verification, prepares without transaction, and preserves safe DTO', async () => {
+  const h = managedConfigurationHarness()
+  assert.deepEqual(await h.service.configureManagedConnector(configurationInput()), {
+    configured: true, clientId: configurationInput().clientId, homeTenantId: configurationInput().homeTenantId,
+    credentialExpiresAt: null, verifiedOrganization: 'Synthetic organization',
+  })
+  assert.deepEqual(h.events.slice(0, 4), ['capture-or-compare', 'verify', 'prepare', 'capture-or-compare'])
+  assert.equal(h.events.filter(x => x === 'secret-write').length, 1)
+})
+test('managed configuration loses a stale expectation without writes or recapture', async () => {
+  const h = managedConfigurationHarness()
+  ;(h.service as any).verifyTenantWithCredentials = async () => {
+    h.replace('bbbbbbbb-cccc-4ddd-8eee-ffffffffffff')
+    return { missingRequiredPermissions: [], displayName: 'Synthetic' }
+  }
+  await assert.rejects(h.service.configureManagedConnector(configurationInput()), (error: any) => error.getStatus() === 409)
+  assert.deepEqual(h.events, ['capture-or-compare', 'prepare', 'capture-or-compare'])
+})
+for (const outcome of ['throw', 'missing'] as const) test('managed verification '+outcome+' performs no preparation/publication', async () => {
+  const h = managedConfigurationHarness()
+  ;(h.service as any).verifyTenantWithCredentials = async () => {
+    if (outcome === 'throw') throw new Error('synthetic verification failure')
+    return { missingRequiredPermissions: ['Organization.Read.All'] }
+  }
+  await assert.rejects(h.service.configureManagedConnector(configurationInput()))
+  assert.deepEqual(h.events, ['capture-or-compare'])
+})
+test('managed configuration snapshots mutable caller inputs across the verifier await', async () => {
+  const h = managedConfigurationHarness(), input = { ...configurationInput(), credentialExpiresAt: new Date('2030-01-01T00:00:00Z') }
+  ;(h.service as any).verifyTenantWithCredentials = async (tenant: string, credentials: { clientId: string; clientSecret: string }) => {
+    assert.equal(tenant, input.homeTenantId)
+    assert.equal(credentials.clientSecret, input.clientSecret)
+    input.clientId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+    input.credentialExpiresAt.setUTCFullYear(2040)
+    return { missingRequiredPermissions: [], displayName: 'Synthetic' }
+  }
+  const result = await h.service.configureManagedConnector(input)
+  assert.equal(result.clientId, configurationInput().clientId)
+  assert.equal(result.credentialExpiresAt, '2030-01-01T00:00:00.000Z')
+})

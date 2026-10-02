@@ -382,3 +382,30 @@ test('immutable namespace refuses generic creation and overwrite, retains deleti
     assert.equal(db.rows.size, 0)
   })
 })
+
+test('managed preparation writes nothing, uses canonical revision AAD and yields a readable immutable reference', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const db = database(), service = db.service(), revision = randomUUID()
+    const sealed = service.prepareManagedRevision(revision.toUpperCase(), 'synthetic-managed-value')
+    assert.equal(db.rows.size, 0)
+    db.rows.set(revision, { id: revision, name: IMMUTABLE_MANAGED_SECRET_PREFIX + revision, ...sealed })
+    assert.equal(await service.access('encrypted-secret:' + revision), 'synthetic-managed-value')
+    const swapped = randomUUID()
+    db.rows.set(swapped, { id: swapped, name: IMMUTABLE_MANAGED_SECRET_PREFIX + swapped, ...sealed })
+    await assert.rejects(service.access('encrypted-secret:' + swapped))
+    await assert.rejects(service.store(IMMUTABLE_MANAGED_SECRET_PREFIX + revision, 'replacement', PLATFORM_OWNED),
+      /MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION/)
+    assert.equal(await service.access('encrypted-secret:' + revision), 'synthetic-managed-value')
+  })
+})
+test('managed preparation rejects bad identity, empty content and UTF8 overflow without persistence', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const db = database(), service = db.service()
+    assert.throws(() => service.prepareManagedRevision('not-a-revision', 'synthetic'), /INVALID_MANAGED_AUTHORITY_ID/)
+    for (const value of ['', 'é'.repeat(32769)]) {
+      assert.throws(() => service.prepareManagedRevision(randomUUID(), value), /INVALID_MANAGED_CREDENTIAL/)
+    }
+    assert.equal(service.prepareManagedRevision(randomUUID(), 'é'.repeat(32768)).ciphertext.length, 65536)
+    assert.equal(db.rows.size, 0)
+  })
+})

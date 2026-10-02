@@ -1,16 +1,18 @@
 import {
   BadGatewayException,
   BadRequestException,
+  ConflictException,
   Inject,
   Injectable,
   Logger,
   ServiceUnavailableException,
 } from '@nestjs/common'
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { decodeJwt, jwtVerify, SignJWT } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
+import { captureManagedAuthority, publishManagedAuthority } from './managed-connector-authority.js'
 import {
   fetchMicrosoftWithRetry,
   microsoftErrorMetadata,
@@ -807,12 +809,22 @@ export class MicrosoftConsentService {
     clientSecret: string
     credentialExpiresAt?: Date | null
   }) {
+    // Snapshot the requested content before any await; verification and publication
+    // must use the same inputs even if an in-process caller mutates its object.
+    const requested = {
+      clientId: input.clientId,
+      homeTenantId: input.homeTenantId,
+      clientSecret: input.clientSecret,
+      credentialExpiresAt: input.credentialExpiresAt == null
+        ? null : new Date(input.credentialExpiresAt.getTime()),
+    }
+    const operationId = randomUUID(), revision = randomUUID()
+    // Capture BEFORE network verification. Never recapture to make stale work current.
+    // This read transaction ends before any provider request is made.
+    const expected = await captureManagedAuthority(this.prisma)
     const verification = await this.verifyTenantWithCredentials(
-      input.homeTenantId,
-      {
-        clientId: input.clientId,
-        clientSecret: input.clientSecret,
-      }
+      requested.homeTenantId,
+      { clientId: requested.clientId, clientSecret: requested.clientSecret },
     )
     if (verification.missingRequiredPermissions.length > 0) {
       throw new BadRequestException(
@@ -820,34 +832,26 @@ export class MicrosoftConsentService {
       )
     }
 
-    const credentialReference = await this.secretStore.store(
-      'hawkview-microsoft-connector-client-secret',
-      input.clientSecret,
-      PLATFORM_OWNED
-    )
-    const connector = await this.prisma.platformMicrosoftConnector.upsert({
-      where: { id: 'default' },
-      create: {
-        id: 'default',
-        clientId: input.clientId,
-        homeTenantId: input.homeTenantId,
-        credentialReference,
-        credentialExpiresAt: input.credentialExpiresAt,
-      },
-      update: {
-        clientId: input.clientId,
-        homeTenantId: input.homeTenantId,
-        credentialReference,
-        credentialExpiresAt: input.credentialExpiresAt,
-        configuredAt: new Date(),
-      },
+    const sealed = this.secretStore.prepareManagedRevision(revision, requested.clientSecret)
+    // The existing primitive commits immutable content and its active reference
+    // together. No mutable legacy write, tenant fanout or receipt activation.
+    const publication = await publishManagedAuthority(this.prisma, {
+      expectedRevision: expected?.configurationRevision ?? null,
+      operationId, revision,
+      clientId: requested.clientId,
+      homeTenantId: requested.homeTenantId,
+      credentialExpiresAt: requested.credentialExpiresAt,
+      sealed,
     })
-
+    if (publication.status !== 'published' && publication.status !== 'replayed') {
+      throw new ConflictException('The Microsoft connector configuration changed. Submit a new configuration request.')
+    }
+    // No automatic retry: a new HTTP request is a new operation, not a replay.
     return {
       configured: true,
-      clientId: connector.clientId,
-      homeTenantId: connector.homeTenantId,
-      credentialExpiresAt: connector.credentialExpiresAt?.toISOString() ?? null,
+      clientId: publication.authority.clientId,
+      homeTenantId: publication.authority.homeTenantId,
+      credentialExpiresAt: requested.credentialExpiresAt?.toISOString() ?? null,
       verifiedOrganization: verification.displayName,
     }
   }
