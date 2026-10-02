@@ -299,6 +299,8 @@ export default function ActivityPage() {
     }
   }, [rawSignInEvents, rawAuditEvents])
 
+  const notReportedSignInCount = rawSignInEvents.filter(event => event.status === 'Not reported').length
+
   // Processed and sorted Sign-in rows
   const signInRows = React.useMemo<SignInEvent[]>(() => {
     if (bundleState !== 'ready' || !selectedBundle) return []
@@ -803,6 +805,7 @@ export default function ActivityPage() {
       ) : tab === 'signins' ? (
         <SignInLogsPage
           rows={signInRows}
+          notReportedCount={notReportedSignInCount}
           sortField={signInSortField}
           sortOrder={signInSortOrder}
           onSort={handleSignInSort}

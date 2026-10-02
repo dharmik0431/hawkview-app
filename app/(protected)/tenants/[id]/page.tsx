@@ -1,5 +1,7 @@
 'use client'
 
+import { reportedSignInResult, signInResultClass, signInResultColor } from '@/lib/tenants/sign-in-result'
+
 import { DataFreshnessLink } from '@/components/tenant/data-freshness-link'
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
@@ -483,7 +485,7 @@ function UserRolesPopover({
 // Sign-in log data types
 // =====================
 
-type SignInResult = 'Success' | 'Failure'
+type SignInResult = 'Success' | 'Failure' | 'Not reported'
 
 type SignInEvent = {
   id: string
@@ -1611,7 +1613,7 @@ function TenantDetailsWorkspace() {
     [bundle?.users]
   )
   const SIGNINS = useMemo(
-    () => (bundle?.signIns ?? []) as SignInEvent[],
+    () => ((bundle?.signIns ?? []) as SignInEvent[]).map(event => ({ ...event, result: reportedSignInResult(event.result) })),
     [bundle?.signIns]
   )
 
@@ -3618,7 +3620,7 @@ function TenantDetailsWorkspace() {
               dot.style.border = '2px solid #fff'
               dot.style.boxShadow = '0 8px 18px rgba(0,0,0,0.18)'
               dot.style.background =
-                e.result === 'Failure' ? '#EF4444' : '#22C55E'
+                signInResultColor(e.result)
               dot.style.cursor = 'pointer'
               dot.style.transform =
                 selectedEventId === e.id ? 'scale(1.25)' : 'scale(1)'
@@ -3817,9 +3819,7 @@ function TenantDetailsWorkspace() {
                     </div>
                     <Badge
                       className={
-                        hovered.result === 'Success'
-                          ? 'bg-green-50 text-green-700 border border-green-200'
-                          : 'bg-red-50 text-red-700 border border-red-200'
+                        signInResultClass(hovered.result)
                       }
                     >
                       {hovered.result}
@@ -3884,9 +3884,7 @@ function TenantDetailsWorkspace() {
                     <td className="px-4 py-3">
                       <Badge
                         className={
-                          e.result === 'Success'
-                            ? 'bg-green-50 text-green-700 border border-green-200'
-                            : 'bg-red-50 text-red-700 border border-red-200'
+                          signInResultClass(e.result)
                         }
                       >
                         {e.result}
@@ -4996,9 +4994,7 @@ function TenantDetailsWorkspace() {
                           </div>
                           <Badge
                             className={
-                              event.result === 'Success'
-                                ? 'bg-green-50 text-green-700 border border-green-200'
-                                : 'bg-red-50 text-red-700 border border-red-200'
+                              signInResultClass(event.result)
                             }
                           >
                             {event.result}

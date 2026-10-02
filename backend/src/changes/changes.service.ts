@@ -1,3 +1,4 @@
+import { signInResult, signInSource } from '../tenants/sign-in-result.js'
 import { BadRequestException, ForbiddenException, Inject, Injectable, Logger } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { PrismaService } from '../prisma/prisma.service.js'
@@ -664,16 +665,16 @@ export class ChangesService {
     const relatedSignIns = correlatedSignIns
       .filter((signIn) => correlationIdFromRaw(signIn.raw) === event.correlationId)
       .map((signIn) => {
-        const failed = Boolean(signIn.statusErrorCode && signIn.statusErrorCode !== '0')
+        const source = signInSource(signIn.raw)
         return {
           id: signIn.microsoftSignInId,
           eventDateTime: signIn.eventDateTime,
           actor: signIn.userPrincipalName ?? signIn.userDisplayName ?? undefined,
           application: signIn.resourceDisplayName ?? signIn.appDisplayName ?? undefined,
-          result: failed ? 'Failure' : 'Success',
+          result: signInResult(signIn.statusErrorCode),
           ipAddress: signIn.ipAddress ?? undefined,
-          source: 'Microsoft Graph auditLogs/signIns',
-          provenance: 'Microsoft Graph auditLogs/signIns',
+          source,
+          provenance: source,
           relationship: 'Shares Microsoft correlation ID; this is supporting evidence and does not establish causation.',
         }
       })

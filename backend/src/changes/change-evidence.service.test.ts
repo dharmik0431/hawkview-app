@@ -1982,3 +1982,28 @@ test('HAW66 successful empty reads qualify stored counts without claiming collec
 
 // Keep the composed service/query/table regression in the normal backend CI inventory.
 await import(new URL('../../../scripts/what-changed-availability.test.mjs', import.meta.url).href)
+
+test('related sign-ins preserve neutral codes and audit provenance under scoped correlation', async () => {
+  const event = {
+    id: 'audit-row', source: 'DIRECTORY_AUDIT', sourceEventId: 'audit-correlation', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), customerTenantId: 'tenant-1', organizationId: 'org-1', category: 'Groups', severity: 'Medium', operationName: 'Add member to group', summary: 'Success', actorId: 'actor-1', actorPrincipalName: 'owner@example.test', actorDisplayName: null, targetDisplayName: 'Example group', correlationId: 'corr-1', changedFields: [], workload: 'Microsoft Entra ID', result: 'success', location: null, beforeState: null, afterState: null,
+  }
+  const matchingSignIn = {
+    microsoftSignInId: 'sign-in-matching', eventDateTime: new Date('2026-08-01T12:01:00.000Z'), raw: { correlationId: 'corr-1' }, userPrincipalName: 'owner@example.test', userDisplayName: null, resourceDisplayName: 'Microsoft 365', appDisplayName: null, statusErrorCode: '0', ipAddress: '203.0.113.10',
+  }
+  for (const [code, expected] of [[null, 'Not reported'], ['null', 'Not reported'], ['0', 'Success'], ['50126', 'Failure'], ['2147483647', 'Failure'], ['2147483648', 'Not reported']]) {
+    let scope: any
+    const service = new ChangesService(changesPrisma({
+      changeEvidenceEvent: { findFirst: async () => event, findMany: async () => [event] },
+      signInLog: { findMany: async (args: any) => { scope = args.where; return [{ ...matchingSignIn, statusErrorCode: code,
+        raw: { correlationId: 'corr-1', hawkviewSource: 'MICROSOFT_365_MANAGEMENT_ACTIVITY' } },
+        { ...matchingSignIn, microsoftSignInId: 'unrelated', raw: { correlationId: 'other' } }] } },
+    }) as never)
+    const detail = await service.detail(identity, 'audit:audit-correlation', 'tenant-1')
+    assert.equal(detail.relatedSignIns.length, 1)
+    assert.equal(detail.relatedSignIns[0].result, expected)
+    assert.equal(detail.relatedSignIns[0].source, 'Microsoft 365 Management Activity')
+    assert.equal(detail.relatedSignIns[0].provenance, detail.relatedSignIns[0].source)
+    assert.deepEqual(scope.organizationId, { in: ['org-1'] })
+    assert.equal(scope.customerTenantId, 'tenant-1')
+  }
+})

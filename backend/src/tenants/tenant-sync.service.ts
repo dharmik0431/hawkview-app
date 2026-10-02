@@ -16,6 +16,7 @@ import { observeCycle, type CycleReason } from '../identity-risk/risk-operationa
 import { isIP } from 'node:net'
 import { projectAuthenticationAuditPageRow, reportedAuthenticationErrorCode } from './authentication-audit-projection.js'
 import { persistCompletedAuthenticationWindow } from '../identity-risk/authentication-window-collector.js'
+import { canonicalSignInCode, signInResult } from './sign-in-result.js'
 import { persistAuthenticationRecords } from '../identity-risk/authentication-ingestion-integrity.js'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from '../identity-risk/mailbox-risk-projector.service.js'
 import { RiskAssessmentProjector } from '../identity-risk/risk-assessment-projector.service.js'
@@ -4251,10 +4252,7 @@ export class TenantSyncService {
               : typeof row.riskLevelDuringSignIn === 'string'
                 ? row.riskLevelDuringSignIn
                 : null,
-          statusErrorCode:
-            row?.status?.errorCode === undefined
-              ? null
-              : String(row.status.errorCode),
+          statusErrorCode: canonicalSignInCode(row?.status?.errorCode),
           failureReason:
             typeof row?.status?.failureReason === 'string'
               ? row.status.failureReason
@@ -6750,8 +6748,7 @@ export class TenantSyncService {
           userPrincipalName: signIn.userPrincipalName ?? '',
           createdAt: signIn.eventDateTime.toISOString(),
           ipAddress: signIn.ipAddress ?? '',
-          result:
-            Number(signIn.statusErrorCode ?? 1) === 0 ? 'Success' : 'Failure',
+          result: signInResult(signIn.statusErrorCode),
           appDisplayName: signIn.appDisplayName ?? 'Unknown application',
           clientAppUsed: signIn.clientAppUsed ?? 'Unknown',
           conditionalAccess: signIn.conditionalAccessStatus,
