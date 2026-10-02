@@ -1,5 +1,6 @@
 'use client'
 
+import { reportedSignInResult, signInResultClass, signInResultColor } from '@/lib/tenants/sign-in-result'
 import { useMemo, useState, useEffect } from 'react'
 import maplibregl from 'maplibre-gl'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,7 +25,7 @@ import type { TenantSyncStatus } from '@/types/tenant-data'
 import type { ServiceSyncFreshness } from '@/types/tenant-data'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 
-export type SignInResult = 'Success' | 'Failure'
+export type SignInResult = 'Success' | 'Failure' | 'Not reported'
 
 export type SignInEvent = {
   id: string
@@ -112,15 +113,16 @@ function formatLocation(event: SignInEvent): string {
 }
 
 export default function SignInActivitySection({
-  signIns,
+  signIns: inputSignIns,
   signInView,
   onSignInViewChange,
   syncStatus,
   signInEvidence,
 }: SignInActivitySectionProps) {
+  const signIns = useMemo(() => inputSignIns.map(event => ({ ...event, result: reportedSignInResult(event.result) })), [inputSignIns])
   const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [resultFilter, setResultFilter] = useState<
-    'all' | 'Success' | 'Failure'
+    'all' | 'Success' | 'Failure' | 'Not reported'
   >('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
@@ -133,10 +135,9 @@ export default function SignInActivitySection({
     ['FAILED_TRANSIENT', 'STALE', 'BLOCKED_PERMISSION', 'BLOCKED_TENANT_CONFIGURATION'].includes(signInEvidence?.availability ?? '')
   const showCollectionFailure = selectedEvidenceFailed || (!signInEvidence?.selectedSource && syncStatus?.status === 'failed')
   // Filtered dataset shared between Table and Map
-  const filteredSignIns = useMemo(() => {
+  const eligibleSignIns = useMemo(() => {
     return signIns.filter((e) => {
       if (!withinTimeWindow(e.createdAt, timeWindow)) return false
-      if (resultFilter !== 'all' && e.result !== resultFilter) return false
       if (searchQuery.trim()) {
         const q = searchQuery.toLowerCase().trim()
         const matchUser =
@@ -151,7 +152,9 @@ export default function SignInActivitySection({
       }
       return true
     })
-  }, [signIns, timeWindow, resultFilter, searchQuery])
+  }, [signIns, timeWindow, searchQuery])
+  const notReportedCount = eligibleSignIns.filter(e => e.result === 'Not reported').length
+  const filteredSignIns = useMemo(() => eligibleSignIns.filter(e => resultFilter === 'all' || e.result === resultFilter), [eligibleSignIns, resultFilter])
 
   // Events with valid coordinates for Map
   const mappedEvents = useMemo(() => {
@@ -257,7 +260,7 @@ export default function SignInActivitySection({
               dot.style.border = '2px solid #ffffff'
               dot.style.boxShadow = '0 2px 6px rgba(0,0,0,0.3)'
               dot.style.backgroundColor =
-                e.result === 'Failure' ? '#ef4444' : '#22c55e'
+                signInResultColor(e.result)
               dot.style.cursor = 'pointer'
 
               const cityCountry = formatLocation(e)
@@ -269,7 +272,7 @@ export default function SignInActivitySection({
                 <div style="display:grid; gap:4px; font-size:11px; color:#334155;">
                   <div><strong>Location:</strong> ${escapeHtml(cityCountry)}</div>
                   <div><strong>Application:</strong> ${escapeHtml(e.appDisplayName)}</div>
-                  <div><strong>Result:</strong> <span style="color:${e.result === 'Success' ? '#16a34a' : '#dc2626'}; font-weight:600;">${e.result}</span></div>
+                  <div><strong>Result:</strong> <span style="color:${signInResultColor(e.result)}; font-weight:600;">${e.result}</span></div>
                   <div><strong>Time:</strong> ${escapeHtml(formatSignInTime(e.createdAt))}</div>
                   <div><strong>IP Address:</strong> <code style="background:#f1f5f9; padding:1px 5px; border-radius:4px; font-family:monospace; color:#0f172a;">${escapeHtml(e.ipAddress)}</code></div>
                 </div>
@@ -381,7 +384,10 @@ export default function SignInActivitySection({
               <option value="all">All Results</option>
               <option value="Success">Success Only</option>
               <option value="Failure">Failure Only</option>
+              <option value="Not reported">Not reported</option>
             </select>
+
+            <span className="text-xs text-slate-600">Not reported: {notReportedCount} in this time/search selection</span>
 
             {/* Time Window */}
             <select
@@ -482,15 +488,9 @@ export default function SignInActivitySection({
                           {e.appDisplayName}
                         </td>
                         <td className="px-5 py-3">
-                          {e.result === 'Success' ? (
-                            <Badge className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800 font-normal text-[10px]">
-                              Success
-                            </Badge>
-                          ) : (
-                            <Badge className="bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800 font-normal text-[10px]">
-                              Failure
-                            </Badge>
-                          )}
+                          <Badge className={`${signInResultClass(e.result)} font-normal text-[10px]`}>
+                            {e.result}
+                          </Badge>
                         </td>
                         <td className="px-5 py-3 text-right text-muted-foreground whitespace-nowrap">
                           {formatSignInTime(e.createdAt)}
@@ -574,6 +574,8 @@ export default function SignInActivitySection({
                 </span>
               </div>
             </div>
+
+            <p className="text-xs text-slate-600">Mapped results not reported: {mappedEvents.length - mappedSuccessCount - mappedFailureCount}</p>
 
             {unmappedCount > 0 && (
               <div className="flex items-center gap-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800/60 p-2.5 rounded-lg">
@@ -702,7 +704,7 @@ export default function SignInActivitySection({
                     Sign-in world map
                   </p>
                   <p className="mt-1 text-[11px] text-muted-foreground">
-                    Drag to pan, use the map controls to zoom, and select a marker for sign-in details. Green is successful; red is failed.
+                    Drag to pan, use the map controls to zoom, and select a marker for sign-in details. Green is successful; red is failed; slate means the result was not reported.
                   </p>
                 </div>
               )}

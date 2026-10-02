@@ -34,7 +34,7 @@ export type TenantUser = {
   isSynced?: boolean
 }
 
-export type SignInResult = 'Success' | 'Failure'
+export type SignInResult = 'Success' | 'Failure' | 'Not reported'
 
 export type SignInEvent = {
   id: string
@@ -213,6 +213,8 @@ export default function EntraOverviewSection({
     () => signIns.filter((e) => e.result === 'Failure').length,
     [signIns]
   )
+  const notReportedSignInsCount = totalSignInsCount - successSignInsCount - failedSignInsCount
+  const signInEvidenceIncomplete = totalSignInsCount === 0 || notReportedSignInsCount > 0
   const uniqueUsersCount = useMemo(
     () => new Set(signIns.map((e) => e.userId || e.userPrincipalName)).size,
     [signIns]
@@ -240,7 +242,7 @@ export default function EntraOverviewSection({
       ) {
         return 'Needs attention'
       }
-      if (caOverview.status === 'neutral') {
+      if (caOverview.status === 'neutral' || signInEvidenceIncomplete) {
         return 'Incomplete data'
       }
       return 'Healthy'
@@ -249,6 +251,7 @@ export default function EntraOverviewSection({
       usersSynchronized,
       authMethodsSynchronized,
       failedSignInsCount,
+      signInEvidenceIncomplete,
       mfaRegistrationCoveragePct,
       bundle?.entra?.riskyUsers,
     ])
@@ -305,9 +308,13 @@ export default function EntraOverviewSection({
       {
         id: 'failures',
         name: 'Failed sign-ins',
-        value: `${failedSignInsCount} authentication failure${failedSignInsCount === 1 ? '' : 's'}`,
-        detail: 'Authentication failures in current dataset',
-        status: failedSignInsCount > 0 ? 'warning' : 'healthy',
+        value: totalSignInsCount === 0
+          ? 'No sign-in data'
+          : `${failedSignInsCount} reported authentication failure${failedSignInsCount === 1 ? '' : 's'}`,
+        detail: notReportedSignInsCount > 0
+          ? `${notReportedSignInsCount} sign-in result${notReportedSignInsCount === 1 ? '' : 's'} not reported; evidence incomplete`
+          : totalSignInsCount === 0 ? 'No sign-in outcomes available' : 'Authentication failures in current dataset',
+        status: failedSignInsCount > 0 ? 'warning' : signInEvidenceIncomplete ? 'neutral' : 'healthy',
         action: () => onNavigateTab('security', 'sign-ins'),
       },
 
@@ -323,6 +330,9 @@ export default function EntraOverviewSection({
     namedLocationsSynchronized,
     namedLocations.length,
     failedSignInsCount,
+    totalSignInsCount,
+    notReportedSignInsCount,
+    signInEvidenceIncomplete,
     onNavigateTab,
   ])
 
@@ -730,6 +740,15 @@ export default function EntraOverviewSection({
             </span>
             <span className="text-base font-bold text-red-600 dark:text-red-400">
               {failedSignInsCount}
+            </span>
+          </div>
+
+          <div>
+            <span className="text-[11px] font-medium text-muted-foreground block">
+              Not reported
+            </span>
+            <span className="text-base font-bold text-slate-600">
+              {notReportedSignInsCount}
             </span>
           </div>
 

@@ -56,11 +56,13 @@ function compareIPs(ipA?: string, ipB?: string): number {
 
 export function SignInLogsPage({
   rows,
+  notReportedCount,
   sortField: externalSortField,
   sortOrder: externalSortOrder,
   onSort: externalOnSort,
 }: {
   rows: SignInEvent[]
+  notReportedCount?: number
   sortField?: keyof SignInEvent
   sortOrder?: 'asc' | 'desc'
   onSort?: (field: keyof SignInEvent) => void
@@ -182,6 +184,7 @@ export function SignInLogsPage({
   return (
     <>
       <div className="space-y-2">
+        <p className="text-xs text-slate-600">Not reported: {notReportedCount ?? rows.filter(row => row.status === 'Not reported').length} in loaded tenant sign-ins</p>
         <div className="flex items-center justify-between px-1 text-xs text-slate-500 dark:text-slate-400">
           <div>
             Showing{' '}
