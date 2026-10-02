@@ -3753,32 +3753,32 @@ export class TenantSyncService {
           throw new Error('invalid batch response')
         }
         const responseById = new Map<string, Record<string, unknown>>()
+        const expectedResponseIds = new Set(batchIds.map((_, index) => String(index + 1)))
+        let batchComplete = parsed.responses.length === batchIds.length
         for (const item of parsed.responses) {
-          if (plainRecord(item) && typeof item.id === 'string') {
+          if (!plainRecord(item) || typeof item.id !== 'string' ||
+              !expectedResponseIds.has(item.id) || responseById.has(item.id)) {
+            batchComplete = false
+          } else {
             responseById.set(item.id, item)
           }
         }
         batchIds.forEach((userId, index) => {
-          const item = responseById.get(String(index + 1))
+          // Ambiguous association invalidates this batch, not unrelated batches.
+          // Still account every incomplete context against the aggregate bound.
+          const item = batchComplete ? responseById.get(String(index + 1)) : undefined
           const body = plainRecord(item?.body) ? item.body : null
           const values = body && Array.isArray(body.value) ? body.value : null
+          const memberIds = values?.map(value => plainRecord(value) ? value.id : null) ?? null
           const complete =
             item?.status === 200 &&
-            values !== null &&
-            typeof body?.['@odata.nextLink'] !== 'string'
+            memberIds !== null &&
+            body !== null && !Object.hasOwn(body, '@odata.nextLink') &&
+            memberIds.every((id): id is string =>
+              typeof id === 'string' && id.length > 0 && id.length <= 128 && id.trim() === id)
           const context = {
             transitiveGroupIds: complete
-              ? [
-                  ...new Set(
-                    values
-                      .filter(plainRecord)
-                      .map((value) => value.id)
-                      .filter(
-                        (id): id is string =>
-                          typeof id === 'string' && id.length > 0 && id.length <= 128,
-                      ),
-                  ),
-                ].sort((left, right) => left.localeCompare(right))
+              ? [...new Set(memberIds)].sort((left, right) => left.localeCompare(right))
               : [],
             membershipComplete: complete,
             observedAt,
