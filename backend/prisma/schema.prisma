@@ -1452,6 +1452,9 @@ model MicrosoftConsentAttempt {
 }
 
 model PlatformMicrosoftConnector {
+  configurationRevision String @default(dbgenerated("gen_random_uuid()")) @map("configuration_revision") @db.Uuid
+  configurationOperationId String? @map("configuration_operation_id") @db.Uuid
+  publicationFingerprint String? @map("publication_fingerprint") @db.VarChar(64)
   id                  String    @id @default("default") @db.VarChar(32)
   clientId            String    @map("client_id") @db.Uuid
   homeTenantId        String    @map("home_tenant_id") @db.Uuid
@@ -1461,6 +1464,13 @@ model PlatformMicrosoftConnector {
   updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("platform_microsoft_connectors")
+}
+
+/// Retains every managed authority identity, including the legacy upgrade revision.
+model ManagedConnectorAuthorityRevision {
+  revision String @id @db.Uuid
+
+  @@map("managed_connector_authority_revisions")
 }
 
 model EncryptedSecret {

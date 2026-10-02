@@ -13,6 +13,8 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { encryptionKeyRing, type EncryptionKeyRing } from './secret-encryption-keys.js'
 import { PLATFORM_OWNED, assertStorable, type SecretOwner } from './secret-owner.js'
 
+import { IMMUTABLE_MANAGED_SECRET_PREFIX } from '../microsoft/managed-connector-authority.js'
+
 const DATABASE_REFERENCE_PREFIX = 'encrypted-secret:'
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
@@ -155,6 +157,9 @@ export class SecretStoreService {
   }
 
   private async persist(name: string, value: string) {
+    if (name.startsWith(IMMUTABLE_MANAGED_SECRET_PREFIX)) {
+      throw new ServiceUnavailableException('MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION')
+    }
     const keys = this.keys
     const keyVersion = keys.currentVersion
     const encrypted = this.encrypt(name, value, keys.current)
@@ -223,7 +228,12 @@ export class SecretStoreService {
           'The stored credential reference is invalid.'
         )
       }
-      await this.prisma.encryptedSecret.deleteMany({ where: { id } })
+      await this.prisma.encryptedSecret.deleteMany({ where: {
+        id,
+        // Retained immutable rows are revision tombstones: generic deletion must
+        // not make a prior authority identity available for reuse.
+        NOT: { name: { startsWith: IMMUTABLE_MANAGED_SECRET_PREFIX } },
+      } })
       return
     }
 
@@ -234,7 +244,7 @@ export class SecretStoreService {
     }
 
     await this.prisma.encryptedSecret.deleteMany({
-      where: { legacyReference: reference },
+      where: { legacyReference: reference, NOT: { name: { startsWith: IMMUTABLE_MANAGED_SECRET_PREFIX } } },
     })
   }
 

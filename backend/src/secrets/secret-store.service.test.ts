@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { IMMUTABLE_MANAGED_SECRET_PREFIX } from '../microsoft/managed-connector-authority.js'
 import { randomUUID } from 'node:crypto'
 import { SEALED_WITH_UNAVAILABLE_KEY, SecretStoreService } from './secret-store.service.js'
 import {
@@ -78,7 +79,11 @@ function database() {
       },
       findMany: async () => [...rows.values()],
       deleteMany: async ({ where }: { where: Record<string, unknown> }) => {
-        if (typeof where.id === 'string') rows.delete(where.id)
+        if (typeof where.id === 'string') {
+          const row = rows.get(where.id)
+          const excluded = (where.NOT as { name?: { startsWith?: string } } | undefined)?.name?.startsWith
+          if (row && !(excluded && row.name.startsWith(excluded))) rows.delete(where.id)
+        }
         return { count: 1 }
       },
     },
@@ -354,4 +359,26 @@ test('accessOrCreate mints under the current version and re-seals an old one', a
   })
   // ...and re-seals it on the way.
   assert.equal([...world.rows.values()][0].keyVersion, 2)
+})
+
+
+test('immutable namespace refuses generic creation and overwrite, retains deletion tombstones', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const db = database(), service = db.service()
+    const name = IMMUTABLE_MANAGED_SECRET_PREFIX + randomUUID()
+    await assert.rejects(service.store(name, 'synthetic', PLATFORM_OWNED), /MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION/)
+    await assert.rejects(service.accessOrCreate(name, () => 'synthetic'), /MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION/)
+    assert.equal(db.rows.size, 0)
+    const ordinary = await service.store('ordinary-platform-name', 'unchanged', PLATFORM_OWNED)
+    const row = [...db.rows.values()][0]
+    row.name = name
+    const before = Buffer.from(row.ciphertext)
+    await assert.rejects(service.store(name, 'replacement', PLATFORM_OWNED), /MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION/)
+    await service.delete(ordinary)
+    assert.equal(db.rows.size, 1)
+    assert.deepEqual(Buffer.from(row.ciphertext), before)
+    row.name = 'ordinary-platform-name'
+    await service.delete(ordinary)
+    assert.equal(db.rows.size, 0)
+  })
 })
