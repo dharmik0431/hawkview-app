@@ -6292,6 +6292,10 @@ export class TenantSyncService {
       syncStateByResource.get('AUTHENTICATION_STRENGTHS'),
       mfaEvaluationNow,
     )
+    const authRegistrationEvidence = mfaEvidenceState(
+      syncStateByResource.get('AUTH_REGISTRATIONS'),
+      mfaEvaluationNow,
+    )
     const directoryRoleEvidence = mfaEvidenceState(
       syncStateByResource.get('DIRECTORY_ROLES'),
       mfaEvaluationNow,
@@ -6577,41 +6581,59 @@ export class TenantSyncService {
           const context = plainRecord(registration?.conditionalAccessContext)
             ? registration.conditionalAccessContext
             : null
-          const transitiveGroupIds = Array.isArray(context?.transitiveGroupIds)
-            ? context.transitiveGroupIds.filter(
-                (id: unknown): id is string =>
-                  typeof id === 'string' && id.length > 0 && id.length <= 128,
-              )
-            : null
+          const membershipObservedAt =
+            typeof context?.observedAt === 'string' &&
+            /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/.test(context.observedAt) &&
+            Number.isFinite(Date.parse(context.observedAt)) &&
+            new Date(context.observedAt).toISOString().slice(0, 19) === context.observedAt.slice(0, 19) &&
+            Date.parse(context.observedAt) <= mfaEvaluationNow.getTime() &&
+            Date.parse(context.observedAt) <= Date.parse(authRegistrationEvidence.observedAt ?? '')
+              ? context.observedAt
+              : null
+          const transitiveGroupIds =
+            Array.isArray(context?.transitiveGroupIds) &&
+            context.transitiveGroupIds.length <= 1000 &&
+            context.transitiveGroupIds.every(
+              (id: unknown): id is string =>
+                typeof id === 'string' &&
+                /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+            )
+              ? context.transitiveGroupIds
+              : null
           const membershipEvidence: MfaEvidenceState =
-            context?.membershipComplete === true && transitiveGroupIds
-              ? {
-                  status: 'FRESH',
-                  observedAt:
-                    typeof context.observedAt === 'string'
-                      ? context.observedAt
-                      : null,
-                  reason: null,
-                }
-              : context?.reasonCode === 'PERMISSION_LIMITED'
+            authRegistrationEvidence.status !== 'FRESH'
+              ? authRegistrationEvidence
+              : context?.membershipComplete === true && transitiveGroupIds && membershipObservedAt
                 ? {
-                    status: 'PERMISSION_LIMITED',
-                    observedAt:
-                      typeof context?.observedAt === 'string'
-                        ? context.observedAt
-                        : null,
-                    reason: 'Microsoft group membership permission unavailable',
+                    status: mfaEvaluationNow.getTime() - Date.parse(membershipObservedAt) > 26 * 60 * 60 * 1000
+                      ? 'STALE' : 'FRESH',
+                    observedAt: membershipObservedAt,
+                    reason: null,
                   }
                 : {
-                    status: registration ? 'FAILED' : 'MISSING',
-                    observedAt:
-                      typeof context?.observedAt === 'string'
-                        ? context.observedAt
-                        : null,
-                    reason: registration
-                      ? 'Transitive group membership is incomplete'
-                      : 'No user authentication evidence',
+                    status: context?.reasonCode === 'PERMISSION_LIMITED'
+                      ? 'PERMISSION_LIMITED' : registration ? 'FAILED' : 'MISSING',
+                    observedAt: membershipObservedAt,
+                    reason: 'Transitive group membership is unavailable or incomplete',
                   }
+          // The complete role set includes assignments inherited through groups.
+          // Its proof cannot be newer or more complete than either input.
+          const derivedRoleEvidence: MfaEvidenceState =
+            directoryRoleEvidence.status !== 'FRESH'
+              ? directoryRoleEvidence
+              : membershipEvidence.status !== 'FRESH'
+                ? membershipEvidence
+                : Date.parse(directoryRoleEvidence.observedAt ?? '') > mfaEvaluationNow.getTime() ||
+                    Date.parse(authRegistrationEvidence.observedAt ?? '') > mfaEvaluationNow.getTime()
+                  ? { status: 'FAILED', observedAt: null, reason: 'Evidence timestamp is in the future' }
+                  : {
+                      status: 'FRESH',
+                      observedAt: new Date(Math.min(
+                        Date.parse(directoryRoleEvidence.observedAt!),
+                        Date.parse(membershipEvidence.observedAt!),
+                      )).toISOString(),
+                      reason: null,
+                    }
           const activeRoleTemplateIds = [
             user.microsoftUserId,
             ...(transitiveGroupIds ?? []),
@@ -6631,7 +6653,7 @@ export class TenantSyncService {
               externalTenantId: null,
               transitiveGroupIds,
               activeRoleTemplateIds:
-                directoryRoleEvidence.status === 'FRESH'
+                derivedRoleEvidence.status === 'FRESH'
                   ? [...new Set(activeRoleTemplateIds)].sort()
                   : null,
             },
@@ -6640,7 +6662,7 @@ export class TenantSyncService {
             evidence: {
               policies: conditionalAccessEvidence,
               membership: membershipEvidence,
-              roles: directoryRoleEvidence,
+              roles: derivedRoleEvidence,
               authenticationStrengths: authenticationStrengthEvidence,
             },
             now: mfaEvaluationNow,
