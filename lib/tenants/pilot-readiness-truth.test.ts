@@ -23,7 +23,7 @@ test('tenant security views consume the server-owned Conditional Access and Secu
   assert.match(page, /caPolicies=\{overviewCaPolicies\}/)
   assert.match(page, /conditionalAccessEvidence=\{collectionReadiness\?\.evidence\.conditionalAccess \?\? null\}/)
   assert.match(overview, /conditionalAccessOverviewState\(conditionalAccessEvidence, caPolicies\)/)
-  assert.match(overview, /if \(caOverview\.status === 'neutral'\) \{\s*return 'Incomplete data'/)
+  assert.match(overview, /if \(caOverview\.status === 'neutral' \|\| signInEvidenceIncomplete\) \{\s*return 'Incomplete data'/)
   assert.doesNotMatch(overview, /caPoliciesSynchronized && enabledCaPoliciesCount === 0/)
 })
 

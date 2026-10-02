@@ -94,6 +94,12 @@ test('composed overview cannot turn unreported outcomes or no data into healthy 
     if(outcomes.length===0) {assert.match(checklistRow.textContent,/No sign-in data/);assert.doesNotMatch(checklistRow.textContent,/0 reported authentication failures/)}
     if(outcomes.includes('Failure' as never)) assert.match(checklistRow.textContent,/1 reported authentication failure/)
   }
+  // Reported successes cannot override neutral Conditional Access evidence.
+  for (const evidence of [{availability:'UNVERIFIED',count:null},{availability:'READY',count:0}]) {
+    await h.render(Overview,{...props,signIns:[{...rows[0],result:'Success'}],caPolicies:[],conditionalAccessEvidence:evidence})
+    assert.match(h.document.body.textContent,/Incomplete data/)
+    assert.doesNotMatch(h.document.body.textContent,/Healthy/)
+  }
   // Unknown sign-ins must not suppress warnings from other security evidence.
   await h.render(Overview,{...props,signIns:[{...rows[0],result:'Not reported'}],bundle:{...props.bundle,entra:{riskyUsers:[{id:'synthetic-risk'}]}}})
   assert.match(h.document.body.textContent,/Needs attention/)
