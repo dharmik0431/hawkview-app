@@ -4751,6 +4751,16 @@ export class TenantSyncService {
         accessToken,
         'directory audit logs'
       )
+      // Validate the complete response before any rows or success state advance.
+      // Filtering malformed rows would turn incomplete evidence into empty success.
+      if (rows.some((row) =>
+        typeof row?.id !== 'string' || !row.id.trim() ||
+        typeof row?.activityDateTime !== 'string' ||
+        typeof row?.activityDisplayName !== 'string' ||
+        !Number.isFinite(new Date(row.activityDateTime).getTime())
+      )) {
+        throw new Error('Microsoft returned an invalid directory audit record; collection is incomplete.')
+      }
       const ingestedAt = new Date()
       const expiresAt = logExpirationDate(ingestedAt)
       const records = rows
@@ -5667,6 +5677,9 @@ export class TenantSyncService {
       if (!plainRecord(parsed) || !Array.isArray(parsed.value)) throw new Error('Microsoft returned an invalid bounded users page.')
       const page = parsed as GraphUsersPage
       const projected = page.value!.map(projectDirectoryUser)
+      if (projected.some((user) => typeof user.id !== 'string' || !user.id.trim())) {
+        throw new Error('Microsoft returned a users record without a valid identifier; collection is incomplete.')
+      }
       budget.retain(projected)
       users.push(...projected)
       for (const link of [page['@odata.nextLink'], page['@odata.deltaLink']]) {
