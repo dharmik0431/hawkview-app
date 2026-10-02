@@ -29,6 +29,7 @@ const expected = [
   "identity-risk/risk-key-operator.database-integration.test.ts",
   "identity-risk/risk-utc-session.database-integration.test.ts",
   "identity-risk/wrapped-risk-key.database-integration.test.ts",
+  "microsoft/managed-connector-authority.database-integration.test.ts",
   "prisma/alert-table-rls.database-integration.test.ts",
   "prisma/public-schema-lockdown.database-integration.test.ts",
   "risky-users-wiring/native-risk-summary.database-integration.test.ts",
