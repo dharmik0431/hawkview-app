@@ -8,10 +8,13 @@ import { AlertCircle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { supabase } from '@/lib/auth/supabase'
 import {
+  classifyHawkViewConfirmationLink,
   confirmationFailureMessage,
+  confirmationShapeMessage,
   HAWKVIEW_EMAIL_CONFIRMATION_PATH,
   parseHawkViewEmailConfirmation,
   verifyHawkViewEmailConfirmation,
+  type ConfirmationLinkShape,
   type EmailConfirmationResult,
 } from '@/lib/auth/email-confirmation'
 
@@ -21,12 +24,25 @@ export function ConfirmAuthEmail() {
   const router = useRouter()
   const requestRef = useRef<ReturnType<typeof parseHawkViewEmailConfirmation>>(null)
   const verificationStartedRef = useRef(false)
+  const capturedRef = useRef(false)
   const [ready, setReady] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [failure, setFailure] = useState<FailureReason | null>(null)
+  const [shape, setShape] = useState<ConfirmationLinkShape>('empty')
 
   useEffect(() => {
-    requestRef.current = parseHawkViewEmailConfirmation(window.location.hash)
+    // Strict Mode invokes effects twice in development, and the first pass
+    // removes the fragment. Capturing again would read an empty hash and report
+    // a broken link for one that was valid, so the capture happens exactly once.
+    if (capturedRef.current) return
+    capturedRef.current = true
+
+    const fragment = window.location.hash
+    // Recorded before the fragment is discarded: it is the only evidence of why
+    // an unusable link failed, and it distinguishes an expired token from an
+    // email that was never issued by HawkView's own templates.
+    setShape(classifyHawkViewConfirmationLink(fragment))
+    requestRef.current = parseHawkViewEmailConfirmation(fragment)
 
     // Token hashes are single-use credentials. Remove them from browser history
     // immediately, and never log provider errors or input. Verification requires
@@ -91,7 +107,15 @@ export function ConfirmAuthEmail() {
             className="flex gap-2 rounded-xl border border-red-200 bg-red-50 p-3.5 text-sm text-red-700"
           >
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-            <span>{confirmationFailureMessage(failure)}</span>
+            <span>
+              {/* An unreadable link is described by its shape; a link that was
+                  read and then rejected by the provider is described by the
+                  verification outcome. Collapsing the two is what made every
+                  cause look like the same unexplained failure. */}
+              {failure === 'invalid'
+                ? confirmationShapeMessage(shape)
+                : confirmationFailureMessage(failure)}
+            </span>
           </div>
         </div>
         <Button asChild className="h-11 w-full">

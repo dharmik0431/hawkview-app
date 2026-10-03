@@ -358,16 +358,29 @@ function MemberActionMenu({
             </DropdownMenu.Item>
           )}
 
-          {/* Password reset is distinct from accepting a pending invitation. */}
-          {member.hasHawkViewAccount && (
-            <DropdownMenu.Item
-              onSelect={() => onPasswordReset(member)}
-              className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer"
-            >
-              <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
-              <span>Send HawkView password reset</span>
-            </DropdownMenu.Item>
-          )}
+          {/* Password reset is distinct from accepting a pending invitation.
+              Supabase can only send a recovery email to an account that exists,
+              which is why this stays unavailable until first sign-in. It is shown
+              disabled rather than hidden: a missing menu entry reads as a broken
+              admin panel, and the member needs "Resend invitation" instead. */}
+          <DropdownMenu.Item
+            disabled={!member.hasHawkViewAccount}
+            onSelect={() => onPasswordReset(member)}
+            title={
+              member.hasHawkViewAccount
+                ? undefined
+                : 'Available after this member signs in for the first time. Use Resend invitation until then.'
+            }
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer data-[disabled]:opacity-50 data-[disabled]:pointer-events-none"
+          >
+            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+            <span>
+              Send HawkView password reset
+              {!member.hasHawkViewAccount && (
+                <span className="text-muted-foreground"> — after first sign-in</span>
+              )}
+            </span>
+          </DropdownMenu.Item>
 
           {/* Reset HawkView MFA */}
           <DropdownMenu.Item
