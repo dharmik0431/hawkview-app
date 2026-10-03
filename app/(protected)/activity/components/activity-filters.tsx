@@ -415,8 +415,8 @@ export function ActivityFilters({
               !tenantSelected
                 ? 'Select a tenant to export'
                 : matchingCount === 0
-                  ? 'No matching events to export'
-                  : 'Export matching events to CSV'
+                  ? 'No matching loaded events to export'
+                  : 'Export matching loaded events to CSV'
             }
           >
             {isExporting ? (

@@ -15,6 +15,7 @@ import {
 } from './components/advanced-filter-panel'
 import { SignInLogsPage } from './components/signin-logs-page'
 import { AuditLogsPage } from './components/audit-logs-page'
+import { LoadedRecordScope } from './components/loaded-record-scope'
 import type { ActivityTab, AuditEvent, SignInEvent } from './data/types'
 import {
   normalizeAuditEvent,
@@ -201,9 +202,22 @@ export default function ActivityPage() {
     }
   }, [bundleReloadKey, filters.tenantId])
 
+  // Bind all rows, counts and exports to the current successful tenant read,
+  // including the render before the selection/retry effect clears old state.
+  const currentBundle =
+    bundleState === 'ready' &&
+    loadedBundleReloadKey === bundleReloadKey &&
+    filters.tenantId &&
+    selectedBundle?.tenant?.id === filters.tenantId
+      ? selectedBundle
+      : null
+  const signInsAvailable = Array.isArray(currentBundle?.signIns)
+  const auditsAvailable = Array.isArray(currentBundle?.auditLogs)
+  const activeRecordsAvailable = tab === 'signins' ? signInsAvailable : auditsAvailable
+
   // Build user dropdown options
   const userOptions = React.useMemo(() => {
-    const signIns = selectedBundle?.signIns ?? []
+    const signIns = Array.isArray(currentBundle?.signIns) ? currentBundle.signIns : []
     const map = new Map<string, string>()
     for (const s of signIns) {
       const upn = s.userPrincipalName ?? s.upn
@@ -214,31 +228,31 @@ export default function ActivityPage() {
     return Array.from(map.entries())
       .sort((a, b) => a[1].localeCompare(b[1]))
       .map(([upn, name]) => ({ upn, label: `${name} (${upn})` }))
-  }, [selectedBundle])
+  }, [currentBundle])
 
   // Map raw sign-in events
   const rawSignInEvents = React.useMemo<SignInEvent[]>(() => {
-    if (bundleState !== 'ready' || !selectedBundle) return []
-    const all = (selectedBundle.signIns ?? []) as any[]
-    const tenantId = selectedBundle?.tenant?.id ?? selectedBundle?.id
-    const tenantName = selectedBundle?.tenant?.name ?? selectedBundle?.name
+    if (bundleState !== 'ready' || !currentBundle) return []
+    const all = (Array.isArray(currentBundle.signIns) ? currentBundle.signIns : []) as any[]
+    const tenantId = currentBundle?.tenant?.id ?? currentBundle?.id
+    const tenantName = currentBundle?.tenant?.name ?? currentBundle?.name
 
     return all.map((event, index) =>
       normalizeSignInEvent(event, { tenantId, tenantName, index }),
     )
-  }, [bundleState, selectedBundle])
+  }, [bundleState, currentBundle])
 
   // Map raw audit events
   const rawAuditEvents = React.useMemo<AuditEvent[]>(() => {
-    if (bundleState !== 'ready' || !selectedBundle) return []
-    const all = (selectedBundle.auditLogs ?? []) as any[]
-    const tenantId = selectedBundle?.tenant?.id ?? selectedBundle?.id
-    const tenantName = selectedBundle?.tenant?.name ?? selectedBundle?.name
+    if (bundleState !== 'ready' || !currentBundle) return []
+    const all = (Array.isArray(currentBundle.auditLogs) ? currentBundle.auditLogs : []) as any[]
+    const tenantId = currentBundle?.tenant?.id ?? currentBundle?.id
+    const tenantName = currentBundle?.tenant?.name ?? currentBundle?.name
 
     return all.map((event, index) =>
       normalizeAuditEvent(event, { tenantId, tenantName, index }),
     )
-  }, [bundleState, selectedBundle])
+  }, [bundleState, currentBundle])
 
   // Dynamically extract available filter options from real event data
   const filterOptions = React.useMemo<FilterOptions>(() => {
@@ -303,7 +317,7 @@ export default function ActivityPage() {
 
   // Processed and sorted Sign-in rows
   const signInRows = React.useMemo<SignInEvent[]>(() => {
-    if (bundleState !== 'ready' || !selectedBundle) return []
+    if (bundleState !== 'ready' || !currentBundle) return []
     const q = filters.search.trim().toLowerCase()
     const adv = advancedFilters
 
@@ -421,7 +435,7 @@ export default function ActivityPage() {
     })
   }, [
     bundleState,
-    selectedBundle,
+    currentBundle,
     rawSignInEvents,
     filters,
     advancedFilters,
@@ -431,7 +445,7 @@ export default function ActivityPage() {
 
   // Processed and sorted Audit rows
   const auditRows = React.useMemo<AuditEvent[]>(() => {
-    if (bundleState !== 'ready' || !selectedBundle) return []
+    if (bundleState !== 'ready' || !currentBundle) return []
     const q = filters.search.trim().toLowerCase()
     const adv = advancedFilters
 
@@ -527,7 +541,7 @@ export default function ActivityPage() {
     })
   }, [
     bundleState,
-    selectedBundle,
+    currentBundle,
     rawAuditEvents,
     filters,
     advancedFilters,
@@ -540,12 +554,13 @@ export default function ActivityPage() {
     if (!filters.tenantId) return ''
     const found = tenants.find((t) => t.id === filters.tenantId)
     return (
-      found?.name || selectedBundle?.tenant?.name || selectedBundle?.name || ''
+      found?.name || currentBundle?.tenant?.name || currentBundle?.name || ''
     )
-  }, [filters.tenantId, tenants, selectedBundle])
+  }, [filters.tenantId, tenants, currentBundle])
 
   // Handle Export CSV
   function handleExportCsv() {
+    if (!currentBundle || !activeRecordsAvailable) return
     setIsExporting(true)
     try {
       let ok = false
@@ -560,7 +575,7 @@ export default function ActivityPage() {
           title: 'CSV export downloaded.',
           description: `${
             tab === 'signins' ? signInRows.length : auditRows.length
-          } events exported to CSV file.`,
+          } matching loaded events exported to CSV file.`,
           category: 'success',
         })
       } else {
@@ -636,15 +651,8 @@ export default function ActivityPage() {
     ;(nextTab === 'signins' ? signInsTabRef : auditTabRef).current?.focus()
   }
 
-  // Retention describes HawkView's policy, not how much history was collected.
-  // Check the tenant before effects clear an old bundle during a selection change.
-  const reportedRetentionMonths =
-    bundleState === 'ready' &&
-    loadedBundleReloadKey === bundleReloadKey &&
-    filters.tenantId &&
-    selectedBundle?.tenant?.id === filters.tenantId
-      ? selectedBundle?.logRetention?.months
-      : null
+  // Retention describes policy, not how much history was collected.
+  const reportedRetentionMonths = currentBundle?.logRetention?.months
   const retentionLabel =
     typeof reportedRetentionMonths === 'number' &&
     Number.isSafeInteger(reportedRetentionMonths) &&
@@ -655,9 +663,9 @@ export default function ActivityPage() {
   const activeMatchingCount =
     tab === 'signins' ? signInRows.length : auditRows.length
   const signInCountLabel =
-    bundleState === 'ready' ? String(signInRows.length) : 'Not reported'
+    signInsAvailable ? String(signInRows.length) : 'Not reported'
   const auditCountLabel =
-    bundleState === 'ready' ? String(auditRows.length) : 'Not reported'
+    auditsAvailable ? String(auditRows.length) : 'Not reported'
 
   return (
     <div className="space-y-4">
@@ -699,6 +707,16 @@ export default function ActivityPage() {
           onExportCsv={handleExportCsv}
           isExporting={isExporting}
         />
+        {filters.tenantId && (
+          <LoadedRecordScope
+            tab={tab}
+            displayedRecordLimit={currentBundle?.logRetention?.displayedRecordLimit}
+            loadedCount={activeRecordsAvailable
+              ? (tab === 'signins' ? rawSignInEvents.length : rawAuditEvents.length)
+              : null}
+            matchingCount={activeRecordsAvailable ? activeMatchingCount : null}
+          />
+        )}
       </div>
 
       {/* Tabs */}
@@ -791,11 +809,11 @@ export default function ActivityPage() {
             and sign-in logs.
           </div>
         </div>
-      ) : bundleState === 'loading' ? (
+      ) : bundleState === 'loading' || bundleState === 'idle' ? (
         <div className="rounded-lg border bg-background">
           <LoadingState message="Loading reported activity evidence…" />
         </div>
-      ) : bundleState === 'error' ? (
+      ) : bundleState === 'error' || !currentBundle || !activeRecordsAvailable ? (
         <div className="rounded-lg border bg-background">
           <ErrorState
             message={`${tab === 'signins' ? 'Sign-in logs' : 'Audit logs'} could not be loaded for this tenant. Try again.`}
