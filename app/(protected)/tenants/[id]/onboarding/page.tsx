@@ -85,11 +85,17 @@ const reportFeedbackClasses: Record<ReportVerificationFeedback['tone'], string> 
 
 export default function TenantOnboardingPage() {
   const params = useParams<{ id: string }>()
-  const router = useRouter()
   const tenantId = String(params.id)
+  return <TenantOnboardingContent key={tenantId} tenantId={tenantId} />
+}
+
+function TenantOnboardingContent({ tenantId }: { tenantId: string }) {
+  const router = useRouter()
   const [state, setState] = useState<TenantOnboarding | null>(null)
   const [exchangeSetup, setExchangeSetup] = useState<ExchangeReadOnlySetup | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [callbackError, setCallbackError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState<BusyAction>(null)
   const [copied, setCopied] = useState(false)
@@ -98,7 +104,7 @@ export default function TenantOnboardingPage() {
 
   const loadState = useCallback(async () => {
     const generation = ++loadGeneration.current
-    setError(null)
+    setLoadError(null)
     try {
       const raw = await apiClient.get<unknown>(
         `/api/tenants/${encodeURIComponent(tenantId)}/onboarding`,
@@ -118,7 +124,7 @@ export default function TenantOnboardingPage() {
       }
     } catch {
       if (generation !== loadGeneration.current) return
-      setError('Tenant setup could not be loaded. Please retry.')
+      setLoadError('Tenant setup could not be loaded. Please retry.')
     }
   }, [tenantId])
 
@@ -157,7 +163,8 @@ export default function TenantOnboardingPage() {
         return
       }
     } else if (consentResult) {
-      setError(microsoftConsentErrorMessage(consentError))
+      // Keep the captured outcome when Strict Mode replays after URL cleanup.
+      setCallbackError(microsoftConsentErrorMessage(consentError))
     }
     if (consentResult) {
       currentUrl.searchParams.delete('microsoftConsent')
@@ -171,6 +178,7 @@ export default function TenantOnboardingPage() {
 
   const run = async (action: BusyAction, operation: () => Promise<void>) => {
     setBusy(action)
+    if (action === 'core-consent' || action === 'exchange-consent') setCallbackError(null)
     setError(null)
     setNotice(null)
     try {
@@ -266,7 +274,7 @@ export default function TenantOnboardingPage() {
 
   const next = useMemo(() => state ? onboardingNextStep(state) : null, [state])
 
-  if (!state && !error) {
+  if (!state && !error && !loadError && !callbackError) {
     return <div className="flex min-h-[60vh] items-center justify-center gap-3 text-slate-600"><Loader2 className="h-5 w-5 animate-spin" /> Loading tenant setup…</div>
   }
 
@@ -283,12 +291,19 @@ export default function TenantOnboardingPage() {
         {state && <Link href="/tenants" className="text-sm font-semibold text-blue-600 hover:underline">Back to tenants</Link>}
       </div>
 
-      {error && (
+      {callbackError && (
         <div role="alert" className="flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
-          <div className="flex gap-2"><TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{error}</span></div>
+          <div className="flex gap-2"><TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{callbackError}</span></div>
+          <button type="button" onClick={() => setCallbackError(null)} className="font-semibold underline">Dismiss consent message</button>
+        </div>
+      )}
+      {loadError && (
+        <div role="alert" className="flex items-start justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+          <div className="flex gap-2"><TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" /><span>{loadError}</span></div>
           <button type="button" onClick={() => void loadState()} className="font-semibold underline">Reload</button>
         </div>
       )}
+      {error && <div role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-800">{error}</div>}
       {notice && <div role="status" className="flex items-start gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-800"><CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />{notice}</div>}
 
       {state && (
