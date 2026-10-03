@@ -72,37 +72,52 @@ export function MfaEnrollment({
     if (!supabase || busy) return
     setBusy(true)
     setError('')
-    const outcome = await startTotpEnrollment(enrollmentClient(supabase), {
-      uniqueToken: enrollmentToken(),
-    })
-    if (outcome.ok) {
-      setEnrollment({
-        factorId: outcome.factorId,
-        qrCode: outcome.qrCode,
-        secret: outcome.secret,
+    try {
+      const outcome = await startTotpEnrollment(enrollmentClient(supabase), {
+        uniqueToken: enrollmentToken(),
       })
-    } else {
-      setError(mfaEnrollmentFailureMessage(outcome.reason))
+      if (outcome.ok) {
+        setEnrollment({
+          factorId: outcome.factorId,
+          qrCode: outcome.qrCode,
+          secret: outcome.secret,
+        })
+      } else {
+        setError(mfaEnrollmentFailureMessage(outcome.reason))
+      }
+    } catch {
+      setError(mfaEnrollmentFailureMessage('failed'))
+    } finally {
+      // Always clear busy. Leaving it set disables the only button on this
+      // screen, which is the lockout this component exists to remove.
+      setBusy(false)
     }
-    setBusy(false)
   }
 
   const cancel = async () => {
     if (busy) return
     setBusy(true)
     setError('')
-    // The sweep runs even with no factor id, which is the state left behind
-    // when enroll() itself failed — previously nothing could clear it.
-    if (supabase) {
-      await cancelTotpEnrollment(
-        enrollmentClient(supabase),
-        enrollment?.factorId ?? null
-      )
+    try {
+      // The sweep runs even with no factor id, which is the state left behind
+      // when enroll() itself failed — previously nothing could clear it.
+      if (supabase) {
+        await cancelTotpEnrollment(
+          enrollmentClient(supabase),
+          enrollment?.factorId ?? null
+        )
+      }
+      setEnrollment(null)
+      setCode('')
+      await onCancel?.()
+    } catch {
+      setError(mfaEnrollmentFailureMessage('failed'))
+    } finally {
+      // onCancel is declared async and callers await provider work in it, so it
+      // can reject. Without this the screen kept busy set and disabled its only
+      // button for good — a second lockout introduced while removing the first.
+      setBusy(false)
     }
-    setEnrollment(null)
-    setCode('')
-    await onCancel?.()
-    setBusy(false)
   }
 
   const verify = async () => {
