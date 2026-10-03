@@ -232,6 +232,10 @@ function formatActionLabel(action: string): string {
     MEMBER_RESTORED: 'Member restored',
     MEMBER_REACTIVATED: 'Member restored',
     REACTIVATE_MEMBER: 'Member restored',
+    MEMBER_ACCOUNT_RECOVERY_REQUESTED: 'Account recovery requested',
+    MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED:
+      'Account recovery accepted by email provider',
+    MEMBER_ACCOUNT_RECOVERY_FAILED: 'Account recovery failed',
     PASSWORD_RESET_SENT: 'Password reset sent',
     PASSWORD_RESET_REQUESTED: 'Password reset requested',
     PASSWORD_RESET_FAILED: 'Password reset failed',
@@ -1490,7 +1494,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
             `/api/workspace/members/${encodeURIComponent(member.membershipId)}/password-reset`,
             { organizationId: selectedOrganizationId }
           ),
-        `A HawkView account password-reset email was sent to ${member.email}.`
+        `A HawkView password reset was requested for ${member.email}. HawkView cannot confirm delivery — ask them to check their inbox, including spam.`
       )
     } else if (type === 'MFA_RESET') {
       await runAction(

@@ -40,6 +40,10 @@ const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
 const INVITATION_NOT_PENDING_CODE = 'INVITATION_NOT_PENDING'
 const PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE =
   'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+const ACCOUNT_RECOVERY_NOT_PENDING_CODE = 'ACCOUNT_RECOVERY_NOT_PENDING'
+const ACCOUNT_RECOVERY_ACCOUNT_DISABLED_CODE = 'ACCOUNT_RECOVERY_ACCOUNT_DISABLED'
+const ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE_CODE =
+  'ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE'
 const EXISTING_AUTH_ACCOUNT = Symbol('existing-auth-account')
 
 type OwnerContext = {
@@ -1022,6 +1026,128 @@ export class WorkspaceService {
         outcome: 'FAILED',
         stage,
         errorCode: workspaceAuditErrorCode(error),
+      })
+      throw error
+    }
+  }
+
+  /**
+   * Explicit administrator recovery for a member who never completed HawkView
+   * account setup but already has a sign-in account at the authentication provider.
+   *
+   * This is the deliberate complement of `sendPasswordReset`, which refuses a
+   * member who has not accepted. Without this action such a member has no
+   * supported route at all: the invite boundary reports acceptance without
+   * advancing anything, and resend refuses because the provider reports the
+   * address is already registered.
+   *
+   * Deliberately does NOT require `authProviderUserId`. A member whose original
+   * invite collided with an existing provider account never had one captured,
+   * and those are precisely the members this exists for. A stored id would not
+   * establish eligibility anyway: it proves a local reference, not a live
+   * provider account.
+   *
+   * Performs NO local mutation by design. `inviteAcceptedAt` advances only
+   * through a successful authenticated bootstrap, never here, so nothing about
+   * this request can be read as the member having accepted the invitation.
+   */
+  async sendAccountRecovery(
+    identity: AuthenticatedIdentity,
+    membershipId: string,
+    body: unknown,
+    requestId?: string
+  ) {
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
+    const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    const delivery = 'ACCOUNT_RECOVERY' as const
+    let stage = 'REQUEST_VALIDATION'
+
+    // Intent is durable before the provider side effect, as on the invite and
+    // resend paths. If evidence storage is unavailable, no recovery is requested.
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+      metadata: { delivery },
+    })
+
+    try {
+      if (member.user.inviteAcceptedAt) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_NOT_PENDING_CODE,
+            message:
+              'This member has already completed HawkView account setup. Use password reset instead.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+      if (member.user.disabledAt) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_ACCOUNT_DISABLED_CODE,
+            message:
+              'This HawkView account is disabled. Re-enable it before sending account recovery.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+      if (member.status !== MembershipStatus.ACTIVE) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE_CODE,
+            message:
+              'This membership is not active. Reactivate it before sending account recovery.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+
+      stage = 'AUTH_PROVIDER'
+      await this.supabaseAdminRequest('/auth/v1/recover', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: member.user.email,
+          redirect_to: this.authEmailRedirectUrl(),
+        }),
+      })
+
+      // PROVIDER_ACCEPTED, never "SENT". The provider answers 200 with an empty
+      // body for an address it cannot find, so a 2xx establishes that the request
+      // was accepted and establishes nothing about delivery. Recording a send
+      // here would place a false SUCCEEDED in the one record an administrator
+      // consults to find out what actually happened.
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED',
+        outcome: 'SUCCEEDED',
+        stage: 'AUTH_PROVIDER',
+        metadata: { delivery },
+      })
+
+      return {
+        requested: true,
+        delivery,
+        operationId: operation.operationId,
+        requestId: operation.requestId,
+      }
+    } catch (error) {
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED',
+        outcome: 'FAILED',
+        stage,
+        errorCode: workspaceAuditErrorCode(error),
+        metadata: { delivery },
       })
       throw error
     }

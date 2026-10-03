@@ -44,7 +44,9 @@ test('every backend invitation and recovery request uses the fail-closed redirec
     new URL('./workspace.service.ts', import.meta.url),
     'utf8',
   )
-  assert.equal(workspaceService.match(/redirect_to: this\.authEmailRedirectUrl\(\)/g)?.length, 3)
+  // invite, invite resend, password reset, and explicit account recovery.
+  // Pinned so a new authentication email cannot be added without the resolver.
+  assert.equal(workspaceService.match(/redirect_to: this\.authEmailRedirectUrl\(\)/g)?.length, 4)
   assert.doesNotMatch(
     workspaceService,
     /redirect_to: process\.env\.HAWKVIEW_AUTH_REDIRECT_URL/,

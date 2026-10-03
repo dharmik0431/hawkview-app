@@ -112,6 +112,20 @@ export class WorkspaceController {
     )
   }
 
+  @Post('members/:membershipId/account-recovery')
+  sendAccountRecovery(
+    @Req() request: AuthenticatedRequest,
+    @Param('membershipId') membershipId: string,
+    @Body() body: unknown
+  ) {
+    return this.workspaceService.sendAccountRecovery(
+      request.auth,
+      membershipId,
+      body,
+      request.requestId
+    )
+  }
+
   @Post('members/:membershipId/mfa-reset')
   resetMfa(
     @Req() request: AuthenticatedRequest,
