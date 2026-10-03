@@ -21,7 +21,7 @@ test('consent core composes actual Prisma transactions', {skip,timeout:90000},as
   const schema='consent_core_'+randomUUID().replaceAll('-','')
   const prisma=new PrismaClient({adapter:new PrismaPg({connectionString:url.toString(),max:8,options:'-c timezone=America/New_York'},{schema})})
   await observer.query(`CREATE SCHEMA ${schema}`);await observer.query(`SET search_path TO ${schema},public`)
-  for(const name of ['customer_tenants','tenant_connections','sync_states','microsoft_consent_attempts',
+  for(const name of ['customer_tenants','tenant_connections','sync_states','microsoft_consent_attempts','notifications',
     'platform_microsoft_connectors','encrypted_secrets','managed_connector_authority_revisions'])
     await observer.query(`CREATE TABLE ${schema}.${name} (LIKE public.${name} INCLUDING ALL)`)
   const host=(hook?:(sql:string,pid:number)=>Promise<void>,beforeCommit?:()=>Promise<void>,entered?:(pid:number)=>void):AuthorityDatabase=>({
@@ -262,6 +262,10 @@ test('additive migration preserves legacy rows, unique nonce and rolls back atom
     await client.query(migration.replace('COMMIT;','ROLLBACK;'))
     assert.equal((await client.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema=$1 AND column_name='operation_version'",[schema])).rows[0].n,0)
     await client.query(migration)
+    const effectsMigration=await readFile(new URL('../../prisma/migrations/20261003070000_consent_effect_occurrences/migration.sql',import.meta.url),'utf8')
+    await client.query(effectsMigration.replace('COMMIT;','ROLLBACK;'))
+    assert.equal((await client.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema=$1 AND column_name='operation_effects_snapshot'",[schema])).rows[0].n,0)
+    await client.query(effectsMigration)
     const after=(await client.query('SELECT * FROM microsoft_consent_attempts ORDER BY id')).rows
     assert.deepEqual(after.map(row=>Object.fromEntries(Object.entries(row).filter(([key])=>!added.some(c=>c.column_name===key)))),before)
     for(const row of after)for(const c of added)assert.equal(row[c.column_name],null)

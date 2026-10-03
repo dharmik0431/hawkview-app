@@ -15,6 +15,8 @@ import {
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import { issueConsentOperation, claimConsentOperation, finishConsentOperation, type ConsentOperationKey, type ConsentTerminal, type PreparedConsentResult } from '../microsoft/consent-operation-store.js'
+import { applyManagedConsentEffects } from '../microsoft/managed-consent-effects.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
@@ -988,7 +990,7 @@ export class TenantsService {
         id: true,
         organizationId: true,
         microsoftTenantId: true,
-        connection: { select: { connectionMode: true } },
+        connection: { select: { connectionMode: true, collectionIncarnation: true } },
       },
     })
 
@@ -1001,39 +1003,16 @@ export class TenantsService {
       )
     }
 
-    const consent = await this.microsoftConsent.createAdminConsentUrl(
-      tenant.microsoftTenantId,
-      {
-        customerTenantId: tenant.id,
-        organizationId: tenant.organizationId,
-      }
-    )
-    await this.prisma.tenantConnection.update({
-      where: {
-        customerTenantId_organizationId: {
-          customerTenantId: tenant.id,
-          organizationId: tenant.organizationId,
-        },
-      },
-      data: {
-        status: 'PENDING_CONSENT',
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      },
+    const prepared = await this.microsoftConsent.prepareExistingConsent()
+    const initiatedByUserId = await this.getTenantOnboardingActor(identity)
+    const issued = await issueConsentOperation(this.prisma, {
+      organizationId: tenant.organizationId, customerTenantId: tenant.id, flow: 'EXISTING_TENANT',
+      microsoftTenantId: tenant.microsoftTenantId, configurationRevision: prepared.authority.configurationRevision,
+      expectedConnectionIncarnation: tenant.connection.collectionIncarnation, stateHash: prepared.stateHash, initiatedByUserId,
     })
-    await this.recordConsentAttempt({
-      identity,
-      organizationId: tenant.organizationId,
-      customerTenantId: tenant.id,
-      flow: 'EXISTING_TENANT',
-      stateHash: consent.stateHash,
-      expiresAt: consent.expiresAt,
-    })
-
-    return {
-      consentUrl: consent.consentUrl,
-      requiredPermissions: this.microsoftConsent.getRequiredPermissions(),
-    }
+    if (issued.status !== 'issued') throw new ConflictException('The connection changed or consent is unavailable. Please try again.')
+    const consentUrl = await this.microsoftConsent.createIssuedConsentUrl(prepared, issued, tenant.microsoftTenantId)
+    return { consentUrl, requiredPermissions: this.microsoftConsent.getRequiredPermissions() }
   }
 
   async createExchangeReadOnlyConsentUrlForIdentity(
@@ -1488,6 +1467,8 @@ export class TenantsService {
       organizationId: string
       nonce: string
       flow: 'existing-tenant' | 'discover-tenant' | 'exchange-readonly'
+      operationId?: string
+      operationVersion?: 1
     }
     try {
       state = await this.microsoftConsent.verifyConsentState(stateToken)
@@ -1495,6 +1476,16 @@ export class TenantsService {
       return this.buildFrontendConsentRedirect('error', 'invalid-state')
     }
 
+
+    if (state.flow === 'existing-tenant') {
+      if (state.operationVersion !== 1 || !state.operationId || !state.customerTenantId) {
+        return this.buildFrontendConsentRedirect('error', 'expired-or-used-state', state.customerTenantId, Boolean(state.customerTenantId))
+      }
+      return this.completeIssuedManagedConsent(query, {
+        operationId: state.operationId, organizationId: state.organizationId, customerTenantId: state.customerTenantId,
+        flow: 'EXISTING_TENANT', stateHash: this.microsoftConsent.hashConsentNonce(state.nonce),
+      })
+    }
 
     const consentAttemptId = await this.consumeConsentAttempt(state)
     if (!consentAttemptId) {
@@ -1540,103 +1531,48 @@ export class TenantsService {
       return this.completeExchangeReadOnlyConsent(query, tenant)
     }
 
-    const returnedTenantId =
-      typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
-    const granted =
-      query.admin_consent === 'True' || query.admin_consent === 'true'
-    const microsoftError = typeof query.error === 'string' ? query.error : null
+    return this.buildFrontendConsentRedirect('error', 'invalid-state')
+  }
 
-    if (
-      microsoftError ||
-      !granted ||
-      returnedTenantId !== tenant.microsoftTenantId.toLowerCase()
-    ) {
-      const errorCode =
-        microsoftError ??
-        (returnedTenantId !== tenant.microsoftTenantId.toLowerCase()
-          ? 'tenant-mismatch'
-          : 'consent-denied')
-      await this.recordConnectionError(
-        tenant,
-        errorCode,
-        typeof query.error_description === 'string'
-          ? query.error_description
-          : 'Microsoft administrator consent was not completed.'
-      )
-      return this.buildFrontendConsentRedirect('error', errorCode, tenant.id, true)
+  private consentTerminalRedirect(key: ConsentOperationKey, terminal: ConsentTerminal) {
+    const code = terminal.resultCode.toLowerCase().replaceAll('_', '-')
+    const success = terminal.state === 'SUCCEEDED'
+    return this.buildFrontendConsentRedirect(success ? 'success' : terminal.resultCode === 'MISSING_PERMISSIONS' ? 'missing-permissions' : 'error',
+      success ? null : code, key.customerTenantId, true)
+  }
+
+  private async completeIssuedManagedConsent(query: Record<string, unknown>, key: ConsentOperationKey) {
+    const claim = await claimConsentOperation(this.prisma, key)
+    if (claim.status === 'rejected') return this.buildFrontendConsentRedirect('error',
+      claim.reason === 'BUSY' ? 'consent-in-progress' : 'expired-or-used-state', key.customerTenantId, true)
+    if (claim.status === 'terminal') {
+      await applyManagedConsentEffects(this.prisma, key)
+      return this.consentTerminalRedirect(key, claim.result)
     }
-
-    try {
-      const verification = await this.microsoftConsent.verifyTenantAfterConsent(
-        tenant.microsoftTenantId
-      )
-      const connected = verification.missingRequiredPermissions.length === 0
-      const now = new Date()
-
-      await this.prisma.$transaction([
-        this.prisma.customerTenant.update({
-          where: { id: tenant.id },
-          data: {
-            displayName: verification.displayName,
-            primaryDomain: verification.primaryDomain,
-            status: connected ? 'ACTIVE' : 'PENDING',
-          },
-        }),
-        this.prisma.tenantConnection.update({
-          where: {
-            customerTenantId_organizationId: {
-              customerTenantId: tenant.id,
-              organizationId: tenant.organizationId,
-            },
-          },
-          data: {
-            status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: preserveOptionalExchangeConsent(
-              verification.grantedPermissions,
-              tenant.connection.consentedPermissions
-            ),
-            consentedAt: now,
-            lastVerifiedAt: now,
-            lastErrorCode: connected ? null : 'missing-permissions',
-            lastErrorMessage: connected
-              ? null
-              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
-          },
-        }),
-      ])
-
-      if (connected) {
-        await this.markInitialSyncDue(tenant.id, tenant.organizationId)
-        await this.notifyConnectionAuthorized(tenant.id, tenant.organizationId)
-      } else {
-        await this.notifyMissingPermissions(
-          tenant.id,
-          tenant.organizationId,
-          verification.missingRequiredPermissions
-        )
+    const context = claim.context
+    let result: PreparedConsentResult
+    const returnedTenant = typeof query.tenant === 'string' ? query.tenant.toLowerCase() : ''
+    if (query.error || !['True','true'].includes(String(query.admin_consent))) {
+      result = { outcome: 'FAILED', code: 'CONSENT_DENIED' }
+    } else if (returnedTenant !== context.microsoftTenantId.toLowerCase()) {
+      result = { outcome: 'FAILED', code: 'TENANT_MISMATCH' }
+    } else {
+      try {
+        const verification = await this.microsoftConsent.verifyClaimedTenantAfterConsent(context)
+        result = verification.missingRequiredPermissions.length > 0
+          ? { outcome: 'FAILED', code: 'MISSING_PERMISSIONS' }
+          : { outcome: 'SUCCEEDED', displayName: verification.displayName, primaryDomain: verification.primaryDomain,
+            grantedPermissions: verification.grantedPermissions }
+      } catch {
+        result = { outcome: 'FAILED', code: 'VERIFICATION_FAILED' }
       }
-
-      return this.buildFrontendConsentRedirect(
-        connected ? 'success' : 'missing-permissions',
-        connected ? null : 'missing-permissions',
-        tenant.id,
-        true,
-      )
-    } catch (error) {
-      await this.recordConnectionError(
-        tenant,
-        'verification-failed',
-        error instanceof Error
-          ? error.message
-          : 'Microsoft tenant verification failed.'
-      )
-      return this.buildFrontendConsentRedirect(
-        'error',
-        'verification-failed',
-        tenant.id,
-        true,
-      )
     }
+    // Provider errors end above. Neither terminal commit nor post-commit effects
+    // enter an unconditional connection-error catch.
+    const finished = await finishConsentOperation(this.prisma, context, result)
+    if (finished.status === 'rejected') return this.buildFrontendConsentRedirect('error', 'consent-unavailable', key.customerTenantId, true)
+    await applyManagedConsentEffects(this.prisma, key)
+    return this.consentTerminalRedirect(key, finished.result)
   }
 
   private async completeExchangeReadOnlyConsent(

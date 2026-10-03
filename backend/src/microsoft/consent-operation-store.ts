@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { withManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from './managed-connector-authority.js'
 
-/** Unwired existing-tenant managed consent prerequisite. No provider, URL, token,
+/** Existing-tenant managed consent transaction boundary. No provider, URL, token,
  * incident or scheduler calls. All authority writers must upgrade/drain before
  * trust activation. Legacy operations (version NULL) cannot become trusted. */
 export const CONSENT_ENTRY_MS = 15 * 60 * 1000
@@ -119,10 +119,12 @@ async function endWithoutAuthority(tx: AuthorityTransaction, row: Operation, sta
 
 export async function issueConsentOperation(db: AuthorityDatabase, input: ConsentScope & {
   microsoftTenantId: string; configurationRevision: string; expectedConnectionIncarnation: string | null; stateHash: string
+  initiatedByUserId?: string | null
 }): Promise<Rejected | { status: 'issued'; operation: ConsentOperationKey; connectionIncarnation: string; expiresAt: Date }> {
   const who = scope(input), microsoftTenantId = id(input.microsoftTenantId), configurationRevision = id(input.configurationRevision)
   const expectedConnection = input.expectedConnectionIncarnation === null ? null : id(input.expectedConnectionIncarnation)
   const stateHash = input.stateHash
+  const actor = input.initiatedByUserId == null ? null : id(input.initiatedByUserId)
   if (typeof stateHash !== 'string' || !HASH.test(stateHash)) throw new Error('INVALID_CONSENT_STATE_HASH')
   const result = await withManagedAuthority(db, configurationRevision, async (tx, current) => {
     await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'UTC'")
@@ -138,11 +140,11 @@ export async function issueConsentOperation(db: AuthorityDatabase, input: Consen
     // Insert first so a nonce collision cannot leave authority changes behind.
     const inserted = await tx.$executeRawUnsafe(`INSERT INTO microsoft_consent_attempts
       (id,organization_id,customer_tenant_id,flow,state_hash,expires_at,created_at,operation_version,operation_state,
-       expected_configuration,expected_connection,expected_microsoft_tenant,expected_client_id,expected_home_tenant_id,expected_credential_reference)
+       expected_configuration,expected_connection,expected_microsoft_tenant,expected_client_id,expected_home_tenant_id,expected_credential_reference,initiated_by_user_id)
       VALUES($1::uuid,$2::uuid,$3::uuid,'EXISTING_TENANT',$4,$5::timestamptz,$6::timestamptz,1,'ISSUED',
-        $7::uuid,$8::uuid,$9::uuid,$10::uuid,$11::uuid,$12) ON CONFLICT (state_hash) DO NOTHING`,
+        $7::uuid,$8::uuid,$9::uuid,$10::uuid,$11::uuid,$12,$13::uuid) ON CONFLICT (state_hash) DO NOTHING`,
       operationId,who.organizationId,who.customerTenantId,stateHash,expiresAt,time.stamp,configurationRevision,incarnation,
-      microsoftTenantId,current.clientId,current.homeTenantId,current.credentialReference)
+      microsoftTenantId,current.clientId,current.homeTenantId,current.credentialReference,actor)
     if (inserted !== 1) return reject('CONFLICT')
     await tx.$executeRawUnsafe(`UPDATE tenant_connections SET collection_incarnation=$2::uuid,status='PENDING_CONSENT',
       last_error_code=NULL,last_error_message=NULL,updated_at=$3::timestamptz WHERE id=$1::uuid`,connection.id,incarnation,time.stamp)
@@ -212,15 +214,26 @@ export async function finishConsentOperation(db: AuthorityDatabase, input: Conse
     if (succeeded) await tx.$executeRawUnsafe(`UPDATE customer_tenants SET display_name=$2,primary_domain=$3,status='ACTIVE',updated_at=$4::timestamptz WHERE id=$1::uuid`,
       k.customerTenantId,result.displayName,result.primaryDomain,time.stamp)
     await tx.$executeRawUnsafe(`UPDATE tenant_connections SET collection_incarnation=$2::uuid,status=$3::"TenantConnectionStatus",
-      consented_permissions=CASE WHEN $4::boolean THEN $5::text[] ELSE consented_permissions END,
+      consented_permissions=CASE WHEN $4::boolean THEN ARRAY(SELECT DISTINCT permission FROM unnest(
+        $5::text[] || CASE WHEN 'Exchange.ManageAsAppV2'=ANY(consented_permissions)
+          THEN ARRAY['Exchange.ManageAsAppV2']::text[] ELSE ARRAY[]::text[] END) permission ORDER BY permission)
+        ELSE consented_permissions END,
       consented_at=CASE WHEN $4::boolean THEN $6::timestamptz ELSE consented_at END,last_verified_at=$6::timestamptz,
       last_error_code=$7,last_error_message=NULL,updated_at=$6::timestamptz WHERE id=$1::uuid`,
       connection.id,incarnation,succeeded?'CONNECTED':'ERROR',succeeded,succeeded?result.grantedPermissions:[],time.stamp,succeeded?null:result.code)
     await invalidateRoles(tx,k)
     const code = succeeded ? 'CONNECTED' : result.code
+    // Capture notification occurrence identities in the terminal write's snapshot,
+    // without notification locks or writes. Effects may fail/retry independently,
+    // but can never adopt an occurrence first seen after terminalization.
     await tx.$executeRawUnsafe(`UPDATE microsoft_consent_attempts SET operation_state=$2,operation_terminal_at=$3::timestamptz,
-      operation_result_connection=$4::uuid,operation_result_digest=$5,result_code=$6 WHERE id=$1::uuid`,
-      row.id,result.outcome,time.stamp,incarnation,digest,code)
+      operation_result_connection=$4::uuid,operation_result_digest=$5,result_code=$6,
+      operation_effects_snapshot=(SELECT jsonb_build_object('version',1,'rows',COALESCE(jsonb_agg(jsonb_build_object(
+        'id',n.id,'key',n.dedupe_key,'tenant',n.customer_tenant_id,'count',n.occurrence_count,'at',n.last_occurred_at::text)
+        ORDER BY n.dedupe_key),'[]'::jsonb)) FROM notifications n
+        WHERE n.organization_id=$7::uuid AND n.dedupe_key IN ($8,$9)) WHERE id=$1::uuid`,
+      row.id,result.outcome,time.stamp,incarnation,digest,code,k.organizationId,
+      `tenant:${k.customerTenantId}:connection`,`tenant:${k.customerTenantId}:onboarding-authorized`)
     return { status: 'applied' as const, result: { state: result.outcome, resultCode: code, resultingConnectionIncarnation: incarnation } }
   })
   if (finished.status === 'current') return finished.value
