@@ -66,6 +66,13 @@ function database() {
         rows.set(row.id, row)
         return row
       },
+      createMany: async ({ data }: { data: Omit<Row, 'id'> }) => {
+        if (updateFails) throw new Error('write unavailable')
+        if ([...rows.values()].some((row) => row.name === data.name)) return { count: 0 }
+        const row = { id: randomUUID(), ...data }
+        rows.set(row.id, row)
+        return { count: 1 }
+      },
       updateMany: async ({ where, data }: {
         where: { id: string; keyVersion: number }
         data: Record<string, unknown>
@@ -407,5 +414,41 @@ test('managed preparation rejects bad identity, empty content and UTF8 overflow 
     }
     assert.equal(service.prepareManagedRevision(randomUUID(), 'é'.repeat(32768)).ciphertext.length, 65536)
     assert.equal(db.rows.size, 0)
+  })
+})
+
+
+test('concurrent first use returns one persisted winner to every caller', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const world = database()
+    const values = await Promise.all(Array.from({ length: 8 }, (_, index) =>
+      world.service().accessOrCreate('first-use', () => `synthetic-${index}`)))
+    assert.equal(new Set(values).size, 1)
+    assert.equal(world.rows.size, 1)
+    const row = [...world.rows.values()][0]
+    assert.equal(await world.service().access(`encrypted-secret:${row.id}`), values[0])
+    assert.equal(await world.service().accessOrCreate('first-use', () => {
+      assert.fail('existing value must not invoke the factory')
+    }), values[0])
+    assert.equal(await world.service().accessOrCreate('other-name', () => 'independent'), 'independent')
+  })
+})
+
+test('first-use storage failure never returns an unpersisted value', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const world = database()
+    world.breakWrites()
+    await assert.rejects(world.service().accessOrCreate('first-use', () => 'synthetic'), /write unavailable/)
+    assert.equal(world.rows.size, 0)
+  })
+})
+
+test('first-use missing winner fails closed instead of returning a generated value', async () => {
+  await withKeys({ current: KEY_ONE }, async () => {
+    const world = database()
+    world.prisma.encryptedSecret.createMany = async () => ({ count: 0 })
+    await assert.rejects(world.service().accessOrCreate('first-use', () => 'synthetic'),
+      /stored.*unavailable/i)
+    assert.equal(world.rows.size, 0)
   })
 })

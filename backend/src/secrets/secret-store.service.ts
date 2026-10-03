@@ -273,9 +273,30 @@ export class SecretStoreService {
     // Stated rather than assumed, so that a future tenant-scoped caller has to
     // change this line and meet the refusal.
     assertStorable(PLATFORM_OWNED)
+    if (secretId.startsWith(IMMUTABLE_MANAGED_SECRET_PREFIX)) {
+      throw new ServiceUnavailableException('MANAGED_CREDENTIAL_REQUIRES_IMMUTABLE_PUBLICATION')
+    }
     const value = createValue()
-    await this.persist(secretId, value)
-    return value
+    const keys = this.keys
+    // PostgreSQL INSERT ... ON CONFLICT DO NOTHING elects one winner across
+    // processes. Unlike persist(), first use must never overwrite that winner.
+    await this.prisma.encryptedSecret.createMany({
+      data: {
+        name: secretId,
+        ...this.encrypt(secretId, value, keys.current),
+        keyVersion: keys.currentVersion,
+      },
+      skipDuplicates: true,
+    })
+    // Read after the insert has completed: a competing uncommitted insert may
+    // have won. Always return its persisted value, never our losing proposal.
+    const winner = await this.prisma.encryptedSecret.findUnique({
+      where: { name: secretId },
+    })
+    if (!winner) {
+      throw new ServiceUnavailableException('The stored secret is unavailable.')
+    }
+    return this.openAndReseal(winner)
   }
 
   /** Whether a rotation is safe to finish, measured by attempting every secret.
