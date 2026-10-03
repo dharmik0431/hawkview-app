@@ -126,6 +126,22 @@ async function registerEmptyEpoch(f: Fixture): Promise<Date> {
   return effectiveCutoff(f)
 }
 
+// Regular claims sample PostgreSQL time, not claim(now). Wait only for the
+// fixture's shared evidence/job instant, never retry a claim or change its cutoff.
+async function assertFixtureTimeReached(f: Fixture, at: Date) {
+  const deadline = performance.now() + 1_000
+  let clockMs = Number.NEGATIVE_INFINITY
+  do {
+    const rows = await f.prisma.$queryRawUnsafe<{ clock_ms: string }[]>(
+      `SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint::text AS clock_ms`)
+    assert.equal(rows.length, 1)
+    clockMs = Number(rows[0]!.clock_ms)
+    assert.ok(Number.isFinite(clockMs), 'fixture database clock unavailable')
+    if (clockMs >= at.getTime()) return
+  } while (performance.now() < deadline)
+  assert.fail(`fixture instant ${at.toISOString()} not reached by database clock ${clockMs} within 1 second`)
+}
+
 async function seedIncident(f: Fixture, options: { at?: Date; ordinal?: string } = {}) {
   const at = options.at ?? new Date()
   const subject = `subject:${randomUUID()}`
@@ -470,10 +486,12 @@ test('rolling six-message and twelve-reservation limits count controlled and unk
         await insertControlledEnvelope(f, { createdAt: new Date(now.getTime() - 10_000 - index) })
       }
       await seedIncident(f, { at: now, ordinal: 'sixth' })
+      await assertFixtureTimeReached(f, now)
       const sixth = await claimOpen(f)
       await sixth.release.settle(sixth.claim,
         { kind: 'PERMANENT', code: 'PROVIDER_REQUEST_REJECTED' }, Date.now())
       await seedIncident(f, { at: new Date(now.getTime() + 1), ordinal: 'seventh' })
+      await assertFixtureTimeReached(f, new Date(now.getTime() + 1))
       const limited = store(f.prisma)
       assert.equal(await limited.claim(f.config, Date.now()), null)
       assert.equal(limited.regularStatus, 'REGULAR_RATE_LIMITED')
@@ -489,10 +507,12 @@ test('rolling six-message and twelve-reservation limits count controlled and unk
           })
         }
         await seedIncident(attemptsFixture, { at: clock, ordinal: 'twelfth attempt' })
+        await assertFixtureTimeReached(attemptsFixture, clock)
         const twelfth = await claimOpen(attemptsFixture)
         await twelfth.release.settle(twelfth.claim,
           { kind: 'RETRYABLE', code: 'PROVIDER_BUSY', retryAfterMs: 1 }, Date.now())
         await seedIncident(attemptsFixture, { at: new Date(clock.getTime() + 1), ordinal: 'thirteenth attempt' })
+        await assertFixtureTimeReached(attemptsFixture, new Date(clock.getTime() + 1))
         const next = store(attemptsFixture.prisma)
         const nextClaim = await next.claim(attemptsFixture.config, Date.now())
         assert.ok(nextClaim)
