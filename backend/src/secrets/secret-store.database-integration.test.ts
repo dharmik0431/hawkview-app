@@ -3,6 +3,7 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
+import { SignJWT, jwtVerify } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from './secret-store.service.js'
 import {
@@ -167,5 +168,84 @@ test('the database refuses a secret whose key version is not stated',
     } finally {
       await client.query('DELETE FROM encrypted_secrets WHERE name = $1', [name])
       await client.end()
+    }
+  })
+
+
+test('concurrent first-use instances share the persisted signing key and validate each other tokens',
+  { skip, timeout: 30_000 }, async () => {
+    disposable()
+    const clients = [new PrismaService(), new PrismaService()]
+    const name = `test-${randomUUID()}-first-use`
+    const variables = [CURRENT_KEY_VARIABLE, KEY_VERSION_VARIABLE, PREVIOUS_KEY_VARIABLE]
+    const before = variables.map((key) => process.env[key])
+    let release!: () => void
+    const bothMissing = new Promise<void>((resolve) => { release = resolve })
+    let misses = 0
+    try {
+      useKeys({ current: KEY_ONE })
+      await Promise.all(clients.map((client) => client.$connect()))
+      const services = clients.map((client) => {
+        const findUnique = client.encryptedSecret.findUnique.bind(client.encryptedSecret)
+        let firstRead = true
+        // Only coordinate the initial reads; all persistence and winner reads
+        // run through independent real Prisma clients and PostgreSQL connections.
+        const encryptedSecret = new Proxy(client.encryptedSecret, {
+          get(target, property) {
+            if (property === 'findUnique') return async (args: Parameters<typeof findUnique>[0]) => {
+              const row = await findUnique(args)
+              if (firstRead) {
+                firstRead = false
+                assert.equal(row, null, 'both initial reads must observe absence')
+                misses += 1
+                if (misses === clients.length) release()
+                await bothMissing
+              }
+              return row
+            }
+            const value = Reflect.get(target, property)
+            return typeof value === 'function' ? value.bind(target) : value
+          },
+        })
+        return new SecretStoreService({ encryptedSecret } as PrismaService)
+      })
+      let factories = 0
+      const values = await Promise.all(services.map((service, index) =>
+        service.accessOrCreate(name, () => {
+          factories += 1
+          return `synthetic-first-use-signing-key-${index}`
+        })))
+      assert.equal(misses, 2)
+      assert.equal(factories, 2, 'distinct contenders must both reach creation')
+      assert.equal(new Set(values).size, 1, 'both callers must return the stored winner')
+      const rows = await clients[0].encryptedSecret.findMany({ where: { name } })
+      assert.equal(rows.length, 1)
+      const stored = await services[0].access(`encrypted-secret:${rows[0].id}`)
+      assert.equal(values.every((value) => value === stored), true)
+      const keys = values.map((value) => new TextEncoder().encode(value))
+      for (let index = 0; index < services.length; index += 1) {
+        const token = await new SignJWT({ fixture: name }).setProtectedHeader({ alg: 'HS256' })
+          .sign(keys[index])
+        const verified = await jwtVerify(token, keys[1 - index], { algorithms: ['HS256'] })
+        assert.equal(verified.payload.fixture, name)
+        await assert.rejects(jwtVerify(token, new TextEncoder().encode('synthetic-wrong-key'),
+          { algorithms: ['HS256'] }))
+      }
+      for (const service of services) {
+        assert.equal(await service.accessOrCreate(name, () => {
+          assert.fail('an existing winner must not be regenerated')
+        }), stored)
+      }
+    } finally {
+      release()
+      try {
+        await clients[0].encryptedSecret.deleteMany({ where: { name } })
+      } finally {
+        await Promise.all(clients.map((client) => client.$disconnect()))
+        variables.forEach((key, index) => {
+          if (before[index] === undefined) delete process.env[key]
+          else process.env[key] = before[index]
+        })
+      }
     }
   })
