@@ -22,6 +22,18 @@ test('existing tenant public consent route with physical transaction and synthet
   // Refuse to overwrite another suite's global connector fixture.
   assert.equal((await observer.query("SELECT count(*)::int AS n FROM platform_microsoft_connectors WHERE id='default'")).rows[0].n,0)
   const organizationId=randomUUID(),customerTenantId=randomUUID(),microsoftTenantId=randomUUID(),actor=randomUUID()
+  const foreignOrganizationId=randomUUID(),foreignTenantId=randomUUID(),siblingTenantId=randomUUID(),foreignActor=randomUUID()
+  const connectionKey=`tenant:${customerTenantId}:connection`,authorizedKey=`tenant:${customerTenantId}:onboarding-authorized`
+  const notificationScope=[organizationId,connectionKey,authorizedKey]
+  // Include malformed-tenant rows at this fixture's exact keys so scope-rejection
+  // tests still observe them. Other organizations and sibling tenant keys stay out.
+  const notificationRows=async()=>(await observer.query('SELECT * FROM notifications WHERE organization_id=$1 AND dedupe_key IN ($2,$3) ORDER BY id',notificationScope)).rows
+  const foreignRows=async()=>({
+    notifications:(await observer.query('SELECT * FROM notifications WHERE organization_id=$1 OR customer_tenant_id=$2 ORDER BY id',[foreignOrganizationId,siblingTenantId])).rows,
+    states:(await observer.query('SELECT s.* FROM notification_user_states s JOIN notifications n ON n.id=s.notification_id WHERE n.organization_id=$1 OR n.customer_tenant_id=$2 ORDER BY s.id',[foreignOrganizationId,siblingTenantId])).rows,
+    connections:(await observer.query('SELECT * FROM tenant_connections WHERE customer_tenant_id IN ($1,$2) ORDER BY id',[foreignTenantId,siblingTenantId])).rows,
+    sync:(await observer.query('SELECT * FROM sync_states WHERE customer_tenant_id IN ($1,$2) ORDER BY id',[foreignTenantId,siblingTenantId])).rows,
+  })
   let revision=randomUUID()
   const revisions=[revision]
   const publication = (next:string) => ({expectedRevision:revision,revision:next,operationId:randomUUID(),clientId:randomUUID(),homeTenantId:randomUUID(),credentialExpiresAt:null,
@@ -49,6 +61,21 @@ test('existing tenant public consent route with physical transaction and synthet
     await prisma.user.create({data:{id:actor,email:`${actor}@fixture.invalid`}})
     await observer.query("INSERT INTO customer_tenants(id,organization_id,microsoft_tenant_id,status,updated_at) VALUES($1,$2,$3,'ACTIVE',now())",[customerTenantId,organizationId,microsoftTenantId])
     await observer.query("INSERT INTO tenant_connections(id,organization_id,customer_tenant_id,status,consented_permissions,updated_at) VALUES($1,$2,$3,'CONNECTED',ARRAY['Exchange.ManageAsAppV2'],now())",[randomUUID(),organizationId,customerTenantId])
+    // Shared CI database deliberately contains unrelated data. A matching dedupe
+    // key in another organization also catches missing scope on fixture updates.
+    await prisma.organization.create({data:{id:foreignOrganizationId,name:'Foreign route fixture',slug:foreignOrganizationId}})
+    await prisma.user.create({data:{id:foreignActor,email:`${foreignActor}@fixture.invalid`}})
+    for(const [org,tenant] of [[foreignOrganizationId,foreignTenantId],[organizationId,siblingTenantId]]) {
+      await observer.query("INSERT INTO customer_tenants(id,organization_id,microsoft_tenant_id,status,updated_at) VALUES($1,$2,$3,'ACTIVE',now())",[tenant,org,randomUUID()])
+      await observer.query("INSERT INTO tenant_connections(id,organization_id,customer_tenant_id,status,updated_at) VALUES($1,$2,$3,'CONNECTED',now())",[randomUUID(),org,tenant])
+      await observer.query("INSERT INTO sync_states(id,organization_id,customer_tenant_id,resource_type,updated_at) VALUES($1,$2,$3,'USERS',now())",[randomUUID(),org,tenant])
+      for(const key of org===foreignOrganizationId?[connectionKey,authorizedKey]:[`tenant:${tenant}:connection`]) {
+        const row=await prisma.notification.create({data:{organizationId:org,customerTenantId:tenant,dedupeKey:key,eventType:'fixture.unrelated',
+          category:'error',severity:'high',title:'Foreign fixture',description:'Synthetic unrelated secret sentinel',source:'route-test'}})
+        await prisma.notificationUserState.create({data:{notificationId:row.id,userId:foreignActor,readAt:new Date()}})
+      }
+    }
+    const foreignBefore=await foreignRows()
     assert.equal((await publishManagedAuthority(prisma,{...publication(revision),expectedRevision:null})).status,'published')
     await t.test('actual URL binds committed context and retains actor, optional permission, and replay identity',async()=>{
       const issued=await issue(),op=await operation(issued.key.operationId)
@@ -56,12 +83,12 @@ test('existing tenant public consent route with physical transaction and synthet
       assert.equal((await connection()).collection_incarnation,op.expected_connection)
       assert.deepEqual(await callback(issued.state),{result:'success',error:null})
       assert.deepEqual((await connection()).consented_permissions,['Directory.Read.All','Exchange.ManageAsAppV2'])
-      const before=(await observer.query('SELECT * FROM notifications ORDER BY id')).rows
+      const before=await notificationRows()
       assert.equal(before.length,1);assert.equal(before[0].occurrence_count,1)
       assert.match(before[0].description,/ready for scheduled/)
       const calls=providerCalls
       assert.deepEqual(await callback(issued.state),{result:'success',error:null})
-      assert.equal(providerCalls,calls);assert.deepEqual((await observer.query('SELECT * FROM notifications ORDER BY id')).rows,before)
+      assert.equal(providerCalls,calls);assert.deepEqual(await notificationRows(),before)
     })
     await t.test('two concurrent callbacks admit exactly one provider verifier',async()=>{
       const issued=await issue(),entered=gate(),resume=gate();const before=providerCalls
@@ -75,9 +102,9 @@ test('existing tenant public consent route with physical transaction and synthet
       const old=await issue(),entered=gate(),resume=gate()
       microsoft.verifyClaimedTenantAfterConsent=async()=>{entered.release();await resume.promise;if(failed)throw Error('synthetic private error');return good()}
       const first=callback(old.state);await entered.promise
-      const next=await issue(),before=await connection(),notes=(await observer.query('SELECT * FROM notifications ORDER BY id')).rows
+      const next=await issue(),before=await connection(),notes=await notificationRows()
       resume.release();assert.deepEqual(await first,{result:'error',error:'superseded'})
-      assert.deepEqual(await connection(),before);assert.deepEqual((await observer.query('SELECT * FROM notifications ORDER BY id')).rows,notes)
+      assert.deepEqual(await connection(),before);assert.deepEqual(await notificationRows(),notes)
       microsoft.verifyClaimedTenantAfterConsent=good;assert.deepEqual(await callback(next.state),{result:'success',error:null})
     })
     await t.test('effect failure cannot downgrade success; conditional replay can recover',async()=>{
@@ -94,7 +121,7 @@ test('existing tenant public consent route with physical transaction and synthet
       assert.deepEqual(await callback(denied.state,{error:'sensitive-provider-error',error_description:'secret'}),{result:'error',error:'consent-denied'})
       const wrong=await issue();assert.deepEqual(await callback(wrong.state,{tenant:randomUUID()}),{result:'error',error:'tenant-mismatch'})
       assert.equal(providerCalls,before)
-      assert.doesNotMatch(JSON.stringify((await observer.query('SELECT * FROM notifications')).rows),/sensitive-provider-error|secret/)
+      assert.doesNotMatch(JSON.stringify(await notificationRows()),/sensitive-provider-error|secret/)
     })
     await t.test('managed replacement while verifier waits makes old callback historical',async()=>{
       const issued=await issue(),entered=gate(),resume=gate()
@@ -106,8 +133,8 @@ test('existing tenant public consent route with physical transaction and synthet
     })
     await t.test('missing USERS remains scheduled without a callback sync-state write',async()=>{
       const issued=await issue();await callback(issued.state)
-      assert.equal((await observer.query("SELECT count(*)::int AS n FROM sync_states WHERE resource_type='USERS'")).rows[0].n,0)
-      const now=new Date(),found=await prisma.customerTenant.findMany({where:scheduledSyncTenantWhere(now),select:{id:true,syncStates:true}})
+      assert.equal((await observer.query("SELECT count(*)::int AS n FROM sync_states WHERE resource_type='USERS' AND organization_id=$1 AND customer_tenant_id=$2",[organizationId,customerTenantId])).rows[0].n,0)
+      const now=new Date(),found=await prisma.customerTenant.findMany({where:{AND:[scheduledSyncTenantWhere(now),{organizationId,id:customerTenantId}]},select:{id:true,syncStates:true}})
       assert.equal(found.length,1);assert.equal(selectScheduledTenantWork(found,now,10)[0].tenantId,customerTenantId)
     })
     await t.test('missing required permissions fail without clearing prior optional Exchange evidence',async()=>{
@@ -132,15 +159,15 @@ test('existing tenant public consent route with physical transaction and synthet
       microsoft.verifyClaimedTenantAfterConsent=good
     })
     await t.test('real actor FK failure rolls back issuance and connection mutation',async()=>{
-      const before=await connection(),count=(await observer.query('SELECT count(*)::int AS n FROM microsoft_consent_attempts')).rows[0].n
+      const before=await connection(),count=(await observer.query('SELECT count(*)::int AS n FROM microsoft_consent_attempts WHERE organization_id=$1 AND customer_tenant_id=$2',[organizationId,customerTenantId])).rows[0].n
       ;(tenants as any).getTenantOnboardingActor=async()=>randomUUID()
       await assert.rejects(issue())
       assert.deepEqual(await connection(),before)
-      assert.equal((await observer.query('SELECT count(*)::int AS n FROM microsoft_consent_attempts')).rows[0].n,count)
+      assert.equal((await observer.query('SELECT count(*)::int AS n FROM microsoft_consent_attempts WHERE organization_id=$1 AND customer_tenant_id=$2',[organizationId,customerTenantId])).rows[0].n,count)
       ;(tenants as any).getTenantOnboardingActor=async()=>actor
     })
     await t.test('recipient reset failure rolls back incident but never terminal success',async()=>{
-      const target=(await observer.query('SELECT id FROM notifications WHERE dedupe_key=$1',[`tenant:${customerTenantId}:onboarding-authorized`])).rows[0]
+      const target=(await observer.query('SELECT id FROM notifications WHERE organization_id=$2 AND dedupe_key=$1',[`tenant:${customerTenantId}:onboarding-authorized`,organizationId])).rows[0]
       await prisma.notificationUserState.create({data:{notificationId:target.id,userId:actor,readAt:new Date()}})
       const before=(await observer.query('SELECT * FROM notifications WHERE id=$1',[target.id])).rows[0]
       await observer.query(`CREATE FUNCTION consent_route_reject_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic reset failure'; END $$`)
@@ -157,17 +184,17 @@ test('existing tenant public consent route with physical transaction and synthet
     })
     await t.test('later incident survives delayed success effects',async()=>{
       const issued=await issue();await callback(issued.state)
-      await observer.query("UPDATE notifications SET metadata='{}',last_occurred_at=clock_timestamp()+interval '1 second' WHERE dedupe_key=$1",[`tenant:${customerTenantId}:connection`])
-      const before=(await observer.query('SELECT * FROM notifications ORDER BY id')).rows
+      await observer.query("UPDATE notifications SET metadata='{}',last_occurred_at=clock_timestamp()+interval '1 second' WHERE organization_id=$2 AND dedupe_key=$1",[`tenant:${customerTenantId}:connection`,organizationId])
+      const before=await notificationRows()
       // Remove the success marker to exercise stale occurrence rejection, not replay.
-      await observer.query("UPDATE notifications SET metadata='{}' WHERE dedupe_key=$1",[`tenant:${customerTenantId}:onboarding-authorized`])
+      await observer.query("UPDATE notifications SET metadata='{}' WHERE organization_id=$2 AND dedupe_key=$1",[`tenant:${customerTenantId}:onboarding-authorized`,organizationId])
       assert.equal(await applyManagedConsentEffects(prisma,issued.key),'stale')
-      assert.deepEqual((await observer.query('SELECT * FROM notifications WHERE dedupe_key=$1',[`tenant:${customerTenantId}:connection`])).rows[0],before.find(r=>r.dedupe_key.endsWith(':connection')))
+      assert.deepEqual((await observer.query('SELECT * FROM notifications WHERE organization_id=$2 AND dedupe_key=$1',[`tenant:${customerTenantId}:connection`,organizationId])).rows[0],before.find(r=>r.dedupe_key.endsWith(':connection')))
     })
     // v2 regression fixtures use deterministic synthetic occurrence times. The
     // provider/route/transactions are real; no clock scheduling is causal proof.
     const deferred = async (success=true, beforeFinish?:()=>Promise<void>) => {
-      await observer.query('DELETE FROM notifications WHERE organization_id=$1',[organizationId])
+      await observer.query('DELETE FROM notifications WHERE organization_id=$1 AND dedupe_key IN ($2,$3)',notificationScope)
       const issued=await issue()
       await beforeFinish?.()
       await observer.query(`ALTER TABLE notifications ADD CONSTRAINT reject_route_effect CHECK (metadata->>'consentOperationId' <> '${issued.key.operationId}')`)
@@ -182,9 +209,8 @@ test('existing tenant public consent route with physical transaction and synthet
       await prisma.notificationUserState.create({data:{notificationId:row.id,userId:actor,readAt:at}})
       return row
     }
-    const notes = async () => ({rows:(await observer.query('SELECT * FROM notifications WHERE organization_id=$1 ORDER BY id',[organizationId])).rows,
-      states:(await observer.query('SELECT s.* FROM notification_user_states s JOIN notifications n ON n.id=s.notification_id WHERE n.organization_id=$1 ORDER BY s.id',[organizationId])).rows})
-    const connectionKey=`tenant:${customerTenantId}:connection`,authorizedKey=`tenant:${customerTenantId}:onboarding-authorized`
+    const notes = async () => ({rows:await notificationRows(),
+      states:(await observer.query('SELECT s.* FROM notification_user_states s JOIN notifications n ON n.id=s.notification_id WHERE n.organization_id=$1 AND n.dedupe_key IN ($2,$3) ORDER BY s.id',notificationScope)).rows})
     for (const success of [true,false]) for (const targetKey of [connectionKey,authorizedKey]) {
       await t.test(`equal-time occurrence and read state survive deferred ${success?'success':'failure'} for ${targetKey.endsWith(':connection')?'connection':'authorized'} key`,async()=>{
         const issued=await deferred(success)
@@ -279,12 +305,15 @@ test('existing tenant public consent route with physical transaction and synthet
       const before=await notes()
       assert.equal(await applyManagedConsentEffects(prisma,issued.key),'stale');assert.deepEqual(await notes(),before)
     })
+    await t.test('unrelated organization and sibling tenant rows remain unchanged',async()=>{
+      assert.deepEqual(await foreignRows(),foreignBefore,'foreign fixture changed')
+    })
   } finally {
     await observer.query('DROP TRIGGER IF EXISTS consent_route_reject_delete ON notification_user_states')
     await observer.query('DROP FUNCTION IF EXISTS consent_route_reject_delete()')
     await observer.query('ALTER TABLE notifications DROP CONSTRAINT IF EXISTS reject_route_effect')
-    await prisma.organization.deleteMany({where:{id:organizationId}})
-    await prisma.user.deleteMany({where:{id:actor}})
+    await prisma.organization.deleteMany({where:{id:{in:[organizationId,foreignOrganizationId]}}})
+    await prisma.user.deleteMany({where:{id:{in:[actor,foreignActor]}}})
     await observer.query("DELETE FROM platform_microsoft_connectors WHERE id='default' AND configuration_revision=ANY($1::uuid[])",[revisions])
     await observer.query('DELETE FROM managed_connector_authority_revisions WHERE revision=ANY($1::uuid[])',[revisions])
     await observer.query('DELETE FROM encrypted_secrets WHERE id=ANY($1::uuid[])',[revisions])
