@@ -5,6 +5,12 @@ import { Check, Copy, Loader2, QrCode, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { supabase } from '@/lib/auth/supabase'
+import {
+  cancelTotpEnrollment,
+  mfaEnrollmentFailureMessage,
+  startTotpEnrollment,
+  type MfaEnrollmentClient,
+} from '@/lib/auth/mfa-enrollment'
 
 type Enrollment = {
   factorId: string
@@ -12,16 +18,34 @@ type Enrollment = {
   secret: string
 }
 
-function mfaError(error: unknown) {
+type SupabaseClient = NonNullable<typeof supabase>
+
+/** Narrow the client to the three calls enrollment recovery needs, so that
+ * logic stays unit-testable without a live provider. */
+function enrollmentClient(client: SupabaseClient): MfaEnrollmentClient {
+  return {
+    listFactors: () => client.auth.mfa.listFactors(),
+    unenroll: ({ factorId }) => client.auth.mfa.unenroll({ factorId }),
+    enroll: ({ factorType, friendlyName }) =>
+      client.auth.mfa.enroll({ factorType, friendlyName }),
+  }
+}
+
+/** Only needs to be collision-free, not unguessable: it disambiguates a
+ * retry's authenticator name when a previous setup could not be cleared. */
+function enrollmentToken() {
+  const api = globalThis.crypto
+  if (api && typeof api.randomUUID === 'function') return api.randomUUID()
+  return Date.now().toString(36) + Math.random().toString(36).slice(2)
+}
+
+function verificationError(error: unknown) {
   const message =
     error && typeof error === 'object' && 'message' in error
       ? String(error.message)
       : ''
-  if (/invalid.*code|challenge.*verify/i.test(message)) {
+  if (/invalid.*code|challenge.*verify|totp/i.test(message)) {
     return 'That code was not accepted. Wait for a new code and try again.'
-  }
-  if (/factor.*exist/i.test(message)) {
-    return 'An authenticator setup is already in progress. Cancel it or refresh this page.'
   }
   return 'Authenticator setup could not be completed. Please try again.'
 }
@@ -41,24 +65,31 @@ export function MfaEnrollment({
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
 
+  // An enrollment that was started and never verified keeps its factor on the
+  // account and blocks every later attempt under the same name, so recovery
+  // clears that leftover state before enrolling instead of reporting a dead end.
   const start = async () => {
     if (!supabase || busy) return
     setBusy(true)
     setError('')
     try {
-      const result = await supabase.auth.mfa.enroll({
-        factorType: 'totp',
-        friendlyName: 'HawkView Authenticator',
+      const outcome = await startTotpEnrollment(enrollmentClient(supabase), {
+        uniqueToken: enrollmentToken(),
       })
-      if (result.error) throw result.error
-      setEnrollment({
-        factorId: result.data.id,
-        qrCode: result.data.totp.qr_code,
-        secret: result.data.totp.secret,
-      })
-    } catch (failure) {
-      setError(mfaError(failure))
+      if (outcome.ok) {
+        setEnrollment({
+          factorId: outcome.factorId,
+          qrCode: outcome.qrCode,
+          secret: outcome.secret,
+        })
+      } else {
+        setError(mfaEnrollmentFailureMessage(outcome.reason))
+      }
+    } catch {
+      setError(mfaEnrollmentFailureMessage('failed'))
     } finally {
+      // Always clear busy. Leaving it set disables the only button on this
+      // screen, which is the lockout this component exists to remove.
       setBusy(false)
     }
   }
@@ -68,18 +99,23 @@ export function MfaEnrollment({
     setBusy(true)
     setError('')
     try {
-      if (supabase && enrollment?.factorId) {
-        const result = await supabase.auth.mfa.unenroll({
-          factorId: enrollment.factorId,
-        })
-        if (result.error) throw result.error
+      // The sweep runs even with no factor id, which is the state left behind
+      // when enroll() itself failed — previously nothing could clear it.
+      if (supabase) {
+        await cancelTotpEnrollment(
+          enrollmentClient(supabase),
+          enrollment?.factorId ?? null
+        )
       }
       setEnrollment(null)
       setCode('')
       await onCancel?.()
-    } catch (failure) {
-      setError(mfaError(failure))
+    } catch {
+      setError(mfaEnrollmentFailureMessage('failed'))
     } finally {
+      // onCancel is declared async and callers await provider work in it, so it
+      // can reject. Without this the screen kept busy set and disabled its only
+      // button for good — a second lockout introduced while removing the first.
       setBusy(false)
     }
   }
@@ -101,7 +137,7 @@ export function MfaEnrollment({
       if (result.error) throw result.error
       await onComplete()
     } catch (failure) {
-      setError(mfaError(failure))
+      setError(verificationError(failure))
     } finally {
       setBusy(false)
     }

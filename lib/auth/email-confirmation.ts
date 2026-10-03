@@ -106,3 +106,68 @@ export function confirmationFailureMessage(
   }
   return 'This HawkView link is invalid or has expired. Request a new email and use only its latest link.'
 }
+
+/**
+ * Why an unparseable link failed.
+ *
+ * `parseHawkViewEmailConfirmation` is deliberately strict — it reads only the URL
+ * fragment, so a single-use token never reaches a server log or `Referer`, and it
+ * refuses extra parameters so a crafted link cannot smuggle a redirect target.
+ * The cost of that strictness was a single opaque message for every cause, which
+ * makes a provider misconfiguration indistinguishable from an expired link.
+ *
+ * Classifying the shape recovers the distinction without relaxing either property:
+ * nothing here widens what is accepted, and no token or provider text is returned.
+ */
+export type ConfirmationLinkShape =
+  | 'hawkview'
+  | 'provider-session'
+  | 'provider-error'
+  | 'empty'
+  | 'unrecognised'
+
+export function classifyHawkViewConfirmationLink(
+  fragment: string | URLSearchParams
+): ConfirmationLinkShape {
+  if (typeof fragment === 'string' && fragment.length > 4_096) return 'unrecognised'
+  const params =
+    typeof fragment === 'string'
+      ? new URLSearchParams(
+          fragment.startsWith('#') || fragment.startsWith('?')
+            ? fragment.slice(1)
+            : fragment
+        )
+      : fragment
+  const keys = Array.from(params.keys())
+  if (keys.length === 0) return 'empty'
+  if (parseHawkViewEmailConfirmation(params) !== null) return 'hawkview'
+  // Supabase reports link failures on the fragment of the redirect target.
+  if (keys.some((key) => key === 'error' || key === 'error_code' || key === 'error_description')) {
+    return 'provider-error'
+  }
+  // The provider's own `/auth/v1/verify` endpoint redirects here with a session
+  // in the fragment. Receiving that shape means the email used the default
+  // template, so the managed HawkView template is not the one installed.
+  if (keys.some((key) => key === 'access_token' || key === 'refresh_token')) {
+    return 'provider-session'
+  }
+  return 'unrecognised'
+}
+
+/**
+ * `provider-session` is an operator-facing fault, not a user mistake, so the
+ * copy must not tell the user to request another email: every new email would
+ * fail the same way until the templates are reinstalled.
+ */
+export function confirmationShapeMessage(shape: ConfirmationLinkShape): string {
+  if (shape === 'provider-error') {
+    return 'This HawkView link has already been used or has expired. Request a new email and open only its most recent link.'
+  }
+  if (shape === 'provider-session') {
+    return 'This link was not issued by HawkView. Your sign-in may already be complete — return to login and try signing in. If this keeps happening, a HawkView administrator needs to reinstall the authentication email templates.'
+  }
+  if (shape === 'empty') {
+    return 'This page needs the link from your HawkView email. Open the most recent email and select its button directly.'
+  }
+  return 'This HawkView link is invalid or has expired. Request a new email and use only its latest link.'
+}
