@@ -30,6 +30,7 @@ export const databaseTests = Object.freeze([
   'identity-risk/risk-key-operator.database-integration.test.ts',
   'identity-risk/risk-utc-session.database-integration.test.ts',
   'identity-risk/wrapped-risk-key.database-integration.test.ts',
+  'microsoft/consent-operation-store.database-integration.test.ts',
   'microsoft/managed-connector-authority.database-integration.test.ts',
   'microsoft/managed-connector-configuration.database-integration.test.ts',
   'prisma/alert-table-rls.database-integration.test.ts',
@@ -82,7 +83,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: '55b3074431fad22928b4d33b1f09b05254a0b6f3',
+    blob: 'cab93d2beb5521ae3aa24462e85116eb3ccd19ac',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });
