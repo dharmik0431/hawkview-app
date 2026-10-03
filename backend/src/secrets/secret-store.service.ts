@@ -79,6 +79,20 @@ export class SecretStoreService {
     }
   }
 
+  /** Prepare immutable managed content without writing or activating it. The
+   * authority publisher is the only persistence path for this reserved namespace. */
+  prepareManagedRevision(revision: string, value: string) {
+    if (typeof revision !== 'string' || !UUID_PATTERN.test(revision)) {
+      throw new ServiceUnavailableException('INVALID_MANAGED_AUTHORITY_ID')
+    }
+    if (typeof value !== 'string' || value.length === 0 || Buffer.byteLength(value, 'utf8') > 65536) {
+      throw new ServiceUnavailableException('INVALID_MANAGED_CREDENTIAL')
+    }
+    const keys = this.keys
+    const name = IMMUTABLE_MANAGED_SECRET_PREFIX + revision.toLowerCase()
+    return { ...this.encrypt(name, value, keys.current), keyVersion: keys.currentVersion }
+  }
+
   private decrypt(secret: StoredSecret) {
     const keys = this.keys
     const key = keys.key(secret.keyVersion)
