@@ -179,6 +179,21 @@ const ok = () =>
     headers: { 'content-type': 'application/json' },
   })
 
+/**
+ * A real `Response` carrying the given status whose body stream rejects. Not a
+ * mock of the failure — the status is genuinely received and `text()` genuinely
+ * throws, which is the boundary root and E2 both reproduced.
+ */
+const unreadableBody = (status: number) =>
+  new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(new Error('body stream failed'))
+      },
+    }),
+    { status, headers: { 'content-type': 'application/json' } }
+  )
+
 function errorCodeOf(error: unknown): string {
   const response = (error as { getResponse?: () => unknown }).getResponse?.()
   if (response && typeof response === 'object' && 'code' in response) {
@@ -531,4 +546,152 @@ test('CONTROL: the audit-failure injector is live', async () => {
     !f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'),
     'the injected failure did not prevent the write; those assertions prove nothing'
   )
+})
+
+// ---------------------------------------------------------------------------
+// The acceptance boundary: status received, body unreadable.
+//
+// `supabaseAdminRequest` consumed the body before inspecting `response.ok`, so a
+// genuine HTTP 200 whose stream rejected was thrown as a provider failure and a
+// known 429 lost its classification. Per Codex 65efb21f, an unreadable success
+// body is NOT an evidence-persistence failure: recovery reads no payload, so if
+// the status is established and our audit persists, the request is recorded.
+// ---------------------------------------------------------------------------
+
+test('CONTROL: the unreadable-body fixture really does reject', async () => {
+  // Without this, every assertion below could be passing against a readable
+  // response and prove nothing about the boundary.
+  const rejected = await unreadableBody(200).text().then(() => false, () => true)
+  assert.equal(rejected, true, 'the fixture must genuinely fail to read')
+  assert.equal(unreadableBody(200).status, 200, 'and must genuinely carry the status')
+})
+
+test('a real HTTP 200 with an unreadable body is an accepted, recorded request', async () => {
+  configureEnvironment()
+  const calls = provider(() => unreadableBody(200))
+  const f = fixture()
+
+  const result = await recover(f.service)
+
+  assert.equal(calls.paths.length, 1, 'exactly one provider request')
+  assert.equal(result.requested, true, 'the successful status was received and must stand')
+  assert.equal(result.recorded, true,
+    'recovery reads no payload, so an unreadable body is not an evidence failure')
+
+  const actions = f.actions()
+  assert.ok(actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'))
+  assert.ok(!actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'),
+    'a received 200 must never be classified as a provider failure')
+  assert.ok(!actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED'),
+    'our evidence write succeeded, so there is no recording failure to report')
+})
+
+test('CONTROL: a normal readable 200 reaches the same outcome', async () => {
+  configureEnvironment()
+  const calls = provider(ok)
+  const f = fixture()
+
+  const result = await recover(f.service)
+
+  assert.equal(calls.paths.length, 1)
+  assert.equal(result.requested, true)
+  assert.equal(result.recorded, true)
+  // The point of this control: readable and unreadable success bodies must be
+  // indistinguishable in outcome, because neither is read.
+  assert.ok(f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'))
+})
+
+test('a 429 whose error body cannot be read still surfaces rate limiting', async () => {
+  configureEnvironment()
+  const calls = provider(() => unreadableBody(429))
+  const f = fixture()
+
+  const error = await recover(f.service).then(() => null, (e: unknown) => e)
+
+  assert.ok(error, 'a genuine non-2xx must still reject')
+  assert.equal(errorCodeOf(error), 'AUTH_EMAIL_RATE_LIMITED',
+    'the status alone establishes rate limiting; it must not be lost with the body')
+  assert.equal(calls.paths.length, 1)
+  const actions = f.actions()
+  assert.ok(actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'))
+  assert.ok(!actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'),
+    'nothing was accepted')
+})
+
+test('an unreadable 500 is still a failure and still throws', async () => {
+  configureEnvironment()
+  provider(() => unreadableBody(500))
+  const f = fixture()
+
+  const error = await recover(f.service).then(() => null, (e: unknown) => e)
+
+  assert.ok(error, 'tolerance of unreadable bodies must not swallow real failures')
+  assert.ok(f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'))
+  assert.equal(f.counts().userWrites, 0)
+})
+
+test('the two conditions are independent: unreadable body AND a failed evidence write', async () => {
+  configureEnvironment()
+  const calls = provider(() => unreadableBody(200))
+  // Attempt 2 is the PROVIDER_ACCEPTED write.
+  const f = fixture({ failAuditAttempts: [2] })
+
+  const result = await recover(f.service)
+
+  assert.equal(calls.paths.length, 1, 'still exactly one provider request')
+  assert.equal(result.requested, true)
+  assert.equal(result.recorded, false,
+    'here our own write failed, which is the only thing that sets recorded:false')
+  const record = f.audits.find(
+    entry => entry.action === 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED'
+  )
+  assert.equal(record?.stage, 'EVIDENCE_PERSISTENCE')
+  assert.ok(!f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'))
+})
+
+// ---------------------------------------------------------------------------
+// Collateral-damage guard for the shared helper.
+//
+// `supabaseAdminRequest` is shared with `resetHawkViewMfa`, which DOES read the
+// payload. Making the body read unconditionally tolerant would hand it an empty
+// factor list on an unreadable 200, so it would report having removed nothing as
+// a success. Tolerance is therefore opt-in, and this is the test that holds it.
+// ---------------------------------------------------------------------------
+
+test('a payload-reading caller still fails on an unreadable success body', async () => {
+  configureEnvironment()
+  provider(() => unreadableBody(200))
+  const f = fixture({ withProviderId: true })
+
+  const error = await f.service
+    .resetHawkViewMfa(identity, 'membership-pending', { organizationId })
+    .then(() => null, (e: unknown) => e)
+
+  assert.ok(error,
+    'an unreadable factor list must fail, not be read as "no factors to remove"')
+  assert.match(String((error as Error).message), /could not be read/i)
+  assert.ok(
+    !f.actions().includes('HAWKVIEW_MFA_RESET'),
+    'it must not record a successful MFA reset it did not perform'
+  )
+})
+
+test('CONTROL: that same caller succeeds on a readable success body', async () => {
+  configureEnvironment()
+  provider(() =>
+    new Response(JSON.stringify({ factors: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  )
+  const f = fixture({ withProviderId: true })
+
+  const result = await f.service.resetHawkViewMfa(
+    identity, 'membership-pending', { organizationId }
+  )
+
+  // Proves the failure above is caused by the unreadable body and not by the
+  // fixture being unable to drive this path at all.
+  assert.equal(result.factorsRemoved, 0)
+  assert.ok(f.actions().includes('HAWKVIEW_MFA_RESET'))
 })

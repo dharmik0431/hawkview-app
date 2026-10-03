@@ -592,7 +592,7 @@ export class WorkspaceService {
   private async supabaseAdminRequest(
     path: string,
     init: RequestInit,
-    options?: { normalizeExistingInvite?: boolean }
+    options?: { normalizeExistingInvite?: boolean; bodyUnused?: boolean }
   ) {
     const { url, serviceRoleKey } = this.supabaseConfiguration()
     let response: Response
@@ -609,9 +609,21 @@ export class WorkspaceService {
     } catch {
       throw new ServiceUnavailableException('HawkView account service could not be reached.')
     }
-    const text = await response.text()
+    // The response body is a stream that can reject on its own. Reading it before
+    // inspecting the status discarded the outcome we had already received: a real
+    // HTTP 200 became a thrown provider failure, and a known 429 lost its
+    // classification, purely because the body could not be read.
+    let text = ''
+    let bodyUnavailable = false
+    try {
+      text = await response.text()
+    } catch {
+      bodyUnavailable = true
+    }
     let result: unknown = null
-    try { result = text ? JSON.parse(text) : null } catch { result = null }
+    if (text) {
+      try { result = JSON.parse(text) } catch { result = null }
+    }
     if (!response.ok) {
       const isAuthenticationEmailRequest = path === '/auth/v1/invite' || path === '/auth/v1/recover'
       if (response.status === HttpStatus.TOO_MANY_REQUESTS && isAuthenticationEmailRequest) {
@@ -640,6 +652,16 @@ export class WorkspaceService {
         return EXISTING_AUTH_ACCOUNT
       }
       throw new BadRequestException('The requested HawkView account operation could not be completed.')
+    }
+    // Past here the provider returned success. Callers that read the payload must
+    // still fail rather than act on an absent one — `resetHawkViewMfa` would
+    // otherwise see an empty factor list and report having removed nothing as a
+    // success. So tolerance is opt-in, and only a caller that uses no payload
+    // sets it.
+    if (bodyUnavailable && options?.bodyUnused !== true) {
+      throw new ServiceUnavailableException(
+        'HawkView account service returned a response that could not be read.'
+      )
     }
     return result
   }
@@ -1114,13 +1136,20 @@ export class WorkspaceService {
       }
 
       stage = 'AUTH_PROVIDER'
-      await this.supabaseAdminRequest('/auth/v1/recover', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: member.user.email,
-          redirect_to: this.authEmailRedirectUrl(),
-        }),
-      })
+      // `bodyUnused`: recovery reads nothing from the response. An unreadable
+      // success body is not evidence that the request failed, and must not be
+      // turned into a provider failure — that is what invites a second email.
+      await this.supabaseAdminRequest(
+        '/auth/v1/recover',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email: member.user.email,
+            redirect_to: this.authEmailRedirectUrl(),
+          }),
+        },
+        { bodyUnused: true }
+      )
       // The discriminator, tracked separately from `stage` on purpose. Every
       // failure after this point is OUR persistence failing, not the provider's,
       // and the provider has already been asked to send exactly one email.
