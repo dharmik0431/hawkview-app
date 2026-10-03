@@ -44,6 +44,8 @@ const ACCOUNT_RECOVERY_NOT_PENDING_CODE = 'ACCOUNT_RECOVERY_NOT_PENDING'
 const ACCOUNT_RECOVERY_ACCOUNT_DISABLED_CODE = 'ACCOUNT_RECOVERY_ACCOUNT_DISABLED'
 const ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE_CODE =
   'ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE'
+const ACCOUNT_RECOVERY_RECORDING_FAILED_CODE =
+  'ACCOUNT_RECOVERY_RECORDING_FAILED'
 const EXISTING_AUTH_ACCOUNT = Symbol('existing-auth-account')
 
 type OwnerContext = {
@@ -1063,6 +1065,7 @@ export class WorkspaceService {
     const target = this.memberTarget(operation, member.userId)
     const delivery = 'ACCOUNT_RECOVERY' as const
     let stage = 'REQUEST_VALIDATION'
+    let providerAccepted = false
 
     // Intent is durable before the provider side effect, as on the invite and
     // resend paths. If evidence storage is unavailable, no recovery is requested.
@@ -1118,6 +1121,11 @@ export class WorkspaceService {
           redirect_to: this.authEmailRedirectUrl(),
         }),
       })
+      // The discriminator, tracked separately from `stage` on purpose. Every
+      // failure after this point is OUR persistence failing, not the provider's,
+      // and the provider has already been asked to send exactly one email.
+      providerAccepted = true
+      stage = 'EVIDENCE_PERSISTENCE'
 
       // PROVIDER_ACCEPTED, never "SENT". The provider answers 200 with an empty
       // body for an address it cannot find, so a 2xx establishes that the request
@@ -1135,20 +1143,56 @@ export class WorkspaceService {
 
       return {
         requested: true,
+        recorded: true,
         delivery,
         operationId: operation.operationId,
         requestId: operation.requestId,
       }
     } catch (error) {
-      await this.audit(actor, {
-        ...operation,
-        ...target,
-        action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED',
-        outcome: 'FAILED',
-        stage,
-        errorCode: workspaceAuditErrorCode(error),
-        metadata: { delivery },
-      })
+      if (providerAccepted) {
+        // Our own evidence write failed after the provider accepted. Reporting
+        // this as a provider failure — and throwing — is exactly what invites a
+        // second send. Record it honestly at its real stage and return an
+        // accepted-but-unrecorded outcome instead.
+        try {
+          await this.audit(actor, {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED',
+            outcome: 'FAILED',
+            stage: 'EVIDENCE_PERSISTENCE',
+            errorCode: ACCOUNT_RECOVERY_RECORDING_FAILED_CODE,
+            metadata: { delivery },
+          })
+        } catch {
+          // The failure record is itself unwritable. Swallowed deliberately:
+          // the caller is still told `recorded: false`, and throwing would
+          // misreport an accepted request as a failed one.
+        }
+        return {
+          requested: true,
+          recorded: false,
+          delivery,
+          operationId: operation.operationId,
+          requestId: operation.requestId,
+        }
+      }
+      // Pre-acceptance failure: no provider request was accepted, so this is a
+      // genuine failure and the caller must see it. Best-effort record, then the
+      // original error — losing the cause to a failing audit write is its own bug.
+      try {
+        await this.audit(actor, {
+          ...operation,
+          ...target,
+          action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED',
+          outcome: 'FAILED',
+          stage,
+          errorCode: workspaceAuditErrorCode(error),
+          metadata: { delivery },
+        })
+      } catch {
+        // Nothing to add: the caller still receives the original failure.
+      }
       throw error
     }
   }

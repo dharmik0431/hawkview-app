@@ -48,6 +48,11 @@ import {
 import { apiClient } from '@/lib/api/client'
 import { workspaceAdminErrorMessage } from '@/lib/auth/workspace-admin-errors'
 import { canResendInvitation } from '@/lib/auth/workspace-member-invitation'
+import {
+  accountRecoveryRequestedNotice,
+  accountRecoveryUnavailableReason,
+  canSendAccountRecovery,
+} from '@/lib/auth/workspace-member-recovery'
 import { useAuth } from '@/components/providers/auth-provider'
 import { OrganizationProfileEditor } from '@/components/admin/organization-profile-editor'
 import { Button } from '@/components/ui/button'
@@ -164,7 +169,7 @@ type BulkConfirmModalState = {
 
 type ConfirmModal = {
   type:
-    | 'PASSWORD_RESET' | 'MFA_RESET' | 'REMOVE' | 'SUSPEND' | 'REACTIVATE' | 'ROLE_CHANGE'
+    | 'PASSWORD_RESET' | 'ACCOUNT_RECOVERY' | 'MFA_RESET' | 'REMOVE' | 'SUSPEND' | 'REACTIVATE' | 'ROLE_CHANGE'
   member: Member
   targetRole?: MembershipRole
 } | null
@@ -236,6 +241,8 @@ function formatActionLabel(action: string): string {
     MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED:
       'Account recovery accepted by email provider',
     MEMBER_ACCOUNT_RECOVERY_FAILED: 'Account recovery failed',
+    MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED:
+      'Account recovery accepted but not recorded',
     PASSWORD_RESET_SENT: 'Password reset sent',
     PASSWORD_RESET_REQUESTED: 'Password reset requested',
     PASSWORD_RESET_FAILED: 'Password reset failed',
@@ -292,6 +299,7 @@ function MemberActionMenu({
   onChangeRole,
   onResendInvitation,
   onPasswordReset,
+  onAccountRecovery,
   onMfaReset,
   onToggleStatus,
   onAuditHistory,
@@ -305,6 +313,7 @@ function MemberActionMenu({
   onChangeRole: (m: Member) => void
   onResendInvitation: (m: Member) => void
   onPasswordReset: (m: Member) => void
+  onAccountRecovery: (m: Member) => void
   onMfaReset: (m: Member) => void
   onToggleStatus: (m: Member) => void
   onAuditHistory: (m: Member) => void
@@ -382,6 +391,25 @@ function MemberActionMenu({
               Send HawkView password reset
               {!member.hasHawkViewAccount && (
                 <span className="text-muted-foreground"> — after first sign-in</span>
+              )}
+            </span>
+          </DropdownMenu.Item>
+
+          {/* Account recovery is the complement of password reset: it covers the
+              member who never completed setup, whose address may already have a
+              provider account. Shown disabled with a reason rather than hidden,
+              and only ever enabled where the endpoint is actually invocable. */}
+          <DropdownMenu.Item
+            disabled={!canSendAccountRecovery(member, organizationId)}
+            onSelect={() => onAccountRecovery(member)}
+            title={accountRecoveryUnavailableReason(member, organizationId) ?? undefined}
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 text-xs rounded hover:bg-accent focus:bg-accent focus:outline-none cursor-pointer data-[disabled]:opacity-50 data-[disabled]:pointer-events-none"
+          >
+            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+            <span>
+              Send account recovery
+              {!canSendAccountRecovery(member, organizationId) && (
+                <span className="text-muted-foreground"> — pending members only</span>
               )}
             </span>
           </DropdownMenu.Item>
@@ -1496,6 +1524,15 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
           ),
         `A HawkView password reset was requested for ${member.email}. HawkView cannot confirm delivery — ask them to check their inbox, including spam.`
       )
+    } else if (type === 'ACCOUNT_RECOVERY') {
+      await runAction(
+        () =>
+          apiClient.post(
+            `/api/workspace/members/${encodeURIComponent(member.membershipId)}/account-recovery`,
+            { organizationId: selectedOrganizationId }
+          ),
+        accountRecoveryRequestedNotice(member.email)
+      )
     } else if (type === 'MFA_RESET') {
       await runAction(
         () =>
@@ -2590,6 +2627,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                               onChangeRole={setRoleChangeMember}
                               onResendInvitation={handleResendInvitation}
                               onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m, })}
+                              onAccountRecovery={(m) => setConfirmModal({ type: 'ACCOUNT_RECOVERY', member: m, })}
                               onMfaReset={(m) => setConfirmModal({ type: 'MFA_RESET', member: m, })}
                               onToggleStatus={(m) =>
                                 setConfirmModal({
@@ -2686,6 +2724,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                             onChangeRole={setRoleChangeMember}
                             onResendInvitation={handleResendInvitation}
                             onPasswordReset={(m) => setConfirmModal({ type: 'PASSWORD_RESET', member: m, })}
+                              onAccountRecovery={(m) => setConfirmModal({ type: 'ACCOUNT_RECOVERY', member: m, })}
                             onMfaReset={(m) => setConfirmModal({ type: 'MFA_RESET', member: m })}
                             onToggleStatus={(m) =>
                               setConfirmModal({
@@ -3902,6 +3941,8 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                     ? 'Reactivate member account?'
                     : confirmModal.type === 'PASSWORD_RESET'
                     ? 'Send HawkView password reset?'
+                    : confirmModal.type === 'ACCOUNT_RECOVERY'
+                    ? 'Send account recovery?'
                     : confirmModal.type === 'MFA_RESET'
                     ? 'Reset HawkView MFA?'
                     : 'Remove from workspace?'}
@@ -3914,6 +3955,16 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
               {confirmModal.type === 'PASSWORD_RESET' && (
                 <p>
                   A password reset email will be sent for this user&apos;s{' '} <strong>HawkView account</strong>. This action does not affect Microsoft 365 passwords or tenant credentials.
+                </p>
+              )}
+              {confirmModal.type === 'ACCOUNT_RECOVERY' && (
+                <p>
+                  HawkView will ask the sign-in provider to email{' '}
+                  <strong>{confirmModal.member.email}</strong> a recovery link so they
+                  can finish setting up their <strong>HawkView account</strong>.{' '}
+                  <strong>Delivery cannot be confirmed</strong> — the provider answers
+                  the same way whether or not an account exists for that address. Do not
+                  repeat this straight away; each request asks for another email.
                 </p>
               )}
               {confirmModal.type === 'MFA_RESET' && (

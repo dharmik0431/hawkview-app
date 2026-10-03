@@ -56,6 +56,10 @@ type Options = {
   crossOrganization?: boolean
   notAnOwner?: boolean
   initialAuditFailure?: boolean
+  /** 1-based audit write attempts that must fail. Attempt 1 is the durable
+   *  intent record; attempt 2 is the post-provider PROVIDER_ACCEPTED write;
+   *  attempt 3 is the RECORDING_FAILED record written when 2 fails. */
+  failAuditAttempts?: number[]
 }
 
 function fixture(options: Options = {}) {
@@ -95,6 +99,9 @@ function fixture(options: Options = {}) {
     create: async (entry: { data: Record<string, unknown> }) => {
       auditAttempts += 1
       if (options.initialAuditFailure && auditAttempts === 1) {
+        throw new Error('audit storage unavailable')
+      }
+      if (options.failAuditAttempts?.includes(auditAttempts)) {
         throw new Error('audit storage unavailable')
       }
       audits.push(entry.data)
@@ -194,6 +201,7 @@ test('a pending member with no stored provider id can be sent account recovery',
   assert.deepEqual(calls.paths, ['/auth/v1/recover'],
     'recovery must use the provider recover endpoint and nothing else')
   assert.equal(result.requested, true)
+  assert.equal(result.recorded, true, 'the ordinary path must report its evidence as recorded')
   assert.ok(
     !Object.prototype.hasOwnProperty.call(result, 'sent'),
     'the response must not carry a "sent" field — a 2xx does not establish delivery'
@@ -415,4 +423,112 @@ test('an unexpected provider rejection does not become a success', async () => {
   const actions = f.actions()
   assert.ok(!actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'))
   assert.equal(f.counts().userWrites, 0)
+})
+
+// ---------------------------------------------------------------------------
+// Post-provider persistence failure.
+//
+// Root's blocking finding on v1: the PROVIDER_ACCEPTED audit write sat inside
+// the provider catch with the stage still AUTH_PROVIDER, so a failure of OUR
+// write was recorded and thrown as a provider failure after the provider had
+// already accepted. An administrator seeing that failure presses the button
+// again and the provider sends a second email.
+// ---------------------------------------------------------------------------
+
+test('a failed post-provider audit write is not reported as a provider failure', async () => {
+  configureEnvironment()
+  const calls = provider(ok)
+  // Attempt 1 = durable intent (must succeed). Attempt 2 = PROVIDER_ACCEPTED.
+  const f = fixture({ failAuditAttempts: [2] })
+
+  const result = await recover(f.service)
+
+  assert.equal(calls.paths.length, 1, 'exactly one provider request may be made')
+  assert.deepEqual(calls.paths, ['/auth/v1/recover'])
+  assert.equal(result.requested, true, 'the provider did accept; that must still be reported')
+  assert.equal(result.recorded, false, 'our evidence did not survive and must be reported as such')
+
+  const actions = f.actions()
+  assert.ok(
+    actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED'),
+    'the persistence failure must be recorded at its own stage'
+  )
+  assert.ok(
+    !actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'),
+    'a persistence failure must never be classified as a provider failure'
+  )
+  const record = f.audits.find(
+    entry => entry.action === 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED'
+  )
+  assert.equal(record?.stage, 'EVIDENCE_PERSISTENCE',
+    'the stage must not still read AUTH_PROVIDER after the provider accepted')
+  assert.equal(record?.errorCode, 'ACCOUNT_RECOVERY_RECORDING_FAILED')
+})
+
+test('it does not throw after the provider accepted, so nothing invites a second send', async () => {
+  configureEnvironment()
+  const calls = provider(ok)
+  const f = fixture({ failAuditAttempts: [2] })
+
+  // The absence of a rejection is the property under test: a thrown error is
+  // what a caller retries, and a retry here is a duplicate email.
+  const outcome = await recover(f.service).then(() => 'resolved', () => 'rejected')
+
+  assert.equal(outcome, 'resolved', 'an accepted request must not surface as a rejection')
+  assert.equal(calls.paths.length, 1, 'still exactly one provider request')
+})
+
+test('even an unwritable failure record does not turn acceptance into an error', async () => {
+  configureEnvironment()
+  const calls = provider(ok)
+  // Attempt 2 (PROVIDER_ACCEPTED) and attempt 3 (RECORDING_FAILED) both fail.
+  const f = fixture({ failAuditAttempts: [2, 3] })
+
+  const result = await recover(f.service)
+
+  assert.equal(calls.paths.length, 1, 'exactly one provider request may be made')
+  assert.equal(result.requested, true)
+  assert.equal(result.recorded, false)
+  assert.equal(f.counts().auditAttempts, 3,
+    'it must attempt the failure record once and then stop, not loop')
+  assert.ok(
+    !f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'),
+    'still not a provider failure'
+  )
+  assert.equal(f.counts().userWrites, 0, 'no local mutation on any branch')
+})
+
+test('a pre-acceptance failure still throws and is still classified as a failure', async () => {
+  configureEnvironment()
+  // 429 before acceptance: the caller must see a real error here, otherwise the
+  // honest-outcome change above would have swallowed genuine failures too.
+  provider(() =>
+    new Response(JSON.stringify({ message: 'rate limit exceeded' }), {
+      status: 429,
+      headers: { 'content-type': 'application/json' },
+    })
+  )
+  const f = fixture()
+
+  const error = await recover(f.service).then(() => null, (e: unknown) => e)
+
+  assert.ok(error, 'a pre-acceptance failure must still reject')
+  assert.equal(errorCodeOf(error), 'AUTH_EMAIL_RATE_LIMITED')
+  const actions = f.actions()
+  assert.ok(actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED'))
+  assert.ok(!actions.includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED'),
+    'nothing was accepted, so there is no recording-failure to report')
+})
+
+test('CONTROL: the audit-failure injector is live', async () => {
+  configureEnvironment()
+  provider(ok)
+  const f = fixture({ failAuditAttempts: [2] })
+  await recover(f.service)
+  // If injection were inert, PROVIDER_ACCEPTED would have been recorded and the
+  // three tests above would pass against unchanged code.
+  assert.ok(
+    !f.actions().includes('WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED'),
+    'the injected failure did not prevent the write; those assertions prove nothing'
+  )
 })
