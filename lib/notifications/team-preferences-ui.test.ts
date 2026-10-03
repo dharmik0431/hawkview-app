@@ -119,6 +119,13 @@ test('Team notification preferences fence A-B-A and logout-return request comple
     if (name === '@/lib/api/client') return { apiClient }
     if (name === '@/lib/auth/workspace-admin-errors') return { workspaceAdminErrorMessage: (_error: unknown, fallback: string) => fallback }
     if (name === '@/lib/auth/workspace-member-invitation') return { canResendInvitation: () => false }
+    // Stubbed in the same shape as the invitation predicate above: these
+    // suites exercise notification/onboarding wiring, not recovery eligibility.
+    if (name === '@/lib/auth/workspace-member-recovery') return {
+      canSendAccountRecovery: () => false,
+      accountRecoveryUnavailableReason: () => null,
+      accountRecoveryRequestedNotice: () => '',
+    }
     if (name === '@/components/providers/auth-provider') return { useAuth: () => ({ identityUser: activeSession ? { id: activeSession.user.id } : null, session: activeSession, isLoading: false }) }
     if (name === '@/components/admin/organization-profile-editor') return { OrganizationProfileEditor: () => null }
     if (name === '@/components/ui/button') return { Button: ({ variant: _v, size: _s, ...props }: Record<string, unknown>) => React.createElement('button', props) }
