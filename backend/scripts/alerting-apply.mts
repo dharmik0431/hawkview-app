@@ -24,13 +24,14 @@
  * property is not "we check the version", it is "the check and the write are one statement".
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readApplyReconciliationRows } from '../src/alerts/reconciliation-audit-reader.js'
 import { dirname, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import {
-  exclusionKindFor, parseDedupeKey, reconcile,
-  type ExclusionKind, type ExistingAlertRow,
+  exclusionKindFor, reconcile,
+  type ExclusionKind,
 } from '../src/alerts/reconciliation.js'
 import {
   applyStatement, applyValidated, digestOf, explain, revertStatement, validateApply,
@@ -161,39 +162,7 @@ async function computeMapping(): Promise<{
   excluded: Excluded[]
   figures: Record<string, number>
 }> {
-  const notifications = await prisma().notification.findMany({
-    select: {
-      id: true, organizationId: true, customerTenantId: true,
-      dedupeKey: true, occurrenceCount: true, resolvedAt: true,
-    },
-  })
-  const auditIds = notifications
-    .map((row) => parseDedupeKey(row.dedupeKey).eventIdInKey)
-    .filter((id): id is string => id !== null)
-  const audits = auditIds.length === 0 ? [] : await prisma().directoryAuditLog.findMany({
-    where: { microsoftAuditId: { in: auditIds } },
-    select: { microsoftAuditId: true, initiatedBy: true, targetResources: true, eventDateTime: true },
-  })
-  const auditById = new Map(audits.map((audit) => [audit.microsoftAuditId, audit]))
-
-  const rows: ExistingAlertRow[] = notifications.map((row) => {
-    const auditId = parseDedupeKey(row.dedupeKey).eventIdInKey
-    const audit = auditId === null ? null : auditById.get(auditId) ?? null
-    return {
-      id: row.id,
-      organizationId: row.organizationId,
-      customerTenantId: row.customerTenantId,
-      dedupeKey: row.dedupeKey,
-      occurrenceCount: row.occurrenceCount,
-      resolvedAt: row.resolvedAt,
-      occurredAt: audit?.eventDateTime ?? null,
-      audit: audit === null ? null : {
-        initiatedBy: typeof audit.initiatedBy === 'string' ? audit.initiatedBy : null,
-        targetResources: [],
-        privileged: null,
-      },
-    }
-  })
+  const { rows } = await readApplyReconciliationRows(prisma())
 
   const report = reconcile(rows)
   if (report.invariants.episodeOrdinalsAgreeWithCounts.length > 0) {
@@ -242,7 +211,7 @@ async function computeMapping(): Promise<{
     decisions,
     excluded,
     figures: {
-      rows: notifications.length,
+      rows: rows.length,
       writable: writes.length,
       typeUndetermined: excluded.filter((entry) => entry.because === 'TYPE_UNDETERMINED').length,
       subjectUnresolved: excluded.filter((entry) => entry.because === 'SUBJECT_UNRESOLVED').length,

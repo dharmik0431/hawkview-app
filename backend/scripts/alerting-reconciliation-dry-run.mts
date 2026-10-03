@@ -4,7 +4,8 @@
  *
  * Run with:  npx tsx scripts/alerting-reconciliation-dry-run.mts
  *
- * WHAT THIS DOES: two `findMany` calls and a print. There is no `create`, `update`,
+ * WHAT THIS DOES: a notification read, bounded tenant-scoped audit reads and a print.
+ * There is no `create`, `update`,
  * `upsert`, `delete` or `$executeRaw` anywhere in this file, and the reconciliation it
  * calls is a pure function with no client, clock or environment of its own. Verify that by
  * reading it rather than by trusting this comment — it is short on purpose.
@@ -22,9 +23,10 @@
  * notification id.
  */
 import { readFileSync } from 'node:fs'
+import { readDryRunReconciliationRows } from '../src/alerts/reconciliation-audit-reader.js'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
-import { reconcile, parseDedupeKey, type ExistingAlertRow } from '../src/alerts/reconciliation.js'
+import { reconcile, type ExistingAlertRow } from '../src/alerts/reconciliation.js'
 
 /** Rows from a JSON file instead of the database.
  *
@@ -105,74 +107,11 @@ async function main() {
     return
   }
 
-  const notifications = await prisma().notification.findMany({
-    select: {
-      id: true,
-      organizationId: true,
-      customerTenantId: true,
-      dedupeKey: true,
-      occurrenceCount: true,
-      resolvedAt: true,
-    },
-  })
-
-  // The audit ids the directory-audit keys name, so the actor and target can be resolved.
-  // Only for keys that carry one; nothing is invented for keys that do not.
-  const auditIds = notifications
-    .map((row) => parseDedupeKey(row.dedupeKey).eventIdInKey)
-    .filter((id): id is string => id !== null)
-
-  const audits = auditIds.length === 0 ? [] : await prisma().directoryAuditLog.findMany({
-    where: { microsoftAuditId: { in: auditIds } },
-    select: { microsoftAuditId: true, initiatedBy: true, targetResources: true, eventDateTime: true },
-  })
-  const auditById = new Map(audits.map((audit) => [audit.microsoftAuditId, audit]))
-
-  const rows: ExistingAlertRow[] = notifications.map((row) => {
-    const auditId = parseDedupeKey(row.dedupeKey).eventIdInKey
-    const audit = auditId === null ? null : auditById.get(auditId) ?? null
-    return {
-      id: row.id,
-      organizationId: row.organizationId,
-      customerTenantId: row.customerTenantId,
-      dedupeKey: row.dedupeKey,
-      occurrenceCount: row.occurrenceCount,
-      resolvedAt: row.resolvedAt,
-      // The event's OWN time, from the audit record rather than from the notification.
-      // `first_occurred_at` is when HawkView raised the alert, which is arrival time — the
-      // thing every episode rule in this feature refuses to decide on.
-      occurredAt: audit?.eventDateTime ?? null,
-      audit: audit === null ? null : {
-        // `initiatedBy` and `targetResources` are JSON on the audit row; reduced to the two
-        // strings the reconciliation needs, and left null rather than coerced when the shape
-        // is not what we expect. A coerced value here would be a guess presented as a join.
-        initiatedBy: typeof audit.initiatedBy === 'string' ? audit.initiatedBy
-          : readString(audit.initiatedBy, ['user', 'userPrincipalName'])
-            ?? readString(audit.initiatedBy, ['user', 'id']),
-        targetResources: readTargets(audit.targetResources),
-        privileged: null,
-      },
-    }
-  })
-
+  const { rows, auditJoin } = await readDryRunReconciliationRows(prisma())
   printReport(reconcile(rows), {
     source: 'database (read-only)',
     rejected: [],
-    auditJoin: {
-      keysNamingAnAuditRecord: auditIds.length,
-      distinctAuditIds: new Set(auditIds).size,
-      auditRecordsFound: audits.length,
-      // AGAINST THE DISTINCT COUNT, because findMany returns one row per distinct id while
-      // auditIds is not deduplicated — and `dedupeKey` is unique PER ORGANIZATION rather
-      // than globally, so two organizations holding the same audit id produced a phantom
-      // shortfall. The error could only ever over-report, never under-report.
-      //
-      // Which makes the measured zero a stronger result than it looked: an over-reporting
-      // metric reading zero establishes BOTH that every id joined AND that no audit id is
-      // shared across organizations. That second fact was not measured; it follows from the
-      // direction of the error.
-      notJoined: new Set(auditIds).size - audits.length,
-    },
+    auditJoin,
   })
 }
 
@@ -181,15 +120,7 @@ function printReport(
   context: {
     source: string
     rejected: readonly string[]
-    auditJoin: {
-      keysNamingAnAuditRecord: number
-      /** Reported and printed, and MISSING FROM THIS TYPE until the scripts were first
-       * typechecked. `notJoined` is derived from it, so the figure a reader needs in order to
-       * check the subtraction was the one the shape did not admit. */
-      distinctAuditIds: number
-      auditRecordsFound: number
-      notJoined: number
-    } | null
+    auditJoin: Awaited<ReturnType<typeof readDryRunReconciliationRows>>['auditJoin'] | null
   },
 ) {
   console.log(JSON.stringify({
@@ -243,24 +174,6 @@ function printReport(
   for (const entry of report.mapping) {
     console.log([entry.notificationId, entry.shape, entry.alertTypeId ?? '-', entry.incidentKey ?? 'UNGROUPED'].join('\t'))
   }
-}
-
-/** Reads a nested string from a JSON value without coercing. Null when absent or not a
- * string, because a coerced value would be a guess wearing the clothes of a join. */
-function readString(value: unknown, path: readonly string[]): string | null {
-  let cursor: unknown = value
-  for (const segment of path) {
-    if (typeof cursor !== 'object' || cursor === null || Array.isArray(cursor)) return null
-    cursor = (cursor as Record<string, unknown>)[segment]
-  }
-  return typeof cursor === 'string' ? cursor : null
-}
-
-function readTargets(value: unknown): readonly string[] {
-  if (!Array.isArray(value)) return []
-  return value
-    .map((entry) => readString(entry, ['id']) ?? readString(entry, ['displayName']))
-    .filter((id): id is string => id !== null)
 }
 
 main()
