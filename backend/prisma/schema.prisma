@@ -1454,6 +1454,21 @@ model TenantConnection {
 }
 
 model MicrosoftConsentAttempt {
+  // NULL version is legacy/untrusted. No trusted defaults or backfill.
+  operationVersion Int? @map("operation_version")
+  operationState String? @map("operation_state") @db.VarChar(16)
+  expectedConfiguration String? @map("expected_configuration") @db.Uuid
+  expectedConnection String? @map("expected_connection") @db.Uuid
+  expectedMicrosoftTenant String? @map("expected_microsoft_tenant") @db.Uuid
+  expectedClientId String? @map("expected_client_id") @db.Uuid
+  expectedHomeTenantId String? @map("expected_home_tenant_id") @db.Uuid
+  expectedCredentialReference String? @map("expected_credential_reference") @db.VarChar(500)
+  operationClaimId String? @map("operation_claim_id") @db.Uuid
+  operationClaimedAt DateTime? @map("operation_claimed_at") @db.Timestamptz(6)
+  operationFinalDeadline DateTime? @map("operation_final_deadline") @db.Timestamptz(6)
+  operationTerminalAt DateTime? @map("operation_terminal_at") @db.Timestamptz(6)
+  operationResultConnection String? @map("operation_result_connection") @db.Uuid
+  operationResultDigest String? @map("operation_result_digest") @db.VarChar(64)
   id                 String               @id @default(uuid()) @db.Uuid
   organizationId     String               @map("organization_id") @db.Uuid
   customerTenantId   String?              @map("customer_tenant_id") @db.Uuid
