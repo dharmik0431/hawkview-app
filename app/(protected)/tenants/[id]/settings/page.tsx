@@ -22,6 +22,7 @@ import {
   settingsSynchronizationRows,
 } from '@/lib/tenants/settings-readiness-view'
 import type { TenantBundle } from '@/types/tenant-data'
+import { MicrosoftConsentResponseSchema } from '@/types/api'
 
 import {
   ChevronLeft,
@@ -127,6 +128,11 @@ function formatModuleName(rawName: string) {
 
 export default function TenantSettingsPage() {
   const params = useParams<{ id: string }>()
+  return <TenantSettingsContent key={String(params?.id)} />
+}
+
+function TenantSettingsContent() {
+  const params = useParams<{ id: string }>()
   const searchParams = useSearchParams()
   const router = useRouter()
   const queryClient = useQueryClient()
@@ -166,6 +172,18 @@ export default function TenantSettingsPage() {
 
   const [isReviewingConsent, setIsReviewingConsent] = useState(false)
   const [consentError, setConsentError] = useState<string | null>(null)
+  const [consentRecoveryUrl, setConsentRecoveryUrl] = useState<string | null>(null)
+  const consentGeneration = useRef(0)
+  const consentMounted = useRef(false)
+  const consentPending = useRef(false)
+
+  useEffect(() => {
+    consentMounted.current = true
+    return () => {
+      consentMounted.current = false
+      consentGeneration.current += 1
+    }
+  }, [])
 
   // Danger zone state
   const [isDangerZoneExpanded, setIsDangerZoneExpanded] = useState(false)
@@ -356,17 +374,33 @@ export default function TenantSettingsPage() {
   }
 
   const handleReviewPermissions = async () => {
+    if (!consentMounted.current || consentPending.current || !tenantId) return
+    consentPending.current = true
+    const generation = ++consentGeneration.current
+    const isCurrent = () => consentMounted.current && generation === consentGeneration.current
     setIsReviewingConsent(true)
     setConsentError(null)
+    setConsentRecoveryUrl(null)
     try {
-      const res = await apiClient.post<any>(`/api/tenants/${tenant.id}/microsoft-consent`)
-      if (res?.consentUrl) {
-        window.open(res.consentUrl, '_blank')
+      const raw = await apiClient.post<unknown>(`/api/tenants/${encodeURIComponent(String(tenantId))}/microsoft-consent`)
+      if (!isCurrent()) return
+      const parsed = MicrosoftConsentResponseSchema.safeParse(raw)
+      if (!parsed.success || new URL(parsed.data.consentUrl).protocol !== 'https:') {
+        setConsentError('Microsoft consent returned an invalid response. Please retry.')
+        return
+      }
+      const popup = window.open(parsed.data.consentUrl, '_blank')
+      if (!popup) {
+        setConsentRecoveryUrl(parsed.data.consentUrl)
+        setConsentError('The consent window could not be opened. Open Microsoft consent below to continue.')
       }
     } catch {
-      setConsentError('Microsoft consent workflow is unavailable. Please retry.')
+      if (isCurrent()) setConsentError('Microsoft consent workflow is unavailable. Please retry.')
     } finally {
-      setIsReviewingConsent(false)
+      if (isCurrent()) {
+        consentPending.current = false
+        setIsReviewingConsent(false)
+      }
     }
   }
 
@@ -704,6 +738,12 @@ export default function TenantSettingsPage() {
         </div>
 
         {/* Action Notices */}
+        {consentError && (
+          <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+            <p>{consentError}</p>
+            {consentRecoveryUrl && <a href={consentRecoveryUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-block font-semibold underline">Open Microsoft consent</a>}
+          </div>
+        )}
         {verifyNotice && (
           <div role="status" aria-live="polite" className="rounded-lg border border-emerald-200 bg-emerald-50/80 dark:bg-emerald-950/30 dark:border-emerald-900/50 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
