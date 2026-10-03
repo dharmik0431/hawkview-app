@@ -77,24 +77,41 @@ export function factorFriendlyName(factor: MfaFactorRecord): string | null {
 }
 
 /**
- * Ids of abandoned TOTP enrollments. `verified` is excluded on an exact match,
- * so an unrecognised or missing status is treated as NOT verified and therefore
- * removable — a stale factor left behind is the failure we are fixing, while
- * deleting a working authenticator would lock the user out of the product.
- * A missing factor type is included: the only factor kind this app enrolls is
- * TOTP, and refusing to clean up an unlabelled record reinstates the lockout.
+ * Ids of abandoned TOTP enrollments, selected fail-closed.
+ *
+ * A record is swept only when it states explicitly that it is an `unverified`
+ * `totp` factor. Missing or unrecognised status, and missing or unrecognised
+ * type, are RETAINED. Absence of evidence that a factor is verified is not
+ * evidence that it is abandoned, and the two errors are not symmetric: leaving
+ * a stale factor costs one fallback rename, while deleting a working
+ * authenticator destroys the user's second factor irreversibly.
+ *
+ * Nothing is stranded by that caution. `startTotpEnrollment` falls back to a
+ * distinct friendly name for any blocker this sweep declines to remove, so
+ * being conservative here cannot reinstate the lockout.
+ *
+ * An id seen as `verified` in ANY record vetoes every other representation of
+ * the same id, because the provider returns the same factor through more than
+ * one collection and a duplicate carrying less information must not override
+ * the one that proves the factor works.
  */
 export function pendingTotpFactorIds(factors: unknown): string[] {
   if (!Array.isArray(factors)) return []
+  const verified: string[] = []
+  for (const candidate of factors) {
+    if (!candidate || typeof candidate !== 'object') continue
+    const factor = candidate as MfaFactorRecord
+    const id = text(factor.id)
+    if (id && factorStatus(factor) === 'verified') verified.push(id)
+  }
   const ids: string[] = []
   for (const candidate of factors) {
     if (!candidate || typeof candidate !== 'object') continue
     const factor = candidate as MfaFactorRecord
     const id = text(factor.id)
-    if (!id || ids.includes(id)) continue
-    if (factorStatus(factor) === 'verified') continue
-    const kind = factorType(factor)
-    if (kind !== null && kind !== 'totp') continue
+    if (!id || verified.includes(id) || ids.includes(id)) continue
+    if (factorStatus(factor) !== 'unverified') continue
+    if (factorType(factor) !== 'totp') continue
     ids.push(id)
   }
   return ids

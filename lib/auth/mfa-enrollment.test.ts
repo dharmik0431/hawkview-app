@@ -206,23 +206,69 @@ test('a listFactors error is not mistaken for an empty factor list', async () =>
     'factors returned alongside an error must not be acted on')
 })
 
-test('pending factor selection keeps verified factors and tolerates both field shapes', () => {
+test('only an explicitly unverified TOTP record is selected for deletion', () => {
   assert.deepEqual(pendingTotpFactorIds([abandoned, working]), ['stale-1'])
   assert.deepEqual(
     pendingTotpFactorIds([{ id: 'camel', status: 'unverified', factorType: 'totp' }]),
     ['camel']
   )
-  // An unrecognised status is treated as not verified: a leftover factor is the
-  // bug being fixed, while deleting a working one would be far worse.
-  assert.deepEqual(pendingTotpFactorIds([{ id: 'odd', status: 'PENDING' }]), ['odd'])
-  assert.deepEqual(pendingTotpFactorIds([{ id: 'up', status: 'VERIFIED' }]), [],
+  assert.deepEqual(pendingTotpFactorIds([{ id: 'up', status: 'VERIFIED', factor_type: 'TOTP' }]), [],
     'status comparison must be case-insensitive or verified factors get deleted')
-  assert.deepEqual(pendingTotpFactorIds([{ id: 'untyped', status: 'unverified' }]), ['untyped'])
-  assert.deepEqual(pendingTotpFactorIds([{ id: 'sms', status: 'unverified', factor_type: 'phone' }]), [])
   assert.deepEqual(pendingTotpFactorIds([abandoned, { ...abandoned }]), ['stale-1'],
     'duplicates across all/totp must not be unenrolled twice')
   assert.deepEqual(pendingTotpFactorIds(null), [])
   assert.deepEqual(pendingTotpFactorIds([null, 'x', 42, {}]), [])
+})
+
+test('records that do not prove they are abandoned are retained, not deleted', () => {
+  // Codex reproduced the opposite behaviour against the frozen v2 module: a
+  // missing status and a 'PENDING' status were both swept. Absence of evidence
+  // that a factor is verified is not evidence that it is abandoned, and the
+  // unique-name fallback already covers anything left behind.
+  for (const record of [
+    { id: 'missing-status', factor_type: 'totp' },
+    { id: 'unknown-status', status: 'PENDING', factor_type: 'totp' },
+    { id: 'untyped', status: 'unverified' },
+    { id: 'unknown-type', status: 'unverified', factor_type: 'webauthn' },
+    { id: 'sms', status: 'unverified', factor_type: 'phone' },
+    { id: 'bare' },
+  ]) {
+    assert.deepEqual(pendingTotpFactorIds([record]), [],
+      'destructive sweep must require explicit unverified+totp: ' + record.id)
+  }
+})
+
+test('a verified representation vetoes a less informative duplicate of the same id', () => {
+  // The provider returns one factor through more than one collection. If the
+  // uninformative copy is seen first, a naive scan would delete a working
+  // authenticator; the veto is what prevents that.
+  const vague = { id: 'verified-1', status: 'unverified', factor_type: 'totp' }
+  assert.deepEqual(pendingTotpFactorIds([vague, working]), [],
+    'a record proving the factor is verified must win regardless of order')
+  assert.deepEqual(pendingTotpFactorIds([working, vague]), [])
+  // And the veto is id-scoped: a genuinely abandoned factor alongside it still goes.
+  assert.deepEqual(pendingTotpFactorIds([working, vague, abandoned]), ['stale-1'])
+})
+
+test('a provider emitting only malformed records deletes nothing and still unblocks', async () => {
+  const unenrolled: string[] = []
+  const client: MfaEnrollmentClient = {
+    listFactors: async () => ({
+      data: { all: [{ id: 'malformed-1' }, { id: 'malformed-2', status: 'WEIRD' }], totp: [] },
+      error: null,
+    }),
+    unenroll: async ({ factorId }) => {
+      unenrolled.push(factorId)
+      return { error: null }
+    },
+    enroll: async ({ friendlyName }) =>
+      friendlyName === HAWKVIEW_AUTHENTICATOR_NAME
+        ? { data: null, error: { code: 'mfa_factor_name_conflict' } }
+        : { data: { id: 'new', totp: { qr_code: QR, secret: SECRET } }, error: null },
+  }
+  const outcome = await startTotpEnrollment(client, { uniqueToken: 'cafe1234' })
+  assert.deepEqual(unenrolled, [], 'nothing provable was abandoned, so nothing may be destroyed')
+  assert.equal(outcome.ok, true, 'and the user must still get through, via the fallback name')
 })
 
 test('factor records are read from whichever collection the provider populates', () => {
