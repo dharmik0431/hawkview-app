@@ -40,6 +40,12 @@ const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
 const INVITATION_NOT_PENDING_CODE = 'INVITATION_NOT_PENDING'
 const PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE =
   'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
+const ACCOUNT_RECOVERY_NOT_PENDING_CODE = 'ACCOUNT_RECOVERY_NOT_PENDING'
+const ACCOUNT_RECOVERY_ACCOUNT_DISABLED_CODE = 'ACCOUNT_RECOVERY_ACCOUNT_DISABLED'
+const ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE_CODE =
+  'ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE'
+const ACCOUNT_RECOVERY_RECORDING_FAILED_CODE =
+  'ACCOUNT_RECOVERY_RECORDING_FAILED'
 const EXISTING_AUTH_ACCOUNT = Symbol('existing-auth-account')
 
 type OwnerContext = {
@@ -586,7 +592,7 @@ export class WorkspaceService {
   private async supabaseAdminRequest(
     path: string,
     init: RequestInit,
-    options?: { normalizeExistingInvite?: boolean }
+    options?: { normalizeExistingInvite?: boolean; bodyUnused?: boolean }
   ) {
     const { url, serviceRoleKey } = this.supabaseConfiguration()
     let response: Response
@@ -603,9 +609,21 @@ export class WorkspaceService {
     } catch {
       throw new ServiceUnavailableException('HawkView account service could not be reached.')
     }
-    const text = await response.text()
+    // The response body is a stream that can reject on its own. Reading it before
+    // inspecting the status discarded the outcome we had already received: a real
+    // HTTP 200 became a thrown provider failure, and a known 429 lost its
+    // classification, purely because the body could not be read.
+    let text = ''
+    let bodyUnavailable = false
+    try {
+      text = await response.text()
+    } catch {
+      bodyUnavailable = true
+    }
     let result: unknown = null
-    try { result = text ? JSON.parse(text) : null } catch { result = null }
+    if (text) {
+      try { result = JSON.parse(text) } catch { result = null }
+    }
     if (!response.ok) {
       const isAuthenticationEmailRequest = path === '/auth/v1/invite' || path === '/auth/v1/recover'
       if (response.status === HttpStatus.TOO_MANY_REQUESTS && isAuthenticationEmailRequest) {
@@ -634,6 +652,16 @@ export class WorkspaceService {
         return EXISTING_AUTH_ACCOUNT
       }
       throw new BadRequestException('The requested HawkView account operation could not be completed.')
+    }
+    // Past here the provider returned success. Callers that read the payload must
+    // still fail rather than act on an absent one — `resetHawkViewMfa` would
+    // otherwise see an empty factor list and report having removed nothing as a
+    // success. So tolerance is opt-in, and only a caller that uses no payload
+    // sets it.
+    if (bodyUnavailable && options?.bodyUnused !== true) {
+      throw new ServiceUnavailableException(
+        'HawkView account service returned a response that could not be read.'
+      )
     }
     return result
   }
@@ -1023,6 +1051,177 @@ export class WorkspaceService {
         stage,
         errorCode: workspaceAuditErrorCode(error),
       })
+      throw error
+    }
+  }
+
+  /**
+   * Explicit administrator recovery for a member who never completed HawkView
+   * account setup but already has a sign-in account at the authentication provider.
+   *
+   * This is the deliberate complement of `sendPasswordReset`, which refuses a
+   * member who has not accepted. Without this action such a member has no
+   * supported route at all: the invite boundary reports acceptance without
+   * advancing anything, and resend refuses because the provider reports the
+   * address is already registered.
+   *
+   * Deliberately does NOT require `authProviderUserId`. A member whose original
+   * invite collided with an existing provider account never had one captured,
+   * and those are precisely the members this exists for. A stored id would not
+   * establish eligibility anyway: it proves a local reference, not a live
+   * provider account.
+   *
+   * Performs NO local mutation by design. `inviteAcceptedAt` advances only
+   * through a successful authenticated bootstrap, never here, so nothing about
+   * this request can be read as the member having accepted the invitation.
+   */
+  async sendAccountRecovery(
+    identity: AuthenticatedIdentity,
+    membershipId: string,
+    body: unknown,
+    requestId?: string
+  ) {
+    const actor = await this.ownerContext(identity, requiredOrganizationId(body))
+    const operation = this.operation(requestId)
+    const member = await this.memberForOwner(actor.organizationId, membershipId)
+    const target = this.memberTarget(operation, member.userId)
+    const delivery = 'ACCOUNT_RECOVERY' as const
+    let stage = 'REQUEST_VALIDATION'
+    let providerAccepted = false
+
+    // Intent is durable before the provider side effect, as on the invite and
+    // resend paths. If evidence storage is unavailable, no recovery is requested.
+    await this.audit(actor, {
+      ...operation,
+      ...target,
+      action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_REQUESTED',
+      outcome: 'STARTED',
+      stage: 'REQUEST_ACCEPTED',
+      metadata: { delivery },
+    })
+
+    try {
+      if (member.user.inviteAcceptedAt) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_NOT_PENDING_CODE,
+            message:
+              'This member has already completed HawkView account setup. Use password reset instead.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+      if (member.user.disabledAt) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_ACCOUNT_DISABLED_CODE,
+            message:
+              'This HawkView account is disabled. Re-enable it before sending account recovery.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+      if (member.status !== MembershipStatus.ACTIVE) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: ACCOUNT_RECOVERY_MEMBERSHIP_INACTIVE_CODE,
+            message:
+              'This membership is not active. Reactivate it before sending account recovery.',
+          },
+          HttpStatus.CONFLICT
+        )
+      }
+
+      stage = 'AUTH_PROVIDER'
+      // `bodyUnused`: recovery reads nothing from the response. An unreadable
+      // success body is not evidence that the request failed, and must not be
+      // turned into a provider failure — that is what invites a second email.
+      await this.supabaseAdminRequest(
+        '/auth/v1/recover',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email: member.user.email,
+            redirect_to: this.authEmailRedirectUrl(),
+          }),
+        },
+        { bodyUnused: true }
+      )
+      // The discriminator, tracked separately from `stage` on purpose. Every
+      // failure after this point is OUR persistence failing, not the provider's,
+      // and the provider has already been asked to send exactly one email.
+      providerAccepted = true
+      stage = 'EVIDENCE_PERSISTENCE'
+
+      // PROVIDER_ACCEPTED, never "SENT". The provider answers 200 with an empty
+      // body for an address it cannot find, so a 2xx establishes that the request
+      // was accepted and establishes nothing about delivery. Recording a send
+      // here would place a false SUCCEEDED in the one record an administrator
+      // consults to find out what actually happened.
+      await this.audit(actor, {
+        ...operation,
+        ...target,
+        action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_PROVIDER_ACCEPTED',
+        outcome: 'SUCCEEDED',
+        stage: 'AUTH_PROVIDER',
+        metadata: { delivery },
+      })
+
+      return {
+        requested: true,
+        recorded: true,
+        delivery,
+        operationId: operation.operationId,
+        requestId: operation.requestId,
+      }
+    } catch (error) {
+      if (providerAccepted) {
+        // Our own evidence write failed after the provider accepted. Reporting
+        // this as a provider failure — and throwing — is exactly what invites a
+        // second send. Record it honestly at its real stage and return an
+        // accepted-but-unrecorded outcome instead.
+        try {
+          await this.audit(actor, {
+            ...operation,
+            ...target,
+            action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_RECORDING_FAILED',
+            outcome: 'FAILED',
+            stage: 'EVIDENCE_PERSISTENCE',
+            errorCode: ACCOUNT_RECOVERY_RECORDING_FAILED_CODE,
+            metadata: { delivery },
+          })
+        } catch {
+          // The failure record is itself unwritable. Swallowed deliberately:
+          // the caller is still told `recorded: false`, and throwing would
+          // misreport an accepted request as a failed one.
+        }
+        return {
+          requested: true,
+          recorded: false,
+          delivery,
+          operationId: operation.operationId,
+          requestId: operation.requestId,
+        }
+      }
+      // Pre-acceptance failure: no provider request was accepted, so this is a
+      // genuine failure and the caller must see it. Best-effort record, then the
+      // original error — losing the cause to a failing audit write is its own bug.
+      try {
+        await this.audit(actor, {
+          ...operation,
+          ...target,
+          action: 'WORKSPACE_MEMBER_ACCOUNT_RECOVERY_FAILED',
+          outcome: 'FAILED',
+          stage,
+          errorCode: workspaceAuditErrorCode(error),
+          metadata: { delivery },
+        })
+      } catch {
+        // Nothing to add: the caller still receives the original failure.
+      }
       throw error
     }
   }
