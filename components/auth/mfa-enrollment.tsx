@@ -64,6 +64,10 @@ export function MfaEnrollment({
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
+  // Set the instant the provider confirms the factor, which is before the
+  // caller's onComplete runs. Once true the factor is a working authenticator,
+  // not a pending enrollment, and nothing on this screen may delete it.
+  const [enrolled, setEnrolled] = useState(false)
 
   // An enrollment that was started and never verified keeps its factor on the
   // account and blocks every later attempt under the same name, so recovery
@@ -101,7 +105,12 @@ export function MfaEnrollment({
     try {
       // The sweep runs even with no factor id, which is the state left behind
       // when enroll() itself failed — previously nothing could clear it.
-      if (supabase) {
+      // Once the provider has confirmed the factor, no provider cleanup runs at
+      // all. Not the direct delete, which would undo working MFA, and not the
+      // sweep either: the sweep's verified-id veto depends on the factor list
+      // already reporting the new status, and a stale read must not be the only
+      // thing standing between a failed refresh and a destroyed authenticator.
+      if (supabase && !enrolled) {
         await cancelTotpEnrollment(
           enrollmentClient(supabase),
           enrollment?.factorId ?? null
@@ -135,7 +144,19 @@ export function MfaEnrollment({
         code: normalizedCode,
       })
       if (result.error) throw result.error
-      await onComplete()
+      // Record success before handing control to the caller. onComplete awaits
+      // provider work and can reject; letting that rejection fall into the
+      // verification catch below made a verified factor look like a pending
+      // enrollment, and cancelling then deleted the authenticator the user had
+      // just set up.
+      setEnrolled(true)
+      try {
+        await onComplete()
+      } catch {
+        setError(
+          'Your authenticator is set up, but HawkView could not refresh this page. Reload to continue — do not set it up again.'
+        )
+      }
     } catch (failure) {
       setError(verificationError(failure))
     } finally {
@@ -246,7 +267,7 @@ export function MfaEnrollment({
         <Button
           type="button"
           onClick={verify}
-          disabled={busy || code.length !== 6}
+          disabled={busy || code.length !== 6 || enrolled}
           className="gap-2"
         >
           {busy ? (
@@ -256,15 +277,20 @@ export function MfaEnrollment({
           )}
           Verify and enable
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          onClick={() => void cancel()}
-          disabled={busy}
-          className="gap-2"
-        >
-          <X className="h-4 w-4" /> Cancel
-        </Button>
+        {/* Withdrawn once the factor exists. Offering "Cancel" beside a working
+            authenticator invites the user to destroy it while believing setup
+            never completed. */}
+        {!enrolled && (
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void cancel()}
+            disabled={busy}
+            className="gap-2"
+          >
+            <X className="h-4 w-4" /> Cancel
+          </Button>
+        )}
       </div>
     </div>
   )

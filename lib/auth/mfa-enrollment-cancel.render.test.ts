@@ -41,7 +41,7 @@ function compile(text: string, dependencies: Record<string, unknown>) {
   return exports
 }
 
-async function mount(text: string) {
+async function mount(text: string, onCompleteRejects = false) {
   const dom = new JSDOM('<div id="root"></div>', {
     url: 'https://console.hawkviewapp.com/profile/security',
   })
@@ -59,11 +59,14 @@ async function mount(text: string) {
   }
 
   const factors: Array<{ id: string; friendly_name: string; status: string; factor_type: string }> = []
+  const unenrolled: string[] = []
+  const inputProps: { current: any } = { current: null }
   const supabase = {
     auth: {
       mfa: {
         listFactors: async () => ({ data: { all: [...factors], totp: [] }, error: null }),
         unenroll: async ({ factorId }: { factorId: string }) => {
+          unenrolled.push(factorId)
           const index = factors.findIndex((f) => f.id === factorId)
           if (index >= 0) factors.splice(index, 1)
           return { error: null }
@@ -73,7 +76,13 @@ async function mount(text: string) {
           factors.push({ id, friendly_name: friendlyName, status: 'unverified', factor_type: 'totp' })
           return { data: { id, totp: { qr_code: QR, secret: SECRET } }, error: null }
         },
-        challengeAndVerify: async () => ({ error: null }),
+        // Mirrors the provider: a successful verification flips the factor to
+        // verified BEFORE the caller's onComplete is given control.
+        challengeAndVerify: async ({ factorId }: { factorId: string }) => {
+          const f = factors.find((x) => x.id === factorId)
+          if (f) f.status = 'verified'
+          return { error: null }
+        },
       },
     },
   }
@@ -83,7 +92,14 @@ async function mount(text: string) {
     '@/components/ui/button': {
       Button: ({ variant: _v, size: _s, asChild: _a, ...props }: any) => h('button', props),
     },
-    '@/components/ui/input': { Input: (props: any) => h('input', props) },
+    // Captured so the code field can be driven at the component boundary.
+    // A DOM-level value set does not reach React's controlled state here.
+    '@/components/ui/input': {
+      Input: (props: any) => {
+        inputProps.current = props
+        return h('input', props)
+      },
+    },
     '@/lib/auth/supabase': { supabase },
     '@/lib/auth/mfa-enrollment': enrollment,
   }) as { MfaEnrollment: (props: unknown) => unknown }
@@ -93,7 +109,10 @@ async function mount(text: string) {
   const onCancel = async () => {
     throw new Error('refreshMfa failed')
   }
-  await React.act(async () => root.render(h(MfaEnrollment, { onComplete: () => {}, onCancel })))
+  const onComplete = async () => {
+    if (onCompleteRejects) throw new Error('refreshMfa failed')
+  }
+  await React.act(async () => root.render(h(MfaEnrollment, { onComplete, onCancel })))
 
   const button = (label: RegExp) =>
     [...dom.window.document.querySelectorAll('button')].find((node) =>
@@ -110,7 +129,12 @@ async function mount(text: string) {
       else delete (globalThis as Record<string, unknown>)[key]
     }
   }
-  return { dom, button, click, teardown, factors }
+  const type = async (value: string) => {
+    await React.act(async () => {
+      inputProps.current?.onChange({ target: { value } })
+    })
+  }
+  return { dom, button, click, type, teardown, factors, unenrolled }
 }
 
 const source = readFileSync(SOURCE, 'utf8')
@@ -170,5 +194,59 @@ test('cancelling clears the abandoned factor server-side even as onCancel fails'
       'the unverified factor must be removed, or the next enrollment conflicts again')
   } finally {
     h3.teardown()
+  }
+})
+
+/**
+ * E2 reproduced this trace identically on base 1d514255 and on v2:
+ *   enroll -> verify:verified -> onComplete:rejected -> unenroll:<verified factor>
+ * A successful verification followed by a failing refresh left the screen
+ * looking like a pending enrollment, so Cancel deleted the authenticator the
+ * user had just set up. Pre-existing, not introduced by the enrollment work.
+ */
+test('a verified factor is never deleted when the post-verification refresh fails', async () => {
+  const h = await mount(source, true)
+  try {
+    await h.click(h.button(/Set up authenticator/)!)
+    await h.type('123456')
+    await h.click(h.button(/Verify and enable/)!)
+
+    assert.equal(h.factors[0]?.status, 'verified', 'the provider must have confirmed the factor')
+    assert.match(h.dom.window.document.body.textContent ?? '', /authenticator is set up/,
+      'a failed refresh must read as success-plus-warning, not as a failed verification')
+    assert.equal(h.button(/Cancel/), undefined,
+      'Cancel must be withdrawn once the factor exists, or it invites destroying it')
+
+    // Even if cancellation is reached by another route, nothing may be deleted.
+    await h.click(h.button(/Set up authenticator/) ?? h.button(/Verify and enable/)!)
+    assert.deepEqual(h.unenrolled, [], 'no unenroll may be issued against a verified factor')
+    assert.equal(h.factors.filter((f) => f.status === 'verified').length, 1)
+  } finally {
+    h.teardown()
+  }
+})
+
+test('NEGATIVE CONTROL: without the guard the verified factor is destroyed', async () => {
+  // Restores the pre-fix behaviour in memory: verification success is no longer
+  // recorded before onComplete, so a rejection falls into the verification
+  // catch and the factor stays cancellable.
+  const regressed = source
+    .replace(/      setEnrolled\(true\)\n      try \{\n        await onComplete\(\)\n      \} catch \{\n        setError\(\n[\s\S]*?\n        \)\n      \}/, '      await onComplete()')
+    .replace('if (supabase && !enrolled) {', 'if (supabase) {')
+    .replace(/\{!enrolled && \(\n(\s+)<Button/, '{true && (\n$1<Button')
+  assert.notEqual(regressed, source, 'the mutation did not apply; this control proves nothing')
+
+  const h = await mount(regressed, true)
+  try {
+    await h.click(h.button(/Set up authenticator/)!)
+    await h.type('123456')
+    await h.click(h.button(/Verify and enable/)!)
+    const cancel = h.button(/Cancel/)
+    assert.ok(cancel, 'the regressed build should still offer Cancel — that is the defect')
+    await h.click(cancel)
+    assert.ok(h.unenrolled.length > 0,
+      'the control must observe the verified factor being deleted, or it is not testing the guard')
+  } finally {
+    h.teardown()
   }
 })
