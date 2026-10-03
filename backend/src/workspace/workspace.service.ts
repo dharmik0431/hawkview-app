@@ -38,6 +38,14 @@ const AUTH_EMAIL_RATE_LIMITED_CODE = 'AUTH_EMAIL_RATE_LIMITED'
 const AUTH_EMAIL_RATE_LIMITED_MESSAGE =
   'Authentication email sending is temporarily rate-limited. Please wait a few minutes and try again.'
 const INVITATION_NOT_PENDING_CODE = 'INVITATION_NOT_PENDING'
+const INVITATION_ACCOUNT_ALREADY_REGISTERED_CODE =
+  'INVITATION_ACCOUNT_ALREADY_REGISTERED'
+// Observed in production: the provider answers a resend for an already-created
+// sign-in account with 422 email_exists, and nothing is delivered. Reporting
+// that as a generic administrative failure told an administrator nothing, and
+// normalizing it into success would claim an email that was never sent.
+const INVITATION_ACCOUNT_ALREADY_REGISTERED_MESSAGE =
+  'HawkView could not send another invitation because this address already has a sign-in account. No email was sent.'
 const PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT_CODE =
   'PASSWORD_RESET_REQUIRES_ACCEPTED_ACCOUNT'
 const EXISTING_AUTH_ACCOUNT = Symbol('existing-auth-account')
@@ -586,7 +594,10 @@ export class WorkspaceService {
   private async supabaseAdminRequest(
     path: string,
     init: RequestInit,
-    options?: { normalizeExistingInvite?: boolean }
+    options?: {
+      normalizeExistingInvite?: boolean
+      conflictOnExistingAccount?: boolean
+    }
   ) {
     const { url, serviceRoleKey } = this.supabaseConfiguration()
     let response: Response
@@ -623,6 +634,25 @@ export class WorkspaceService {
         Object.prototype.hasOwnProperty.call(result, 'code')
           ? (result as { code?: unknown }).code
           : null
+      // Distinct from normalizeExistingInvite. That one hides the difference at
+      // the email-entry boundary so an address cannot be probed for membership.
+      // Here the administrator already knows the member exists, so the honest
+      // answer is that nothing was sent -- and it must not read as success.
+      if (
+        options?.conflictOnExistingAccount === true &&
+        path === '/auth/v1/invite' &&
+        response.status === HttpStatus.UNPROCESSABLE_ENTITY &&
+        providerCode === 'email_exists'
+      ) {
+        throw new HttpException(
+          {
+            statusCode: HttpStatus.CONFLICT,
+            code: INVITATION_ACCOUNT_ALREADY_REGISTERED_CODE,
+            message: INVITATION_ACCOUNT_ALREADY_REGISTERED_MESSAGE,
+          },
+          HttpStatus.CONFLICT
+        )
+      }
       if (
         options?.normalizeExistingInvite === true &&
         path === '/auth/v1/invite' &&
@@ -805,16 +835,22 @@ export class WorkspaceService {
       }
 
       stage = 'AUTH_PROVIDER'
-      await this.supabaseAdminRequest('/auth/v1/invite', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: member.user.email,
-          data: member.user.displayName
-            ? { display_name: member.user.displayName }
-            : undefined,
-          redirect_to: this.authEmailRedirectUrl(),
-        }),
-      })
+      // No inviteSentAt update follows a rejection: the timestamp means an email
+      // was accepted for delivery, and an existing-account conflict is not that.
+      await this.supabaseAdminRequest(
+        '/auth/v1/invite',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email: member.user.email,
+            data: member.user.displayName
+              ? { display_name: member.user.displayName }
+              : undefined,
+            redirect_to: this.authEmailRedirectUrl(),
+          }),
+        },
+        { conflictOnExistingAccount: true }
+      )
       await this.audit(actor, {
         ...operation,
         ...target,

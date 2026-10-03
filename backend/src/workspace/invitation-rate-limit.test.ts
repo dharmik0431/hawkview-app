@@ -433,7 +433,11 @@ test('provider email-exists rejection cannot become a successful resend', async 
   }
   const subject = fixture({ memberState: 'PENDING' })
 
-  await assert.rejects(() => resend(subject.service), /could not be completed/i)
+  // The guarantee this test exists for is unchanged: never a successful resend.
+  // The reported shape is now the specific existing-account conflict rather than
+  // a generic failure, because production showed administrators could not tell a
+  // refused send from a transient one and retried something that cannot succeed.
+  await assert.rejects(() => resend(subject.service), /already has a sign-in account/i)
   assert.deepEqual(paths, ['/auth/v1/invite'])
   assert.deepEqual(subject.counts(), {
     auditAttempts: 2,
@@ -571,4 +575,95 @@ test('an unavailable initial audit write fails closed before Supabase or local p
     userWrites: 0,
   })
   assert.deepEqual(subject.audits, [])
+})
+
+/**
+ * Production evidence (Codex read-only provider logs, two correlated failures):
+ * the resend reached the provider and was answered
+ *   422 email_exists — "A user with this email address has already been registered"
+ * and nothing was delivered. HawkView surfaced that as a generic administrative
+ * failure, so an administrator could not tell a refused send from a transient
+ * one and could only retry something that can never succeed.
+ */
+test('the confirmed existing-account provider rejection is reported truthfully and sends nothing', async () => {
+  configureEnvironment()
+  const paths: string[] = []
+  globalThis.fetch = async (input) => {
+    paths.push(new URL(String(input)).pathname)
+    return new Response(
+      JSON.stringify({
+        code: 'email_exists',
+        message: 'A user with this email address has already been registered',
+      }),
+      { status: 422 }
+    )
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+
+  await assert.rejects(() => resend(subject.service), (error: unknown) => {
+    const response = (error as { getResponse?: () => unknown }).getResponse?.() as
+      | { statusCode?: unknown; code?: unknown; message?: unknown }
+      | undefined
+    assert.equal(response?.statusCode, 409, 'must be a conflict, not a generic 400')
+    assert.equal(response?.code, 'INVITATION_ACCOUNT_ALREADY_REGISTERED')
+    // The message must not claim delivery of anything.
+    assert.match(String(response?.message), /No email was sent/i)
+    return true
+  })
+
+  assert.deepEqual(paths, ['/auth/v1/invite'], 'exactly one provider call, and no recovery fallback')
+  // inviteSentAt means "an email was accepted for delivery"; nothing was, so no write.
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.equal(subject.audits.at(-1)?.data.action, 'WORKSPACE_MEMBER_INVITE_RESEND_FAILED')
+  assert.equal(subject.audits.at(-1)?.data.stage, 'AUTH_PROVIDER')
+  // The provider's wording stays out of durable evidence.
+  assert.doesNotMatch(JSON.stringify(subject.audits), /email_exists|already been registered/i)
+})
+
+test('ordinary invite still hides the existing-account difference at the email-entry boundary', async () => {
+  // The two paths must not converge: probing an address through the invite form
+  // would leak membership, so only the resend path may name this outcome.
+  configureEnvironment()
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ code: 'email_exists' }), { status: 422 })
+  const subject = fixture({})
+  const result = await subject.service.inviteMember(identity, {
+    organizationId,
+    email: 'someone-else@example.com',
+    displayName: 'Someone else',
+    role: 'MSP_VIEWER',
+  })
+  assert.ok(result, 'the invite boundary must still answer uniformly, not conflict')
+})
+
+test('a provider transport failure is unavailable, not an existing-account conflict', async () => {
+  configureEnvironment()
+  globalThis.fetch = async () => {
+    throw new Error('socket hang up')
+  }
+  const subject = fixture({ memberState: 'PENDING' })
+  await assert.rejects(() => resend(subject.service), /could not be reached/i)
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  assert.equal(subject.audits.at(-1)?.data.stage, 'AUTH_PROVIDER')
+})
+
+test('an unreadable or malformed provider body never becomes an existing-account conflict', async () => {
+  configureEnvironment()
+  for (const body of ['<html>gateway error</html>', '']) {
+    globalThis.fetch = async () => new Response(body, { status: 502 })
+    const subject = fixture({ memberState: 'PENDING' })
+    // Generic, because the provider gave no code to act on — and specifically
+    // NOT the conflict, which would assert a cause the response does not state.
+    await assert.rejects(() => resend(subject.service), /could not be completed/i)
+    assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
+  }
+})
+
+test('a 422 without the exact email_exists code stays generic', async () => {
+  configureEnvironment()
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ code: 'weak_password' }), { status: 422 })
+  const subject = fixture({ memberState: 'PENDING' })
+  await assert.rejects(() => resend(subject.service), /could not be completed/i)
+  assert.deepEqual(subject.counts(), { auditAttempts: 2, membershipWrites: 0, userWrites: 0 })
 })

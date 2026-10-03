@@ -48,3 +48,20 @@ test('maps only the approved pending-invitation and accepted-account conflicts',
     'This member has not accepted their HawkView invitation. Resend the invitation instead of sending a password reset.',
   )
 })
+
+test('an existing-account resend refusal says no email was sent, and is not the generic fallback', () => {
+  // Production evidence: the provider answers a resend for an already-created
+  // sign-in account with 422 email_exists and delivers nothing. The old generic
+  // text gave an administrator no way to tell that from a transient failure.
+  const message = workspaceAdminErrorMessage(
+    { status: 409, code: 'INVITATION_ACCOUNT_ALREADY_REGISTERED' },
+    'fallback'
+  )
+  assert.notEqual(message, 'fallback')
+  assert.match(message, /no email went out/i)
+  // It must never read as a delivered invitation.
+  assert.doesNotMatch(message, /sent (an|a new) invitation|invitation (was )?sent/i)
+  // A different status with the same code, or the code alone, stays generic.
+  assert.equal(workspaceAdminErrorMessage({ status: 400, code: 'INVITATION_ACCOUNT_ALREADY_REGISTERED' }, 'fallback'), 'fallback')
+  assert.equal(workspaceAdminErrorMessage({ status: 409 }, 'fallback'), 'fallback')
+})
