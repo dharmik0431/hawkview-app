@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 import {
   CONNECTION_REQUIRED_PERMISSIONS,
   DEFAULT_REQUIRED_PERMISSIONS,
@@ -11,6 +12,7 @@ import {
 } from './microsoft-access-contract.js'
 import { MicrosoftConsentService } from './microsoft-consent.service.js'
 import { CURRENT_SECURE_SCORE_URL } from '../tenants/secure-score-collection.js'
+import { DIRECTORY_ROLE_URL } from '../tenants/directory-role-collector.js'
 import { effectiveMicrosoftConnectionStatus } from '../tenants/tenants.service.js'
 
 test('registers every requested application permission against a real capability and exact resource', () => {
@@ -79,7 +81,6 @@ test('keeps current Microsoft call-site families represented in the registry', (
     ['/users/delta', '/users/delta'],
     ['/groups?', '/groups'],
     ['/devices?', '/devices'],
-    ['/roleManagement/directory/roleAssignments', '/roleManagement/directory/roleAssignments'],
     ['/reports/authenticationMethods/userRegistrationDetails', '/reports/authenticationMethods/userRegistrationDetails'],
     ['/authentication/requirements', '/authentication/requirements'],
     ['/authentication/methods', '/authentication/methods'],
@@ -120,6 +121,55 @@ test('keeps current Microsoft call-site families represented in the registry', (
   assert.ok(consentService.includes('/v1.0/admin/reportSettings?$select=displayConcealedNames'))
   assert.ok(registered.includes('/v1.0/admin/reportSettings?$select=displayConcealedNames'))
   assert.equal(consentService.includes('PATCH') && consentService.includes('/admin/reportSettings'), false)
+})
+
+test('directory role endpoint stays registered and wired through its dedicated collector', () => {
+  assert.equal(DIRECTORY_ROLE_URL, 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)')
+  const capability = MICROSOFT_ACCESS_CAPABILITIES.find(value => value.key === 'entra_directory_roles')
+  assert.ok(capability, 'Directory role capability disappeared')
+  assert.deepEqual(capability.resourceTypes, ['DIRECTORY_ROLES'])
+  assert.ok(capability.endpointPatterns.includes('GET /v1.0/roleManagement/directory/roleAssignments'), 'Directory role endpoint is not registered')
+  const ts = createRequire(new URL('../../../package.json', import.meta.url))('typescript')
+  const parse = (name: string) => ts.createSourceFile(name, readFileSync(new URL(name, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
+  const service = parse('../tenants/tenant-sync.service.ts'), collector = parse('../tenants/directory-role-collector.ts')
+  const imported = service.statements.filter((node: any) => ts.isImportDeclaration(node)
+    && node.moduleSpecifier.text === './directory-role-collector.js')
+  assert.equal(imported.length, 1, 'Directory collector import disappeared')
+  assert.deepEqual(imported[0].importClause.namedBindings.elements.map((node: any) => node.name.text).sort(),
+    ['DIRECTORY_ROLE_URL', 'collectDirectoryRoles'])
+  const type = service.statements.find((node: any) => ts.isClassDeclaration(node) && node.name.text === 'TenantSyncService')
+  const adapter = type.members.find((node: any) => ts.isMethodDeclaration(node) && node.name.getText(service) === 'syncDirectoryRoles')
+  assert.ok(adapter?.body, 'Directory adapter disappeared')
+  const calls = (node: any, source: any, expression: string): any[] => {
+    const found: any[] = []
+    const visit = (child: any) => {
+      if (ts.isCallExpression(child) && child.expression.getText(source) === expression) found.push(child)
+      ts.forEachChild(child, visit)
+    }
+    visit(node); return found
+  }
+  const delegation = calls(adapter.body, service, 'collectDirectoryRoles')
+  assert.equal(delegation.length, 1, 'Directory adapter must delegate to the actual collector')
+  const dependencies = delegation[0].arguments[1]
+  const property = (name: string) => dependencies.properties.find((node: any) => ts.isPropertyAssignment(node) && node.name.getText(service) === name)?.initializer
+  const transport = calls(property('fetchPage'), service, 'this.fetchGraphPage')
+  assert.equal(transport.length, 1, 'Directory provider transport delegation disappeared')
+  assert.deepEqual(transport[0].arguments.slice(0, 2).map((node: any) => node.getText(service)), ['url', 'token'])
+  const legacy = calls(property('legacy'), service, 'this.syncEntraCollection')
+  assert.equal(legacy.length, 1, 'Legacy directory collector disappeared')
+  assert.deepEqual(legacy[0].arguments.slice(2).map((node: any) => node.getText(service)), ["'DIRECTORY_ROLES'", 'DIRECTORY_ROLE_URL'])
+  const runtime = collector.statements.find((node: any) => ts.isFunctionDeclaration(node) && node.name.text === 'collectDirectoryRoles')
+  assert.ok(runtime?.body, 'Directory collector disappeared')
+  const pageCalls = calls(runtime.body, collector, 'deps.fetchPage')
+  assert.equal(pageCalls.length, 1, 'Directory collector must call the injected provider transport')
+  assert.deepEqual(pageCalls[0].arguments.map((node: any) => node.getText(collector)), ['url', 'token', 'deadlineAt'])
+  const initializers: string[] = []
+  const visit = (node: any) => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(collector) === 'next') initializers.push(node.initializer?.getText(collector))
+    ts.forEachChild(node, visit)
+  }
+  visit(runtime.body)
+  assert.deepEqual(initializers, ['DIRECTORY_ROLE_URL'], 'Directory pagination must start from the dedicated endpoint')
 })
 
 test('publishes canonical permission metadata without turning optional coverage into a connection gate', () => {

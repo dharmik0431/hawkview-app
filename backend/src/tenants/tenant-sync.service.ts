@@ -1,4 +1,5 @@
 import { projectSyncOutcome } from './sync-outcome-projection.js'
+import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
 import { validatedLicenseRows } from './license-validation.js'
 import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
@@ -2063,10 +2064,7 @@ export class TenantSyncService {
         tenant, accessToken, 'DEVICES',
         'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)',
       ),
-      DIRECTORY_ROLES: () => this.syncEntraCollection(
-        tenant, accessToken, 'DIRECTORY_ROLES',
-        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)',
-      ),
+      DIRECTORY_ROLES: () => this.syncDirectoryRoles(tenant, accessToken),
       RISKY_USERS: () => this.syncEntraCollection(
         tenant, accessToken, 'RISKY_USERS',
         'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime',
@@ -2445,12 +2443,7 @@ export class TenantSyncService {
         'DEVICES',
         'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
       ) },
-      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncEntraCollection(
-        tenant,
-        snapshotAccessToken,
-        'DIRECTORY_ROLES',
-        'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
-      ) },
+      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncDirectoryRoles(tenant, snapshotAccessToken) },
       { resource: 'RISKY_USERS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
@@ -3412,6 +3405,23 @@ export class TenantSyncService {
       // Complete for the explicitly scoped current-score query, not history.
       await this.saveSnapshot(tenant, 'SECURE_SCORES', currentScoreSnapshot(rows))
     })
+  }
+
+  private async syncDirectoryRoles(tenant: TenantSyncTarget, legacyToken: string) {
+    const result = await collectDirectoryRoles({ organizationId: tenant.organizationId,
+      customerTenantId: tenant.id, microsoftTenantId: tenant.microsoftTenantId }, {
+      db: this.prisma,
+      token: (authority, tenantId, deadlineAt) => this.microsoftConsent.getCapturedDirectoryRoleToken(authority, tenantId, deadlineAt),
+      fetchPage: (url, token, deadlineAt) => this.fetchGraphPage(url, token, 'directory roles',
+        { deadlineAt, timeoutMs: Math.max(1, Math.min(30000, deadlineAt - Date.now())) }),
+      read: readBoundedResponseText,
+      buildDifference: input => this.changeEvidence.buildSnapshotDifferenceEvidence(input),
+      legacy: () => this.syncEntraCollection(tenant, legacyToken, 'DIRECTORY_ROLES', DIRECTORY_ROLE_URL),
+    })
+    if (!['legacy', 'committed', 'replayed'].includes(result.status)) {
+      // Collector orchestration may report failure, but must not write another terminal state.
+      throw new Error('DIRECTORY_ROLE_COLLECTION_NOT_COMMITTED')
+    }
   }
 
   private async syncEntraCollection(
@@ -4965,12 +4975,7 @@ export class TenantSyncService {
           'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
         ),
       DIRECTORY_ROLES: () =>
-        this.syncEntraCollection(
-          tenant,
-          accessToken,
-          'DIRECTORY_ROLES',
-          'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
-        ),
+        this.syncDirectoryRoles(tenant, accessToken),
       SERVICE_PRINCIPALS: () =>
         this.syncEntraCollection(
           tenant,

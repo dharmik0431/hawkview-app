@@ -13,7 +13,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
 import type { ClaimedConsent, ConsentOperationKey } from './consent-operation-store.js'
-import { captureManagedAuthority, publishManagedAuthority } from './managed-connector-authority.js'
+import { captureManagedAuthority, publishManagedAuthority, type ManagedAuthority } from './managed-connector-authority.js'
 import {
   fetchMicrosoftWithRetry,
   microsoftErrorMetadata,
@@ -629,6 +629,23 @@ export class MicrosoftConsentService {
       grantedPermissions,
       directoryRoleIds,
     }
+  }
+
+  /** Directory adapter only: consume the captured immutable authority, never reload latest credentials. */
+  async getCapturedDirectoryRoleToken(authority: ManagedAuthority, microsoftTenantId: string, deadlineAt: number) {
+    const captured = { ...authority }, tenantId = microsoftTenantId
+    if (captured.credentialReference !== `encrypted-secret:${captured.configurationRevision}`
+      || !Number.isFinite(deadlineAt) || Date.now() >= deadlineAt) throw new Error('INVALID_CAPTURED_DIRECTORY_AUTHORITY')
+    const clientSecret = await this.secretStore.access(captured.credentialReference)
+    if (!clientSecret || Date.now() >= deadlineAt) throw new Error('CAPTURED_DIRECTORY_CREDENTIAL_UNAVAILABLE')
+    const result = await this.requestAccessToken(tenantId, { clientId: captured.clientId, clientSecret }, undefined, deadlineAt)
+    const claims = decodeJwt(result.accessToken)
+    const application = claims.appid ?? claims.azp
+    if (claims.tid !== tenantId || application !== captured.clientId
+      || !['https://graph.microsoft.com', 'https://graph.microsoft.com/', '00000003-0000-0000-c000-000000000000'].includes(String(claims.aud))) {
+      throw new Error('CAPTURED_DIRECTORY_TOKEN_SCOPE_MISMATCH')
+    }
+    return result.accessToken
   }
 
   async getTenantAccessToken(input: {
