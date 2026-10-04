@@ -544,6 +544,32 @@ export interface CancelledRow {
   readonly was_claimed: boolean
 }
 
+/** One target predicate for the operator preview and atomic cancellation statement. */
+function cancellationTargetWhere(scope: CancelScope, cutoffParam: number, scopeParam: number): readonly string[] {
+  const where = [
+    `   WHERE state NOT IN (${TERMINAL_SQL})`,
+    `     AND created_at < $${cutoffParam}::timestamptz`,
+  ]
+  if (scope.kind === 'ORGANISATION') where.push(`     AND message_id LIKE $${scopeParam} || '%'`)
+  return where
+}
+
+/** Read-only operator preview; the update below still captures and reports its own locked pre-image. */
+export function cancellationPreviewStatement(scope: CancelScope): CancelStatement {
+  const params: unknown[] = [scope.createdBeforeIso]
+  if (scope.kind === 'ORGANISATION') params.push(`incident/${scope.organizationId}|`)
+  return {
+    sql: [
+      'SELECT message_id, state AS state_before, attempts_made, (claimed_by IS NOT NULL) AS was_claimed',
+      '  FROM alert_send_jobs',
+      ...cancellationTargetWhere(scope, 1, 2),
+      ' ORDER BY message_id',
+    ].join('\n'),
+    params,
+    expectedRowCount: null,
+  }
+}
+
 /** Cancel every job that is not already finished.
  *
  * STOP MEANS STOP, INCLUDING JOBS THAT HAVE BEEN ATTEMPTED. This bound was `attempts_made = 0`
@@ -577,19 +603,7 @@ export interface CancelledRow {
 export function cancelStatement(order: CancelOrder, nowIso: string): CancelStatement {
   const { scope } = order
   const scoped = scope.kind === 'ORGANISATION'
-  const targetWhere = [
-    // Not already finished — and nothing else. A CLAIMED job whose worker died must stop, and so
-    // must one that was attempted and refused retryably, or stop does not stop. A terminal job is
-    // not relabelled: those are history, and this cancels intent.
-    //
-    // THE SECOND HAND-WRITTEN COPY, now also derived. A WITHDRAWN job left out of this list would
-    // be relabelled CANCELLED by the next stop — turning "the type was switched off" into "a
-    // person stopped it", which is the exact confusion the new state was added to prevent.
-    `   WHERE state NOT IN (${TERMINAL_SQL})`,
-    '     AND created_at < $4::timestamptz',
-  ]
-  // `LIKE` with the separator included, so `incident/org-1|` cannot also match `incident/org-12|`.
-  if (scoped) targetWhere.push("     AND message_id LIKE $5 || '%'")
+  const targetWhere = cancellationTargetWhere(scope, 4, 5)
 
   const sql = [
     'WITH targets AS (',
