@@ -1,9 +1,10 @@
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../src/generated/prisma/client.js'
 import {
-  cancelReason, cancelStatement, classifyCancellation,
-  type CancelOrder, type CancelReason, type CancelScope, type CancelledJob, type CancelledRow,
+  cancellationPreviewStatement, cancelStatement, classifyCancellation,
+  type CancelOrder, type CancelScope, type CancelledJob, type CancelledRow,
 } from '../src/alerts/send-queue.js'
+import { parseCancellationArguments, type CancellationArguments } from '../src/alerts/cancellation-operator.js'
 
 /**
  * THE STOP BUTTON'S PRESS.
@@ -28,13 +29,6 @@ import {
 // ARGUMENTS. Every one of them required on purpose; see the note on each.
 // ---------------------------------------------------------------------------------------
 
-interface Arguments {
-  readonly scope: CancelScope
-  readonly by: string
-  readonly because: CancelReason
-  readonly apply: boolean
-}
-
 const USAGE = `
 Stop unsent alert send jobs.
 
@@ -58,46 +52,6 @@ because the generated Prisma client is TypeScript and plain node cannot resolve 
     --by dharmik --because "duplicate storm from the 09:00 tick"
 `
 
-function parse(argv: readonly string[]): Arguments {
-  const value = (flag: string): string | undefined => {
-    const at = argv.indexOf(flag)
-    return at >= 0 ? argv[at + 1] : undefined
-  }
-  const organisation = value('--organisation')
-  const everything = argv.includes('--everything')
-  const createdBefore = value('--created-before')
-  const by = value('--by')
-  const because = value('--because')
-
-  // BOTH OR NEITHER IS AN ERROR, not a precedence rule. An operator who typed both does not know
-  // which they meant, and picking one for them is how the wrong MSP gets silenced.
-  if (organisation !== undefined && everything) {
-    throw new Error('Pass --organisation or --everything, not both. Which one you meant is not something this can guess.')
-  }
-  if (organisation === undefined && !everything) throw new Error('Pass --organisation <uuid> or --everything.')
-  if (createdBefore === undefined) throw new Error('--created-before is required. See the note in --help.')
-  if (by === undefined || by.trim() === '') throw new Error('--by is required.')
-  if (because === undefined) throw new Error('--because is required. An unexplained stop is what turns into an argument with a customer.')
-
-  const parsed = Date.parse(createdBefore)
-  // A REFUSAL, NOT A FALLBACK. `Date.parse` of nonsense is NaN, and a NaN comparison in SQL
-  // matches nothing — so a typo would silently stop zero jobs and read as "nothing was waiting".
-  if (Number.isNaN(parsed)) throw new Error(`--created-before is not a date: ${createdBefore}`)
-  const createdBeforeIso = new Date(parsed).toISOString()
-
-  return {
-    scope: organisation !== undefined
-      ? { kind: 'ORGANISATION', organizationId: organisation, createdBeforeIso }
-      : { kind: 'EVERYTHING', createdBeforeIso },
-    by,
-    // CONSTRUCTED HERE so a blank reason is an argument error with an exit code, not a
-    // stack trace. It threw past the handler when it lived in main, which is a worse first
-    // experience than the mistake deserves.
-    because: cancelReason(because),
-    apply: argv.includes('--apply'),
-  }
-}
-
 // ---------------------------------------------------------------------------------------
 // THE TWO QUESTIONS. Before: which jobs would stop. After: which of them may already have gone.
 // ---------------------------------------------------------------------------------------
@@ -111,21 +65,8 @@ function parse(argv: readonly string[]): Arguments {
  * behaviour from the other side.
  */
 async function preview(prisma: PrismaClient, scope: CancelScope): Promise<readonly CancelledRow[]> {
-  const where = [
-    "WHERE state NOT IN ('SENT', 'EXHAUSTED', 'GAVE_UP', 'CANCELLED')",
-    '  AND created_at < $1::timestamptz',
-  ]
-  const params: unknown[] = [scope.createdBeforeIso]
-  if (scope.kind === 'ORGANISATION') {
-    where.push("  AND message_id LIKE $2 || '%'")
-    params.push(`incident/${scope.organizationId}|`)
-  }
-  return prisma.$queryRawUnsafe<CancelledRow[]>(
-    `SELECT message_id, state AS state_before, attempts_made, (claimed_by IS NOT NULL) AS was_claimed
-       FROM alert_send_jobs
-       ${where.join('\n       ')}
-      ORDER BY message_id`,
-    ...params)
+  const statement = cancellationPreviewStatement(scope)
+  return prisma.$queryRawUnsafe<CancelledRow[]>(statement.sql, ...statement.params)
 }
 
 const describe = (scope: CancelScope): string =>
@@ -167,9 +108,9 @@ async function main(): Promise<number> {
     return 2
   }
 
-  let args: Arguments
+  let args: CancellationArguments
   try {
-    args = parse(process.argv.slice(2))
+    args = parseCancellationArguments(process.argv.slice(2))
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error))
     console.error('\nRun with --help.')
