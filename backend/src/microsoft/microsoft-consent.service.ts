@@ -12,6 +12,7 @@ import { decodeJwt, jwtVerify, SignJWT } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
+import type { ClaimedConsent, ConsentOperationKey } from './consent-operation-store.js'
 import { captureManagedAuthority, publishManagedAuthority } from './managed-connector-authority.js'
 import {
   fetchMicrosoftWithRetry,
@@ -130,6 +131,8 @@ export function normalizeConfiguredRequiredPermissions(value: string | undefined
 }
 
 interface ConsentState {
+  operationId?: string
+  operationVersion?: 1
   customerTenantId?: string
   organizationId: string
   nonce: string
@@ -257,6 +260,63 @@ export class MicrosoftConsentService {
     }
   }
 
+  async prepareExistingConsent() {
+    const configuration = await this.getStateConfiguration()
+    const authority = await captureManagedAuthority(this.prisma)
+    if (!authority || authority.credentialReference !== `encrypted-secret:${authority.configurationRevision}`) {
+      throw new ServiceUnavailableException('Managed consent authority is not ready.')
+    }
+    const nonce = randomBytes(32).toString('base64url')
+    return { authority, nonce, stateHash: this.hashConsentNonce(nonce), configuration }
+  }
+
+  async createIssuedConsentUrl(prepared: Awaited<ReturnType<MicrosoftConsentService['prepareExistingConsent']>>,
+    issued: { operation: ConsentOperationKey; expiresAt: Date }, microsoftTenantId: string) {
+    if (issued.operation.stateHash !== this.hashConsentNonce(prepared.nonce)) throw new Error('CONSENT_NONCE_MISMATCH')
+    const state = await new SignJWT({ organizationId: issued.operation.organizationId,
+      customerTenantId: issued.operation.customerTenantId, nonce: prepared.nonce,
+      flow: 'existing-tenant', operationVersion: 1, operationId: issued.operation.operationId })
+      .setProtectedHeader({ alg: 'HS256', typ: 'JWT' }).setIssuedAt()
+      // JWT has second precision; database claim eligibility remains authoritative.
+      .setExpirationTime(Math.ceil(issued.expiresAt.getTime() / 1000))
+      .setIssuer('hawkview-api').setAudience('microsoft-admin-consent')
+      .sign(new TextEncoder().encode(prepared.configuration.stateSecret))
+    const url = new URL(`https://login.microsoftonline.com/${microsoftTenantId}/v2.0/adminconsent`)
+    url.searchParams.set('client_id', prepared.authority.clientId)
+    url.searchParams.set('scope', 'https://graph.microsoft.com/.default')
+    url.searchParams.set('redirect_uri', prepared.configuration.redirectUri)
+    url.searchParams.set('state', state)
+    return url.toString()
+  }
+
+  async verifyClaimedTenantAfterConsent(context: ClaimedConsent) {
+    const deadlineAt = context.finalDeadline.getTime()
+    if (!Number.isFinite(deadlineAt) || Date.now() >= deadlineAt) throw new Error('CONSENT_VERIFICATION_EXPIRED')
+    const credentials = { clientId: context.clientId, clientSecret: await this.secretStore.access(context.credentialReference) }
+    const delays = [1000, 2000, 3000, 5000, 8000]
+    let last: Awaited<ReturnType<MicrosoftConsentService['verifyTenantWithCredentials']>> | null = null
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      if (Date.now() >= deadlineAt) throw new Error('CONSENT_VERIFICATION_EXPIRED')
+      try {
+        const value = await this.verifyTenantWithCredentials(context.microsoftTenantId, credentials, deadlineAt)
+        if (typeof value.displayName !== 'string' || value.displayName.length < 1 || value.displayName.length > 200 ||
+          (value.primaryDomain !== null && (typeof value.primaryDomain !== 'string' || value.primaryDomain.length > 253)) ||
+          ![value.grantedPermissions,value.missingPermissions,value.missingRequiredPermissions].every(items =>
+            Array.isArray(items) && items.length <= 200 && items.every(item => typeof item === 'string' && /^[A-Za-z][A-Za-z0-9.]{0,199}$/.test(item)))) {
+          throw new Error('INVALID_CONSENT_VERIFICATION')
+        }
+        last = value
+        if (last.missingPermissions.length === 0) return last
+      } catch { /* Only a bounded safe result may cross the adapter boundary. */ }
+      const delay = delays[attempt]
+      if (delay && Date.now() + delay < deadlineAt) await new Promise(resolve => setTimeout(resolve, delay))
+      else if (delay) break
+    }
+    if (Date.now() >= deadlineAt) throw new Error('CONSENT_VERIFICATION_EXPIRED')
+    if (last) return last
+    throw new BadGatewayException('Microsoft tenant verification did not complete after consent.')
+  }
+
   async createAdminConsentUrl(
     microsoftTenantId: string,
     state: Omit<ConsentState, 'nonce' | 'flow'>
@@ -331,6 +391,12 @@ export class MicrosoftConsentService {
       }
     )
 
+    if (payload.operationVersion !== undefined || payload.operationId !== undefined) {
+      if (payload.operationVersion !== 1 || payload.flow !== 'existing-tenant' ||
+        typeof payload.operationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(payload.operationId)) {
+        throw new Error('Microsoft consent operation state is invalid.')
+      }
+    }
     const flow = payload.flow === 'discover-tenant'
       ? 'discover-tenant'
       : payload.flow === 'exchange-readonly' && typeof payload.customerTenantId === 'string'
@@ -350,6 +416,7 @@ export class MicrosoftConsentService {
     }
 
     return {
+      ...(payload.operationVersion === 1 ? { operationVersion: 1 as const, operationId: payload.operationId as string } : {}),
       customerTenantId:
         typeof payload.customerTenantId === 'string'
           ? payload.customerTenantId
@@ -407,11 +474,12 @@ export class MicrosoftConsentService {
 
   async verifyTenantWithCredentials(
     microsoftTenantId: string,
-    credentials: { clientId: string; clientSecret: string }
+    credentials: { clientId: string; clientSecret: string },
+    deadlineAt?: number
   ) {
     let graphToken: Awaited<ReturnType<MicrosoftConsentService['requestAccessToken']>>
     try {
-      graphToken = await this.requestAccessToken(microsoftTenantId, credentials)
+      graphToken = await this.requestAccessToken(microsoftTenantId, credentials, undefined, deadlineAt)
     } catch (error) {
       if (error instanceof MicrosoftRequestError) {
         throw new BadGatewayException(error.message)
@@ -428,7 +496,7 @@ export class MicrosoftConsentService {
       const managementToken = await this.requestAccessToken(
         microsoftTenantId,
         credentials,
-        'https://manage.office.com/.default'
+        'https://manage.office.com/.default', deadlineAt
       )
       managementPermissions = managementToken.grantedPermissions
     } catch {
@@ -448,7 +516,7 @@ export class MicrosoftConsentService {
           Accept: 'application/json',
         },
       },
-      { label: 'Microsoft organization verification', timeoutMs: 15_000 },
+      { label: 'Microsoft organization verification', timeoutMs: 15_000, deadlineAt },
     )
 
     if (!organizationResponse.ok) {
@@ -502,7 +570,8 @@ export class MicrosoftConsentService {
   private async requestAccessToken(
     microsoftTenantId: string,
     credentials: { clientId: string; clientSecret: string },
-    scope = 'https://graph.microsoft.com/.default'
+    scope = 'https://graph.microsoft.com/.default',
+    deadlineAt?: number
   ) {
     const { clientId, clientSecret } = credentials
     const tokenUrl = `https://login.microsoftonline.com/${microsoftTenantId}/oauth2/v2.0/token`
@@ -517,6 +586,7 @@ export class MicrosoftConsentService {
       }),
     }, {
       label: 'Microsoft tenant access-token acquisition',
+      deadlineAt,
       timeoutMs: 15_000,
       // Client-credentials token acquisition is idempotent. Retrying only
       // transport/429/5xx failures never repeats a user or tenant mutation.

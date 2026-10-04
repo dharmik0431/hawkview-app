@@ -1454,6 +1454,8 @@ model TenantConnection {
 }
 
 model MicrosoftConsentAttempt {
+  // Frozen terminal notification identities; NULL legacy operations cannot apply effects.
+  operationEffectsSnapshot Json? @map("operation_effects_snapshot")
   // NULL version is legacy/untrusted. No trusted defaults or backfill.
   operationVersion Int? @map("operation_version")
   operationState String? @map("operation_state") @db.VarChar(16)
