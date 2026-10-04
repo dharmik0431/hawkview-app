@@ -83,6 +83,8 @@ jobs:
         run: npm ci
       - run: npm ci
       - run: npm run db:generate
+      - name: Typecheck backend operator scripts
+        run: node node_modules/typescript/bin/tsc --noEmit --incremental false -p tsconfig.scripts.json
       - run: npm run db:validate
       - name: Apply every committed migration
         run: npm run db:migrate:deploy
