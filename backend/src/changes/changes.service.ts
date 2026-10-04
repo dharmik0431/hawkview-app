@@ -12,6 +12,7 @@ import {
   managementActivityRoleFromEvidence,
 } from './m365-activity-classification.js'
 import { classifyEvidenceTrust, classifyLegacyDirectoryProjection } from './evidence-trust-catalog.js'
+import { readDirectoryAuditMetadata } from './directory-audit-projection-metadata.js'
 import { productGuidanceForSnapshot } from './microsoft-admin-change-catalog.js'
 
 type JsonObject = Record<string, unknown>
@@ -214,7 +215,7 @@ function targetResourceTypes(value: unknown) {
   return array(value).map(object).map((target) => text(target.type)).filter((type): type is string => Boolean(type))
 }
 
-function normalizedEvidenceClassification(event: {
+type ProjectedEvidence = {
   source: string
   operationName: string
   category?: string | null
@@ -227,52 +228,42 @@ function normalizedEvidenceClassification(event: {
   targetDisplayName?: string | null
   beforeState?: unknown
   afterState?: unknown
-}): ChangeClassification {
-  const raw = object(event.raw)
-  const operationType = text(raw.operationType) ?? text(raw.OperationType)
-  if (event.source === 'DIRECTORY_AUDIT' && !operationType && !event.targetType) {
-    return classifyLegacyDirectoryProjection({
-      source: event.source,
-      operation: event.operationName,
-      category: event.category,
-      actor: event.actorPrincipalName ?? event.actorDisplayName,
-      result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
-      beforeState: event.beforeState,
-      afterState: event.afterState,
-    }).classification
-  }
-  return classifyEvidence({
-    source: event.source,
-    workload: event.workload,
-    activity: event.operationName,
-    category: event.category,
-    operationType,
-    targetResourceTypes: [event.targetType],
-    actor: event.actorPrincipalName ?? event.actorDisplayName,
-    target: event.targetDisplayName,
-    result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
-    beforeState: event.beforeState,
-    afterState: event.afterState,
-    raw: event.raw,
-  })
 }
 
-function normalizedEvidenceTrust(event: Parameters<typeof normalizedEvidenceClassification>[0]) {
+function normalizedEvidenceInput(event: ProjectedEvidence) {
   const raw = object(event.raw)
   const operationType = text(raw.operationType) ?? text(raw.OperationType)
+  const metadata = event.source === 'DIRECTORY_AUDIT' ? readDirectoryAuditMetadata(raw, event) : { kind: 'legacy' as const }
   const input = {
     source: event.source,
     workload: event.workload,
-    operation: event.operationName,
-    category: event.category,
-    operationType,
-    targetResourceTypes: [event.targetType],
+    operation: metadata.kind === 'invalid' ? '' : event.operationName,
+    category: metadata.kind === 'provider' ? metadata.category : event.category,
+    operationType: metadata.kind === 'provider' ? metadata.operationType : operationType,
+    targetResourceTypes: metadata.kind === 'provider' ? metadata.targetResourceTypes : [event.targetType],
     actor: event.actorPrincipalName ?? event.actorDisplayName,
-    result: event.result ?? text(raw.ResultStatus) ?? text(raw.result),
+    target: event.targetDisplayName,
+    result: metadata.kind === 'legacy' ? event.result ?? text(raw.ResultStatus) ?? text(raw.result) : event.result,
     beforeState: event.beforeState,
     afterState: event.afterState,
+    raw: event.raw,
   }
-  return event.source === 'DIRECTORY_AUDIT' && !operationType && !event.targetType
+  return {
+    input,
+    legacy: metadata.kind === 'legacy' && event.source === 'DIRECTORY_AUDIT' && !operationType && !event.targetType,
+  }
+}
+
+function normalizedEvidenceClassification(event: ProjectedEvidence): ChangeClassification {
+  const { input, legacy } = normalizedEvidenceInput(event)
+  return legacy
+    ? classifyLegacyDirectoryProjection(input).classification
+    : classifyEvidence({ ...input, activity: input.operation })
+}
+
+function normalizedEvidenceTrust(event: ProjectedEvidence) {
+  const { input, legacy } = normalizedEvidenceInput(event)
+  return legacy
     ? classifyLegacyDirectoryProjection(input)
     : classifyEvidenceTrust(input)
 }

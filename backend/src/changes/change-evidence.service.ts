@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common'
 import { createHash } from 'node:crypto'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { legacyCategory } from './change-classification.js'
+import { DIRECTORY_AUDIT_METADATA_KEY, directoryAuditMetadata } from './directory-audit-projection-metadata.js'
 import {
   SNAPSHOT_DIFFERENCE_SPECS,
   type EvidenceOrigin,
@@ -199,10 +200,11 @@ export class ChangeEvidenceService {
     if (records.length === 0) return
     const data = records.map((record) => {
       const target = targetState(record.targetResources)
+      const metadata = directoryAuditMetadata(record)
       const kind = legacyCategory(
         record.activityDisplayName,
-        record.category,
-        record.operationType,
+        metadata.category,
+        metadata.operationType,
         [target.targetType],
       )
       const initiatedBy = actor(record.initiatedBy)
@@ -236,6 +238,7 @@ export class ChangeEvidenceService {
         changedFields: target.fields ?? undefined,
         raw: {
           ...object(redactSensitiveValues(record.raw)),
+          [DIRECTORY_AUDIT_METADATA_KEY]: metadata,
           evidenceOrigin: 'microsoft_audit_event',
           microsoftSource: 'Microsoft Graph /auditLogs/directoryAudits',
         } as never,
