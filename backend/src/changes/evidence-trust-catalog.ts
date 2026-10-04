@@ -82,7 +82,7 @@ export function isReadOnlyEvidenceOperation(operation: string | null | undefined
   const tokens = new Set(`${operationWords} ${typeWords}`.split(/\s+/).filter(Boolean))
   return ['get', 'list', 'read', 'report', 'export', 'view', 'search', 'query', 'lookup'].some((token) => tokens.has(token)) ||
     /(?:^|[_\-.])(get|list|read|report|export|view|search)(?:$|[_\-.])/i.test(operation ?? '') ||
-    /(?:get|list|read|report|export|view|search)(?:async)?$/i.test((operation ?? '').replace(/[^a-z0-9]/gi, ''))
+    /\b(?:get|list|read|report|export|view|search)(?:\s*async)?$/i.test(operationWords)
 }
 
 function decision(
