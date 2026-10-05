@@ -9,15 +9,27 @@ import { useAuth } from '@/components/providers/auth-provider'
 import { supabase } from '@/lib/auth/supabase'
 
 export function MfaAccessGate() {
-  const { mfa, refreshMfa, refreshSession, signOut } = useAuth()
+  const { mfa, refreshMfa, refreshSession, signOut, currentIdentityToken } = useAuth()
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [selectedFactorId, setSelectedFactorId] = useState<string | null>(null)
 
-  const finish = async () => {
+  class IdentityChanged extends Error {}
+
+  const finish = async (dispatchedFor?: string) => {
+    const owns = () => dispatchedFor === undefined || currentIdentityToken() === dispatchedFor
     await refreshMfa()
-    await refreshSession()
+    // Re-checked BETWEEN the awaits: the account can change while refreshMfa is
+    // in flight, and starting refreshSession then would read the new identity's
+    // session on the old attempt's behalf.
+    if (!owns()) throw new IdentityChanged()
+    const session = await refreshSession()
+    if (!owns()) throw new IdentityChanged()
+    // refreshSession RESOLVES null when the refresh did not succeed; treating
+    // "resolved" as "succeeded" reports nothing at all. Recovery itself lives
+    // in ProtectedRoute, which survives this component being unmounted.
+    if (!session) throw new Error('SESSION_REFRESH_INCOMPLETE')
   }
 
   const verify = async (event: FormEvent) => {
@@ -37,15 +49,44 @@ export function MfaAccessGate() {
     }
     setBusy(true)
     setError('')
+    // Captured BEFORE the provider call: a verification dispatched for one
+    // account must not drive refreshes for whoever is active when it returns.
+    const dispatchedFor = currentIdentityToken()
     try {
       const result = await supabase.auth.mfa.challengeAndVerify({
         factorId,
         code: normalizedCode,
       })
       if (result.error) throw result.error
-      await finish()
     } catch {
       setError('That code was not accepted. Wait for a new code and try again.')
+      setBusy(false)
+      return
+    }
+
+    if (currentIdentityToken() !== dispatchedFor) {
+      // The signed-in identity changed while this verification was in flight.
+      // The code was still consumed, but refreshing now would act on a
+      // different account's session.
+      setBusy(false)
+      return
+    }
+
+    // The provider has accepted the code, which consumes it. Any failure from
+    // here is HawkView's and must be reported as such: telling the user their
+    // code was rejected sends them to retry with a code that cannot work and
+    // hides the refresh failure that actually occurred. The gate stays closed
+    // either way, so this is an attribution fault, not an assurance one.
+    try {
+      await finish(dispatchedFor)
+    } catch (thrown) {
+      // An abandoned attempt reports nothing: the screen belongs to whoever is
+      // signed in now, not to the identity this verification was dispatched for.
+      if (thrown instanceof IdentityChanged) return
+      setError(
+        'Your code was accepted, but HawkView could not finish signing you in. ' +
+          'You do not need a new code — reload to continue, or sign out and start again.'
+      )
     } finally {
       setBusy(false)
     }
