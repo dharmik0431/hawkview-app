@@ -25,10 +25,23 @@ export function ConfirmAuthEmail() {
   const requestRef = useRef<ReturnType<typeof parseHawkViewEmailConfirmation>>(null)
   const verificationStartedRef = useRef(false)
   const capturedRef = useRef(false)
+  // Verification is click-initiated and can outlive the page: pressing Back
+  // unmounts this component while the provider call is still in flight. A
+  // continuation that navigates then would override the route the user chose.
+  // Its own effect, so Strict Mode's unmount/remount restores it — the capture
+  // effect below returns early on its second pass and could not.
+  const mountedRef = useRef(true)
   const [ready, setReady] = useState(false)
   const [verifying, setVerifying] = useState(false)
   const [failure, setFailure] = useState<FailureReason | null>(null)
   const [shape, setShape] = useState<ConfirmationLinkShape>('empty')
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   useEffect(() => {
     // Strict Mode invokes effects twice in development, and the first pass
@@ -71,6 +84,10 @@ export function ConfirmAuthEmail() {
       supabase,
       requestRef.current
     )
+    // The page may have been unmounted while the provider call was in flight.
+    // Neither outcome may be published on, or navigate away from, whatever the
+    // user is looking at now.
+    if (!mountedRef.current) return
     if (!result.ok) {
       setFailure(result.reason)
       setVerifying(false)
