@@ -37,6 +37,14 @@ interface AuthContextValue {
   refreshMfa: () => Promise<HawkViewMfaState>
   refreshSession: () => Promise<HawkViewSession | null>
   signOut: () => Promise<void>
+  /** A workspace bootstrap that failed AFTER multi-factor verification. This
+   *  is not the same state as "not signed in": the factor is verified and the
+   *  code is consumed, so the route must offer recovery rather than redirect. */
+  sessionBootstrapFailed: boolean
+  isRetryingSession: boolean
+  retrySessionBootstrap: () => Promise<void>
+  /** Identity + generation, for capturing before an await and comparing after. */
+  currentIdentityToken: () => string
 }
 
 export type HawkViewMfaFactor = {
@@ -103,7 +111,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     [commitSession]
   )
 
+  const [bootstrapFailure, setBootstrapFailure] =
+    useState<AuthTransitionTicket | null>(null)
+  const [retryingTicket, setRetryingTicket] = useState<AuthTransitionTicket | null>(null)
+  const retryOperation = useRef<AuthTransitionTicket | null>(null)
+
   const refreshMfa = useCallback(async (): Promise<HawkViewMfaState> => {
+    // Captured BEFORE any await. A subject-only postcheck cannot tell A->B->A
+    // apart: the subject is A again but the generation is new, so a stale
+    // assurance response would commit the OLD generation's MFA state.
+    const dispatchedFor = transitionGuard.current.current()
+    const stillCurrent = () => transitionGuard.current.isCurrent(dispatchedFor)
     if (!supabase) {
       const unavailable: HawkViewMfaState = {
         status: 'error',
@@ -117,7 +135,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const sessionResult = await supabase.auth.getSession()
     const subject = sessionResult.data.session?.user.id
     if (!subject) {
-      setMfa(signedOutMfaState)
+      if (stillCurrent()) setMfa(signedOutMfaState)
       return signedOutMfaState
     }
 
@@ -134,12 +152,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           factorResult.error?.message ||
           'MFA status could not be verified.',
       }
-      setMfa(failed)
+      if (stillCurrent()) setMfa(failed)
       return failed
     }
 
     const current = await supabase.auth.getSession()
     if (current.data.session?.user.id !== subject) return signedOutMfaState
+    // Subject equality is not identity equality across a generation change.
+    if (!stillCurrent()) return signedOutMfaState
 
     const factors = factorResult.data.totp.map((factor) => ({
       id: factor.id,
@@ -155,7 +175,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       ),
       factors,
     }
-    setMfa(next)
+    if (stillCurrent()) setMfa(next)
     return next
   }, [])
 
@@ -203,9 +223,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
 
           commitSession(nextSession)
+          setBootstrapFailure(null)
           return nextSession
         } catch {
-          if (transitionGuard.current.isCurrent(ticket)) commitSession(null)
+          if (transitionGuard.current.isCurrent(ticket)) {
+            commitSession(null)
+            // Bound to the ticket, so a later subject or generation makes this
+            // failure stale rather than resurrecting it for another account.
+            setBootstrapFailure(ticket)
+          }
           return null
         } finally {
           if (transitionGuard.current.isCurrent(ticket)) setIsLoading(false)
@@ -339,6 +365,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [beginIdentityTransition])
 
+  const bootstrapFailureTicket = bootstrapFailure
+  const sessionBootstrapFailed =
+    bootstrapFailureTicket !== null &&
+    transitionGuard.current.isCurrent(bootstrapFailureTicket) &&
+    !session
+
+  // Retry ownership is per generation. A recovery still running for an older
+  // identity must not present itself as the current one's busy state, and must
+  // not block the current one from attempting its own recovery.
+  const isRetryingSession =
+    retryingTicket !== null && transitionGuard.current.isCurrent(retryingTicket)
+
+  const retrySessionBootstrap = useCallback(async () => {
+    const user = identityUser
+    if (!user?.email_confirmed_at) return
+    const ticket = transitionGuard.current.current()
+    const running = retryOperation.current
+    // Only a retry belonging to the CURRENT generation holds the lock.
+    if (running && transitionGuard.current.isCurrent(running)) return
+    retryOperation.current = ticket
+    setRetryingTicket(ticket)
+    try {
+      await bootstrapIdentity(user, ticket)
+    } finally {
+      // An older operation's finally must never clear a newer one's lock.
+      if (retryOperation.current === ticket) retryOperation.current = null
+      setRetryingTicket((current) => (current === ticket ? null : current))
+    }
+  }, [bootstrapIdentity, identityUser])
+
+  // Stable reader so a consumer can capture the identity before an await and
+  // compare after it, covering A->B and A->B->A alike.
+  const currentIdentityToken = useCallback(() => {
+    const ticket = transitionGuard.current.current()
+    return `${ticket.subject ?? 'none'}:${ticket.generation}`
+  }, [])
+
   const cacheScope = useMemo(
     () => authDataScope(identityUser?.id, session),
     [identityUser?.id, session]
@@ -355,8 +418,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       refreshMfa,
       refreshSession,
       signOut,
+      sessionBootstrapFailed,
+      isRetryingSession,
+      retrySessionBootstrap,
+      currentIdentityToken,
     }),
-    [cacheScope, identityUser, isLoading, mfa, refreshMfa, refreshSession, session, signOut]
+    [cacheScope, currentIdentityToken, identityUser, isLoading, isRetryingSession, mfa,
+      refreshMfa, refreshSession, retrySessionBootstrap, session, sessionBootstrapFailed,
+      signOut]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
