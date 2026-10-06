@@ -563,6 +563,8 @@ model AlertWebhookRejection {
 }
 
 model Organization {
+  pimScheduleScopes PimScheduleScope[]
+  pimScheduleAttempts PimScheduleAttempt[]
   id                 String                     @id @default(uuid()) @db.Uuid
   name               String                     @db.VarChar(200)
   slug               String                     @unique @db.VarChar(100)
@@ -671,6 +673,8 @@ model WorkspaceAdminAuditLog {
 }
 
 model CustomerTenant {
+  pimScheduleScopes PimScheduleScope[]
+  pimScheduleAttempts PimScheduleAttempt[]
   id                 String                     @id @default(uuid()) @db.Uuid
   organizationId     String                     @map("organization_id") @db.Uuid
   microsoftTenantId  String                     @unique @map("microsoft_tenant_id") @db.Uuid
@@ -1528,4 +1532,119 @@ model EncryptedSecret {
   updatedAt            DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("encrypted_secrets")
+}
+
+// Dedicated observation history. Production collection/retention are not activated.
+enum PimSchedulePlane {
+  ACTIVE
+  ELIGIBLE
+  @@map("pim_schedule_plane")
+}
+
+enum PimAttemptOutcome {
+  COMMITTED
+  FAILED
+  ABANDONED
+  @@map("pim_attempt_outcome")
+}
+
+model PimScheduleScope {
+  id String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  microsoftTenantId String @map("microsoft_tenant_id") @db.Uuid
+  plane PimSchedulePlane
+  scopeIncarnation String @map("scope_incarnation") @db.Uuid
+  scopeVersion String @map("scope_version")
+  endpointDescriptor String @map("endpoint_descriptor")
+  projectionIdentity String @map("projection_identity")
+  isCurrent Boolean @default(false) @map("is_current")
+  createdAt DateTime @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  retiredAt DateTime? @map("retired_at") @db.Timestamptz(6)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "pim_scope_tenant")
+  attempts PimScheduleAttempt[]
+  @@unique([id, plane], map: "pim_scope_id_plane")
+  @@index([organizationId, customerTenantId, plane], map: "pim_scope_tenant_history")
+  @@map("pim_schedule_scopes")
+}
+
+model PimScheduleAttempt {
+  id String @id @default(uuid()) @db.Uuid
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  microsoftTenantId String @map("microsoft_tenant_id") @db.Uuid
+  plane PimSchedulePlane
+  configurationRevision String @map("configuration_revision") @db.Uuid
+  connectionIncarnation String @map("connection_incarnation") @db.Uuid
+  scopeId String @map("scope_id") @db.Uuid
+  scopeIncarnation String @map("scope_incarnation") @db.Uuid
+  scopeVersion String @map("scope_version")
+  endpointDescriptor String @map("endpoint_descriptor")
+  projectionIdentity String @map("projection_identity")
+  startedAt DateTime @map("started_at") @db.Timestamptz(6)
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  committedAt DateTime? @map("committed_at") @db.Timestamptz(6)
+  terminalAt DateTime? @map("terminal_at") @db.Timestamptz(6)
+  contentChangedAt DateTime? @map("content_changed_at") @db.Timestamptz(6)
+  outcome PimAttemptOutcome?
+  failureKind String? @map("failure_kind")
+  traversalOutcome String @map("traversal_outcome")
+  observedRowCount Int? @map("observed_row_count")
+  assuranceState String @default("UNKNOWN") @map("assurance_state")
+  coverageState String @default("NOT_ESTABLISHED") @map("coverage_state")
+  contentDigest String? @map("content_digest")
+  isCurrent Boolean @default(false) @map("is_current")
+  retentionClass String? @map("retention_class")
+  eligibleForDeletionAt DateTime? @map("eligible_for_deletion_at") @db.Timestamptz(6)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "pim_attempt_tenant")
+  scope PimScheduleScope @relation(fields: [scopeId, plane], references: [id, plane], map: "pim_attempt_scope")
+  envelopes PimScheduleEnvelope[]
+  observations PimScheduleObservationRow[]
+  wireFailures PimScheduleWireFailure[]
+  @@unique([id, plane], map: "pim_attempt_id_plane")
+  @@index([organizationId, customerTenantId, plane, startedAt(sort: Desc), id(sort: Desc)], map: "pim_attempt_tenant_history")
+  @@index([scopeId, plane], map: "pim_attempt_scope_idx")
+  @@map("pim_schedule_attempts")
+}
+
+model PimScheduleEnvelope {
+  id String @id @default(uuid()) @db.Uuid
+  attemptId String @map("attempt_id") @db.Uuid
+  pageIndex Int @map("page_index")
+  requestedToken String @map("requested_token")
+  envelope Json @db.JsonB
+  byteLength Int @map("byte_length")
+  attempt PimScheduleAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  @@unique([attemptId, pageIndex], map: "pim_envelope_page")
+  @@map("pim_schedule_envelopes")
+}
+
+model PimScheduleObservationRow {
+  id String @id @default(uuid()) @db.Uuid
+  attemptId String @map("attempt_id") @db.Uuid
+  plane PimSchedulePlane
+  occurrenceOrdinal Int @map("occurrence_ordinal")
+  instanceId String? @map("instance_id")
+  raw Json @db.JsonB
+  observations Json @db.JsonB
+  diagnostics Json @db.JsonB
+  providerStartDateTime DateTime? @map("provider_start_date_time") @db.Timestamptz(6)
+  providerEndDateTime DateTime? @map("provider_end_date_time") @db.Timestamptz(6)
+  attempt PimScheduleAttempt @relation(fields: [attemptId, plane], references: [id, plane], onDelete: Cascade, map: "pim_row_parent_plane")
+  @@unique([attemptId, occurrenceOrdinal], map: "pim_row_occurrence")
+  @@index([attemptId, instanceId], map: "pim_row_instance_idx")
+  @@map("pim_schedule_observation_rows")
+}
+
+model PimScheduleWireFailure {
+  id String @id @default(uuid()) @db.Uuid
+  attemptId String @map("attempt_id") @db.Uuid
+  pageIndex Int @map("page_index")
+  byteLength Int @map("byte_length")
+  failureKind String @map("failure_kind")
+  attempt PimScheduleAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  @@unique([attemptId, pageIndex], map: "pim_wire_failure_page")
+  @@map("pim_schedule_wire_failures")
 }
