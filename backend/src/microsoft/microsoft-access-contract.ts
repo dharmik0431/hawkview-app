@@ -147,3 +147,22 @@ export const MICROSOFT_COLLECTOR_RESOURCE_TYPES = [...new Set(
 )].sort()
 
 export const MICROSOFT_GRAPH_DOCUMENTATION = GRAPH_DOCS
+
+/** Source-only capabilities, outside the active readiness/dispatch registry until activation review.
+ * Existing consent is unchanged. A declaration proves neither a grant nor licence assurance. */
+export const PIM_SCHEDULE_ACCESS_CAPABILITIES = {
+  ACTIVE: {
+    key: 'entra_pim_active_schedule_observations',
+    endpoint: 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignmentScheduleInstances',
+    applicationPermission: { resource: 'MICROSOFT_GRAPH', name: 'RoleManagement.Read.Directory' },
+    documentationUrl: 'https://learn.microsoft.com/graph/api/rbacapplication-list-roleassignmentscheduleinstances?view=graph-rest-1.0',
+    activation: 'DISABLED', assurance: 'UNKNOWN', coverage: 'NOT_ESTABLISHED',
+  },
+  ELIGIBLE: {
+    key: 'entra_pim_eligible_schedule_observations',
+    endpoint: 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilityScheduleInstances',
+    applicationPermission: { resource: 'MICROSOFT_GRAPH', name: 'RoleManagement.Read.Directory' },
+    documentationUrl: 'https://learn.microsoft.com/graph/api/rbacapplication-list-roleeligibilityscheduleinstances?view=graph-rest-1.0',
+    activation: 'DISABLED', assurance: 'UNKNOWN', coverage: 'NOT_ESTABLISHED',
+  },
+} as const
