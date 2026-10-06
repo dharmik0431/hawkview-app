@@ -9,6 +9,9 @@ import {
   NotFoundException,
 } from '@nestjs/common'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
+import { pimUuid, type PimPlane } from './pim-schedule-contract.js'
+import { readPimSchedulePlane, type PimReadAuthorization } from './pim-schedule-reader.js'
+import { toPimScheduleSummary } from './pim-schedule-summary.js'
 import {
   MembershipRole,
   SyncResourceType,
@@ -1904,5 +1907,66 @@ export class TenantsService {
     if (error) url.searchParams.set('error', error)
     if (customerTenantId) url.searchParams.set('tenantId', customerTenantId)
     return url.toString()
+  }
+
+  /** Delegates to the canonical PIM identifier contract so this HTTP boundary cannot be narrower
+   * than the reader it feeds, and maps its refusal to the intended 400. */
+  private requireTenantUuid(value: string): string {
+    try {
+      return pimUuid(value)
+    } catch {
+      throw new BadRequestException('Enter a valid customer tenant identifier.')
+    }
+  }
+
+  private requirePimPlane(value: string): PimPlane {
+    if (value !== 'ACTIVE' && value !== 'ELIGIBLE') {
+      throw new BadRequestException('Enter a valid PIM schedule plane.')
+    }
+    return value
+  }
+
+  /** Authenticated, tenant-scoped summary of the persisted PIM schedule observation.
+   *
+   * Read-only: it consumes the existing reader and triggers no collection or provider work.
+   * The trusted PimReadAuthorization is built ONLY from the verified identity subject and the
+   * organization/tenant resolved from the database — never from caller-supplied organization ids
+   * or membership sets. */
+  async getPimScheduleSummaryForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string,
+    plane: string
+  ) {
+    const tenantId = this.requireTenantUuid(customerTenantId)
+    const requestedPlane = this.requirePimPlane(plane)
+
+    // Resolves the verified subject to a non-disabled user holding ACTIVE memberships in ACTIVE
+    // organizations, and throws Forbidden for unknown or disabled accounts before any tenant read.
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
+    if (organizationIds.length === 0) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    // Nondisclosing: a tenant outside the caller's accessible organizations is indistinguishable
+    // from one that does not exist.
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: tenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true },
+    })
+    if (!tenant) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    const authorization: PimReadAuthorization = {
+      subjectId: identity.subject,
+      organizationId: tenant.organizationId,
+      tenantMemberships: new Set([tenant.id]),
+    }
+
+    const result = await readPimSchedulePlane(this.prisma, authorization, {
+      customerTenantId: tenant.id,
+      plane: requestedPlane,
+    })
+    return toPimScheduleSummary(requestedPlane, result)
   }
 }
