@@ -1599,7 +1599,7 @@ model PimScheduleAttempt {
   eligibleForDeletionAt DateTime? @map("eligible_for_deletion_at") @db.Timestamptz(6)
   organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "pim_attempt_tenant")
-  scope PimScheduleScope @relation(fields: [scopeId, plane], references: [id, plane], map: "pim_attempt_scope")
+  scope PimScheduleScope @relation(fields: [scopeId, plane], references: [id, plane], onDelete: NoAction, map: "pim_attempt_scope")
   envelopes PimScheduleEnvelope[]
   observations PimScheduleObservationRow[]
   wireFailures PimScheduleWireFailure[]
