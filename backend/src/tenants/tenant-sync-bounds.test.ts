@@ -458,6 +458,11 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
       'https://graph.microsoft.com/v1.0/groups',
     )
 
+  // Scheduling harness: model the directory boundary as one serialized collector.
+  ;(service as any).syncDirectoryRoles = async (tenant: unknown, token: string) =>
+    (service as any).syncEntraCollection(tenant, token, 'DIRECTORY_ROLES',
+      'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)')
+
   let signInActive = false
   let safeStartedDuringSignIn = false
   ;(service as any).syncSignInLogs = async () => {
@@ -506,7 +511,7 @@ test('actual full sync continues from a failed sign-in collector to audit withou
   )
   ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
   for (const method of [
-    'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups',
+    'syncDirectoryRoles', 'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains', 'syncGroups',
     'syncSharePointSites', 'syncSharePointSettings', 'syncSharePointUsage',
     'syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings',
     'syncExchangeAcceptedDomains', 'syncExchangeMailboxUsage',

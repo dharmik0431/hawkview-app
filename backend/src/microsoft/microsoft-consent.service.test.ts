@@ -1,11 +1,43 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { randomUUID } from 'node:crypto'
 import {
   MicrosoftConsentService,
   normalizeConfiguredRequiredPermissions,
   PRODUCTION_MICROSOFT_ADMIN_CONSENT_REDIRECT_URI,
   resolveMicrosoftAdminConsentRedirectUri,
 } from './microsoft-consent.service.js'
+
+test('directory token uses detached captured credentials and deadline, never latest connector', async () => {
+  const original = { configurationRevision: randomUUID(), clientId: randomUUID(), homeTenantId: randomUUID(), credentialReference: '' }
+  original.credentialReference = 'encrypted-secret:' + original.configurationRevision
+  const authority = { ...original }, tenant = randomUUID(), deadline = Date.now() + 60000
+  let reads = 0, requests = 0
+  const jwt = (payload: unknown) => 'e30.' + Buffer.from(JSON.stringify(payload)).toString('base64url') + '.c2ln'
+  const service = new MicrosoftConsentService({} as never, { access: async (reference: string) => {
+    assert.equal(reference, original.credentialReference); reads++
+    authority.clientId = randomUUID(); authority.credentialReference = 'latest-must-not-be-read'
+    return 'captured-secret'
+  } } as never)
+  ;(service as any).getManagedConnector = async () => { throw Error('must not read latest') }
+  ;(service as any).requestAccessToken = async (actualTenant: string, credentials: unknown, scope: unknown, expires: number) => {
+    requests++; assert.equal(actualTenant, tenant); assert.equal(expires, deadline); assert.equal(scope, undefined)
+    assert.deepEqual(credentials, { clientId: original.clientId, clientSecret: 'captured-secret' })
+    return { accessToken: jwt({ tid: tenant, appid: original.clientId, aud: 'https://graph.microsoft.com' }) }
+  }
+  assert.ok(await service.getCapturedDirectoryRoleToken(authority, tenant, deadline))
+  assert.equal(reads, 1); assert.equal(requests, 1)
+  for (const payload of [{ tid: randomUUID(), appid: original.clientId, aud: 'https://graph.microsoft.com' },
+    { tid: tenant, appid: randomUUID(), aud: 'https://graph.microsoft.com' },
+    { tid: tenant, appid: original.clientId, aud: 'https://manage.office.com' }]) {
+    ;(service as any).requestAccessToken = async () => ({ accessToken: jwt(payload) })
+    await assert.rejects(service.getCapturedDirectoryRoleToken(original, tenant, deadline), /SCOPE_MISMATCH/)
+  }
+  const before = reads
+  await assert.rejects(service.getCapturedDirectoryRoleToken(original, tenant, 0), /INVALID_CAPTURED/)
+  await assert.rejects(service.getCapturedDirectoryRoleToken({ ...original, credentialReference: 'mutable' }, tenant, deadline), /INVALID_CAPTURED/)
+  assert.equal(reads, before)
+})
 
 test('production consent is pinned to the branded HawkView callback', () => {
   assert.equal(
