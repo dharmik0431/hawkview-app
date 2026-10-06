@@ -221,4 +221,19 @@ export class TenantsController {
       await this.tenantsService.completeMicrosoftConsent(query)
     response.redirect(303, redirectUrl)
   }
+
+  @Get(':id/pim/schedules/:plane/summary')
+  getPimScheduleSummary(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+    @Param('plane') plane: string,
+    @Res({ passthrough: true }) response: Response
+  ) {
+    response.setHeader('Cache-Control', 'no-store')
+    return this.tenantsService.getPimScheduleSummaryForIdentity(
+      request.auth,
+      customerTenantId,
+      plane
+    )
+  }
 }
