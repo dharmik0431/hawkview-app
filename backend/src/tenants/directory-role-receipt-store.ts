@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { withManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from '../microsoft/managed-connector-authority.js'
+import { captureManagedAuthority, withManagedAuthority, type ManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from '../microsoft/managed-connector-authority.js'
 import type { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 
-/** Unwired persistence primitive. It does not validate provider pages or enable reader trust.
+/** Fenced persistence primitive. Provider validation belongs to the directory adapter; no reader trust is enabled.
  * All live authority writers must join this protocol before rollout/activation is trusted.
  * Current reporting later requires a COMPLETE within 1h; 26h is retained compatibility only.
  */
@@ -23,13 +23,16 @@ export interface RoleContext extends RoleIdentity {
   connectionIncarnation: string; scopeIncarnation: string; scopeVersion: string
 }
 export interface RoleAttempt extends RoleContext { attemptId: string }
+export type CapturedRoleAttempt = RoleRejection | { status: 'legacy' } | {
+  status: 'claimed'; attempt: RoleAttempt; authority: ManagedAuthority; startedAt: Date; expiresAt: Date
+}
 export interface RoleReceipt extends RoleAttempt {
   contractVersion: 1; checkedAt: Date; snapshotObservedAt: Date; contentDigest: string; rowCount: number
 }
 export type RoleRejection = { status: 'rejected'; reason: 'SUPERSEDED' | 'INCARNATION_CHANGED' | 'UNAVAILABLE' | 'BUSY' | 'CONFLICT' }
 export type RoleResult = RoleRejection | { status: 'committed' | 'replayed'; receipt: RoleReceipt }
   | { status: 'failed' | 'partial' | 'expired'; attemptId: string }
-/** Only a future approved validator may prepare production input. Synthetic values test persistence only. */
+/** Runtime input is prepared by directory-role-collection-validation; synthetic values test persistence only. */
 export interface PreparedRoleCollection { rows: readonly unknown[]; contentDigest: string }
 type DifferenceBuilder = ChangeEvidenceService['buildSnapshotDifferenceEvidence']
 interface State {
@@ -95,6 +98,40 @@ async function lockScope(tx: AuthorityTransaction, who: RoleIdentity, create = f
 function matches(locked: Locked, ctx: RoleContext): boolean {
   return locked.incarnation === ctx.connectionIncarnation && locked.state?.role_scope_incarnation === ctx.scopeIncarnation
     && locked.state.role_scope_version === ctx.scopeVersion
+}
+/** Durable opt-in: S survives C/G rotations. Classify before eligibility filtering.
+ * Never activate here. Activation remains blocked on authority writers, explicit
+ * scope revocation and fenced notification integration. No provider I/O under locks.
+ */
+export async function captureRoleAttempt(db: AuthorityDatabase,
+  input: Omit<RoleIdentity, 'configurationRevision'>): Promise<CapturedRoleAttempt> {
+  const who = { organizationId: id(input.organizationId), customerTenantId: id(input.customerTenantId),
+    microsoftTenantId: id(input.microsoftTenantId) }
+  return db.$transaction(async tx => {
+    // Reuse the authority primitive inside this transaction, keeping G through T/C/R.
+    const scoped: AuthorityDatabase = { $transaction: work => work(tx) }
+    const authority = await captureManagedAuthority(scoped)
+    const tenants = await tx.$queryRawUnsafe<{ status: string }[]>(`SELECT status FROM customer_tenants
+      WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid FOR NO KEY UPDATE`,
+      who.customerTenantId, who.organizationId, who.microsoftTenantId)
+    if (tenants.length !== 1) return rejected('UNAVAILABLE')
+    const connections = await tx.$queryRawUnsafe<{ status: string; mode: string; incarnation: string | null }[]>(
+      `SELECT status,connection_mode AS mode,collection_incarnation::text AS incarnation FROM tenant_connections
+       WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid FOR NO KEY UPDATE`, who.customerTenantId, who.organizationId)
+    const states = await tx.$queryRawUnsafe<State[]>(`SELECT * FROM sync_states
+      WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND resource_type='DIRECTORY_ROLES' FOR UPDATE`,
+      who.customerTenantId, who.organizationId)
+    const s = states[0]
+    if (!s?.role_scope_incarnation && !s?.role_scope_version) return { status: 'legacy' }
+    const c = connections[0]
+    if (tenants[0].status !== 'ACTIVE' || connections.length !== 1 || c.status !== 'CONNECTED'
+      || c.mode !== 'HAWKVIEW_MANAGED' || !c.incarnation || !s.role_scope_incarnation
+      || s.role_scope_version !== DIRECTORY_ROLE_RECEIPT_SCOPE || !authority
+      || authority.credentialReference !== `encrypted-secret:${authority.configurationRevision}`) return rejected('UNAVAILABLE')
+    const result = await claimRoleAttempt(scoped, { ...who, configurationRevision: authority.configurationRevision,
+      connectionIncarnation: c.incarnation, scopeIncarnation: s.role_scope_incarnation, scopeVersion: s.role_scope_version })
+    return result.status === 'claimed' ? { ...result, authority } : result
+  }, { isolationLevel: 'ReadCommitted' })
 }
 function owns(s: State, a: RoleAttempt): boolean {
   return s.role_attempt_id === a.attemptId && s.role_attempt_connection === a.connectionIncarnation

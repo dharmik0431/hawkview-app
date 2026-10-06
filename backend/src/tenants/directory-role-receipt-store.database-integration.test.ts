@@ -7,8 +7,9 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
+import { collectDirectoryRoles } from './directory-role-collector.js'
 import { publishManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from '../microsoft/managed-connector-authority.js'
-import { activateRoleScope, claimRoleAttempt, completeRoleAttempt, finishRoleAttempt,
+import { captureRoleAttempt, activateRoleScope, claimRoleAttempt, completeRoleAttempt, finishRoleAttempt,
   ROLE_CLOCK_SQL, ROLE_DEADLINE_PREDICATE, type RoleContext } from './directory-role-receipt-store.js'
 const skip = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1'
 const difference = ChangeEvidenceService.prototype.buildSnapshotDifferenceEvidence
@@ -71,6 +72,7 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
     await observer.query(`INSERT INTO tenant_connections(id,organization_id,customer_tenant_id,status,updated_at) VALUES($1,$2,$3,'CONNECTED',now())`,[randomUUID(),organizationId,customerTenantId])
     assert.equal((await publishManagedAuthority(db,publication(null,revision))).status,'published')
     await t.test('nullable legacy state remains unverified; activation CAS and first R creation',async()=>{
+      assert.deepEqual(await captureRoleAttempt(db,who),{status:'legacy'})
       assert.equal((await snapshot()).length,0)
       const [a,b]=await Promise.all([activateRoleScope(db,{...who,expectedConnectionIncarnation:null,expectedScopeIncarnation:null}),activateRoleScope(db,{...who,expectedConnectionIncarnation:null,expectedScopeIncarnation:null})])
       const winner=a.status==='activated'?a:b;assert.equal(winner.status,'activated')
@@ -78,6 +80,20 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
       if(winner.status!=='activated')throw Error('activation');ctx=winner.context
       assert.equal((await state()).role_complete_id,null)
       assert.equal((await state()).last_successful_at,null)
+    })
+    await t.test('runtime capture rejects retained marker on revoked/inactive authority, never legacy',async()=>{
+      const before=await state()
+      try {
+        await observer.query("UPDATE tenant_connections SET status='REVOKED' WHERE customer_tenant_id=$1",[customerTenantId])
+        assert.deepEqual(await captureRoleAttempt(db,who),{status:'rejected',reason:'UNAVAILABLE'})
+        await observer.query("UPDATE tenant_connections SET status='CONNECTED' WHERE customer_tenant_id=$1",[customerTenantId])
+        await observer.query("UPDATE customer_tenants SET status='DISCONNECTED' WHERE id=$1",[customerTenantId])
+        assert.deepEqual(await captureRoleAttempt(db,who),{status:'rejected',reason:'UNAVAILABLE'})
+        assert.deepEqual(await state(),before)
+      } finally {
+        await observer.query("UPDATE tenant_connections SET status='CONNECTED' WHERE customer_tenant_id=$1",[customerTenantId])
+        await observer.query("UPDATE customer_tenants SET status='ACTIVE' WHERE id=$1",[customerTenantId])
+      }
     })
     await t.test('one winner, BUSY loser and empty/no-change COMPLETE advances identity atomically',async()=>{
       const [a,b]=await Promise.all([claimRoleAttempt(db,ctx),claimRoleAttempt(db,ctx)])
@@ -134,6 +150,39 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
       assert.equal((await pending).status,'committed');assert.equal((await replace).status,'published')
       assert.deepEqual(await finishRoleAttempt(db,a,'FAILED'),{status:'rejected',reason:'SUPERSEDED'})
       who.configurationRevision=replacement.revision;ctx={...ctx,configurationRevision:replacement.revision}
+      const captured=await captureRoleAttempt(db,who)
+      assert.equal(captured.status,'claimed')
+      if(captured.status!=='claimed')throw Error('capture')
+      assert.equal(captured.attempt.scopeIncarnation,ctx.scopeIncarnation)
+      assert.equal(captured.authority.configurationRevision,replacement.revision)
+      assert.equal(captured.attempt.configurationRevision,replacement.revision)
+      assert.equal((await finishRoleAttempt(db,captured.attempt,'FAILED')).status,'failed')
+    })
+    await t.test('captured adapter releases locks for provider; old G success/error reject and fresh G completes under retained S',async()=>{
+      for(const failure of [false,true]) {
+        const entered=gate(),release=gate(),capturedRevision=who.configurationRevision
+        const beforeSnapshot=await snapshot(),beforeEvidence=await evidence()
+        const dependencies={db,token:async(authority:{configurationRevision:string})=>{
+          assert.equal(authority.configurationRevision,capturedRevision);return 'synthetic-token'
+        },fetchPage:async()=>{entered.resolve();await release.promise;if(failure)throw Error('old provider failure');return Response.json({value:[]})},
+        read:async(response:Response)=>response.text(),buildDifference:difference,legacy:async()=>{throw Error('activated fallback')}}
+        const pending=collectDirectoryRoles(who,dependencies)
+        await entered.promise
+        const replacement=publication(capturedRevision)
+        try {
+          // This actual writer must finish while the provider callback is still paused.
+          assert.equal((await publishManagedAuthority(db,replacement)).status,'published')
+        } finally {release.resolve()}
+        assert.deepEqual(await pending,{status:'rejected',reason:'SUPERSEDED'})
+        assert.deepEqual(await snapshot(),beforeSnapshot);assert.deepEqual(await evidence(),beforeEvidence)
+        who.configurationRevision=replacement.revision;ctx={...ctx,configurationRevision:replacement.revision}
+        const fresh=await collectDirectoryRoles(who,{...dependencies,token:async(authority:{configurationRevision:string})=>{
+          assert.equal(authority.configurationRevision,replacement.revision);return 'new-token'
+        },fetchPage:async()=>Response.json({value:[]})})
+        assert.equal(fresh.status,'committed')
+        if(fresh.status!=='committed')throw Error('fresh capture')
+        assert.equal(fresh.receipt.scopeIncarnation,ctx.scopeIncarnation)
+      }
     })
     await t.test('post-lock clock after C wait rejects expired attempt; caller time cannot extend it',async()=>{
       const a=await claim(ctx), client=await pool.connect(),pid=gate<number>()
