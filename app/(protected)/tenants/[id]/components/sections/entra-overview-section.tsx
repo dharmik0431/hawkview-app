@@ -6,6 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
 import { conditionalAccessOverviewState } from '@/lib/tenants/conditional-access-overview'
+import { PimScheduleObservationsPanel } from '@/components/tenant/pim-schedule-observations-panel'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 import {
   ChevronRight,
@@ -94,6 +95,8 @@ interface EntraOverviewSectionProps {
   conditionalAccessEvidence: PilotEvidenceView['conditionalAccess'] | null
   authMethods: AuthMethodRow[]
   namedLocations: NamedLocation[]
+  /** Route customer tenant id from the page (resolvedTenantId), not the Microsoft tenant id. */
+  resolvedTenantId: string
   onNavigateTab: (
     tab:
       | 'overview'
@@ -132,6 +135,7 @@ export default function EntraOverviewSection({
   conditionalAccessEvidence,
   authMethods,
   namedLocations,
+  resolvedTenantId,
   onNavigateTab,
 }: EntraOverviewSectionProps) {
   // DIRECTORY DATA CALCULATIONS
@@ -773,6 +777,7 @@ export default function EntraOverviewSection({
           </div>
         </div>
       </div>
+      <PimScheduleObservationsPanel customerTenantId={resolvedTenantId} className="mt-6" />
     </div>
   )
 }
