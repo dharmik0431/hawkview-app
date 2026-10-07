@@ -11,19 +11,25 @@ import {
   useSetDirectoryRoleControl,
 } from '@/lib/api/directory-role-control-hooks'
 import { isDirectoryControlOffered } from '@/lib/tenants/directory-role-control-view'
+import type { DirectoryRoleControlFailure } from '@/lib/api/directory-role-control-hooks'
 
-const READ_COPY = {
+const UNREADABLE = 'HawkView cannot read this collection setting right now, so it cannot be changed here.'
+
+/** Keyed by the full failure union so a new member cannot be added without deciding its copy. */
+const READ_COPY: Record<DirectoryRoleControlFailure, string> = {
   forbidden: 'Your role cannot change directory role collection for this tenant.',
-  unavailable: 'HawkView cannot read this collection setting right now, so it cannot be changed here.',
-  conflict: 'HawkView cannot read this collection setting right now, so it cannot be changed here.',
-  rejected: 'HawkView cannot read this collection setting right now, so it cannot be changed here.',
-  error: 'HawkView cannot read this collection setting right now, so it cannot be changed here.',
-} as const
+  unavailable: UNREADABLE,
+  conflict: UNREADABLE,
+  rejected: UNREADABLE,
+  error: UNREADABLE,
+  // A read is never refused locally, but the union includes it, so it must be answered.
+  'not-sent': UNREADABLE,
+}
 
 /** Copy for a write the server PROVED it did not apply. Even here the setting is not restated and no
  * action is offered: the context the server refused against is already gone, so the only honest next
  * step is a fresh read. */
-const REFUSED_COPY = {
+const REFUSED_COPY: Record<DirectoryRoleControlFailure, string> = {
   conflict:
     'HawkView refused the change because this tenant’s collection context is no longer the one it read — it changed, or the tenant is no longer eligible for managed collection. The setting was not changed. Re-read it below before choosing again.',
   rejected:
