@@ -299,8 +299,18 @@ test('defect 3: a completion from an obsolete identity generation writes nothing
     generation = 3
     ui.client.setQueryData(key, answer(false))
     const fresh = ui.client.getQueryState(key)?.dataUpdatedAt
+    // Count invalidations specifically. A mounted observer refetches on its own when the cache is
+    // written, so read counts cannot isolate the completion's side effects; invalidation calls can.
+    // The cache-recency guard alone would already block the data write, so this is what makes the
+    // identity-generation guard load-bearing.
+    let invalidations = 0
+    const realInvalidate = ui.client.invalidateQueries.bind(ui.client)
+    ;(ui.client as any).invalidateQueries = (...a: any[]) => { invalidations += 1; return realInvalidate(...a) }
 
     await act(async () => { resolvePost?.(answer(true)); await new Promise((r) => setTimeout(r, 0)) })
+    await waitFor(() => !ui.client.isMutating(), 'the obsolete completion to finish')
+    assert.equal(invalidations, 0,
+      'an obsolete completion must apply no invalidation to the new visit')
 
     const after = ui.client.getQueryState(key)
     // The completion carried enabled=true; the new visit's own read says false. A mounted observer
