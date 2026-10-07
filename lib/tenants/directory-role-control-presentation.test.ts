@@ -60,7 +60,7 @@ function loadPure() {
   return moduleObject.exports
 }
 
-const { classifyControlFailure, writeOutcomeOf, controlPresentation } = loadPure()
+const { classifyControlFailure, writeOutcomeOf, controlPresentation, LocalRefusal } = loadPure()
 
 const EXPECTED = {
   configurationRevision: 'G', connectionIncarnation: 'C', scopeIncarnation: 'S',
@@ -84,6 +84,17 @@ test('status mapping distinguishes read and write, and leaves the unknown unknow
   assert.equal(classifyControlFailure(new ApiError(500, 'x'), 'write'), 'error')
   assert.equal(classifyControlFailure(new TypeError('socket closed'), 'write'), 'error')
   assert.equal(classifyControlFailure(undefined, 'write'), 'error')
+})
+
+test('a write refused in the browser is never reported as an uncertain remote outcome', () => {
+  // This path is not reachable through the mounted panel — the action is offered only after a
+  // confirmed read — so it is covered here, at the mapping that decides what the user is told.
+  const refusal = new LocalRefusal('no current context')
+  assert.equal(classifyControlFailure(refusal, 'write'), 'not-sent')
+  assert.equal(writeOutcomeOf('not-sent'), 'not-sent',
+    'nothing was sent, so there is no remote apply to be uncertain about')
+  assert.notEqual(writeOutcomeOf('not-sent'), 'unknown')
+  assert.notEqual(writeOutcomeOf('not-sent'), 'refused')
 })
 
 test('only a pre-apply refusal proves the opt-in was not changed', () => {
