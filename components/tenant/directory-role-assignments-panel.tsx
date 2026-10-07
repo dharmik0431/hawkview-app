@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { AlertTriangle, RefreshCw, ShieldQuestion } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { DirectoryRoleControl } from './directory-role-control'
 import { useDirectoryRoleResults } from '@/lib/api/directory-role-results-hooks'
 import type { DirectoryRoleResultsView } from '@/lib/tenants/directory-role-results-view'
 import { cn } from '@/lib/utils'
@@ -197,6 +198,11 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
       {!isError && attempt && (
         <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{ATTEMPT_COPY[attempt]}</p>
       )}
+
+      {/* The durable opt-in, read and written separately from the stored results above. It is shown
+          whatever the results status is, because withdrawing collection must stay possible even when
+          no trustworthy result can be displayed. */}
+      <DirectoryRoleControl customerTenantId={customerTenantId} />
     </section>
   )
 }
