@@ -11,6 +11,7 @@ import {
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { pimUuid, type PimPlane } from './pim-schedule-contract.js'
 import { readPimSchedulePlane, type PimReadAuthorization } from './pim-schedule-reader.js'
+import { readDirectoryRoleResults } from './directory-role-reader.js'
 import { toPimScheduleSummary } from './pim-schedule-summary.js'
 import {
   MembershipRole,
@@ -1968,5 +1969,44 @@ export class TenantsService {
       plane: requestedPlane,
     })
     return toPimScheduleSummary(requestedPlane, result)
+  }
+
+  /** Stored DIRECTORY_ROLES results for one tenant.
+   *
+   * Authorization runs to completion BEFORE any payload is read: the same accessible-organization
+   * resolution the PIM summary uses, then a nondisclosing tenant lookup. The reader is handed ids
+   * that are already established and performs no membership check of its own. */
+  async getDirectoryRoleResultsForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string
+  ) {
+    const tenantId = this.requireTenantUuid(customerTenantId)
+
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
+    if (organizationIds.length === 0) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    // Nondisclosing, as above: outside the caller's organizations is indistinguishable from absent.
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: tenantId, organizationId: { in: organizationIds } },
+      select: {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        connection: { select: { collectionIncarnation: true } },
+      },
+    })
+    if (!tenant) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    return readDirectoryRoleResults(this.prisma, {
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      microsoftTenantId: tenant.microsoftTenantId,
+      collectionIncarnation: tenant.connection?.collectionIncarnation ?? null,
+      now: Date.now(),
+    })
   }
 }

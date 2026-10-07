@@ -236,4 +236,17 @@ export class TenantsController {
       plane
     )
   }
+
+  @Get(':id/directory-roles/results')
+  getDirectoryRoleResults(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+    @Res({ passthrough: true }) response: Response
+  ) {
+    response.setHeader('Cache-Control', 'no-store')
+    return this.tenantsService.getDirectoryRoleResultsForIdentity(
+      request.auth,
+      customerTenantId
+    )
+  }
 }

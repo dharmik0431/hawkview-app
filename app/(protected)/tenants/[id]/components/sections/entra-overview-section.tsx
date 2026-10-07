@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { tenantUserMfaRegistration } from '@/lib/tenants/mfa-status'
 import { conditionalAccessOverviewState } from '@/lib/tenants/conditional-access-overview'
 import { PimScheduleObservationsPanel } from '@/components/tenant/pim-schedule-observations-panel'
+import { DirectoryRoleAssignmentsPanel } from '@/components/tenant/directory-role-assignments-panel'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
 import {
   ChevronRight,
@@ -777,6 +778,7 @@ export default function EntraOverviewSection({
           </div>
         </div>
       </div>
+      <DirectoryRoleAssignmentsPanel customerTenantId={resolvedTenantId} className="mt-6" />
       <PimScheduleObservationsPanel customerTenantId={resolvedTenantId} className="mt-6" />
     </div>
   )
