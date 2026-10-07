@@ -105,12 +105,20 @@ function mountPanel(options: {
   post?: (body: any) => Promise<unknown>
   identity?: () => string
 }) {
+  let blockReads = false
   const env = environment()
   const gets: number[] = []
   const reads: Array<{ endpoint: string; init: any }> = []
   const posts: any[] = []
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    // gcTime must be long enough that no entry is collected mid-test (gcTime: 0 let a cleared and
+    // reseeded entry vanish, which flaked ~2% of runs) and short enough that its timer does not
+    // hold the process open: the library's default 5 minutes kept node alive for exactly that long
+    // after the last test, and the runner then reported the FILE as timed out.
+    defaultOptions: {
+      queries: { retry: false, gcTime: 2_000 },
+      mutations: { retry: false, gcTime: 2_000 },
+    },
   })
   const load = makeLoader({
     '@/components/providers/auth-provider': {
@@ -124,7 +132,13 @@ function mountPanel(options: {
       ApiError,
       apiClient: {
         get: async (endpoint: string, init: any) => {
-          gets.push(Date.now()); reads.push({ endpoint, init }); return options.get()
+          gets.push(Date.now()); reads.push({ endpoint, init })
+          // When reads are blocked they FAIL rather than hang: TanStack keeps the cached data on a
+          // failed refetch, so no refetch can repair the cache and a stale completion that slipped
+          // past the recency guard stays observable — without leaving a promise pending forever,
+          // which made this suite take minutes.
+          if (blockReads) throw new ApiError(503, 'reads blocked for this case')
+          return options.get()
         },
         post: async (_endpoint: string, body: any) => {
           posts.push(body)
@@ -151,6 +165,7 @@ function mountPanel(options: {
       (Array.from(container.querySelectorAll('button')) as any[])
         .find((b) => re.test(b.textContent ?? '')),
     render: () => act(() => { root.render(tree) }),
+    blockReads: () => { blockReads = true },
     click: (node: any) =>
       act(() => { node.dispatchEvent(new env.dom.window.MouseEvent('click', { bubbles: true })) }),
     /** Drains this test's own work before releasing the globals. Without it a pending refetch or
@@ -160,6 +175,12 @@ function mountPanel(options: {
       await act(async () => { root.unmount() })
       await client.cancelQueries()
       client.unmount()
+      // Remove each cached query explicitly. `clear()` alone left this file holding two live
+      // garbage-collection timers (gcTime is 5 minutes), so the process stayed alive after the last
+      // test and the runner reported the FILE as timed out while every subtest had passed.
+      const cache = client.getQueryCache()
+      for (const query of cache.getAll()) cache.remove(query)
+      client.getMutationCache().clear()
       client.clear()
       await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
       env.restore()
@@ -416,5 +437,116 @@ test('an unreadable answer is a read failure, never a reported opt-in of off', a
     await waitFor(() => /cannot read this collection setting/i.test(ui.text()), 'the read failure')
     assert.doesNotMatch(ui.text(), /switched off for this tenant/i)
     assert.equal(ui.button(/switch on|switch off/i), undefined)
+  } finally { await ui.cleanup() }
+})
+
+test('defect 3 (recency): a stale completion cannot overwrite a newer same-key answer', async () => {
+  let resolvePost: ((v: unknown) => void) | null = null
+  const ui = mountPanel({
+    get: async () => answer(false),
+    post: async () => new Promise((r) => { resolvePost = r }),
+  })
+  const key = ['directory-role-control', SCOPE_A, 'tenant-A']
+  try {
+    ui.render()
+    await waitFor(() => ui.button(/switch on/i) !== undefined, 'the enable action')
+    ui.click(ui.button(/switch on/i))
+    await waitFor(() => resolvePost !== null, 'the write to be in flight')
+
+    // A newer answer lands for the same key, then reads are blocked: nothing except the completion
+    // itself can change the cache from here, so no refetch can mask a stale write.
+    ui.blockReads()
+    await act(async () => { ui.client.setQueryData(key, answer(true)); await Promise.resolve() })
+
+    await act(async () => { resolvePost?.(answer(false)); await new Promise((r) => setTimeout(r, 0)) })
+    await waitFor(() => !ui.client.isMutating(), 'the stale completion to finish')
+
+    assert.equal((ui.client.getQueryData(key) as any)?.enabled, true,
+      'the completion was based on an entry the cache no longer holds, so it must not be adopted')
+  } finally { await ui.cleanup() }
+})
+
+test('defect 3 (error path): an obsolete identity’s FAILED completion invalidates nothing', async () => {
+  let generation = 1
+  let rejectPost: ((e: unknown) => void) | null = null
+  const ui = mountPanel({
+    get: async () => answer(false),
+    post: async () => new Promise((_r, reject) => { rejectPost = reject }),
+    identity: () => `subject-A:${generation}`,
+  })
+  try {
+    ui.render()
+    await waitFor(() => ui.button(/switch on/i) !== undefined, 'the enable action')
+    ui.click(ui.button(/switch on/i))
+    await waitFor(() => rejectPost !== null, 'the write to be in flight')
+
+    ui.client.clear()
+    generation = 7
+    let invalidations = 0
+    const real = ui.client.invalidateQueries.bind(ui.client)
+    ;(ui.client as any).invalidateQueries = (...a: any[]) => { invalidations += 1; return real(...a) }
+
+    await act(async () => { rejectPost?.(new ApiError(500, 'gone')); await new Promise((r) => setTimeout(r, 0)) })
+    await waitFor(() => !ui.client.isMutating(), 'the obsolete failure to finish')
+    assert.equal(invalidations, 0,
+      'the error settlement path needs the same identity guard as the success path')
+  } finally { await ui.cleanup() }
+})
+
+test('a resolved write outcome is not revived by a later read failure', async () => {
+  // Root's deterministic pattern. An immediate successful automatic GET can tie dataUpdatedAt with
+  // settledAt, or finish before the unknown phase is ever rendered; neither would show anything
+  // about the latch. So: the automatic recovery read FAILS, the uncertainty is therefore persistent
+  // and observable, the user's explicit re-read succeeds and resolves it, and only then is a later
+  // refetch forced to fail.
+  let autoReadFailures = 0
+  let enabled = false
+  const ui = mountPanel({
+    get: async () => {
+      if (enabled && autoReadFailures < 1) { autoReadFailures += 1; throw new ApiError(503, 'later') }
+      return answer(enabled)
+    },
+    post: async () => { enabled = true; throw new TypeError('lost') },
+  })
+  try {
+    ui.render()
+    await waitFor(() => ui.button(/switch on/i) !== undefined, 'the enable action')
+    ui.click(ui.button(/switch on/i))
+    await waitFor(() => /could not confirm/i.test(ui.text()), 'persistent uncertainty')
+
+    ui.click(ui.button(/re-read setting/i))
+    await waitFor(() => /switched on for this tenant/i.test(ui.text()), 'the resolved setting')
+    assert.doesNotMatch(ui.text(), /could not confirm/i, 'the explicit re-read resolved it')
+
+    // Now force a later read failure. This must read as a CURRENT read failure.
+    ui.blockReads()
+    await act(async () => { await ui.client.refetchQueries() })
+    await waitFor(() => /cannot read this collection setting/i.test(ui.text()), 'the read failure')
+
+    assert.doesNotMatch(ui.text(), /could not confirm/i,
+      'a resolved write outcome must not be revived by a later read failure')
+    assert.doesNotMatch(ui.text(), /was not changed/i, 'nor a proved-refusal history')
+    assert.doesNotMatch(ui.text(), /switched on for this tenant/i, 'and stale state is withheld')
+    assert.equal(ui.button(/switch on|switch off/i), undefined, 'stale actions are withheld')
+  } finally { await ui.cleanup() }
+})
+
+test('the panel does not claim it automatically resent anything', async () => {
+  let autoReadFailures = 0
+  let sent = false
+  const ui = mountPanel({
+    get: async () => {
+      if (sent && autoReadFailures < 1) { autoReadFailures += 1; throw new ApiError(503, 'later') }
+      return answer(false)
+    },
+    post: async () => { sent = true; throw new TypeError('lost') },
+  })
+  try {
+    ui.render()
+    await waitFor(() => ui.button(/switch on/i) !== undefined, 'the enable action')
+    ui.click(ui.button(/switch on/i))
+    await waitFor(() => /could not confirm/i.test(ui.text()), 'persistent uncertainty')
+    assert.match(ui.text(), /did not resend it automatically/i)
+    assert.equal(ui.posts.length, 1, 'and in fact nothing was resent')
   } finally { await ui.cleanup() }
 })

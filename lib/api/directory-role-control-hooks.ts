@@ -26,6 +26,8 @@ export type DirectoryRoleControlFailure =
   | 'rejected'
   /** Anything else, including an answer we could not parse. */
   | 'error'
+  /** Refused in the browser before anything was sent. Not a server answer at all. */
+  | 'not-sent'
 
 /** Whether a failed write PROVES the durable opt-in was not changed.
  *
@@ -34,10 +36,19 @@ export type DirectoryRoleControlFailure =
  * timeout, a 500, a body we could not parse — leaves the outcome UNKNOWN, because this contract
  * commits the opt-in and then serialises a reply, so the commit can succeed while the reply is lost.
  * Reporting unknown as "nothing was changed" asserts a state we have no evidence for. */
-export function writeOutcomeOf(failure: DirectoryRoleControlFailure): 'refused' | 'unknown' {
+export function writeOutcomeOf(
+  failure: DirectoryRoleControlFailure
+): 'refused' | 'unknown' | 'not-sent' {
+  if (failure === 'not-sent') return 'not-sent'
   return failure === 'forbidden' || failure === 'conflict' || failure === 'rejected'
     ? 'refused'
     : 'unknown'
+}
+
+/** A write refused before any request left the browser. Distinct from every server answer: there is
+ * no outcome to be uncertain about, because nothing was sent. */
+export class LocalRefusal extends Error {
+  readonly localRefusal = true
 }
 
 const controlPath = (customerTenantId: string) =>
@@ -55,6 +66,7 @@ export function classifyControlFailure(
   error: unknown,
   phase: 'read' | 'write'
 ): DirectoryRoleControlFailure {
+  if (error instanceof LocalRefusal) return 'not-sent'
   const status = error instanceof ApiError ? error.status : null
   if (status === 403) return 'forbidden'
   if (status === 409) return phase === 'read' ? 'unavailable' : 'conflict'
@@ -90,7 +102,8 @@ export type ControlLifecycle = {
   readonly isReadError: boolean
   readonly readError: unknown
   readonly writeFailure: DirectoryRoleControlFailure | null
-  /** When the outstanding write settled, or null when none has. */
+  /** When the outstanding write failed, or null when none is outstanding. Cleared once a successful
+   * fresh read has resolved it, which is what stops a later read failure reviving it. */
   readonly settledAt: number | null
   /** react-query's `dataUpdatedAt`: when the currently cached answer was accepted. */
   readonly dataUpdatedAt: number
@@ -118,7 +131,9 @@ export function controlPresentation(l: ControlLifecycle): DirectoryRoleControlPr
   if (!l.offered) return { phase: 'current', stateIsKnown: false, affordance: none, ...base }
   if (l.isPending) return { phase: 'checking', stateIsKnown: false, affordance: none, ...base }
 
-  // An outstanding write is resolved only by an answer read AFTER it settled.
+  // Fail closed: an outstanding write is resolved only by an answer accepted strictly AFTER it
+  // settled. A same-millisecond tie counts as unresolved, which is the safe direction — the panel
+  // says it cannot confirm rather than claiming a state it may not have re-read.
   const resolvedByFreshRead = l.settledAt !== null && !l.isFetching && !l.isReadError
     && l.control !== undefined && l.dataUpdatedAt > l.settledAt
   if (l.settledAt !== null && !resolvedByFreshRead) {
@@ -194,7 +209,9 @@ export function useSetDirectoryRoleControl(customerTenantId: string) {
   const { cacheScope, currentIdentityToken } = useAuth()
   const queryClient = useQueryClient()
   const queryKey = directoryRoleControlKey(cacheScope, customerTenantId)
-  /** Set when a write settles and cleared only once a fresh successful read supersedes it. */
+  /** Set when a write fails; cleared once a successful fresh read has resolved it, or when a new
+   * explicit action supersedes it. Clearing is what makes the resolution PERSIST: a later failed or
+   * pending refetch is then a current read failure, not a revival of the old write outcome. */
   const [settledAt, setSettledAt] = useState<number | null>(null)
   const attempt = useRef<{ identity: string; baseline: DirectoryRoleControlView } | null>(null)
 
@@ -202,10 +219,18 @@ export function useSetDirectoryRoleControl(customerTenantId: string) {
 
   const mutation = useMutation<DirectoryRoleControlView, unknown, { enabled: boolean }>({
     mutationKey: ['directory-role-control-write', cacheScope, customerTenantId],
+    onMutate: () => {
+      // A new explicit action supersedes any earlier unresolved one, and must never inherit the
+      // previous attempt's identity or baseline.
+      attempt.current = null
+      setSettledAt(null)
+    },
     mutationFn: async ({ enabled }) => {
       const current = queryClient.getQueryData<DirectoryRoleControlView>(queryKey)
       if (!current) {
-        throw new Error('HawkView has no current directory collection context to act on.')
+        // Refused locally: nothing was sent, so there is no remote outcome to be uncertain about.
+        // `attempt.current` stays null, which is how the settlement paths tell the two apart.
+        throw new LocalRefusal('HawkView has no current directory collection context to act on.')
       }
       // The cached OBJECT we based this write on, not a timestamp. Millisecond timestamps tie, and
       // a tie would let an older completion win; an object identity check cannot tie, because any
@@ -238,7 +263,9 @@ export function useSetDirectoryRoleControl(customerTenantId: string) {
     },
     onError: () => {
       const started = attempt.current
-      if (!started || started.identity !== currentIdentityToken()) return
+      // Never sent: no uncertainty to report and nothing to re-read for.
+      if (!started) return
+      if (started.identity !== currentIdentityToken()) return
       // Only a FAILED write needs a fresh read to resolve it. A success carries the server's own
       // authoritative answer, so marking it unresolved would demand a read for a state we were just
       // told — and with millisecond timestamps that read can tie and never appear to resolve.

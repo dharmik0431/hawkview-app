@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect } from 'react'
 import { AlertTriangle, HelpCircle, Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/components/providers/auth-provider'
@@ -24,12 +25,13 @@ const READ_COPY = {
  * step is a fresh read. */
 const REFUSED_COPY = {
   conflict:
-    'This tenant’s connection or configuration changed before your change was applied, so the setting was not changed. Re-read it below before choosing again.',
+    'HawkView refused the change because this tenant’s collection context is no longer the one it read — it changed, or the tenant is no longer eligible for managed collection. The setting was not changed. Re-read it below before choosing again.',
   rejected:
     'HawkView could not apply your change against the setting it had read, so the setting was not changed. Re-read it below before choosing again.',
   forbidden: 'Your role cannot change directory role collection for this tenant.',
   unavailable: 'The setting was not changed. This control is unavailable right now.',
   error: '',
+  'not-sent': '',
 } as const
 
 /** Explicit opt-in control for stored DIRECTORY_ROLES collection.
@@ -60,6 +62,15 @@ export function DirectoryRoleControl({ customerTenantId }: { customerTenantId: s
     dataUpdatedAt: read.dataUpdatedAt,
     offered,
   })
+
+  // Declared BEFORE the eligibility return so the hook order cannot change when a role or tenant
+  // changes. Releasing the latch on resolution is what persists it: once a successful fresh read
+  // has resolved a failed write, a later failed or pending refetch is reported as a current read
+  // failure and never revives that write's outcome.
+  const resolved = presented.phase === 'current' && presented.stateIsKnown
+  useEffect(() => {
+    if (resolved && write.settledAt !== null) write.clearSettled()
+  }, [resolved, write.settledAt, write.clearSettled])
 
   if (!customerTenantId || !offered) return null
 
@@ -92,12 +103,21 @@ export function DirectoryRoleControl({ customerTenantId }: { customerTenantId: s
             <HelpCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
             <span>
               HawkView could not confirm the result of your change. It may or may not have been
-              applied. Your request was sent once and has not been resent. Re-read the setting to see
-              where it stands.
+              applied. HawkView did not resend it automatically. Re-read the setting to see where it
+              stands.
             </span>
           </p>
           <Refresh busy={rereading} onClick={() => void read.refetch()} />
         </div>
+      )}
+
+      {writeFailure === 'not-sent' && (
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
+          <span>
+            HawkView had no current setting to act on, so nothing was sent and nothing was changed.
+          </span>
+        </p>
       )}
 
       {phase === 'refused' && writeFailure && REFUSED_COPY[writeFailure] && (
