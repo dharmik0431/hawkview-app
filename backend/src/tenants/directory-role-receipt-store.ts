@@ -7,6 +7,7 @@ import type { ChangeEvidenceService } from '../changes/change-evidence.service.j
  * Current reporting later requires a COMPLETE within 1h; 26h is retained compatibility only.
  */
 export const DIRECTORY_ROLE_RECEIPT_SCOPE = 'directory-role-assignments/v1'
+export const DIRECTORY_ROLE_REVOKED_SCOPE = 'directory-role-assignments/revoked-v1'
 export const ROLE_ATTEMPT_MS = 5 * 60 * 1000
 // Shared by the actual clock query and precision tests: never round sampled_at for eligibility.
 export const ROLE_DEADLINE_PREDICATE = 'sampled_at < role_attempt_expires_at'
@@ -47,6 +48,124 @@ interface State {
 }
 interface Locked { state: State | null; connectionId: string; incarnation: string | null }
 interface Snapshot { payload: unknown; observedAt: Date; publicationId: string | null; samePayload: boolean }
+export type DirectoryControlIdentity = Omit<RoleIdentity, 'configurationRevision'>
+export interface DirectoryControlExpectation {
+  configurationRevision: string | null
+  connectionIncarnation: string | null
+  scopeIncarnation: string | null
+  scopeVersion: string | null
+}
+function controlIdentity(input: DirectoryControlIdentity): DirectoryControlIdentity {
+  return { organizationId: id(input.organizationId), customerTenantId: id(input.customerTenantId), microsoftTenantId: id(input.microsoftTenantId) }
+}
+export function directoryControlExpectation(input: unknown): DirectoryControlExpectation {
+  if (!input || typeof input !== 'object') throw new Error('INVALID_DIRECTORY_CONTROL_EXPECTATION')
+  const value = input as Record<string, unknown>
+  const nullableId = (key: string) => value[key] === null ? null : id(value[key] as string)
+  const scopeVersion = value.scopeVersion
+  if (scopeVersion !== null && (typeof scopeVersion !== 'string' || !scopeVersion.length || scopeVersion.length > 100)) {
+    throw new Error('INVALID_DIRECTORY_CONTROL_EXPECTATION')
+  }
+  const result = { configurationRevision: nullableId('configurationRevision'), connectionIncarnation: nullableId('connectionIncarnation'),
+    scopeIncarnation: nullableId('scopeIncarnation'), scopeVersion }
+  if ((result.scopeIncarnation === null) !== (result.scopeVersion === null)) throw new Error('INVALID_DIRECTORY_CONTROL_EXPECTATION')
+  return result
+}
+async function lockControl(tx: AuthorityTransaction, who: DirectoryControlIdentity) {
+  const authority = await captureManagedAuthority({ $transaction: work => work(tx) })
+  const tenants = await tx.$queryRawUnsafe<{ status: string }[]>(`/* directory-control:tenant */ SELECT status FROM customer_tenants
+    WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid FOR NO KEY UPDATE`,
+  who.customerTenantId, who.organizationId, who.microsoftTenantId)
+  if (tenants.length !== 1) return null
+  const connections = await tx.$queryRawUnsafe<{ id: string; incarnation: string | null; status: string; mode: string }[]>(
+    `/* directory-control:connection */ SELECT id,collection_incarnation::text AS incarnation,status,connection_mode AS mode
+    FROM tenant_connections WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid FOR NO KEY UPDATE`,
+    who.customerTenantId, who.organizationId)
+  if (connections.length > 1 || (connections[0] && connections[0].mode !== 'HAWKVIEW_MANAGED')) return null
+  const states = await tx.$queryRawUnsafe<State[]>(`/* directory-control:scope */ SELECT * FROM sync_states
+    WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND resource_type='DIRECTORY_ROLES' FOR UPDATE`,
+    who.customerTenantId, who.organizationId)
+  const state = states[0] ?? null, connection = connections[0] ?? null
+  const expected: DirectoryControlExpectation = { configurationRevision: authority?.configurationRevision ?? null,
+    connectionIncarnation: connection?.incarnation ?? null, scopeIncarnation: state?.role_scope_incarnation ?? null,
+    scopeVersion: state?.role_scope_version ?? null }
+  return { authority, tenant: tenants[0], connection, state, expected }
+}
+const sameControl = (a: DirectoryControlExpectation, b: DirectoryControlExpectation) =>
+  a.configurationRevision === b.configurationRevision && a.connectionIncarnation === b.connectionIncarnation
+  && a.scopeIncarnation === b.scopeIncarnation && a.scopeVersion === b.scopeVersion
+
+export async function readDirectoryRoleControl(db: AuthorityDatabase, input: DirectoryControlIdentity) {
+  const who = controlIdentity(input)
+  return db.$transaction(async tx => {
+    const current = await lockControl(tx, who)
+    return current ? { status: 'current' as const, expected: current.expected,
+      enabled: current.expected.scopeVersion === DIRECTORY_ROLE_RECEIPT_SCOPE } : rejected('UNAVAILABLE')
+  }, { isolationLevel: 'ReadCommitted' })
+}
+async function writeRevokedScope(tx: AuthorityTransaction, who: DirectoryControlIdentity) {
+  const scopeIncarnation = randomUUID()
+  // Parent T/C locks serialize both absent-row creation and competing activation.
+  await tx.$executeRawUnsafe(`/* directory-control:ensure */ INSERT INTO sync_states
+    (id,organization_id,customer_tenant_id,resource_type,updated_at)
+    VALUES ($1::uuid,$2::uuid,$3::uuid,'DIRECTORY_ROLES',clock_timestamp()) ON CONFLICT DO NOTHING`,
+    randomUUID(), who.organizationId, who.customerTenantId)
+  const writes = await tx.$executeRawUnsafe(`/* directory-control:revoke */ UPDATE sync_states
+    SET role_scope_version=$3,role_scope_incarnation=$4::uuid,
+    role_attempt_id=NULL,role_attempt_connection=NULL,role_attempt_configuration=NULL,role_attempt_scope=NULL,
+    role_attempt_started_at=NULL,role_attempt_expires_at=NULL,role_attempt_outcome=NULL,role_attempt_terminal_at=NULL,
+    status='IDLE',updated_at=clock_timestamp()
+    WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND resource_type='DIRECTORY_ROLES'`,
+    who.customerTenantId, who.organizationId, DIRECTORY_ROLE_REVOKED_SCOPE, scopeIncarnation)
+  if (writes !== 1) throw new Error('DIRECTORY_CONTROL_CONFLICT')
+  return scopeIncarnation
+}
+export async function setDirectoryRoleControl(db: AuthorityDatabase, input: DirectoryControlIdentity,
+  expectation: DirectoryControlExpectation, enabled: boolean) {
+  const who = controlIdentity(input), expected = directoryControlExpectation(expectation)
+  if (typeof enabled !== 'boolean') throw new Error('INVALID_DIRECTORY_CONTROL_ACTION')
+  return db.$transaction(async tx => {
+    const current = await lockControl(tx, who)
+    if (!current) return rejected('UNAVAILABLE')
+    if (!sameControl(current.expected, expected)) return rejected('SUPERSEDED')
+    if (enabled) {
+      const authority = current.authority
+      if (!authority || authority.credentialReference !== `encrypted-secret:${authority.configurationRevision}`
+        || current.tenant.status !== 'ACTIVE' || current.connection?.status !== 'CONNECTED') return rejected('UNAVAILABLE')
+      const result = await activateRoleScope({ $transaction: work => work(tx) }, { ...who,
+        configurationRevision: authority.configurationRevision, expectedConnectionIncarnation: expected.connectionIncarnation,
+        expectedScopeIncarnation: expected.scopeIncarnation })
+      if (result.status !== 'activated') return result
+      return { status: 'applied' as const, enabled: true, expected: { configurationRevision: authority.configurationRevision,
+        connectionIncarnation: result.context.connectionIncarnation, scopeIncarnation: result.context.scopeIncarnation,
+        scopeVersion: result.context.scopeVersion } }
+    }
+    const scopeIncarnation = await writeRevokedScope(tx, who)
+    return { status: 'applied' as const, enabled: false,
+      expected: { ...current.expected, scopeIncarnation, scopeVersion: DIRECTORY_ROLE_REVOKED_SCOPE } }
+  }, { isolationLevel: 'ReadCommitted' })
+}
+
+/** Explicit tenant deletion: revoke and delete atomically. Managed credentials
+ * belong to the global connector, so this operation never deletes a secret. */
+export async function removeManagedDirectoryTenant(db: AuthorityDatabase, input: DirectoryControlIdentity,
+  expectation: DirectoryControlExpectation) {
+  const who = controlIdentity(input), expected = directoryControlExpectation(expectation)
+  return db.$transaction(async tx => {
+    const current = await lockControl(tx, who)
+    if (!current || !sameControl(current.expected, expected)) return rejected('SUPERSEDED')
+    await writeRevokedScope(tx, who)
+    await tx.$executeRawUnsafe(`/* directory-control:disconnect */ UPDATE customer_tenants SET status='DISCONNECTED',updated_at=clock_timestamp()
+      WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid`, who.customerTenantId,who.organizationId,who.microsoftTenantId)
+    await tx.$executeRawUnsafe(`/* directory-control:disconnect-connection */ UPDATE tenant_connections
+      SET status='REVOKED',collection_incarnation=$3::uuid,updated_at=clock_timestamp()
+      WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid`,who.customerTenantId,who.organizationId,randomUUID())
+    const count = await tx.$executeRawUnsafe(`/* directory-control:delete */ DELETE FROM customer_tenants
+      WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid`,who.customerTenantId,who.organizationId,who.microsoftTenantId)
+    if (count !== 1) throw new Error('DIRECTORY_CONTROL_CONFLICT')
+    return { status: 'removed' as const }
+  }, { isolationLevel: 'ReadCommitted' })
+}
 const rejected = (reason: RoleRejection['reason']): RoleRejection => ({ status: 'rejected', reason })
 function id(value: string): string {
   if (typeof value !== 'string' || !UUID.test(value)) throw new Error('INVALID_ROLE_ID')
@@ -122,8 +241,13 @@ export async function captureRoleAttempt(db: AuthorityDatabase,
       WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND resource_type='DIRECTORY_ROLES' FOR UPDATE`,
       who.customerTenantId, who.organizationId)
     const s = states[0]
-    if (!s?.role_scope_incarnation && !s?.role_scope_version) return { status: 'legacy' }
     const c = connections[0]
+    if (!s?.role_scope_incarnation && !s?.role_scope_version) {
+      // A missing connection cannot grant compatibility, and managed collection
+      // requires explicit opt-in. Decide from the locked row, not a stale caller.
+      return connections.length === 1 && c.mode === 'CUSTOMER_MANAGED'
+        ? { status: 'legacy' } : rejected('UNAVAILABLE')
+    }
     if (tenants[0].status !== 'ACTIVE' || connections.length !== 1 || c.status !== 'CONNECTED'
       || c.mode !== 'HAWKVIEW_MANAGED' || !c.incarnation || !s.role_scope_incarnation
       || s.role_scope_version !== DIRECTORY_ROLE_RECEIPT_SCOPE || !authority

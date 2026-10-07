@@ -11,6 +11,7 @@ export {
 } from './microsoft-collection-budget.js'
 import { projectSyncOutcome } from './sync-outcome-projection.js'
 import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
+import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type CapturedConnectionVerification } from './connection-verification-store.js'
 import { validatedLicenseRows } from './license-validation.js'
 import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
 import {
@@ -2006,6 +2007,16 @@ export class TenantSyncService {
       )
     }
 
+    let capturedManaged: CapturedConnectionVerification | undefined
+    if (tenant.connection.connectionMode !== 'CUSTOMER_MANAGED') {
+      const capture = await captureConnectionVerification(this.prisma, {
+        customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
+      }, true)
+      if (capture.status !== 'captured' || capture.context.tenant.status !== 'ACTIVE' || capture.context.connection.status !== 'CONNECTED') {
+        throw new ConflictException('The managed connection changed before synchronization.')
+      }
+      capturedManaged = capture.context
+    }
     const now = new Date()
     const { claimed, existingState } = await claimTenantUsersLease(this.prisma, tenant, now)
     if (!claimed) {
@@ -2024,7 +2035,9 @@ export class TenantSyncService {
     let accessToken: string
     let graphTokenAcquired = false
     try {
-      accessToken = await this.microsoftConsent.getTenantAccessToken({
+      accessToken = capturedManaged
+        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId)
+        : await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
           tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
@@ -2059,7 +2072,7 @@ export class TenantSyncService {
             consecutiveFailures: 0,
           },
         })
-        await transaction.tenantConnection.update({
+        if (!capturedManaged) await transaction.tenantConnection.update({
           where: {
             customerTenantId_organizationId: {
               customerTenantId: tenant.id,
@@ -2079,7 +2092,7 @@ export class TenantSyncService {
       // still usable. Collection failures (including a Graph 401/403) belong
       // to the resource and must never suspend the whole customer tenant.
       if (!graphTokenAcquired && failure.failureClass === 'AUTHENTICATION_REQUIRED') {
-        await this.markConnectionUnavailable(tenant, error)
+        await this.markConnectionUnavailable(tenant, error, capturedManaged)
       }
       const message = customerCollectionFailureMessage(
         'user directory',
@@ -2116,6 +2129,14 @@ export class TenantSyncService {
           ? error.message
           : 'Microsoft users synchronization failed.'
       )
+    }
+
+    // Publication is outside the provider/resource catch. A lost context or an
+    // uncertain commit cannot trigger compensation or another provider workload.
+    if (capturedManaged) {
+      const refreshed = await publishCapturedConnectionRefresh(this.prisma, capturedManaged, 'sync-timestamp')
+      if (refreshed.status !== 'applied') throw new ConflictException('The managed connection changed during synchronization.')
+      capturedManaged = refreshed.context
     }
 
     if (incrementalOnly) {
@@ -2203,7 +2224,9 @@ export class TenantSyncService {
 
     let snapshotAccessToken: string
     try {
-      snapshotAccessToken = await this.microsoftConsent.getTenantAccessToken({
+      snapshotAccessToken = capturedManaged
+        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId)
+        : await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
           tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
@@ -2216,7 +2239,7 @@ export class TenantSyncService {
       const technicalMessage = safeErrorMessage(error, 'Microsoft token acquisition failed.')
       const failure = classifyMicrosoftFailure(error, technicalMessage)
       if (failure.failureClass === 'AUTHENTICATION_REQUIRED') {
-        await this.markConnectionUnavailable(tenant, error)
+        await this.markConnectionUnavailable(tenant, error, capturedManaged)
       }
       throw new BadGatewayException(
         customerCollectionFailureMessage('Microsoft 365', failure, true),
@@ -2408,7 +2431,7 @@ export class TenantSyncService {
     if (initialSync) {
       const actionRequired = actionRequiredResources.length > 0
       const retrying = !actionRequired && retryingResources.length > 0
-      await this.notifications.publishIncident({
+      if (!capturedManaged) await this.notifications.publishIncident({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         eventType: actionRequired
@@ -2552,10 +2575,17 @@ export class TenantSyncService {
   }
 
   private async markConnectionUnavailable(
-    tenant: { id: string; organizationId: string },
-    error: unknown
+    tenant: { id: string; organizationId: string; connection?: { connectionMode: string } | null },
+    error: unknown,
+    captured?: CapturedConnectionVerification
   ) {
     const message = safeErrorMessage(error, 'Microsoft tenant access failed.')
+    if (tenant.connection?.connectionMode !== 'CUSTOMER_MANAGED') {
+      // An uncaptured/old failure grants no authority and emits no incident.
+      if (!captured) return
+      await publishConnectionVerification(this.prisma, captured, { outcome: 'failed', message, authenticationFailure: true })
+      return
+    }
     const failedAt = new Date()
 
     await this.prisma.$transaction([
