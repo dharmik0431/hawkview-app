@@ -94,6 +94,14 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
   }
   const refetches: string[] = []
   const asked: string[] = []
+  const listeners: string[] = []
+  for (const [label, target] of [['window', dom.window], ['document', dom.window.document]] as const) {
+    const original = target.addEventListener.bind(target)
+    ;(target as any).addEventListener = (type: string, ...rest: any[]) => {
+      listeners.push(`${label}:${type}`)
+      return original(type, ...rest)
+    }
+  }
   const load = makeLoader({
     '@/lib/api/directory-role-results-hooks': {
       useDirectoryRoleResults: (tenantId: string) => {
@@ -120,8 +128,11 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
   }
   return {
     container, text: () => container.textContent ?? '', refetches, asked, cleanup,
+    listeners: () => listeners,
     buttons: () => Array.from(container.querySelectorAll('button')) as any[],
     click: (node: any) => act(() => { node.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) }),
+    // Dispatched on the JSDOM window, which is the target the panel actually listens on.
+    resume: () => act(() => { dom.window.dispatchEvent(new dom.window.Event('focus')) }),
   }
 }
 
@@ -207,6 +218,36 @@ test('an unreadable answer is an error with a retry, not an empty result', () =>
     assert.deepEqual(panel.buttons().map((b) => (b.textContent ?? '').trim()), ['Try again'])
     panel.click(panel.buttons()[0])
     assert.deepEqual(panel.refetches, ['tenant-A'])
+  } finally { panel.cleanup() }
+})
+
+/** P4 — the mounted view must not stay "current" indefinitely while the tab is open.
+ *
+ * Two halves, each proven directly: the boundary arithmetic as a pure function, and the fact that the
+ * panel actually subscribes to the resume signals that drive it. I did NOT get a dispatched focus
+ * event to re-render through this loader harness; rather than weaken the assertion or skip it, the
+ * subscription is asserted at the listener level and that limitation is declared in the report. */
+test('elapsed presentation crosses the one-hour boundary', () => {
+  const panelModule = makeLoader({})(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx'))
+  const { elapsedPresentation, DIRECTORY_ROLE_CURRENT_MS } = panelModule
+  assert.equal(DIRECTORY_ROLE_CURRENT_MS, 3_600_000)
+  const justUnder = elapsedPresentation(59 * 60_000, 0)
+  assert.equal(justUnder.agedStale, false)
+  const crossed = elapsedPresentation(59 * 60_000, 2 * 60_000)
+  assert.equal(crossed.elapsedMs, 61 * 60_000)
+  assert.equal(crossed.agedStale, true, 'a view left open must stop presenting an hour-old result as current')
+  assert.equal(elapsedPresentation(3_600_000, 0).agedStale, false, 'exactly one hour is still current')
+  assert.equal(elapsedPresentation(3_600_000, 1).agedStale, true)
+  assert.equal(elapsedPresentation(60_000, -5_000).elapsedMs, 60_000, 'a backwards clock never ages less than zero')
+})
+
+test('the mounted panel subscribes to the resume signals that advance its clock', () => {
+  const panel = renderPanel({ data: view('current', observed([ROW], { ageMs: 59 * 60_000 })) })
+  try {
+    const listeners = panel.listeners()
+    assert.ok(listeners.includes('window:focus'), 'resume from a backgrounded tab')
+    assert.ok(listeners.includes('document:visibilitychange'), 'tab becoming visible again')
+    assert.deepEqual(panel.refetches, [], 'ageing must never trigger a request')
   } finally { panel.cleanup() }
 })
 

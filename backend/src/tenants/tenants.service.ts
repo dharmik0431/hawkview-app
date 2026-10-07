@@ -1988,14 +1988,12 @@ export class TenantsService {
     }
 
     // Nondisclosing, as above: outside the caller's organizations is indistinguishable from absent.
+    // Only identity is selected here; every value the result depends on — tenant and connection
+    // status, mode, scope, receipt, snapshot and the read clock — is read coherently inside the
+    // reader's single statement, so none of it can drift between this check and that read.
     const tenant = await this.prisma.customerTenant.findFirst({
       where: { id: tenantId, organizationId: { in: organizationIds } },
-      select: {
-        id: true,
-        organizationId: true,
-        microsoftTenantId: true,
-        connection: { select: { collectionIncarnation: true } },
-      },
+      select: { id: true, organizationId: true },
     })
     if (!tenant) {
       throw new NotFoundException('Customer tenant was not found.')
@@ -2004,9 +2002,6 @@ export class TenantsService {
     return readDirectoryRoleResults(this.prisma, {
       organizationId: tenant.organizationId,
       customerTenantId: tenant.id,
-      microsoftTenantId: tenant.microsoftTenantId,
-      collectionIncarnation: tenant.connection?.collectionIncarnation ?? null,
-      now: Date.now(),
     })
   }
 }

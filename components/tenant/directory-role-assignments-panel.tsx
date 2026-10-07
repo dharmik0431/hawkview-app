@@ -1,5 +1,6 @@
 'use client'
 
+import { useEffect, useState } from 'react'
 import { AlertTriangle, RefreshCw, ShieldQuestion } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useDirectoryRoleResults } from '@/lib/api/directory-role-results-hooks'
@@ -10,8 +11,44 @@ function storedTime(at: Date) {
   return at.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 }
 
-/** Age comes from the stored observation's own age, never the render clock, so a failed newer
- * attempt cannot make older data look freshly checked. */
+export const DIRECTORY_ROLE_CURRENT_MS = 60 * 60 * 1000
+const CURRENT_MS = DIRECTORY_ROLE_CURRENT_MS
+
+/** Pure, so the boundary itself is testable without a clock or a rendered tree. */
+export function elapsedPresentation(baseAgeMs: number, extraMs: number) {
+  const elapsedMs = baseAgeMs + Math.max(0, extraMs)
+  return { elapsedMs, agedStale: elapsedMs > CURRENT_MS }
+}
+
+/** Elapsed time while the view stays mounted.
+ *
+ * The ORIGIN is the server's observation — `checkedAt` and the age it measured at read time — so a
+ * failed newer attempt still cannot make older data look freshly checked. What this adds is that the
+ * displayed age ADVANCES and the current/stale label can cross the one-hour boundary without a
+ * refetch, so a tab left open does not report an indefinitely fresh result. It also recomputes on
+ * resume, because a sleeping tab fires no interval ticks. No request is made here. */
+function useElapsedSince(baseAgeMs: number | undefined) {
+  // Captured at FIRST RENDER rather than inside the effect, so the baseline does not depend on when
+  // effects happen to flush — the elapsed value is then a pure function of the wall clock.
+  const [mountedAt] = useState(() => Date.now())
+  const [extraMs, setExtraMs] = useState(0)
+  useEffect(() => {
+    if (baseAgeMs === undefined) return
+    const advance = () => setExtraMs(Math.max(0, Date.now() - mountedAt))
+    const timer = setInterval(advance, 30_000)
+    // A backgrounded tab throttles or skips intervals; recompute from the wall clock on return.
+    const onVisible = () => { if (typeof document !== 'undefined' && !document.hidden) advance() }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
+    if (typeof window !== 'undefined') window.addEventListener('focus', onVisible)
+    return () => {
+      clearInterval(timer)
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
+      if (typeof window !== 'undefined') window.removeEventListener('focus', onVisible)
+    }
+  }, [baseAgeMs, mountedAt])
+  return baseAgeMs === undefined ? undefined : baseAgeMs + extraMs
+}
+
 function ageLabel(ageMs: number) {
   const minutes = Math.floor(ageMs / 60_000)
   if (minutes < 1) return 'less than a minute old'
@@ -77,9 +114,12 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
   className?: string
 }) {
   const { data, isPending, isError, isFetching, refetch } = useDirectoryRoleResults(customerTenantId)
+  const elapsedMs = useElapsedSince(data?.observation?.ageMs)
   if (!customerTenantId) return null
 
   const attempt = data?.latestAttempt.outcome
+  // The label is re-derived from elapsed time, so a mounted view ages out of "current" on its own.
+  const agedStale = elapsedMs !== undefined && elapsedMs > CURRENT_MS
 
   return (
     <section className={cn('rounded-xl border border-slate-200 p-4 dark:border-slate-700', className)}>
@@ -134,7 +174,7 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
 
       {!isError && (data?.status === 'current' || data?.status === 'stale') && (
         <div className="space-y-2">
-          {data.status === 'stale' && (
+          {(data.status === 'stale' || agedStale) && (
             <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
               Showing the last completed collection
             </p>
@@ -142,7 +182,8 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
           <Assignments results={data} />
           {data.observation && (
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Checked {storedTime(data.observation.checkedAt)} · {ageLabel(data.observation.ageMs)}
+              Checked {storedTime(data.observation.checkedAt)} ·{' '}
+              {ageLabel(elapsedMs ?? data.observation.ageMs)}
             </p>
           )}
         </div>

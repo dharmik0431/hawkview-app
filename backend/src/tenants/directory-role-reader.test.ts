@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { createHash } from 'node:crypto'
 import { readDirectoryRoleResults, DIRECTORY_ROLE_CURRENT_MS } from './directory-role-reader.js'
 
 const ORG = '11111111-1111-4111-8111-111111111111'
@@ -9,158 +10,158 @@ const INCARNATION = '44444444-4444-4444-8444-444444444444'
 const SCOPE_INCARNATION = '55555555-5555-4555-8555-555555555555'
 const COMPLETE_ID = '66666666-6666-4666-8666-666666666666'
 const REVISION = '77777777-7777-4777-8777-777777777777'
-const NOW = Date.UTC(2026, 9, 7, 6, 0, 0)
-const CHECKED = new Date(NOW - 60_000)
+const PRINCIPAL = '88888888-8888-4888-8888-888888888888'
+const DEFINITION = '99999999-9999-4999-8999-999999999999'
+const READ_AT = new Date(Date.UTC(2026, 9, 7, 7, 0, 0))
+const CHECKED = new Date(READ_AT.getTime() - 60_000)
 
+/** The canonical shape the collection contract produces, so the digest below is the real one. */
 const ROW = {
-  id: 'assignment-1', principalId: 'principal-1', roleDefinitionId: 'definition-1',
+  id: 'assignment-1', principalId: PRINCIPAL, roleDefinitionId: DEFINITION,
   directoryScopeId: '/', appScopeId: null,
-  roleDefinition: { id: 'definition-1', displayName: 'Global Reader', templateId: 'template-1' },
+  roleDefinition: { id: DEFINITION, displayName: 'Global Reader', templateId: null },
 }
+const digestOf = (rows: unknown[]) => createHash('sha256').update(JSON.stringify(rows)).digest('hex')
 
-function completeState(overrides: Record<string, unknown> = {}) {
+function row(overrides: Record<string, unknown> = {}) {
+  const payload = (overrides.snapshotPayload as unknown[] | undefined) ?? [ROW]
   return {
-    roleScopeVersion: 'directory-role-assignments/v1', roleScopeIncarnation: SCOPE_INCARNATION,
-    roleAttemptOutcome: null, roleAttemptTerminalAt: null, roleAttemptId: null,
-    roleCompleteId: COMPLETE_ID, roleCompleteConnection: INCARNATION,
-    roleCompleteConfiguration: REVISION, roleCompleteScope: SCOPE_INCARNATION,
-    roleCompleteScopeVersion: 'directory-role-assignments/v1', roleCompleteMicrosoftTenantId: MSFT,
-    roleCompleteCheckedAt: CHECKED, roleCompleteCount: 1,
+    readAt: READ_AT,
+    tenantStatus: 'ACTIVE', microsoftTenantId: MSFT,
+    connectionStatus: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', connectionIncarnation: INCARNATION,
+    scopeVersion: 'directory-role-assignments/v1', scopeIncarnation: SCOPE_INCARNATION,
+    attemptOutcome: 'COMPLETE', attemptTerminalAt: CHECKED,
+    completeId: COMPLETE_ID, completeConnection: INCARNATION, completeConfiguration: REVISION,
+    completeScope: SCOPE_INCARNATION, completeScopeVersion: 'directory-role-assignments/v1',
+    completeMicrosoftTenantId: MSFT, completeCheckedAt: CHECKED,
+    completeDigest: digestOf(payload), completeCount: payload.length,
+    snapshotPayload: payload, snapshotAttemptId: COMPLETE_ID, snapshotObservedAt: CHECKED,
     ...overrides,
   }
 }
 
-function db(options: { state?: unknown; snapshot?: unknown; authority?: unknown } = {}) {
-  const authorityRow = options.authority === undefined
-    ? [{ configurationRevision: REVISION, clientId: 'client', homeTenantId: MSFT, credentialReference: `encrypted-secret:${REVISION}`, operationId: null, fingerprint: null }]
-    : (options.authority as unknown[])
-  const reads: string[] = []
+function db(rows: unknown[], authority: unknown[] = [{ configurationRevision: REVISION, clientId: 'c', homeTenantId: MSFT, credentialReference: `encrypted-secret:${REVISION}`, operationId: null, fingerprint: null }]) {
+  const statements: string[] = []
   return {
-    reads,
+    statements,
     $transaction: async (work: (tx: unknown) => Promise<unknown>) => work({
       $queryRawUnsafe: async (query: string) => {
-        reads.push(query.includes('pg_advisory') ? 'authority-lock' : 'authority-row')
-        return query.includes('pg_advisory') ? [{ locked: 1 }] : authorityRow
+        if (query.includes('directory-role-results:coherent-read')) { statements.push('coherent-read'); return rows }
+        if (query.includes('pg_advisory')) { statements.push('authority-lock'); return [{ locked: 1 }] }
+        statements.push('authority-row'); return authority
       },
       $executeRawUnsafe: async () => 0,
     }),
-    syncState: { findFirst: async () => { reads.push('sync-state'); return options.state === undefined ? completeState() : options.state } },
-    tenantEntraSnapshot: { findFirst: async () => { reads.push('snapshot'); return options.snapshot === undefined ? { payload: [ROW], rolePublicationAttemptId: COMPLETE_ID, observedAt: CHECKED } : options.snapshot } },
   } as never
 }
 
-const input = { organizationId: ORG, customerTenantId: TEN, microsoftTenantId: MSFT, collectionIncarnation: INCARNATION, now: NOW }
+const input = { organizationId: ORG, customerTenantId: TEN }
 
-test('a coherent complete receipt is current, with rows projected field by field', async () => {
-  const result = await readDirectoryRoleResults(db(), input)
+test('one coherent statement, then the authority, inside a single transaction', async () => {
+  const database = db([row()])
+  const result = await readDirectoryRoleResults(database, input)
   assert.equal(result.status, 'current')
-  assert.equal(result.observation?.observedCount, 1)
-  assert.equal(result.observation?.verifiedCompleteEmpty, false)
+  assert.deepEqual((database as any).statements, ['coherent-read', 'authority-lock', 'authority-row'])
   assert.deepEqual(result.observation?.assignments, [{
-    id: 'assignment-1', principalId: 'principal-1', roleDefinitionId: 'definition-1',
+    id: 'assignment-1', principalId: PRINCIPAL, roleDefinitionId: DEFINITION,
     roleDisplayName: 'Global Reader', directoryScopeId: '/', appScopeId: null,
   }])
-  // The provider payload is never spread: templateId is stored but must not reach the response.
-  assert.equal(JSON.stringify(result).includes('templateId'), false)
-  assert.equal(JSON.stringify(result).includes('template-1'), false)
-  assert.equal(result.latestAttempt.outcome, null)
+  assert.equal(result.latestAttempt.outcome, null, 'COMPLETE is not an outstanding attempt')
 })
 
-test('an unactivated tenant is never-vouched-for, even when a snapshot holds rows', async () => {
-  for (const state of [
-    null,
-    completeState({ roleScopeVersion: null, roleScopeIncarnation: null }),
-    completeState({ roleScopeVersion: 'directory-role-assignments/v0' }),
-    completeState({ roleScopeIncarnation: null }),
-  ]) {
-    const result = await readDirectoryRoleResults(db({ state }), input)
-    assert.equal(result.status, 'not-activated')
+test('ROOT COUNTEREXAMPLE: a malformed payload can never read as a verified empty', async () => {
+  // A zero-count receipt whose stored payload is garbage. v1 dropped the rows and called this
+  // "verified complete empty"; the whole payload must now be refused.
+  for (const payload of [[{}], [ROW, {}], [{ id: 'x' }], 'not-an-array', null, [ROW, 'junk']]) {
+    const result = await readDirectoryRoleResults(db([row({ snapshotPayload: payload, completeCount: 0, completeDigest: digestOf([]) })]), input)
+    assert.equal(result.status, 'superseded', JSON.stringify(payload))
     assert.equal(result.observation, null)
+  }
+  // A genuinely empty, correctly bound payload is still the one trustworthy empty.
+  const empty = await readDirectoryRoleResults(db([row({ snapshotPayload: [], completeCount: 0, completeDigest: digestOf([]) })]), input)
+  assert.equal(empty.status, 'current')
+  assert.equal(empty.observation?.verifiedCompleteEmpty, true)
+})
+
+test('ROOT COUNTEREXAMPLE: a same-count payload with different content fails the digest', async () => {
+  const renamed = [{ ...ROW, roleDefinition: { ...ROW.roleDefinition, displayName: 'Changed Name' } }]
+  const result = await readDirectoryRoleResults(db([row({ snapshotPayload: renamed, completeDigest: digestOf([ROW]) })]), input)
+  assert.equal(result.status, 'superseded')
+  // ...and the digest is what rejects it: with the matching digest the same payload is current.
+  const ok = await readDirectoryRoleResults(db([row({ snapshotPayload: renamed, completeDigest: digestOf(renamed) })]), input)
+  assert.equal(ok.status, 'current')
+})
+
+test('ROOT COUNTEREXAMPLE: the snapshot clock must equal the receipt clock', async () => {
+  for (const observedAt of [new Date(0), new Date(CHECKED.getTime() + 1), null]) {
+    const result = await readDirectoryRoleResults(db([row({ snapshotObservedAt: observedAt })]), input)
+    assert.equal(result.status, 'superseded', String(observedAt))
   }
 })
 
-test('activated but never completed is distinct from an empty result', async () => {
-  const result = await readDirectoryRoleResults(db({ state: completeState({ roleCompleteId: null, roleCompleteCheckedAt: null }) }), input)
-  assert.equal(result.status, 'never-collected')
-  assert.equal(result.observation, null)
-})
-
-test('every coherence key is load-bearing: changing any one supersedes the receipt', async () => {
-  const mismatches: Array<[string, Record<string, unknown>]> = [
-    ['scope version', { roleCompleteScopeVersion: 'directory-role-assignments/v0' }],
-    ['microsoft tenant', { roleCompleteMicrosoftTenantId: '99999999-9999-4999-8999-999999999999' }],
-    ['scope incarnation (re-activation)', { roleCompleteScope: '88888888-8888-4888-8888-888888888888' }],
-    ['connection incarnation', { roleCompleteConnection: '88888888-8888-4888-8888-888888888888' }],
-    ['authority revision', { roleCompleteConfiguration: '88888888-8888-4888-8888-888888888888' }],
+test('ROOT COUNTEREXAMPLE: ineligible current state is never advertised as current', async () => {
+  const ineligible: Array<[string, Record<string, unknown>]> = [
+    ['suspended tenant', { tenantStatus: 'SUSPENDED' }],
+    ['disconnected tenant', { tenantStatus: 'DISCONNECTED' }],
+    ['connection error', { connectionStatus: 'ERROR' }],
+    ['revoked connection', { connectionStatus: 'REVOKED' }],
+    ['customer-managed mode', { connectionMode: 'CUSTOMER_MANAGED' }],
+    ['no incarnation', { connectionIncarnation: null }],
   ]
-  for (const [label, overrides] of mismatches) {
-    const result = await readDirectoryRoleResults(db({ state: completeState(overrides) }), input)
+  for (const [label, overrides] of ineligible) {
+    const result = await readDirectoryRoleResults(db([row(overrides)]), input)
     assert.equal(result.status, 'superseded', label)
     assert.equal(result.observation, null, label)
   }
-  // A missing authority row is also not a current success.
-  const noAuthority = await readDirectoryRoleResults(db({ authority: [] }), input)
-  assert.equal(noAuthority.status, 'superseded')
+  // A mutable (non-immutable-reference) managed authority is equally ineligible.
+  const mutable = await readDirectoryRoleResults(db([row()], [{ configurationRevision: REVISION, clientId: 'c', homeTenantId: MSFT, credentialReference: 'encrypted-secret:other', operationId: null, fingerprint: null }]), input)
+  assert.equal(mutable.status, 'superseded')
 })
 
-test('an unstamped snapshot is legacy evidence and is never read as this attempt', async () => {
-  const legacy = await readDirectoryRoleResults(db({ snapshot: { payload: [ROW], rolePublicationAttemptId: null, observedAt: CHECKED } }), input)
-  assert.equal(legacy.status, 'superseded')
-  assert.equal(legacy.observation, null)
-  const other = await readDirectoryRoleResults(db({ snapshot: { payload: [ROW], rolePublicationAttemptId: '00000000-0000-4000-8000-000000000000', observedAt: CHECKED } }), input)
-  assert.equal(other.status, 'superseded')
-  const missing = await readDirectoryRoleResults(db({ snapshot: null }), input)
-  assert.equal(missing.status, 'superseded')
+test('ROOT COUNTEREXAMPLE: a persisted RUNNING attempt is reported, beside the kept observation', async () => {
+  const result = await readDirectoryRoleResults(db([row({ attemptOutcome: 'RUNNING', attemptTerminalAt: null })]), input)
+  assert.equal(result.latestAttempt.outcome, 'RUNNING')
+  assert.equal(result.latestAttempt.terminalAt, null)
+  assert.equal(result.status, 'current')
+  assert.equal(result.observation?.observedCount, 1, 'the completed observation is preserved')
+  for (const outcome of ['FAILED', 'PARTIAL', 'EXPIRED']) {
+    const failed = await readDirectoryRoleResults(db([row({ attemptOutcome: outcome })]), input)
+    assert.equal(failed.latestAttempt.outcome, outcome)
+    assert.equal(failed.observation?.observedCount, 1)
+  }
+  // An unknown or absent outcome is reported as no outstanding attempt, never inferred as RUNNING.
+  for (const outcome of [null, 'COMPLETE', 'SOMETHING_ELSE']) {
+    const quiet = await readDirectoryRoleResults(db([row({ attemptOutcome: outcome })]), input)
+    assert.equal(quiet.latestAttempt.outcome, null, String(outcome))
+  }
 })
 
-test('the receipt count and the stored rows must agree, including at zero', async () => {
-  const short = await readDirectoryRoleResults(db({ state: completeState({ roleCompleteCount: 2 }) }), input)
-  assert.equal(short.status, 'superseded')
-  const nullCount = await readDirectoryRoleResults(db({ state: completeState({ roleCompleteCount: null }) }), input)
-  assert.equal(nullCount.status, 'superseded')
-  // The one trustworthy empty: a coherent COMPLETE whose counted rows are zero.
-  const empty = await readDirectoryRoleResults(
-    db({ state: completeState({ roleCompleteCount: 0 }), snapshot: { payload: [], rolePublicationAttemptId: COMPLETE_ID, observedAt: CHECKED } }),
-    input
-  )
-  assert.equal(empty.status, 'current')
-  assert.equal(empty.observation?.verifiedCompleteEmpty, true)
-  assert.equal(empty.observation?.observedCount, 0)
+test('activation evidence and receipt binding each fail closed on their own', async () => {
+  for (const overrides of [{ scopeVersion: null, scopeIncarnation: null }, { scopeVersion: 'directory-role-assignments/v0' }, { scopeIncarnation: null }]) {
+    const result = await readDirectoryRoleResults(db([row(overrides)]), input)
+    assert.equal(result.status, 'not-activated')
+  }
+  assert.equal((await readDirectoryRoleResults(db([]), input)).status, 'not-activated')
+  assert.equal((await readDirectoryRoleResults(db([row({ completeId: null, completeCheckedAt: null })]), input)).status, 'never-collected')
+  for (const overrides of [
+    { completeScopeVersion: 'directory-role-assignments/v0' },
+    { completeMicrosoftTenantId: PRINCIPAL },
+    { completeScope: PRINCIPAL },
+    { completeConnection: PRINCIPAL },
+    { completeConfiguration: PRINCIPAL },
+    { snapshotAttemptId: null },
+    { snapshotAttemptId: PRINCIPAL },
+    { completeCount: 2 },
+  ]) {
+    const result = await readDirectoryRoleResults(db([row(overrides)]), input)
+    assert.equal(result.status, 'superseded', JSON.stringify(overrides))
+  }
 })
 
-test('an older coherent receipt is stale rather than current, and keeps its own clock', async () => {
-  const old = new Date(NOW - DIRECTORY_ROLE_CURRENT_MS - 1000)
-  const result = await readDirectoryRoleResults(db({ state: completeState({ roleCompleteCheckedAt: old }) }), input)
+test('age comes from the read clock against the receipt clock, and crosses into stale', async () => {
+  const old = new Date(READ_AT.getTime() - DIRECTORY_ROLE_CURRENT_MS - 1000)
+  const result = await readDirectoryRoleResults(db([row({ completeCheckedAt: old, snapshotObservedAt: old, attemptTerminalAt: old })]), input)
   assert.equal(result.status, 'stale')
   assert.equal(result.observation?.checkedAt, old.toISOString())
-  assert.equal(result.observation?.ageMs, NOW - old.getTime())
-})
-
-test('a failed or partial attempt never replaces a complete result and never implies zero', async () => {
-  for (const outcome of ['FAILED', 'PARTIAL', 'EXPIRED'] as const) {
-    const result = await readDirectoryRoleResults(
-      db({ state: completeState({ roleAttemptOutcome: outcome, roleAttemptTerminalAt: new Date(NOW - 10_000), roleAttemptId: COMPLETE_ID }) }),
-      input
-    )
-    assert.equal(result.status, 'current', outcome)
-    assert.equal(result.observation?.observedCount, 1, outcome)
-    assert.equal(result.latestAttempt.outcome, outcome)
-    assert.equal(result.latestAttempt.terminalAt, new Date(NOW - 10_000).toISOString())
-  }
-  const running = await readDirectoryRoleResults(db({ state: completeState({ roleAttemptId: COMPLETE_ID }) }), input)
-  assert.equal(running.latestAttempt.outcome, 'RUNNING')
-  assert.equal(running.observation?.observedCount, 1)
-})
-
-test('malformed stored rows are dropped rather than rendered, and then fail the count check', async () => {
-  const result = await readDirectoryRoleResults(
-    db({ snapshot: { payload: [{ principalId: 'no-id' }, ROW], rolePublicationAttemptId: COMPLETE_ID, observedAt: CHECKED }, state: completeState({ roleCompleteCount: 2 }) }),
-    input
-  )
-  assert.equal(result.status, 'superseded')
-  const nonArray = await readDirectoryRoleResults(
-    db({ snapshot: { payload: { not: 'an array' }, rolePublicationAttemptId: COMPLETE_ID, observedAt: CHECKED } }),
-    input
-  )
-  assert.equal(nonArray.status, 'superseded')
+  assert.equal(result.observation?.ageMs, READ_AT.getTime() - old.getTime())
 })
