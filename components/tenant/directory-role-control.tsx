@@ -1,17 +1,15 @@
 'use client'
 
-import { AlertTriangle, Loader2, ShieldCheck } from 'lucide-react'
+import { AlertTriangle, HelpCircle, Loader2, RefreshCw, ShieldCheck } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useAuth } from '@/components/providers/auth-provider'
 import {
   classifyControlFailure,
+  controlPresentation,
   useDirectoryRoleControl,
   useSetDirectoryRoleControl,
 } from '@/lib/api/directory-role-control-hooks'
-import {
-  directoryRoleControlAffordance,
-  isDirectoryControlOffered,
-} from '@/lib/tenants/directory-role-control-view'
+import { isDirectoryControlOffered } from '@/lib/tenants/directory-role-control-view'
 
 const READ_COPY = {
   forbidden: 'Your role cannot change directory role collection for this tenant.',
@@ -21,16 +19,17 @@ const READ_COPY = {
   error: 'HawkView cannot read this collection setting right now, so it cannot be changed here.',
 } as const
 
-const WRITE_COPY = {
-  // Nothing was applied and nothing is resent: the context the user acted on is gone, and silently
-  // recapturing it would apply an authority change against a state they never saw.
+/** Copy for a write the server PROVED it did not apply. Even here the setting is not restated and no
+ * action is offered: the context the server refused against is already gone, so the only honest next
+ * step is a fresh read. */
+const REFUSED_COPY = {
   conflict:
-    'This tenant’s connection or configuration changed before your change was applied, so nothing was changed. The current setting is shown again — choose again if you still want it.',
+    'This tenant’s connection or configuration changed before your change was applied, so the setting was not changed. Re-read it below before choosing again.',
   rejected:
-    'HawkView could not apply your change against the setting it had read, so nothing was changed. The current setting is shown again.',
+    'HawkView could not apply your change against the setting it had read, so the setting was not changed. Re-read it below before choosing again.',
   forbidden: 'Your role cannot change directory role collection for this tenant.',
-  unavailable: 'Nothing was changed. This collection setting is unavailable right now.',
-  error: 'Nothing was changed. Please try again.',
+  unavailable: 'The setting was not changed. This control is unavailable right now.',
+  error: '',
 } as const
 
 /** Explicit opt-in control for stored DIRECTORY_ROLES collection.
@@ -38,22 +37,36 @@ const WRITE_COPY = {
  * `enabled` here is the durable opt-in and nothing more. It does not say the connection is eligible,
  * that a collection is running, or that any stored result is trustworthy — the results panel above
  * reports those separately. Switching this on does not fetch anything; HawkView collects on its own
- * schedule afterwards. */
+ * schedule afterwards.
+ *
+ * The panel states the setting, and offers an action, ONLY while a confirmed current read is on
+ * screen. A write whose outcome it could not confirm is reported as uncertain rather than as a
+ * no-op, because this contract commits the opt-in before serialising its reply: a lost response is
+ * indistinguishable from a successful change. Nothing is ever resent automatically. */
 export function DirectoryRoleControl({ customerTenantId }: { customerTenantId: string }) {
   const { session } = useAuth()
   const offered = isDirectoryControlOffered(session?.user?.memberships)
-  const { data, isPending, isError, error } = useDirectoryRoleControl(customerTenantId)
+  const read = useDirectoryRoleControl(customerTenantId)
   const write = useSetDirectoryRoleControl(customerTenantId)
+
+  const presented = controlPresentation({
+    control: read.data,
+    isPending: read.isPending,
+    isFetching: read.isFetching,
+    isReadError: read.isError,
+    readError: read.error,
+    writeFailure: write.isError ? classifyControlFailure(write.error, 'write') : null,
+    settledAt: write.settledAt,
+    dataUpdatedAt: read.dataUpdatedAt,
+    offered,
+  })
 
   if (!customerTenantId || !offered) return null
 
-  const { canEnable, canDisable, eligibilityUnavailable } = directoryRoleControlAffordance(
-    data ?? null,
-    offered
-  )
-  const busy = write.isPending
-  const readFailure = isError ? classifyControlFailure(error, 'read') : null
-  const writeFailure = write.isError ? classifyControlFailure(write.error, 'write') : null
+  const { phase, stateIsKnown, control, affordance, readFailure, writeFailure, isRefreshing } =
+    presented
+  const { canEnable, canDisable, eligibilityUnavailable } = affordance
+  const rereading = isRefreshing
 
   return (
     <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
@@ -65,26 +78,68 @@ export function DirectoryRoleControl({ customerTenantId }: { customerTenantId: s
         a statement that the connection is ready or that a stored result is current.
       </p>
 
-      {isPending && (
+      {phase === 'checking' && (
         <p className="mt-2 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
           Checking this setting…
         </p>
       )}
 
-      {readFailure && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
-          <span>{READ_COPY[readFailure]}</span>
+      {/* An unconfirmed write. The panel says what it does not know, and does not resend. */}
+      {phase === 'unresolved' && (
+        <div className="mt-2 space-y-2">
+          <p className="flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
+            <HelpCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
+            <span>
+              HawkView could not confirm the result of your change. It may or may not have been
+              applied. Your request was sent once and has not been resent. Re-read the setting to see
+              where it stands.
+            </span>
+          </p>
+          <Refresh busy={rereading} onClick={() => void read.refetch()} />
+        </div>
+      )}
+
+      {phase === 'refused' && writeFailure && REFUSED_COPY[writeFailure] && (
+        <div className="mt-2 space-y-2">
+          <p className="flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
+            <span>{REFUSED_COPY[writeFailure]}</span>
+          </p>
+          <Refresh busy={rereading} onClick={() => void read.refetch()} />
+        </div>
+      )}
+
+      {/* A read is in flight. No setting is stated and no action is offered: cached data from before
+          this refresh cannot describe the state we are re-reading. */}
+      {phase === 'refreshing' && (
+        <p className="mt-2 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          Re-reading this setting…
         </p>
       )}
 
-      {data && (
+      {phase === 'read-failed' && (
         <div className="mt-2 space-y-2">
           <p className="flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
-            {data.enabled && <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden />}
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
+            <span>{READ_COPY[readFailure ?? 'error']}</span>
+          </p>
+          {readFailure !== 'forbidden' && (
+            <Refresh busy={rereading} onClick={() => void read.refetch()} />
+          )}
+        </div>
+      )}
+
+      {/* Only a confirmed current read may state the setting or offer a change. */}
+      {phase === 'current' && stateIsKnown && control && (
+        <div className="mt-2 space-y-2">
+          <p className="flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
+            {control.enabled && (
+              <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-emerald-500" aria-hidden />
+            )}
             <span>
-              {data.enabled
+              {control.enabled
                 ? 'Collection is switched on for this tenant.'
                 : 'Collection is switched off for this tenant.'}
             </span>
@@ -101,22 +156,35 @@ export function DirectoryRoleControl({ customerTenantId }: { customerTenantId: s
             <Button
               variant={canDisable ? 'ghost' : 'default'}
               size="sm"
-              disabled={busy}
+              disabled={write.isPending}
               onClick={() => write.mutate({ enabled: canEnable })}
             >
-              {busy && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />}
+              {write.isPending && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />}
               {canEnable ? 'Switch on collection' : 'Switch off collection'}
             </Button>
           )}
         </div>
       )}
-
-      {writeFailure && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs text-slate-700 dark:text-slate-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
-          <span>{WRITE_COPY[writeFailure]}</span>
-        </p>
-      )}
     </div>
+  )
+}
+
+/** Recovery is always a READ, never a resend of the authority-changing request. While a read is
+ * already running we say so instead of offering the button, so the outcome message above stays
+ * visible with an honest account of what is happening. */
+function Refresh({ onClick, busy }: { onClick: () => void; busy: boolean }) {
+  if (busy) {
+    return (
+      <p className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+        Re-reading this setting…
+      </p>
+    )
+  }
+  return (
+    <Button variant="ghost" size="sm" onClick={onClick}>
+      <RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
+      Re-read setting
+    </Button>
   )
 }
