@@ -14,7 +14,12 @@ import {
  * Keyed by authenticated cache scope and customer tenant together, and enabled only for a ready
  * scope, so a delayed answer for a previous identity or tenant can never be read as the current
  * one's data. Read-only: no polling, no automatic retry, and a manual refetch re-reads this summary
- * and collects nothing. */
+ * and collects nothing.
+ *
+ * Consumers must read `dataUpdatedAt` alongside `data`: the server's `ageMs` was measured when IT
+ * read, so the only correct elapsed age is that value plus the time since THIS response was accepted.
+ * `dataUpdatedAt` changes on every accepted response, including a cached one replayed later, which
+ * is what lets the view re-anchor even when the new numeric age is identical to the old one. */
 export function useDirectoryRoleResults(customerTenantId: string) {
   const { cacheScope, isLoading } = useAuth()
   const enabled = !isLoading && isReadyDataScope(cacheScope) && Boolean(customerTenantId)

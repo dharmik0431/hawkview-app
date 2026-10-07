@@ -14,39 +14,38 @@ function storedTime(at: Date) {
 export const DIRECTORY_ROLE_CURRENT_MS = 60 * 60 * 1000
 const CURRENT_MS = DIRECTORY_ROLE_CURRENT_MS
 
-/** Pure, so the boundary itself is testable without a clock or a rendered tree. */
-export function elapsedPresentation(baseAgeMs: number, extraMs: number) {
-  const elapsedMs = baseAgeMs + Math.max(0, extraMs)
+/** Pure, so the boundary is testable without a clock or a rendered tree.
+ *
+ * The origin is the ACCEPTED RESPONSE, never the component's mount: `baseAgeMs` is the age the server
+ * measured when it read, `anchoredAt` is when this response was accepted (react-query's
+ * `dataUpdatedAt`, which already carries cache age because a replayed cached response keeps its
+ * original acceptance time), and `now` is the current wall clock. A replacement response moves
+ * `anchoredAt`, so the displayed age resets even when the new `baseAgeMs` is identical. */
+export function elapsedPresentation(baseAgeMs: number, anchoredAt: number, now: number) {
+  const sinceAccepted = Math.max(0, now - anchoredAt)
+  const elapsedMs = Math.max(0, baseAgeMs) + sinceAccepted
   return { elapsedMs, agedStale: elapsedMs > CURRENT_MS }
 }
 
-/** Elapsed time while the view stays mounted.
- *
- * The ORIGIN is the server's observation — `checkedAt` and the age it measured at read time — so a
- * failed newer attempt still cannot make older data look freshly checked. What this adds is that the
- * displayed age ADVANCES and the current/stale label can cross the one-hour boundary without a
- * refetch, so a tab left open does not report an indefinitely fresh result. It also recomputes on
- * resume, because a sleeping tab fires no interval ticks. No request is made here. */
-function useElapsedSince(baseAgeMs: number | undefined) {
-  // Captured at FIRST RENDER rather than inside the effect, so the baseline does not depend on when
-  // effects happen to flush — the elapsed value is then a pure function of the wall clock.
-  const [mountedAt] = useState(() => Date.now())
-  const [extraMs, setExtraMs] = useState(0)
+/** A ticking wall clock for the mounted view. Advances on an interval and recomputes on resume,
+ * because a backgrounded tab throttles or skips intervals. It issues no request. */
+function useWallClock(active: boolean) {
+  const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
-    if (baseAgeMs === undefined) return
-    const advance = () => setExtraMs(Math.max(0, Date.now() - mountedAt))
+    if (!active) return
+    const advance = () => setNow(Date.now())
+    advance()
     const timer = setInterval(advance, 30_000)
-    // A backgrounded tab throttles or skips intervals; recompute from the wall clock on return.
-    const onVisible = () => { if (typeof document !== 'undefined' && !document.hidden) advance() }
-    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
-    if (typeof window !== 'undefined') window.addEventListener('focus', onVisible)
+    const onResume = () => advance()
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onResume)
+    if (typeof window !== 'undefined') window.addEventListener('focus', onResume)
     return () => {
       clearInterval(timer)
-      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
-      if (typeof window !== 'undefined') window.removeEventListener('focus', onVisible)
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onResume)
+      if (typeof window !== 'undefined') window.removeEventListener('focus', onResume)
     }
-  }, [baseAgeMs, mountedAt])
-  return baseAgeMs === undefined ? undefined : baseAgeMs + extraMs
+  }, [active])
+  return now
 }
 
 function ageLabel(ageMs: number) {
@@ -113,13 +112,17 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
   customerTenantId: string
   className?: string
 }) {
-  const { data, isPending, isError, isFetching, refetch } = useDirectoryRoleResults(customerTenantId)
-  const elapsedMs = useElapsedSince(data?.observation?.ageMs)
+  const { data, dataUpdatedAt, isPending, isError, isFetching, refetch } = useDirectoryRoleResults(customerTenantId)
+  const now = useWallClock(data?.observation !== undefined && data?.observation !== null)
   if (!customerTenantId) return null
 
   const attempt = data?.latestAttempt.outcome
-  // The label is re-derived from elapsed time, so a mounted view ages out of "current" on its own.
-  const agedStale = elapsedMs !== undefined && elapsedMs > CURRENT_MS
+  // Anchored to THIS response, so a replacement resets the display even when its age value repeats,
+  // and a long-open tab cannot accumulate session time onto a freshly accepted result.
+  const presented = data?.observation
+    ? elapsedPresentation(data.observation.ageMs, dataUpdatedAt, now)
+    : null
+  const agedStale = presented?.agedStale ?? false
 
   return (
     <section className={cn('rounded-xl border border-slate-200 p-4 dark:border-slate-700', className)}>
@@ -183,7 +186,7 @@ export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
           {data.observation && (
             <p className="text-xs text-slate-500 dark:text-slate-400">
               Checked {storedTime(data.observation.checkedAt)} ·{' '}
-              {ageLabel(elapsedMs ?? data.observation.ageMs)}
+              {ageLabel(presented?.elapsedMs ?? data.observation.ageMs)}
             </p>
           )}
         </div>

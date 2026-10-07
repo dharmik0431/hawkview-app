@@ -131,8 +131,8 @@ export async function readDirectoryRoleResults(
   }
   const base = { responseVersion: DIRECTORY_ROLE_RESPONSE_VERSION, source: DIRECTORY_ROLE_SOURCE, observation: null, latestAttempt } as const
 
-  // FAIL CLOSED #1 — no usable activation evidence: capture would fall back to the legacy collector,
-  // so whatever is stored was not written by the fenced path and is not vouched for here.
+  // FAIL CLOSED #1 — no usable activation evidence in THIS read. Nothing here establishes which
+  // path wrote any stored row; the only claim made is that this evidence cannot be vouched for.
   if (!row || row.scopeVersion !== DIRECTORY_ROLE_RECEIPT_SCOPE || !row.scopeIncarnation) {
     return { ...base, status: 'not-activated' }
   }

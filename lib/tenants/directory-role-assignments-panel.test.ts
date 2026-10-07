@@ -80,10 +80,11 @@ const observed = (rows: Record<string, unknown>[], extra: Record<string, unknown
   assignments: rows, verifiedCompleteEmpty: rows.length === 0, ...extra,
 })
 
-type State = { data?: unknown; isPending?: boolean; isError?: boolean; isFetching?: boolean }
+type State = { data?: unknown; isPending?: boolean; isError?: boolean; isFetching?: boolean; dataUpdatedAt?: number }
 
 function renderPanel(state: State, customerTenantId = 'tenant-A') {
-  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://hawkview.invalid' })
+  let current: State = state
+  const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://hawkview.invalid', pretendToBeVisual: true })
   const previous = new Map<string, PropertyDescriptor | undefined>()
   for (const [key, value] of Object.entries({
     window: dom.window, document: dom.window.document, navigator: dom.window.navigator,
@@ -107,8 +108,9 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
       useDirectoryRoleResults: (tenantId: string) => {
         asked.push(tenantId)
         return {
-          data: state.data, isPending: state.isPending ?? false, isError: state.isError ?? false,
-          isFetching: state.isFetching ?? false,
+          data: current.data, dataUpdatedAt: current.dataUpdatedAt ?? Date.now(),
+          isPending: current.isPending ?? false, isError: current.isError ?? false,
+          isFetching: current.isFetching ?? false,
           refetch: () => { refetches.push(tenantId); return Promise.resolve() },
         }
       },
@@ -133,6 +135,14 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
     click: (node: any) => act(() => { node.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) }),
     // Dispatched on the JSDOM window, which is the target the panel actually listens on.
     resume: () => act(() => { dom.window.dispatchEvent(new dom.window.Event('focus')) }),
+    hidden: () => dom.window.document.hidden,
+    /** Replace the accepted response and re-render, which is what the real hook does when a new
+     *  response is accepted. A focus dispatch alone cannot stand in for it: when the wall clock has
+     *  not moved, the clock state is identical and React correctly bails out of the re-render. */
+    replace: (next: State) => {
+      current = next
+      act(() => { root.render(React.createElement(DirectoryRoleAssignmentsPanel, { customerTenantId })) })
+    },
   }
 }
 
@@ -221,34 +231,82 @@ test('an unreadable answer is an error with a retry, not an empty result', () =>
   } finally { panel.cleanup() }
 })
 
-/** P4 — the mounted view must not stay "current" indefinitely while the tab is open.
- *
- * Two halves, each proven directly: the boundary arithmetic as a pure function, and the fact that the
- * panel actually subscribes to the resume signals that drive it. I did NOT get a dispatched focus
- * event to re-render through this loader harness; rather than weaken the assertion or skip it, the
- * subscription is asserted at the listener level and that limitation is declared in the report. */
-test('elapsed presentation crosses the one-hour boundary', () => {
-  const panelModule = makeLoader({})(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx'))
-  const { elapsedPresentation, DIRECTORY_ROLE_CURRENT_MS } = panelModule
-  assert.equal(DIRECTORY_ROLE_CURRENT_MS, 3_600_000)
-  const justUnder = elapsedPresentation(59 * 60_000, 0)
-  assert.equal(justUnder.agedStale, false)
-  const crossed = elapsedPresentation(59 * 60_000, 2 * 60_000)
-  assert.equal(crossed.elapsedMs, 61 * 60_000)
-  assert.equal(crossed.agedStale, true, 'a view left open must stop presenting an hour-old result as current')
-  assert.equal(elapsedPresentation(3_600_000, 0).agedStale, false, 'exactly one hour is still current')
-  assert.equal(elapsedPresentation(3_600_000, 1).agedStale, true)
-  assert.equal(elapsedPresentation(60_000, -5_000).elapsedMs, 60_000, 'a backwards clock never ages less than zero')
+/** P4 — real mounted behaviour, with a VISIBLE document (default JSDOM reports hidden, which is what
+ *  made my earlier resume assertion look like a harness fault). */
+test('a mounted view ages across the one-hour boundary on resume', async () => {
+  const realNow = Date.now
+  let clock = Date.UTC(2026, 9, 7, 8, 0, 0)
+  Date.now = () => clock
+  try {
+    const panel = renderPanel({
+      data: view('current', observed([ROW], { ageMs: 59 * 60_000 })),
+      dataUpdatedAt: clock,
+    })
+    try {
+      assert.equal(panel.hidden(), false, 'the document must be visible or resume cannot fire')
+      assert.match(panel.text(), /59 minutes old/)
+      assert.equal(panel.text().includes('Showing the last completed collection'), false)
+
+      clock += 2 * 60_000
+      panel.resume()
+      await act(async () => { await Promise.resolve() })
+
+      assert.match(panel.text(), /1 hour old/)
+      assert.match(panel.text(), /Showing the last completed collection/,
+        'a view left open must stop presenting an hour-old result as current')
+      assert.deepEqual(panel.refetches, [], 'ageing must not issue a request')
+    } finally { panel.cleanup() }
+  } finally { Date.now = realNow }
 })
 
-test('the mounted panel subscribes to the resume signals that advance its clock', () => {
-  const panel = renderPanel({ data: view('current', observed([ROW], { ageMs: 59 * 60_000 })) })
+/** The defect Root reproduced: a fresh result displayed with the previous session's elapsed time. */
+test('a replacement response re-anchors the age, even when its numeric age repeats', async () => {
+  const realNow = Date.now
+  let clock = Date.UTC(2026, 9, 7, 8, 0, 0)
+  Date.now = () => clock
   try {
-    const listeners = panel.listeners()
-    assert.ok(listeners.includes('window:focus'), 'resume from a backgrounded tab')
-    assert.ok(listeners.includes('document:visibilitychange'), 'tab becoming visible again')
-    assert.deepEqual(panel.refetches, [], 'ageing must never trigger a request')
-  } finally { panel.cleanup() }
+    const panel = renderPanel({
+      data: view('current', observed([ROW], { ageMs: 60_000 })),
+      dataUpdatedAt: clock,
+    })
+    try {
+      assert.match(panel.text(), /1 minute old/)
+
+      // Two hours pass with the tab open: the SAME response must age.
+      clock += 2 * 60 * 60_000
+      panel.resume()
+      await act(async () => { await Promise.resolve() })
+      assert.match(panel.text(), /2 hours old/)
+      assert.match(panel.text(), /Showing the last completed collection/)
+
+      // A fresh response arrives whose server-measured age is IDENTICAL to the original one.
+      panel.replace({
+        data: view('current', observed([ROW], { ageMs: 60_000 })),
+        dataUpdatedAt: clock,
+      })
+      await act(async () => { await Promise.resolve() })
+      const text = panel.text()
+      assert.match(text, /1 minute old/, 'the new response must not inherit the old elapsed origin')
+      assert.equal(text.includes('2 hours old'), false)
+      assert.equal(text.includes('Showing the last completed collection'), false,
+        'a one-minute-old result is current, however long the tab has been open')
+      assert.deepEqual(panel.refetches, [], 'replacement must not come from ageing')
+    } finally { panel.cleanup() }
+  } finally { Date.now = realNow }
+})
+
+test('the elapsed origin is the accepted response, proven as a pure function', () => {
+  const { elapsedPresentation, DIRECTORY_ROLE_CURRENT_MS } = makeLoader({})(
+    resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx'))
+  assert.equal(DIRECTORY_ROLE_CURRENT_MS, 3_600_000)
+  const t0 = 1_000_000
+  assert.equal(elapsedPresentation(59 * 60_000, t0, t0).agedStale, false)
+  assert.equal(elapsedPresentation(59 * 60_000, t0, t0 + 2 * 60_000).elapsedMs, 61 * 60_000)
+  assert.equal(elapsedPresentation(59 * 60_000, t0, t0 + 2 * 60_000).agedStale, true)
+  assert.equal(elapsedPresentation(3_600_000, t0, t0).agedStale, false, 'exactly one hour is current')
+  assert.equal(elapsedPresentation(3_600_000, t0, t0 + 1).agedStale, true)
+  // A backwards clock never reduces the server-measured age, and never ages negatively.
+  assert.equal(elapsedPresentation(60_000, t0, t0 - 5_000).elapsedMs, 60_000)
 })
 
 test('the panel asks for the tenant it was given, and renders nothing without one', () => {
