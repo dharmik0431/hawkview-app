@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { before, after } from 'node:test'
-import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
+import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 const originalFetch = globalThis.fetch
 before(() => { globalThis.fetch = async () => { throw new Error('Real network forbidden in completeness tests') } })
@@ -11,14 +11,14 @@ function fixture(source: string, pages: any[]) {
   const state: any = { id: 'state', status: 'SUCCEEDED', lastSuccessfulAt: prior, deltaLink: checkpoint }
   const writes: string[] = []; let requests = 0
   const update = async (a: any) => { assert.equal(a.where.customerTenantId_resourceType.customerTenantId, tenant.id); assert.equal(a.where.customerTenantId_resourceType.resourceType, source); Object.assign(state, a.data); return state }
-  const db = utcTestDatabase({
+  const db = managedSyncTestDatabase({
     syncState: { findUnique: async () => ({ ...state }), updateMany: async (a: any) => { Object.assign(state, a.data); return { count: 1 } }, update,
       upsert: async (a: any) => { assert.equal(a.create.organizationId, tenant.organizationId); return update({ ...a, data: a.update }) }, findMany: async () => [] },
     directoryUser: { upsert: async (a: any) => { assert.equal(a.create.organizationId, tenant.organizationId); assert.equal(a.create.customerTenantId, tenant.id); writes.push('user'); return {} }, updateMany: async (a: any) => { assert.equal(a.where.customerTenantId, tenant.id); writes.push('tombstone'); return { count: 1 } } },
     tenantConnection: { update: async (a: any) => { assert.equal(a.where.customerTenantId_organizationId.organizationId, tenant.organizationId); writes.push('connection'); return {} } },
     directoryAuditLog: { findFirst: async () => null, findMany: async () => [], createMany: async (a: any) => { for (const r of a.data) { assert.equal(r.organizationId, tenant.organizationId); assert.equal(r.customerTenantId, tenant.id) } writes.push('audit'); return { count: a.data.length } }, deleteMany: async () => { writes.push('prune'); return { count: 0 } } },
-  })
-  const service: any = new TenantSyncService(db as any, { getTenantAccessToken: async () => 'synthetic' } as any, {} as any, { resolveIncident: async () => {}, publishIncident: async () => {} } as any, { projectDirectoryAudits: async () => {}, pruneExpired: async () => {} } as any, { syncTenant: async () => [] } as any)
+  }, tenant)
+  const service: any = new TenantSyncService(db as any, { getCapturedManagedAccessToken: managedSyncTestToken(tenant, 'synthetic') } as any, {} as any, { resolveIncident: async () => {}, publishIncident: async () => {} } as any, { projectDirectoryAudits: async () => {}, pruneExpired: async () => {} } as any, { syncTenant: async () => [] } as any)
   service.logger = { log() {}, warn() {}, error() {} }
   service.fetchGraphPage = async () => { const p = pages[requests++]; if (p instanceof Error) throw p; assert.notEqual(p, undefined); return new Response(JSON.stringify(p)) }
   for (const m of ['syncSignInLogs','syncM365AuditActivity','refreshCollectionFieldStates','reconcileDirectoryAuditResources']) service[m] = async () => {}

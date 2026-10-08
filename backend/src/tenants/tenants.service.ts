@@ -7,17 +7,22 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common'
+import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type VerificationPublication } from './connection-verification-store.js'
+import { readDirectoryRoleControl, setDirectoryRoleControl, directoryControlExpectation, removeManagedDirectoryTenant } from './directory-role-receipt-store.js'
+import { captureManagedAuthority } from '../microsoft/managed-connector-authority.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
 import { pimUuid, type PimPlane } from './pim-schedule-contract.js'
 import { readPimSchedulePlane, type PimReadAuthorization } from './pim-schedule-reader.js'
+import { readDirectoryRoleResults } from './directory-role-reader.js'
 import { toPimScheduleSummary } from './pim-schedule-summary.js'
 import {
   MembershipRole,
   SyncResourceType,
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
-import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import { CapturedVerificationCredentialsUnavailable, MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { issueConsentOperation, claimConsentOperation, finishConsentOperation, type ConsentOperationKey, type ConsentTerminal, type PreparedConsentResult } from '../microsoft/consent-operation-store.js'
 import { applyManagedConsentEffects } from '../microsoft/managed-consent-effects.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
@@ -469,6 +474,37 @@ export class TenantsService {
     }
   }
 
+  private async directoryControlTenant(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const organizationIds = await this.getOrganizationIdsForRoles(identity, TENANT_DELETION_ROLES, 'controlling directory collection')
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true, microsoftTenantId: true },
+    })
+    if (!tenant) throw new NotFoundException('Customer tenant was not found.')
+    return { customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId }
+  }
+
+  async getDirectoryRoleControlForIdentity(identity: AuthenticatedIdentity, customerTenantId: string) {
+    const who = await this.directoryControlTenant(identity, customerTenantId)
+    const result = await readDirectoryRoleControl(this.prisma, who)
+    if (result.status !== 'current') throw new ConflictException('Managed directory collection control is unavailable.')
+    return { enabled: result.enabled, expected: result.expected }
+  }
+
+  async setDirectoryRoleControlForIdentity(identity: AuthenticatedIdentity, customerTenantId: string, body: unknown) {
+    const who = await this.directoryControlTenant(identity, customerTenantId)
+    if (!body || typeof body !== 'object' || typeof (body as { enabled?: unknown }).enabled !== 'boolean') {
+      throw new BadRequestException('Supply enabled and the expected directory control context.')
+    }
+    const action = body as { enabled: boolean; expected?: unknown }
+    let expected
+    try { expected = directoryControlExpectation(action.expected) }
+    catch { throw new BadRequestException('The expected directory control context is invalid.') }
+    const result = await setDirectoryRoleControl(this.prisma, who, expected, action.enabled)
+    if (result.status !== 'applied') throw new ConflictException({ code: result.reason, message: 'The directory collection context changed or is unavailable.' })
+    return { enabled: result.enabled, expected: result.expected }
+  }
+
   async verifyConnectionForIdentity(
     identity: AuthenticatedIdentity,
     customerTenantId: string
@@ -498,85 +534,125 @@ export class TenantsService {
       throw new NotFoundException('Customer tenant connection was not found.')
     }
 
-    const now = new Date()
+    // Customer-managed credentials have no versioned capture seam. Preserve
+    // the existing path; its mutable-credential race is explicitly deferred.
+    if (tenant.connection.connectionMode === 'CUSTOMER_MANAGED') {
+      const now = new Date()
+      try {
+        const verification = await this.microsoftConsent.verifyConnectedTenant({
+          microsoftTenantId: tenant.microsoftTenantId,
+          connectionMode:
+            tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
+              ? 'CUSTOMER_MANAGED'
+              : 'HAWKVIEW_MANAGED',
+          clientId: tenant.connection.clientId,
+          credentialReference: tenant.connection.credentialReference,
+        })
+        const connected = verification.missingRequiredPermissions.length === 0
+
+        await this.prisma.$transaction([
+          this.prisma.customerTenant.update({
+            where: { id: tenant.id },
+            data: {
+              displayName: verification.displayName,
+              primaryDomain: verification.primaryDomain,
+              status: connected ? 'ACTIVE' : 'SUSPENDED',
+            },
+          }),
+          this.prisma.tenantConnection.update({
+            where: {
+              customerTenantId_organizationId: {
+                customerTenantId: tenant.id,
+                organizationId: tenant.organizationId,
+              },
+            },
+            data: {
+              status: connected ? 'CONNECTED' : 'ERROR',
+              consentedPermissions: preserveOptionalExchangeConsent(
+                verification.grantedPermissions,
+                tenant.connection.consentedPermissions
+              ),
+              lastVerifiedAt: now,
+              lastErrorCode: connected ? null : 'missing-permissions',
+              lastErrorMessage: connected
+                ? null
+                : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
+            },
+          }),
+        ])
+
+        const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
+          where: { id: tenant.id },
+          select: this.tenantSelect(),
+        })
+        return { tenant: this.mapTenant(refreshed), connected }
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Microsoft tenant verification failed.'
+        await this.prisma.$transaction([
+          this.prisma.customerTenant.update({
+            where: { id: tenant.id },
+            data: { status: 'SUSPENDED' },
+          }),
+          this.prisma.tenantConnection.update({
+            where: {
+              customerTenantId_organizationId: {
+                customerTenantId: tenant.id,
+                organizationId: tenant.organizationId,
+              },
+            },
+            data: {
+              status: 'ERROR',
+              consentedPermissions: [],
+              lastVerifiedAt: now,
+              lastErrorCode: 'connection-verification-failed',
+              lastErrorMessage: message.slice(0, 2000),
+            },
+          }),
+        ])
+        throw new BadGatewayException(
+          'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
+        )
+      }
+    }
+
+    const capture = await captureConnectionVerification(this.prisma, {
+      customerTenantId: tenant.id,
+      organizationId: tenant.organizationId,
+      microsoftTenantId: tenant.microsoftTenantId,
+    })
+    if (capture.status !== 'captured') {
+      throw new ServiceUnavailableException({ code: capture.reason, message: 'This connection cannot be verified with captured authority.' })
+    }
+    let result: VerificationPublication
     try {
-      const verification = await this.microsoftConsent.verifyConnectedTenant({
+      const verification = await this.microsoftConsent.verifyCapturedConnectedTenant({
         microsoftTenantId: tenant.microsoftTenantId,
-        connectionMode:
-          tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-            ? 'CUSTOMER_MANAGED'
-            : 'HAWKVIEW_MANAGED',
-        clientId: tenant.connection.clientId,
-        credentialReference: tenant.connection.credentialReference,
+        authority: capture.context.authority,
       })
-      const connected = verification.missingRequiredPermissions.length === 0
-
-      await this.prisma.$transaction([
-        this.prisma.customerTenant.update({
-          where: { id: tenant.id },
-          data: {
-            displayName: verification.displayName,
-            primaryDomain: verification.primaryDomain,
-            status: connected ? 'ACTIVE' : 'SUSPENDED',
-          },
-        }),
-        this.prisma.tenantConnection.update({
-          where: {
-            customerTenantId_organizationId: {
-              customerTenantId: tenant.id,
-              organizationId: tenant.organizationId,
-            },
-          },
-          data: {
-            status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: preserveOptionalExchangeConsent(
-              verification.grantedPermissions,
-              tenant.connection.consentedPermissions
-            ),
-            lastVerifiedAt: now,
-            lastErrorCode: connected ? null : 'missing-permissions',
-            lastErrorMessage: connected
-              ? null
-              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
-          },
-        }),
-      ])
-
-      const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
-        where: { id: tenant.id },
-        select: this.tenantSelect(),
-      })
-      return { tenant: this.mapTenant(refreshed), connected }
+      result = { outcome: 'verified', ...verification }
     } catch (error) {
-      const message =
-        error instanceof Error
-          ? error.message
-          : 'Microsoft tenant verification failed.'
-      await this.prisma.$transaction([
-        this.prisma.customerTenant.update({
-          where: { id: tenant.id },
-          data: { status: 'SUSPENDED' },
-        }),
-        this.prisma.tenantConnection.update({
-          where: {
-            customerTenantId_organizationId: {
-              customerTenantId: tenant.id,
-              organizationId: tenant.organizationId,
-            },
-          },
-          data: {
-            status: 'ERROR',
-            consentedPermissions: [],
-            lastVerifiedAt: now,
-            lastErrorCode: 'connection-verification-failed',
-            lastErrorMessage: message.slice(0, 2000),
-          },
-        }),
-      ])
+      if (error instanceof CapturedVerificationCredentialsUnavailable) throw error
+      result = { outcome: 'failed', message: error instanceof Error ? error.message : 'Microsoft tenant verification failed.' }
+    }
+    // Publication/commit/read errors are not provider failures. Never compensate
+    // an uncertain or successful transaction with another authority write.
+    const published = await publishConnectionVerification(this.prisma, capture.context, result)
+    if (published.status !== 'applied') {
+      throw new ConflictException({ code: 'CONNECTION_VERIFICATION_SUPERSEDED', message: 'The connection changed during verification.' })
+    }
+    if (result.outcome === 'failed') {
       throw new BadGatewayException(
         'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
       )
     }
+    const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
+      where: { id: tenant.id },
+      select: this.tenantSelect(),
+    })
+    return { tenant: this.mapTenant(refreshed), connected: published.connected }
   }
 
   private tenantSelect() {
@@ -781,6 +857,7 @@ export class TenantsService {
         connection: {
           select: {
             status: true,
+            connectionMode: true,
           },
         },
       },
@@ -801,6 +878,9 @@ export class TenantsService {
       }
 
       if (input.connectionMode === 'CUSTOMER_MANAGED') {
+        if (existing.connection?.connectionMode !== 'CUSTOMER_MANAGED') {
+          throw new ConflictException('A managed tenant cannot be replaced through customer-managed onboarding.')
+        }
         const prepared =
           await this.microsoftConsent.prepareCustomerManagedConnection({
             microsoftTenantId,
@@ -811,7 +891,19 @@ export class TenantsService {
             customerTenantId: existing.id,
           })
         const now = new Date()
-        const tenant = await this.prisma.customerTenant.update({
+        const tenant = await this.prisma.$transaction(async transaction => {
+          await captureManagedAuthority({ $transaction: work => work(transaction) })
+          const current = await transaction.$queryRawUnsafe<{ status: string }[]>(`SELECT status FROM customer_tenants
+            WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid FOR NO KEY UPDATE`,existing.id,organizationIds[0],microsoftTenantId)
+          const connections = await transaction.$queryRawUnsafe<{ mode: string; status: string }[]>(`SELECT connection_mode AS mode,status FROM tenant_connections
+            WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid FOR NO KEY UPDATE`,existing.id,organizationIds[0])
+          const scopes = await transaction.$queryRawUnsafe<{ scope: string | null }[]>(`SELECT role_scope_incarnation::text AS scope FROM sync_states
+            WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid AND resource_type='DIRECTORY_ROLES' FOR UPDATE`,existing.id,organizationIds[0])
+          if (current.length !== 1 || current[0].status === 'ACTIVE' || connections.length !== 1
+            || connections[0].mode !== 'CUSTOMER_MANAGED' || connections[0].status === 'CONNECTED' || scopes.some(row => row.scope !== null)) {
+            throw new ConflictException('The tenant connection changed during onboarding.')
+          }
+          return transaction.customerTenant.update({
           where: { id: existing.id },
           data: {
             displayName: prepared.displayName,
@@ -834,6 +926,7 @@ export class TenantsService {
             },
           },
           select: this.tenantSelect(),
+          })
         })
         await this.markInitialSyncDue(tenant.id, organizationIds[0])
         return { tenant: this.mapTenant(tenant), requiresConsent: false }
@@ -918,6 +1011,7 @@ export class TenantsService {
         connection: {
           select: {
             status: true,
+            connectionMode: true,
             credentialReference: true,
           },
         },
@@ -930,7 +1024,9 @@ export class TenantsService {
     const isConnected =
       tenant.status === 'ACTIVE' || tenant.connection?.status === 'CONNECTED'
 
-    if (isConnected) {
+    // Managed removal may race reconnection after this read; require the explicit
+    // tenant confirmation even when its initial presentation was disconnected.
+    if (isConnected || tenant.connection?.connectionMode !== 'CUSTOMER_MANAGED') {
       const candidate =
         body && typeof body === 'object'
           ? (body as Record<string, unknown>)
@@ -945,7 +1041,7 @@ export class TenantsService {
         )
       }
 
-      await this.prisma.$transaction([
+      if (tenant.connection?.connectionMode === 'CUSTOMER_MANAGED') await this.prisma.$transaction([
         this.prisma.customerTenant.update({
           where: { id: tenant.id },
           data: { status: 'DISCONNECTED' },
@@ -960,6 +1056,15 @@ export class TenantsService {
           data: { status: 'REVOKED' },
         }),
       ])
+    }
+
+    if (tenant.connection?.connectionMode !== 'CUSTOMER_MANAGED') {
+      const who = { customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId }
+      const control = await readDirectoryRoleControl(this.prisma, who)
+      if (control.status !== 'current') throw new ConflictException('The tenant connection changed during removal.')
+      const removed = await removeManagedDirectoryTenant(this.prisma, who, control.expected)
+      if (removed.status !== 'removed') throw new ConflictException('The tenant connection changed during removal.')
+      return { removed: true, tenantId: tenant.id, credentialRemoved: false }
     }
 
     if (tenant.connection?.credentialReference) {
@@ -1606,6 +1711,20 @@ export class TenantsService {
     if (!tenant.connection) {
       return this.buildFrontendConsentRedirect('exchange-readonly-error', 'connection-missing', tenant.id, true)
     }
+    if (tenant.connection.connectionMode === 'HAWKVIEW_MANAGED') {
+      const capture = await captureConnectionVerification(this.prisma, {
+        customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
+      }, true)
+      if (capture.status !== 'captured') return this.buildFrontendConsentRedirect('exchange-readonly-error', 'connection-unavailable', tenant.id, true)
+      try {
+        await this.microsoftConsent.getCapturedManagedAccessToken(capture.context.authority, tenant.microsoftTenantId, true)
+      } catch {
+        return this.buildFrontendConsentRedirect('exchange-readonly-error', 'exchange-consent-verification-failed', tenant.id, true)
+      }
+      const published = await publishCapturedConnectionRefresh(this.prisma, capture.context, 'exchange-consent')
+      return this.buildFrontendConsentRedirect(published.status === 'applied' ? 'exchange-readonly-consented' : 'exchange-readonly-error',
+        published.status === 'applied' ? null : 'connection-superseded', tenant.id, true)
+    }
     try {
       const verification = await this.microsoftConsent.verifyTenantExchangeConsent({
         microsoftTenantId: tenant.microsoftTenantId,
@@ -1714,77 +1833,27 @@ export class TenantsService {
       data: { customerTenantId: tenant.id },
     })
 
+    const capture = await captureConnectionVerification(this.prisma, {
+      customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: returnedTenantId,
+    }, true)
+    if (capture.status !== 'captured') return this.buildFrontendConsentRedirect('error', 'consent-unavailable', tenant.id, true)
+    let result: VerificationPublication
     try {
-      const verification =
-        await this.microsoftConsent.verifyTenantAfterConsent(returnedTenantId)
-      const connected = verification.missingRequiredPermissions.length === 0
-      const now = new Date()
-
-      await this.prisma.$transaction([
-        this.prisma.customerTenant.update({
-          where: { id: tenant.id },
-          data: {
-            displayName: verification.displayName,
-            primaryDomain: verification.primaryDomain,
-            status: connected ? 'ACTIVE' : 'PENDING',
-          },
-        }),
-        this.prisma.tenantConnection.update({
-          where: {
-            customerTenantId_organizationId: {
-              customerTenantId: tenant.id,
-              organizationId: tenant.organizationId,
-            },
-          },
-          data: {
-            connectionMode: 'HAWKVIEW_MANAGED',
-            status: connected ? 'CONNECTED' : 'ERROR',
-            consentedPermissions: preserveOptionalExchangeConsent(
-              verification.grantedPermissions,
-              tenant.connection?.consentedPermissions ?? []
-            ),
-            consentedAt: now,
-            lastVerifiedAt: now,
-            lastErrorCode: connected ? null : 'missing-permissions',
-            lastErrorMessage: connected
-              ? null
-              : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
-          },
-        }),
-      ])
-
-      if (connected) {
-        await this.markInitialSyncDue(tenant.id, tenant.organizationId)
-        await this.notifyConnectionAuthorized(tenant.id, tenant.organizationId)
-      } else {
-        await this.notifyMissingPermissions(
-          tenant.id,
-          tenant.organizationId,
-          verification.missingRequiredPermissions
-        )
-      }
-
-      return this.buildFrontendConsentRedirect(
-        connected ? 'success' : 'missing-permissions',
-        connected ? null : 'missing-permissions',
-        tenant.id,
-        true,
-      )
+      const verification = await this.microsoftConsent.verifyCapturedConnectedTenant({
+        microsoftTenantId: returnedTenantId, authority: capture.context.authority,
+      })
+      result = { outcome: 'verified', ...verification, consented: true }
     } catch (error) {
-      await this.recordConnectionError(
-        tenant,
-        'verification-failed',
-        error instanceof Error
-          ? error.message
-          : 'Microsoft tenant verification failed.'
-      )
-      return this.buildFrontendConsentRedirect(
-        'error',
-        'verification-failed',
-        tenant.id,
-        true,
-      )
+      if (error instanceof CapturedVerificationCredentialsUnavailable) {
+        return this.buildFrontendConsentRedirect('error', 'consent-unavailable', tenant.id, true)
+      }
+      result = { outcome: 'failed', message: error instanceof Error ? error.message : 'Microsoft tenant verification failed.' }
     }
+    // No unconditional connection-error compensation or notification effects.
+    const published = await publishConnectionVerification(this.prisma, capture.context, result)
+    if (published.status !== 'applied') return this.buildFrontendConsentRedirect('error', 'consent-superseded', tenant.id, true)
+    const code = result.outcome === 'failed' ? 'verification-failed' : published.connected ? null : 'missing-permissions'
+    return this.buildFrontendConsentRedirect(published.connected ? 'success' : code === 'missing-permissions' ? 'missing-permissions' : 'error', code, tenant.id, true)
   }
 
   private async recordConnectionError(
@@ -1968,5 +2037,39 @@ export class TenantsService {
       plane: requestedPlane,
     })
     return toPimScheduleSummary(requestedPlane, result)
+  }
+
+  /** Stored DIRECTORY_ROLES results for one tenant.
+   *
+   * Authorization runs to completion BEFORE any payload is read: the same accessible-organization
+   * resolution the PIM summary uses, then a nondisclosing tenant lookup. The reader is handed ids
+   * that are already established and performs no membership check of its own. */
+  async getDirectoryRoleResultsForIdentity(
+    identity: AuthenticatedIdentity,
+    customerTenantId: string
+  ) {
+    const tenantId = this.requireTenantUuid(customerTenantId)
+
+    const organizationIds = await this.getAccessibleOrganizationIds(identity)
+    if (organizationIds.length === 0) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    // Nondisclosing, as above: outside the caller's organizations is indistinguishable from absent.
+    // Only identity is selected here; every value the result depends on — tenant and connection
+    // status, mode, scope, receipt, snapshot and the read clock — is read coherently inside the
+    // reader's single statement, so none of it can drift between this check and that read.
+    const tenant = await this.prisma.customerTenant.findFirst({
+      where: { id: tenantId, organizationId: { in: organizationIds } },
+      select: { id: true, organizationId: true },
+    })
+    if (!tenant) {
+      throw new NotFoundException('Customer tenant was not found.')
+    }
+
+    return readDirectoryRoleResults(this.prisma, {
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+    })
   }
 }

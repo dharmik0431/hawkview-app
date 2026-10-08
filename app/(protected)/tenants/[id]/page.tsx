@@ -4167,6 +4167,7 @@ function TenantDetailsWorkspace() {
                   aria-labelledby="entra-tab-overview"
                 >
                   <EntraOverviewSection
+                    resolvedTenantId={resolvedTenantId}
                     tenant={tenant}
                     bundle={bundle}
                     users={USERS as any}

@@ -28,6 +28,14 @@ import {
   PERMISSION_DESCRIPTIONS,
 } from './microsoft-access-contract.js'
 
+/** Only credential preparation in the captured verification seam emits this.
+ * A provider's own ServiceUnavailableException remains a provider failure. */
+export class CapturedVerificationCredentialsUnavailable extends ServiceUnavailableException {
+  constructor() {
+    super({ code: 'MANAGED_CREDENTIAL_CAPTURE_UNAVAILABLE', message: 'Connection verification credentials are temporarily unavailable.' })
+  }
+}
+
 const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
 const MANAGEMENT_RESOURCE_HOST = 'manage.office.com'
 const SHAREPOINT_RESOURCE_APP_ID = '00000003-0000-0ff1-ce00-000000000000'
@@ -648,6 +656,24 @@ export class MicrosoftConsentService {
     return result.accessToken
   }
 
+  /** Shared writer token seam: the operation owns the captured revision. */
+  async getCapturedManagedAccessToken(authority: ManagedAuthority, microsoftTenantId: string, exchange = false) {
+    const captured = { ...authority }, tenantId = microsoftTenantId
+    let clientSecret: string
+    try {
+      if (!captured.configurationRevision || !captured.clientId
+        || captured.credentialReference !== `encrypted-secret:${captured.configurationRevision}`) throw new CapturedVerificationCredentialsUnavailable()
+      clientSecret = await this.secretStore.access(captured.credentialReference)
+      if (!clientSecret) throw new CapturedVerificationCredentialsUnavailable()
+    } catch { throw new CapturedVerificationCredentialsUnavailable() }
+    const result = await this.requestAccessToken(tenantId, { clientId: captured.clientId, clientSecret },
+      exchange ? 'https://outlook.office365.com/.default' : undefined)
+    if (exchange && (!result.grantedPermissions.includes('Exchange.ManageAsAppV2') || (result.directoryRoleIds ?? []).length > 0)) {
+      throw new BadRequestException('The Exchange connector requires Get-Mailbox-only application consent without broader directory roles.')
+    }
+    return result.accessToken
+  }
+
   async getTenantAccessToken(input: {
     microsoftTenantId: string
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
@@ -813,6 +839,25 @@ export class MicrosoftConsentService {
         retryable: true,
       }
     }
+  }
+
+  /** Verification writer seam: use the captured immutable managed credential,
+   * never reload current connector configuration after authority capture. */
+  async verifyCapturedConnectedTenant(input: { microsoftTenantId: string; authority: ManagedAuthority }) {
+    const tenantId = input.microsoftTenantId, authority = { ...input.authority }
+    let clientSecret: string
+    try {
+      if (!authority.configurationRevision || !authority.clientId || authority.credentialReference !== `encrypted-secret:${authority.configurationRevision}`) {
+        throw new CapturedVerificationCredentialsUnavailable()
+      }
+      clientSecret = await this.secretStore.access(authority.credentialReference)
+      if (!clientSecret) throw new CapturedVerificationCredentialsUnavailable()
+    } catch {
+      // Do not expose secret-store details or publish unavailable credentials as
+      // a Microsoft verification failure. Provider work starts below this catch.
+      throw new CapturedVerificationCredentialsUnavailable()
+    }
+    return this.verifyTenantWithCredentials(tenantId, { clientId: authority.clientId, clientSecret })
   }
 
   async verifyConnectedTenant(input: {

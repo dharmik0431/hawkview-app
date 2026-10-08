@@ -84,6 +84,16 @@ export class TenantsController {
     )
   }
 
+  @Get(':id/collection/directory-roles/control')
+  getDirectoryRoleControl(@Req() request: AuthenticatedRequest, @Param('id') customerTenantId: string) {
+    return this.tenantsService.getDirectoryRoleControlForIdentity(request.auth, customerTenantId)
+  }
+
+  @Post(':id/collection/directory-roles/control')
+  setDirectoryRoleControl(@Req() request: AuthenticatedRequest, @Param('id') customerTenantId: string, @Body() body: unknown) {
+    return this.tenantsService.setDirectoryRoleControlForIdentity(request.auth, customerTenantId, body)
+  }
+
   @Post(':id/verify-connection')
   verifyConnection(
     @Req() request: AuthenticatedRequest,
@@ -234,6 +244,19 @@ export class TenantsController {
       request.auth,
       customerTenantId,
       plane
+    )
+  }
+
+  @Get(':id/directory-roles/results')
+  getDirectoryRoleResults(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+    @Res({ passthrough: true }) response: Response
+  ) {
+    response.setHeader('Cache-Control', 'no-store')
+    return this.tenantsService.getDirectoryRoleResultsForIdentity(
+      request.auth,
+      customerTenantId
     )
   }
 }

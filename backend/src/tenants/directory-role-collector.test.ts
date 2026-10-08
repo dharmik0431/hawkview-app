@@ -71,11 +71,11 @@ test('capture locks G/T/C/R and empty collection commits once without legacy eff
   assert.ok(q.indexOf('tenant_connections') < q.indexOf('sync_states'))
   assert.equal(f.writes.filter(q => q.includes('INSERT INTO tenant_entra_snapshots')).length, 1)
 })
-test('never-activated managed and customer-managed retain legacy; unavailable activated never falls back', async () => {
+test('unconfigured managed source fails closed; customer-managed compatibility remains untrusted', async () => {
   for (const mode of ['HAWKVIEW_MANAGED', 'CUSTOMER_MANAGED']) {
     const f = fixture(); f.state.role_scope_version = f.state.role_scope_incarnation = null; f.connection.mode = mode; f.unavailable()
-    assert.equal((await collectDirectoryRoles(f.who, f.deps)).status, 'legacy')
-    assert.deepEqual(f.counts(), { legacy: 1, tokens: 0 }); assert.equal(f.writes.length, 0)
+    assert.equal((await collectDirectoryRoles(f.who, f.deps)).status, mode === 'CUSTOMER_MANAGED' ? 'legacy' : 'rejected')
+    assert.deepEqual(f.counts(), { legacy: mode === 'CUSTOMER_MANAGED' ? 1 : 0, tokens: 0 }); assert.equal(f.writes.length, 0)
   }
   for (const change of [(f: ReturnType<typeof fixture>) => f.unavailable(), (f: ReturnType<typeof fixture>) => f.inactive(),
     (f: ReturnType<typeof fixture>) => { f.connection.status = 'REVOKED' },
