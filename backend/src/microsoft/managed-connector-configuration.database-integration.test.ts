@@ -144,6 +144,67 @@ test('managed configuration integrated service with actual Prisma transactions',
       await prisma.encryptedSecret.update({ where: { id: newSecret.id }, data: { name: 'hawkview-managed-revision:' + randomUUID() } })
       await assert.rejects(secret.access(current.credential_reference))
     })
+    await t.test('legacy first-use upgrade preserves credentials and expiry; concurrent callers publish one immutable successor', async () => {
+      await reset()
+      const old = input(), reference = await secret.store('hawkview-microsoft-connector-client-secret', old.clientSecret, PLATFORM_OWNED)
+      await prisma.platformMicrosoftConnector.create({ data: { id: 'default', clientId: old.clientId, homeTenantId: old.homeTenantId,
+        credentialReference: reference, credentialExpiresAt: old.credentialExpiresAt } })
+      const before = await state()
+      await Promise.all([service().upgradeLegacyManagedConnector(), service().upgradeLegacyManagedConnector()])
+      const after = await state(), current = after.connectors[0]
+      assert.notEqual(current.configuration_revision, before.connectors[0].configuration_revision)
+      assert.equal(current.credential_reference, 'encrypted-secret:' + current.configuration_revision)
+      assert.equal(current.client_id, old.clientId); assert.equal(current.home_tenant_id, old.homeTenantId)
+      assert.deepEqual(current.credential_expires_at, old.credentialExpiresAt)
+      assert.equal(after.secrets.length, 2)
+      assert.deepEqual(after.secrets.find(row => row.id === before.secrets[0].id), before.secrets[0])
+      assert.equal(await secret.access(current.credential_reference), old.clientSecret)
+      await service().upgradeLegacyManagedConnector()
+      assert.deepEqual(await state(), after)
+    })
+    for (const fault of ['secret', 'authority', 'commit'] as const) await t.test('legacy first-use upgrade rolls back at ' + fault, async () => {
+      await reset()
+      const old = input(), reference = await secret.store('hawkview-microsoft-connector-client-secret', old.clientSecret, PLATFORM_OWNED)
+      await prisma.platformMicrosoftConnector.create({ data: { id: 'default', clientId: old.clientId, homeTenantId: old.homeTenantId, credentialReference: reference } })
+      const before = await state()
+      const broken = host(async sql => {
+        if ((fault === 'secret' && sql.startsWith('INSERT INTO encrypted_secrets')) ||
+          (fault === 'authority' && sql.startsWith('INSERT INTO platform_microsoft_connectors'))) throw Error('injected upgrade failure')
+      }, async () => { if (fault === 'commit') throw Error('injected upgrade failure') })
+      await assert.rejects(service(broken).upgradeLegacyManagedConnector(), /injected upgrade failure/)
+      assert.deepEqual(await state(), before)
+    })
+    await t.test('legacy source-row lock prevents a mutable writer racing the immutable copy', async () => {
+      await reset()
+      const old = input(), reference = await secret.store('hawkview-microsoft-connector-client-secret', old.clientSecret, PLATFORM_OWNED)
+      await prisma.platformMicrosoftConnector.create({ data: { id: 'default', clientId: old.clientId, homeTenantId: old.homeTenantId, credentialReference: reference } })
+      const entered = gate(), release = gate(), client = await pool.connect()
+      let upgrade: Promise<void> | undefined, writer: Promise<pg.QueryResult> | undefined
+      try {
+        await client.query(`SET search_path TO ${schema},public`)
+        await client.query("SET statement_timeout='5s'")
+        const pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+        upgrade = service(host(async sql => { if (sql.includes('/* managed:legacy-secret */')) { entered.resolve(); await release.promise } })).upgradeLegacyManagedConnector()
+        await Promise.race([entered.promise, upgrade.then(() => { throw Error('upgrade settled before source-row lock') })])
+        writer = client.query('UPDATE encrypted_secrets SET name=$1 WHERE id=$2::uuid', ['changed-after-copy', reference.slice('encrypted-secret:'.length)])
+        const failedWriter = writer.then(() => { throw Error('mutable writer was not blocked by source-row lock') })
+        const deadline = Date.now() + 4000
+        let blocked = false
+        while (Date.now() < deadline) {
+          blocked = (await Promise.race([observer.query('SELECT cardinality(pg_blocking_pids($1))>0 AS blocked', [pid]), failedWriter])).rows[0].blocked
+          if (blocked) break
+          await new Promise(resolve => setTimeout(resolve, 5))
+        }
+        assert.ok(blocked, 'legacy writer must block until the immutable copy commits')
+        release.resolve(); await upgrade; await writer
+        const current = (await state()).connectors[0]
+        assert.equal(await secret.access(current.credential_reference), old.clientSecret)
+      } finally {
+        release.resolve()
+        await Promise.allSettled([upgrade, writer])
+        client.release()
+      }
+    })
     await t.test('identical prepared operation replays only while current; changed content conflicts and replacement supersedes it', async () => {
       await reset()
       let prepared: PreparedManagedPublication | undefined

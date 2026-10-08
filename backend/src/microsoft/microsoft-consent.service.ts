@@ -13,7 +13,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
 import type { ClaimedConsent, ConsentOperationKey } from './consent-operation-store.js'
-import { captureManagedAuthority, publishManagedAuthority, type ManagedAuthority } from './managed-connector-authority.js'
+import { captureManagedAuthority, publishManagedAuthority, upgradeLegacyManagedAuthority, type ManagedAuthority } from './managed-connector-authority.js'
 import {
   fetchMicrosoftWithRetry,
   microsoftErrorMetadata,
@@ -654,6 +654,13 @@ export class MicrosoftConsentService {
       throw new Error('CAPTURED_DIRECTORY_TOKEN_SCOPE_MISMATCH')
     }
     return result.accessToken
+  }
+
+  /** Bounded first-use compatibility before any sync lease or provider work. */
+  async upgradeLegacyManagedConnector() {
+    const result = await upgradeLegacyManagedAuthority(this.prisma, (revision, source) =>
+      this.secretStore.prepareManagedRevisionFromStored(revision, source))
+    if (result.status === 'unavailable') throw new CapturedVerificationCredentialsUnavailable()
   }
 
   /** Shared writer token seam: the operation owns the captured revision. */

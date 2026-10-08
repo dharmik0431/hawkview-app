@@ -2009,9 +2009,18 @@ export class TenantSyncService {
 
     let capturedManaged: CapturedConnectionVerification | undefined
     if (tenant.connection.connectionMode !== 'CUSTOMER_MANAGED') {
-      const capture = await captureConnectionVerification(this.prisma, {
+      let capture = await captureConnectionVerification(this.prisma, {
         customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
       }, true)
+      if (capture.status === 'unavailable' && capture.reason === 'MANAGED_CREDENTIAL_CAPTURE_UNAVAILABLE') {
+        // Older rows received a revision but retained their old encrypted secret
+        // reference. Promote once before any provider work, then capture the new
+        // committed authority normally; never run with a mutable credential.
+        await this.microsoftConsent.upgradeLegacyManagedConnector()
+        capture = await captureConnectionVerification(this.prisma, {
+          customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
+        }, true)
+      }
       if (capture.status !== 'captured' || capture.context.tenant.status !== 'ACTIVE' || capture.context.connection.status !== 'CONNECTED') {
         throw new ConflictException('The managed connection changed before synchronization.')
       }

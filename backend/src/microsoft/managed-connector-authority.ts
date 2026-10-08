@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import type { StoredSecret } from '../secrets/secret-store.service.js'
 
 export const IMMUTABLE_MANAGED_SECRET_PREFIX = 'hawkview-managed-revision:'
 const LOCK_KEY = 'hawkview:managed-connector:default:authority:v1'
@@ -63,6 +64,44 @@ export async function captureManagedAuthority(db: AuthorityDatabase): Promise<Ma
   return db.$transaction(async tx => {
     const row = await lock(tx, false)
     return row ? authority(row) : null
+  }, { isolationLevel: 'ReadCommitted' })
+}
+
+/** Upgrade only the additive migration's unpublished legacy authority. Copy the
+ * locked, decryptable stored value into a new immutable revision atomically.
+ * No provider calls, mutable-credential fallback, tenant writes or scope opt-in. */
+export async function upgradeLegacyManagedAuthority(db: AuthorityDatabase,
+  prepare: (revision: string, source: StoredSecret) => PreparedManagedPublication['sealed']
+): Promise<{ status: 'current' | 'upgraded' | 'unavailable' }> {
+  return db.$transaction(async tx => {
+    const current = await lock(tx, true)
+    if (!current) return { status: 'unavailable' }
+    if (current.credentialReference === `encrypted-secret:${current.configurationRevision}`) return { status: 'current' }
+    // A malformed published authority is not an old configuration to adopt.
+    if (current.operationId !== null || current.fingerprint !== null) return { status: 'unavailable' }
+    const reference = current.credentialReference
+    const secretId = reference.startsWith('encrypted-secret:') ? uuid(reference.slice('encrypted-secret:'.length)) : null
+    if (secretId === null && !/^projects\/[^/]+\/secrets\/[^/]+\/versions\/[^/]+$/.test(reference)) return { status: 'unavailable' }
+    const rows = await tx.$queryRawUnsafe<(StoredSecret & { credentialExpiresAt: Date | null })[]>(
+      `/* managed:legacy-secret */ SELECT s.id::text AS id,s.name,s.ciphertext,
+        s.initialization_vector AS "initializationVector",s.authentication_tag AS "authenticationTag",s.key_version AS "keyVersion",
+        p.credential_expires_at AS "credentialExpiresAt"
+      FROM encrypted_secrets s CROSS JOIN platform_microsoft_connectors p
+      WHERE p.id='default' AND (s.id=$1::uuid OR s.legacy_reference=$2)
+      FOR SHARE OF s`, secretId, secretId === null ? reference : null)
+    const source = rows[0]
+    if (rows.length !== 1 || source.name.startsWith(IMMUTABLE_MANAGED_SECRET_PREFIX)) return { status: 'unavailable' }
+    const revision = randomUUID()
+    const sealed = prepare(revision, source)
+    // Reuse the same transaction/locks: a second caller sees the committed
+    // immutable revision, and a queued old secret writer cannot alter this copy.
+    const publication = await publishManagedAuthority({ $transaction: work => work(tx) }, {
+      expectedRevision: current.configurationRevision, operationId: randomUUID(), revision,
+      clientId: current.clientId, homeTenantId: current.homeTenantId,
+      credentialExpiresAt: source.credentialExpiresAt, sealed,
+    })
+    if (publication.status !== 'published') throw new Error('MANAGED_LEGACY_UPGRADE_CONFLICT')
+    return { status: 'upgraded' }
   }, { isolationLevel: 'ReadCommitted' })
 }
 /** Global authority lock comes first. Work must be bounded DB work, never provider/network I/O. */
