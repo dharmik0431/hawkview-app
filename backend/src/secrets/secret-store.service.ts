@@ -30,7 +30,7 @@ interface EncryptedPayload {
 /** A stored secret, as every read path here needs to see it. `keyVersion` is not
  * optional: a row whose sealing key is unknown cannot be opened, so there is
  * nothing useful to do with its absence except refuse. */
-interface StoredSecret {
+export interface StoredSecret {
   id: string
   name: string
   ciphertext: Uint8Array
@@ -91,6 +91,12 @@ export class SecretStoreService {
     const keys = this.keys
     const name = IMMUTABLE_MANAGED_SECRET_PREFIX + revision.toLowerCase()
     return { ...this.encrypt(name, value, keys.current), keyVersion: keys.currentVersion }
+  }
+
+  /** Local crypto only. Caller holds the authority and source-row locks through
+   * publication; do not read/reseal a mutable row through access() in this path. */
+  prepareManagedRevisionFromStored(revision: string, source: StoredSecret) {
+    return this.prepareManagedRevision(revision, this.decrypt(source))
   }
 
   private decrypt(secret: StoredSecret) {
