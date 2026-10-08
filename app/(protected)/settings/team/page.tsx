@@ -3103,7 +3103,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
                   <p className="text-[11px] text-muted-foreground">Inactivity threshold before requiring re-authentication.</p>
                 </div>
                 <span className="text-xs font-mono text-muted-foreground bg-muted px-2.5 py-1 rounded border border-border/60">
-                  24 Hours (Default)
+                  1 hour of inactivity
                 </span>
               </div>
             </div>

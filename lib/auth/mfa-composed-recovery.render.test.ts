@@ -214,6 +214,19 @@ async function mountComposed(w: ReturnType<typeof world>) {
   dom.window.document.getElementById('app')!.appendChild(container)
 
   const shared: Record<string, unknown> = {
+    // This suite isolates the existing MFA/recovery contract. The idle suite
+    // composes this same provider with real session-deadline enforcement.
+    '@/lib/auth/idle-session': { idleIdentity: () => null },
+    '@/lib/auth/idle-session-browser': {
+      observeIdleIdentity: () => true,
+      attachIdleSessionEvents: () => () => {},
+      idleSession: {
+        view: () => ({ phase: 'active', sessionId: null, remainingSeconds: 3600, verificationFailed: false }),
+        subscribe: () => () => {}, onExpired: () => () => {},
+        expire: () => {}, activity: async () => {}, resume: async () => {},
+      },
+    },
+    '@/components/auth/idle-session-warning': { IdleSessionWarning: () => null },
     '@/lib/auth/supabase': { supabase: w.supabase, isSupabaseConfigured: () => true },
     '@/lib/api/client': { apiClient: w.apiClient, USER_ACTION: {} },
     '@/lib/auth/mfa': mfaModule,

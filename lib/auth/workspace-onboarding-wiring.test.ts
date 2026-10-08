@@ -26,7 +26,7 @@ const authProvider = readFileSync(
 test('protected route blocks product children on required or unverifiable onboarding', () => {
   const gate = protectedRoute.indexOf('onboardingState.onboarding.required')
   const unavailable = protectedRoute.indexOf("onboardingState.state !== 'ready'")
-  const children = protectedRoute.lastIndexOf('return children')
+  const children = protectedRoute.lastIndexOf('return <>{children}')
   assert.ok(gate > 0 && gate < children)
   assert.ok(unavailable > 0 && unavailable < children)
   assert.match(protectedRoute, /WorkspaceOnboardingGate/)

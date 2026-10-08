@@ -26,6 +26,8 @@ import {
   subscribeWorkspaceChanges,
 } from '@/lib/auth/workspace-onboarding-sync'
 import { mfaAccessStatus } from '@/lib/auth/mfa'
+import { attachIdleSessionEvents, idleSession, observeIdleIdentity } from '@/lib/auth/idle-session-browser'
+import { idleIdentity, type IdleView } from '@/lib/auth/idle-session'
 
 interface AuthContextValue {
   identityUser: User | null
@@ -45,6 +47,9 @@ interface AuthContextValue {
   retrySessionBootstrap: () => Promise<void>
   /** Identity + generation, for capturing before an await and comparing after. */
   currentIdentityToken: () => string
+  idleSessionState: IdleView
+  extendIdleSession: () => Promise<void>
+  retryIdleSession: () => Promise<void>
 }
 
 export type HawkViewMfaFactor = {
@@ -85,6 +90,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     new WorkspaceBootstrapRefreshQueue()
   )
   const sessionRef = useRef<HawkViewSession | null>(null)
+  const identitySessionId = useRef<string | null>(null)
+  const [idleSessionState, setIdleSessionState] = useState<IdleView>(() => idleSession.view())
   const bootstrapInFlight = useRef<{
     ticket: AuthTransitionTicket
     promise: Promise<HawkViewSession | null>
@@ -248,8 +255,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   )
 
   const refreshSession = useCallback(async () => {
+    const before = transitionGuard.current.current()
     const { data } = (await supabase?.auth.getSession()) ?? {
       data: { session: null },
+    }
+    if (!transitionGuard.current.isCurrent(before)) return null
+    if (!observeIdleIdentity(data.session?.access_token)) {
+      beginIdentityTransition(null)
+      setIsLoading(false)
+      return null
     }
     const user = data.session?.user ?? null
     if (!user?.email_confirmed_at) {
@@ -273,15 +287,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [beginIdentityTransition, bootstrapIdentity, commitSession])
 
   useEffect(() => {
+    const unsubscribe = idleSession.subscribe(() => setIdleSessionState(idleSession.view()))
+    const unexpire = idleSession.onExpired((identity) => {
+      const subject = transitionGuard.current.current().subject
+      if (subject && subject !== identity.subject) return
+      beginIdentityTransition(null)
+      setIsLoading(false)
+      // Current browser session only. Other devices keep their own deadlines.
+      void supabase?.auth.getSession().then(({ data }) => {
+        if (idleIdentity(data.session?.access_token ?? '')?.sessionId === identity.sessionId) {
+          return supabase?.auth.signOut({ scope: 'local' })
+        }
+      }).catch(() => {})
+    })
+    const detach = attachIdleSessionEvents()
+    return () => { unsubscribe(); unexpire(); detach() }
+  }, [beginIdentityTransition])
+
+  useEffect(() => {
     if (!supabase) {
       setIsLoading(false)
       return
     }
 
     const { data } = supabase.auth.onAuthStateChange((_event, next) => {
+      const nextSessionId = idleIdentity(next?.access_token ?? '')?.sessionId ?? null
+      const sessionChanged = identitySessionId.current !== nextSessionId
+      identitySessionId.current = nextSessionId
+      if (!observeIdleIdentity(next?.access_token)) {
+        beginIdentityTransition(null)
+        setIsLoading(false)
+        return
+      }
       const user = next?.user ?? null
       const current = transitionGuard.current.current()
-      const subjectChanged = current.subject !== (user?.id ?? null)
+      const subjectChanged = sessionChanged || current.subject !== (user?.id ?? null)
       const ticket = subjectChanged
         ? beginIdentityTransition(user)
         : current
@@ -358,12 +398,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [bootstrapIdentity, identityUser])
 
   const signOut = useCallback(async () => {
+    idleSession.expire(false)
     beginIdentityTransition(null)
     setIsLoading(false)
     if (supabase) {
       await supabase.auth.signOut()
     }
   }, [beginIdentityTransition])
+
+  const extendIdleSession = useCallback(() => idleSession.activity(), [])
+  const retryIdleSession = useCallback(() => idleSession.resume(), [])
 
   const bootstrapFailureTicket = bootstrapFailure
   const sessionBootstrapFailed =
@@ -422,10 +466,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isRetryingSession,
       retrySessionBootstrap,
       currentIdentityToken,
+      idleSessionState,
+      extendIdleSession,
+      retryIdleSession,
     }),
     [cacheScope, currentIdentityToken, identityUser, isLoading, isRetryingSession, mfa,
       refreshMfa, refreshSession, retrySessionBootstrap, session, sessionBootstrapFailed,
-      signOut]
+      signOut, idleSessionState, extendIdleSession, retryIdleSession]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

@@ -9,6 +9,7 @@ import {
 } from '@/components/auth/workspace-onboarding'
 import { workspaceOnboardingState } from '@/lib/auth/workspace-onboarding'
 import { MfaAccessGate } from '@/components/auth/mfa-access-gate'
+import { IdleSessionWarning } from '@/components/auth/idle-session-warning'
 
 export function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const router = useRouter()
@@ -21,6 +22,9 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     sessionBootstrapFailed,
     isRetryingSession,
     retrySessionBootstrap,
+    idleSessionState,
+    extendIdleSession,
+    retryIdleSession,
   } = useAuth()
 
   useEffect(() => {
@@ -97,6 +101,13 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     )
   }
 
+  if (idleSessionState?.phase === 'checking' || idleSessionState?.phase === 'expired') {
+    return <div className="flex min-h-screen items-center justify-center p-6"><div className="space-y-3 text-center">
+      <p className="text-sm text-muted-foreground">{idleSessionState.verificationFailed ? 'Your session could not be verified. Check your connection and try again.' : 'Verifying your session…'}</p>
+      {idleSessionState.verificationFailed && <button type="button" onClick={() => void retryIdleSession().catch(() => {})}>Retry session check</button>}
+    </div></div>
+  }
+
   const onboardingState = workspaceOnboardingState(session)
   if (onboardingState.state !== 'ready') {
     return <WorkspaceOnboardingUnavailable />
@@ -106,5 +117,5 @@ export function ProtectedRoute({ children }: { children: React.ReactNode }) {
     return <WorkspaceOnboardingGate onboarding={onboardingState.onboarding} />
   }
 
-  return children
+  return <>{children}{idleSessionState?.phase === 'warning' && <IdleSessionWarning remainingSeconds={idleSessionState.remainingSeconds} staySignedIn={extendIdleSession} />}</>
 }
