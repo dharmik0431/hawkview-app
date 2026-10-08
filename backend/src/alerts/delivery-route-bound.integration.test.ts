@@ -6,6 +6,7 @@ import { AppModule } from '../app.module.js'
 import { createHawkviewApp } from '../bootstrap.js'
 import { IdentityAuthGuard } from '../auth/identity-auth.guard.js'
 import { IdentityTokenVerifier } from '../auth/identity-token-verifier.service.js'
+import { ConsoleSessionService } from '../auth/console-session.service.js'
 import { RequestCorrelationMiddleware } from '../request-correlation.middleware.js'
 import { RateLimitInterceptor } from '../rate-limiting/rate-limit.interceptor.js'
 import { RateLimitStore } from '../rate-limiting/rate-limit.store.js'
@@ -67,6 +68,18 @@ const tokenVerifierFake = {
   },
 }
 
+/** Public webhooks must bypass session persistence as well as token verification. */
+const sessionCalls: string[] = []
+const unexpectedSessionAccess = (operation: string) => async () => {
+  sessionCalls.push(operation)
+  throw new Error('a public route must never reach the console session store')
+}
+const sessionStoreFake = {
+  check: unexpectedSessionAccess('check'),
+  activity: unexpectedSessionAccess('activity'),
+  end: unexpectedSessionAccess('end'),
+}
+
 /**
  * THE SHIPPING STACK AROUND THE ONE ROUTE UNDER TEST.
  *
@@ -85,6 +98,7 @@ const tokenVerifierFake = {
     { provide: APP_GUARD, useClass: IdentityAuthGuard },
     { provide: APP_INTERCEPTOR, useClass: RateLimitInterceptor },
     { provide: IdentityTokenVerifier, useValue: tokenVerifierFake },
+    { provide: ConsoleSessionService, useValue: sessionStoreFake },
     { provide: ResendSignatureVerifier, useValue: verifierFake },
     { provide: DeliveryOutcomeStore, useValue: outcomeStoreFake },
   ],
@@ -139,7 +153,12 @@ const PAST_THE_LIMIT = UNAUTHENTICATED_REQUESTS_PER_WINDOW + 20
 test.beforeEach(() => {
   storeCalls.length = 0
   tokenVerifications.length = 0
+  sessionCalls.length = 0
   rejectionCount.resetForTest()
+})
+
+test.afterEach(() => {
+  assert.deepEqual(sessionCalls, [], '@Public() webhook requests must never check, extend or revoke a console session')
 })
 
 // ---------------------------------------------------------------------------------------
