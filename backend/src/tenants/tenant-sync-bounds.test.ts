@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
+import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
 import {
   assertGraphCollectionBounds,
   ENTRA_COLLECTION_LIMITS,
@@ -216,13 +217,13 @@ test('actual audit reconciliation serializes every mailbox materializer and reta
 test('actual full sync stops at a bounded USERS failure without a successful checkpoint or any directory/snapshot writes', async () => {
   const updates: any[] = []; const forbidden: string[] = []
   let independentAudit = 0
-  const service = new TenantSyncService(utcTestDatabase({
+  const service = new TenantSyncService(managedSyncTestDatabase({
     syncState: { findUnique: async () => ({ id: 'state', deltaLink: null, lastSuccessfulAt: null }), updateMany: async () => ({ count: 1 }), update: async (args: any) => updates.push(args) },
     directoryUser: { upsert: async () => forbidden.push('user'), updateMany: async () => forbidden.push('deletion') },
     tenantConnection: { update: async () => forbidden.push('verified') },
     tenantEntraSnapshot: { upsert: async () => forbidden.push('snapshot') },
     changeEvidenceEvent: { createMany: async () => forbidden.push('evidence') },
-  }) as any, { getTenantAccessToken: async () => 'token' } as any, {} as any, {} as any, {} as any, { syncTenant: async () => { independentAudit += 1; return [] } } as any)
+  }, boundedTenant) as any, { getCapturedManagedAccessToken: managedSyncTestToken(boundedTenant) } as any, {} as any, {} as any, {} as any, { syncTenant: async () => { independentAudit += 1; return [] } } as any)
   ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream(), { headers: { 'content-length': String(USER_DELTA_COLLECTION_LIMITS.pageBytes + 1) } })
   await assert.rejects(() => (service as any).syncConnectedTenant(boundedTenant, false, { includeBundle: false }), /bounded page-size/)
   assert.deepEqual(forbidden, []); assert.equal(independentAudit, 1)
@@ -413,6 +414,11 @@ test('full-sync collector schedule serializes all materializing collectors while
 })
 
 test('the actual full tenant sync uses the serialized heavy-collector schedule', async () => {
+  const tenant = {
+    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
+    displayName: null, primaryDomain: null, status: 'ACTIVE',
+    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
+  }
   const prisma: any = {
     syncState: {
       findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: new Date(), deltaLink: null }),
@@ -423,9 +429,9 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
     tenantConnection: { update: async () => ({}) },
     $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
   }
-  const microsoftConsent = { getTenantAccessToken: async () => 'token' }
+  const microsoftConsent = { getCapturedManagedAccessToken: managedSyncTestToken(tenant) }
   const notifications = { publishIncident: async () => undefined }
-  const service = new TenantSyncService(utcTestDatabase(prisma), microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
+  const service = new TenantSyncService(managedSyncTestDatabase(prisma, tenant), microsoftConsent as any, {} as any, notifications as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async () => ({ deltaLink: 'next-delta' })
   for (const method of [
     'syncLicenses', 'syncOrganizationConfiguration', 'syncDomains',
@@ -476,11 +482,6 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   ;(service as any).syncM365AuditActivity = async () => {
     safeStartedDuringSignIn = signInActive
   }
-  const tenant = {
-    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
-    displayName: null, primaryDomain: null, status: 'ACTIVE',
-    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
-  }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
   assert.equal(result.status, 'SUCCEEDED')
   assert.equal(safeStartedDuringSignIn, false)
@@ -493,6 +494,11 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
 })
 
 test('actual full sync continues from a failed sign-in collector to audit without overlap and logs one safe outcome', async () => {
+  const tenant = {
+    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
+    displayName: null, primaryDomain: null, status: 'ACTIVE',
+    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
+  }
   const prisma: any = {
     syncState: {
       findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: new Date(), deltaLink: null }),
@@ -502,8 +508,8 @@ test('actual full sync continues from a failed sign-in collector to audit withou
     $transaction: async (operations: Array<Promise<unknown>>) => Promise.all(operations),
   }
   const service = new TenantSyncService(
-    utcTestDatabase(prisma),
-    { getTenantAccessToken: async () => 'token' } as any,
+    managedSyncTestDatabase(prisma, tenant),
+    { getCapturedManagedAccessToken: managedSyncTestToken(tenant) } as any,
     {} as any,
     { publishIncident: async () => undefined } as any,
     {} as any,
@@ -537,11 +543,6 @@ test('actual full sync continues from a failed sign-in collector to audit withou
   }
   const messages: string[] = []
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
-  const tenant = {
-    id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
-    displayName: null, primaryDomain: null, status: 'ACTIVE',
-    connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: null },
-  }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
   assert.equal(result.status, 'SUCCEEDED')
   assert.deepEqual(order, ['sign-in:start', 'sign-in:failed', 'audit:ran'])

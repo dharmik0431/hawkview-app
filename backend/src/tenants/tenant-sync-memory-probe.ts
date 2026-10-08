@@ -1,4 +1,4 @@
-import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
+import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
 import {
   ENTRA_COLLECTION_LIMITS,
   GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES,
@@ -209,6 +209,7 @@ async function actualMaterializer<T>(resource: string, work: () => Promise<T>): 
   }
 }
 const databaseUsers = Array.from({ length: actualRows }, (_, index) => ({ microsoftUserId: `user-${index}`, userPrincipalName: `user-${index}@example.invalid` }))
+const actualTenant = { id: 'synthetic-tenant', organizationId: 'synthetic-org', microsoftTenantId: 'synthetic-microsoft', status: 'ACTIVE', displayName: null, primaryDomain: null, connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: new Date() } }
 const actualPrisma: any = {
   customerTenant: { findFirst: async () => ({ microsoftTenantId: 'synthetic-microsoft' }) },
   syncState: {
@@ -223,8 +224,8 @@ const actualPrisma: any = {
   tenantConnection: { update: async () => ({}) },
   $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
 }
-const actualService = new TenantSyncService(utcTestDatabase(actualPrisma), {
-  getTenantAccessToken: async () => 'synthetic-token', getTenantExchangeAccessToken: async () => 'synthetic-token',
+const actualService = new TenantSyncService(managedSyncTestDatabase(actualPrisma, actualTenant), {
+  getCapturedManagedAccessToken: managedSyncTestToken(actualTenant, 'synthetic-token'), getTenantExchangeAccessToken: async () => 'synthetic-token',
 } as any, {} as any, { publishIncident: async () => undefined } as any, {} as any, {} as any)
 ;(actualService as any).logger = { warn: () => undefined, log: () => undefined }
 const originalUsers = (actualService as any).synchronizeUsers.bind(actualService)
@@ -263,7 +264,6 @@ for (const method of ['syncLicenses', 'syncOrganizationConfiguration', 'syncDoma
     '@odata.deltaLink': isDelta && !more ? 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=done' : undefined,
   }))
 }
-const actualTenant = { id: 'synthetic-tenant', organizationId: 'synthetic-org', microsoftTenantId: 'synthetic-microsoft', status: 'ACTIVE', displayName: null, primaryDomain: null, connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null, exchangeReadOnlyEnabledAt: new Date() } }
 await (actualService as any).syncConnectedTenant(actualTenant, false, { includeBundle: false })
 actualModes.push('full-with-optional-exchange')
 await (actualService as any).reconcileDirectoryAuditChanges(actualTenant, 'token', [{ activityDisplayName: 'Update mailbox' }])

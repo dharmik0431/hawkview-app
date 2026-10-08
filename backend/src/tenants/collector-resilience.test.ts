@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
+import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
 import { MicrosoftRequestError } from '../microsoft/microsoft-request.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 
@@ -40,8 +40,8 @@ test('a collector failure after token acquisition never suspends the tenant conn
     $transaction: async (work: unknown) => work,
   }
   const service = new TenantSyncService(
-    utcTestDatabase(prisma) as any,
-    { getTenantAccessToken: async () => 'token' } as any,
+    managedSyncTestDatabase(prisma, tenant()) as any,
+    { getCapturedManagedAccessToken: managedSyncTestToken(tenant()) } as any,
     {} as any,
     {} as any,
     {} as any,
