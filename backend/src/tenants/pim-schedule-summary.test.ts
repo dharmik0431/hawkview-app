@@ -272,7 +272,8 @@ test('the real controller forwards the trusted identity through the real service
 
 test('the real guard refuses a request carrying no bearer identity', async () => {
   const verifier = { verify: async () => { throw new Error('verifier must not run without a bearer token') } }
-  const guard = new IdentityAuthGuard(new Reflector(), verifier as any)
+  const guard = new IdentityAuthGuard(new Reflector(), verifier as any,
+    { check: async () => { throw new Error('session store must not run without a bearer token') } } as any)
   const request: any = { headers: {} }
   const context: any = {
     getHandler: () => TenantsController.prototype.getPimScheduleSummary,

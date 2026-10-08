@@ -11,6 +11,7 @@ interface SupabasePayload extends JWTPayload {
   aal?: string
   session_id?: string
   is_anonymous?: boolean
+  amr?: unknown
   user_metadata?: {
     display_name?: string
     full_name?: string
@@ -20,6 +21,20 @@ interface SupabasePayload extends JWTPayload {
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+// Explicit interactive methods documented by Supabase. Refresh, anonymous,
+// email-change and unknown methods cannot establish a new console session.
+const INTERACTIVE_AMR = new Set(['password', 'oauth', 'otp', 'totp', 'recovery', 'invite', 'sso/saml', 'magiclink', 'email/signup'])
+export function interactiveAuthenticationTime(amr: unknown): Date | undefined {
+  if (!Array.isArray(amr)) return undefined
+  let latest = 0
+  for (const item of amr) {
+    if (!item || typeof item !== 'object' || !INTERACTIVE_AMR.has(item.method)) continue
+    if (!Number.isSafeInteger(item.timestamp) || item.timestamp <= 0 || item.timestamp > 8_640_000_000_000) return undefined
+    latest = Math.max(latest, item.timestamp)
+  }
+  return latest ? new Date(latest * 1000) : undefined
+}
 
 /**
  * Supabase does not include an authoritative `email_confirmed` claim in its
@@ -56,6 +71,8 @@ export function authenticatedIdentityFromSupabasePayload(
       undefined,
     signInProvider: payload.app_metadata?.provider,
     assuranceLevel: payload.aal,
+    sessionId: payload.session_id.toLowerCase(),
+    authenticatedAt: interactiveAuthenticationTime(payload.amr),
   }
 }
 
