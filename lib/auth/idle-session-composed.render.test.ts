@@ -44,6 +44,9 @@ async function mount() {
   const routers: string[] = []
   let holdPrivate = false
   let releasePrivate: (() => void) | null = null
+  let holdStatus = false
+  let releaseStatus: (() => void) | null = null
+  let latestAuth: any
   const inputHandlers = new Map<string, EventListener>()
   const originalAdd = dom.window.document.addEventListener.bind(dom.window.document)
   dom.window.document.addEventListener = ((name: string, fn: EventListener, options: any) => {
@@ -52,16 +55,19 @@ async function mount() {
   }) as any
   globalThis.fetch = async (input, options) => {
     const path = new URL(String(input)).pathname
+    const expectedToken = current?.access_token
     calls.push(path)
     if (offline) throw new Error('offline')
     if (path === '/private' && holdPrivate) await new Promise<void>((resolve) => { releasePrivate = resolve })
+    if (path === '/auth/session' && holdStatus) await new Promise<void>((resolve) => { releaseStatus = resolve })
     if (path.endsWith('/auth/session/end')) return new Response(JSON.stringify({ ended: true }))
     if (path.includes('/auth/session')) {
       if (now >= serverDeadline) return new Response(JSON.stringify({ code: 'SESSION_IDLE_EXPIRED' }), { status: 401 })
       if (path.endsWith('/activity')) serverDeadline = now + 3600000
-      return new Response(JSON.stringify({ sessionId, serverNow: new Date(now).toISOString(), idleExpiresAt: new Date(serverDeadline).toISOString(), idleTimeoutSeconds: 3600, warningSeconds: 120 }), { headers: { 'Content-Type': 'application/json' } })
+      const requestToken = (options!.headers as Record<string, string>).Authorization.slice(7)
+      return new Response(JSON.stringify({ sessionId: idle.idleIdentity(requestToken)!.sessionId, serverNow: new Date(now).toISOString(), idleExpiresAt: new Date(serverDeadline).toISOString(), idleTimeoutSeconds: 3600, warningSeconds: 120 }), { headers: { 'Content-Type': 'application/json' } })
     }
-    assert.equal(options?.headers && (options.headers as Record<string,string>).Authorization, `Bearer ${makeToken()}`)
+    assert.equal(options?.headers && (options.headers as Record<string,string>).Authorization, `Bearer ${expectedToken}`)
     return new Response(JSON.stringify({
       user: { id: subject, email: 'owner@example.com', memberships: [] },
       workspaceOnboarding: { required: false, organizationId: null, organizationName: null, businessDomain: null, businessDomainVerification: 'UNVERIFIED_INFORMATIONAL', timeZone: null },
@@ -99,7 +105,8 @@ async function mount() {
   const element = dom.window.document.createElement('div')
   dom.window.document.querySelector('main')!.appendChild(element)
   const root = createRoot(element)
-  await React.act(async () => root.render(h(provider.AuthProvider, null, h(route.ProtectedRoute, null, h('div', null, 'PRIVATE TENANT DATA')))))
+  const Probe = () => { latestAuth = provider.useAuth(); return null }
+  await React.act(async () => root.render(h(provider.AuthProvider, null, h(Probe), h(route.ProtectedRoute, null, h('div', null, 'PRIVATE TENANT DATA')))))
   await React.act(async () => listener('INITIAL_SESSION', current))
   const flush = async () => { for (let i = 0; i < 10; i++) await React.act(async () => { await Promise.resolve() }) }
   await flush()
@@ -110,6 +117,10 @@ async function mount() {
     restoreStaleToken: () => { current = { access_token: makeToken(), user: { id: subject, email: 'owner@example.com', email_confirmed_at: '2026-01-01' } } },
     deferPrivate: () => { holdPrivate = true },
     releasePrivate: () => releasePrivate?.(),
+    newSessionBeforeCallback: (id: string) => { current = { ...current, access_token: makeToken(id) }; holdStatus = true },
+    refreshSession: () => latestAuth.refreshSession(),
+    identityGeneration: () => latestAuth.currentIdentityToken(),
+    releaseStatus: () => { holdStatus = false; releaseStatus?.() },
     input: (name: string, trusted: boolean) => inputHandlers.get(name)?.({ isTrusted: trusted } as Event),
     emitRefresh: async () => { await React.act(async () => listener('TOKEN_REFRESHED', current)); await flush() },
     close: async () => { await React.act(async () => root.unmount()); element.remove(); Date.now = originalNow; globalThis.fetch = originalFetch; dom.window.document.addEventListener = originalAdd },
@@ -191,5 +202,22 @@ test('input handlers report trusted human input, excluding synthetic input and p
     })
     assert.equal(w.calls.filter((p) => p.endsWith('/activity')).length, 1)
     assert.equal(w.browser.idleSession.view().remainingSeconds, 3600)
+  } finally { await w.close() }
+})
+
+test('explicit refresh with a new same-user session hides old content before the auth callback', async () => {
+  const w = await mount()
+  try {
+    const oldGeneration = w.identityGeneration()
+    w.newSessionBeforeCallback('bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee')
+    let pending!: Promise<unknown>
+    await React.act(async () => { pending = w.refreshSession(); await Promise.resolve() })
+    await w.flush()
+    assert.notEqual(w.identityGeneration(), oldGeneration)
+    assert.doesNotMatch(w.element.textContent, /PRIVATE TENANT DATA/)
+    assert.equal(w.browser.idleSession.view().phase, 'checking')
+    await React.act(async () => { w.releaseStatus(); await pending })
+    await w.flush()
+    assert.match(w.element.textContent, /PRIVATE TENANT DATA/)
   } finally { await w.close() }
 })

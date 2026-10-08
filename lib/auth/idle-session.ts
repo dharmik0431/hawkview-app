@@ -86,7 +86,8 @@ export class IdleSessionController {
     try { this.environment.write(this.key(), JSON.stringify(this.deadline)) } catch { /* See read(). */ }
   }
   bind(identity: IdleIdentity, token: string) {
-    if (identity.sessionId !== this.identity?.sessionId || identity.subject !== this.identity?.subject) {
+    const changed = identity.sessionId !== this.identity?.sessionId || identity.subject !== this.identity?.subject
+    if (changed) {
       this.generation++
       this.identity = identity
       this.verified = false
@@ -97,6 +98,7 @@ export class IdleSessionController {
       this.read()
     }
     this.token = token
+    if (changed) this.emit()
   }
   clear() {
     this.generation++

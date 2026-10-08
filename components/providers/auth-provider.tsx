@@ -260,6 +260,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       data: { session: null },
     }
     if (!transitionGuard.current.isCurrent(before)) return null
+    const nextSessionId = idleIdentity(data.session?.access_token ?? '')?.sessionId ?? null
+    const sessionChanged = identitySessionId.current !== nextSessionId
+    identitySessionId.current = nextSessionId
     if (!observeIdleIdentity(data.session?.access_token)) {
       beginIdentityTransition(null)
       setIsLoading(false)
@@ -267,7 +270,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     const user = data.session?.user ?? null
     if (!user?.email_confirmed_at) {
-      if (transitionGuard.current.current().subject !== (user?.id ?? null)) {
+      if (sessionChanged || transitionGuard.current.current().subject !== (user?.id ?? null)) {
         beginIdentityTransition(user)
       } else {
         commitSession(null)
@@ -278,7 +281,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const current = transitionGuard.current.current()
     const ticket =
-      current.subject === user.id
+      !sessionChanged && current.subject === user.id
         ? current
         : beginIdentityTransition(user)
     setIdentityUser(user)
