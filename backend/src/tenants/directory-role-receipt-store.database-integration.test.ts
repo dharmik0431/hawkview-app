@@ -93,12 +93,12 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
       assert.deepEqual(await captureRoleAttempt(db,who),{status:'rejected',reason:'UNAVAILABLE'})
       assert.equal(await state(),undefined)
       try {
-        await observer.query("UPDATE tenant_connections SET connection_mode='CUSTOMER_MANAGED' WHERE customer_tenant_id=$1",[customerTenantId])
+        await observer.query("UPDATE tenant_connections SET connection_mode='CUSTOMER_MANAGED',client_id=$2::uuid,credential_reference=$3 WHERE customer_tenant_id=$1",[customerTenantId,randomUUID(),'synthetic-legacy-credential'])
         assert.deepEqual(await captureRoleAttempt(db,who),{status:'legacy'})
         assert.deepEqual(await activateRoleScope(db,{...who,expectedConnectionIncarnation:null,expectedScopeIncarnation:null}),{status:'rejected',reason:'UNAVAILABLE'})
         assert.equal(await state(),undefined)
       } finally {
-        await observer.query("UPDATE tenant_connections SET connection_mode='HAWKVIEW_MANAGED' WHERE customer_tenant_id=$1",[customerTenantId])
+        await observer.query("UPDATE tenant_connections SET connection_mode='HAWKVIEW_MANAGED',client_id=NULL,credential_reference=NULL WHERE customer_tenant_id=$1",[customerTenantId])
       }
       assert.equal((await snapshot()).length,0)
       const [a,b]=await Promise.all([activateRoleScope(db,{...who,expectedConnectionIncarnation:null,expectedScopeIncarnation:null}),activateRoleScope(db,{...who,expectedConnectionIncarnation:null,expectedScopeIncarnation:null})])
