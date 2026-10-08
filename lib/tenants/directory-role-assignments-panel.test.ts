@@ -103,7 +103,31 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
       return original(type, ...rest)
     }
   }
+  // The control's PURE exports are the real ones, so the panel is not wired to a second,
+  // divergent copy of the status mapping or the phase rules.
+  const realControlHooks = makeLoader({
+    '@tanstack/react-query': { useQuery: () => ({}), useMutation: () => ({}), useQueryClient: () => ({}) },
+    '@/components/providers/auth-provider': { useAuth: () => ({ cacheScope: '', isLoading: false }) },
+    './client': { ApiError: class ApiError extends Error {}, apiClient: {} },
+  })(resolvePath(repoRoot, 'lib/api/directory-role-control-hooks.ts'))
+
   const load = makeLoader({
+    '@/components/providers/auth-provider': {
+      // No membership: the control renders nothing, so every assertion below is about the
+      // results panel exactly as before this child was added.
+      useAuth: () => ({ session: { user: { memberships: [] } } }),
+    },
+    '@/lib/api/directory-role-control-hooks': {
+      ...realControlHooks,
+      useDirectoryRoleControl: () => ({
+        data: undefined, isPending: false, isFetching: false, isError: false,
+        error: undefined, dataUpdatedAt: 0, refetch: () => Promise.resolve(),
+      }),
+      useSetDirectoryRoleControl: () => ({
+        mutate: () => {}, isPending: false, isError: false, error: undefined,
+        settledAt: null, clearSettled: () => {},
+      }),
+    },
     '@/lib/api/directory-role-results-hooks': {
       useDirectoryRoleResults: (tenantId: string) => {
         asked.push(tenantId)
@@ -116,18 +140,29 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
       },
     },
   })
-  const { DirectoryRoleAssignmentsPanel } = load(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx'))
-  const container = dom.window.document.getElementById('root') as HTMLElement
-  const root = createRoot(container)
-  act(() => { root.render(React.createElement(DirectoryRoleAssignmentsPanel, { customerTenantId })) })
-  const cleanup = () => {
-    act(() => root.unmount())
+  const release = (root?: { unmount: () => void }) => {
+    try { if (root) act(() => root.unmount()) } catch { /* releasing must not mask the real error */ }
     for (const [key, descriptor] of Array.from(previous.entries())) {
       if (descriptor) Object.defineProperty(globalThis, key, descriptor)
       else delete (globalThis as any)[key]
     }
     dom.window.close()
   }
+  let root: ReturnType<typeof createRoot> | undefined
+  let Panel: any
+  try {
+    Panel = load(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx')).DirectoryRoleAssignmentsPanel
+    const target = dom.window.document.getElementById('root') as HTMLElement
+    root = createRoot(target)
+    act(() => { root!.render(React.createElement(Panel, { customerTenantId })) })
+  } catch (error) {
+    // Release the globals, DOM and timers before propagating, so a fixture failure fails the test
+    // instead of leaving the process alive.
+    release(root)
+    throw error
+  }
+  const container = dom.window.document.getElementById('root') as HTMLElement
+  const cleanup = () => release(root)
   return {
     container, text: () => container.textContent ?? '', refetches, asked, cleanup,
     listeners: () => listeners,
@@ -141,7 +176,7 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
      *  not moved, the clock state is identical and React correctly bails out of the re-render. */
     replace: (next: State) => {
       current = next
-      act(() => { root.render(React.createElement(DirectoryRoleAssignmentsPanel, { customerTenantId })) })
+      act(() => { root!.render(React.createElement(Panel, { customerTenantId })) })
     },
   }
 }

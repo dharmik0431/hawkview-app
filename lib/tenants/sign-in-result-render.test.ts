@@ -14,6 +14,12 @@ function load(path: string): any {
     compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText
   new Function('require', 'exports', js)((name: string) => {
     if (name === 'maplibre-gl') return { __esModule: true, default: {} }
+    // The overview section now renders two authenticated, query-backed panels. This file's subject
+    // is the composed posture from sign-in outcomes, not those panels, and this loader supplies no
+    // auth provider or query client — so they are stubbed to nothing here. Their own suites cover
+    // them against the real providers; stubbing them changes no assertion in this file.
+    if (name === '@/components/tenant/directory-role-assignments-panel') return { DirectoryRoleAssignmentsPanel: () => null }
+    if (name === '@/components/tenant/pim-schedule-observations-panel') return { PimScheduleObservationsPanel: () => null }
     if (!name.startsWith('.') && !name.startsWith('@/')) return require(name)
     const target = name.startsWith('@/') ? resolve(base, name.slice(2)) : resolve(dirname(path), name.replace(/\.js$/, ''))
     const file = [target, target + '.tsx', target + '.ts'].find(p => existsSync(p))!
