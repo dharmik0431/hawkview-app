@@ -11,6 +11,8 @@ import type { Request } from 'express'
 import type { AuthenticatedRequest } from './auth.types.js'
 import { IdentityTokenVerifier } from './identity-token-verifier.service.js'
 import { PUBLIC_ROUTE_KEY } from './public.decorator.js'
+import { ConsoleSessionService } from './console-session.service.js'
+import { CONSOLE_SESSION_OPERATION, assertNoSessionOverrides, type ConsoleSessionOperation } from './console-session.controller.js'
 
 export function hasRequiredAssurance(
   assuranceLevel: 'aal1' | 'aal2' | undefined,
@@ -34,6 +36,8 @@ export class IdentityAuthGuard implements CanActivate {
     private readonly reflector: Reflector,
     @Inject(IdentityTokenVerifier)
     private readonly verifier: IdentityTokenVerifier,
+    @Inject(ConsoleSessionService)
+    private readonly sessions: ConsoleSessionService,
   ) {}
 
   async canActivate(context: ExecutionContext) {
@@ -61,6 +65,18 @@ export class IdentityAuthGuard implements CanActivate {
       throw new ForbiddenException(
         'Multi-factor authentication verification is required.',
       )
+    }
+
+    const operation = this.reflector.getAllAndOverride<ConsoleSessionOperation>(CONSOLE_SESSION_OPERATION,
+      [context.getHandler(), context.getClass()])
+    if (operation) assertNoSessionOverrides(request.body, request.query)
+    if (operation === 'end') {
+      // Still requires a valid verified JWT and the existing MFA policy. Only
+      // this fixed endpoint may revoke an expired session instead of rejecting it.
+      await this.sessions.end(identity)
+    } else {
+      ;(request as AuthenticatedRequest).consoleSession = operation === 'activity'
+        ? await this.sessions.activity(identity) : await this.sessions.check(identity)
     }
 
     return true

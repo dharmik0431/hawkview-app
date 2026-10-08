@@ -11,7 +11,7 @@ const controllerPath = resolve(backendRoot, 'src/identity-risk/identity-risk.con
 
 // Compile the real controller, service and guard with the production bundler,
 // ESM format and tsconfig. No TypeScript decorator-metadata emitter is involved.
-// Only the database and external token verifier are synthetic providers. The
+// Only the database, session store and external token verifier are synthetic providers. The
 // HTTP assertions exercise real Nest routing, DI, auth guard and service scope.
 async function runRuntimeProbe(removeInjection) {
   const source = readFileSync(controllerPath, 'utf8')
@@ -32,12 +32,32 @@ async function runRuntimeProbe(removeInjection) {
     import { IdentityRiskPseudonymProvider } from './src/identity-risk/identity-risk-pseudonym.ts';
     import { IdentityAuthGuard } from './src/auth/identity-auth.guard.ts';
     import { IdentityTokenVerifier } from './src/auth/identity-token-verifier.service.ts';
+    import { ConsoleSessionService } from './src/auth/console-session.service.ts';
     import { PrismaService } from './src/prisma/prisma.service.ts';
 
     const organizationId = '11111111-1111-4111-8111-111111111111';
     const tenantId = '22222222-2222-4222-8222-222222222222';
     const foreignTenantId = '33333333-3333-4333-8333-333333333333';
-    const identity = { subject: 'synthetic-owner', email: 'owner@example.invalid', assuranceLevel: 'aal2' };
+    const identity = {
+      subject: '44444444-4444-4444-8444-444444444444', email: 'owner@example.invalid', assuranceLevel: 'aal2',
+      sessionId: '55555555-5555-4555-8555-555555555555', authenticatedAt: new Date('2026-10-08T12:00:00.000Z'),
+    };
+    const expiredIdentity = { ...identity, sessionId: '66666666-6666-4666-8666-666666666666' };
+    const sessionChecks = [];
+    const sessionMutations = [];
+    const sessions = {
+      check: async (verifiedIdentity) => {
+        assert.ok(verifiedIdentity === identity || verifiedIdentity === expiredIdentity);
+        sessionChecks.push(verifiedIdentity.sessionId);
+        if (verifiedIdentity === expiredIdentity) {
+          throw new UnauthorizedException({ statusCode: 401, code: 'SESSION_IDLE_EXPIRED' });
+        }
+        return { sessionId: identity.sessionId, serverNow: '2026-10-08T12:01:00.000Z',
+          idleExpiresAt: '2026-10-08T13:00:00.000Z', idleTimeoutSeconds: 3600, warningSeconds: 120 };
+      },
+      activity: async () => { sessionMutations.push('activity'); throw new Error('Read routes must not extend sessions'); },
+      end: async () => { sessionMutations.push('end'); throw new Error('Read routes must not revoke sessions'); },
+    };
     let scopeReads = 0;
     let riskReads = 0;
     const database = {
@@ -75,9 +95,11 @@ async function runRuntimeProbe(removeInjection) {
         RiskAssessmentReader, RiskAssessmentProjector, MailboxRiskProjector,
         { provide: IdentityRiskPseudonymProvider, useValue: { configured: false, allowsScope: () => false } },
         { provide: PrismaService, useValue: database },
+        { provide: ConsoleSessionService, useValue: sessions },
         { provide: IdentityTokenVerifier, useValue: {
           verify: async (token) => {
             if (token === 'synthetic-valid') return identity;
+            if (token === 'synthetic-expired') return expiredIdentity;
             if (token === 'synthetic-aal1') return { ...identity, assuranceLevel: 'aal1' };
             throw new UnauthorizedException('Invalid synthetic token');
           },
@@ -85,7 +107,7 @@ async function runRuntimeProbe(removeInjection) {
         { provide: APP_GUARD, useClass: IdentityAuthGuard },
       ],
     })(ProbeModule);
-    const app = await NestFactory.create(ProbeModule, { logger: false });
+    const app = await NestFactory.create(ProbeModule, { logger: false, abortOnError: false });
     try {
       await app.init();
       const controller = app.get(IdentityRiskController);
@@ -96,6 +118,7 @@ async function runRuntimeProbe(removeInjection) {
           assert.throws(() => controller[method]({ auth: identity }, tenantId), TypeError);
         }
         assert.equal(scopeReads, 0);
+        assert.deepEqual(sessionChecks, []);
         console.log(JSON.stringify({ missingInjectionReproduced: true, failingMethods: 3 }));
       } else {
         assert.equal(controller.service, app.get(IdentityRiskService));
@@ -107,8 +130,10 @@ async function runRuntimeProbe(removeInjection) {
         const results = [];
         for (const route of routes) {
           const url = base + '/api/tenants/' + tenantId + '/' + route;
+          const sessionChecksBefore = sessionChecks.length;
           const response = await fetch(url, { headers: { Authorization: 'Bearer synthetic-valid' } });
           assert.equal(response.status, 200);
+          assert.deepEqual(sessionChecks.slice(sessionChecksBefore), [identity.sessionId]);
           assert.match(response.headers.get('content-type'), /^application\\/json/);
           const payload = await response.json();
           const body = route.endsWith('/assessment') ? payload.meta : payload;
@@ -139,15 +164,23 @@ async function runRuntimeProbe(removeInjection) {
             await denied.arrayBuffer();
           }
           assert.deepEqual({ scopeReads, riskReads }, readsBeforeDenial);
+          assert.equal(sessionChecks.length, sessionChecksBefore + 1, 'token/MFA denials must not reach the session store');
+          const expired = await fetch(url, { headers: { Authorization: 'Bearer synthetic-expired' } });
+          assert.equal(expired.status, 401);
+          assert.equal((await expired.json()).code, 'SESSION_IDLE_EXPIRED');
+          assert.deepEqual({ scopeReads, riskReads }, readsBeforeDenial, 'expired sessions must not reach protected reads');
+          assert.deepEqual(sessionChecks.slice(sessionChecksBefore), [identity.sessionId, expiredIdentity.sessionId]);
           const foreign = await fetch(base + '/api/tenants/' + foreignTenantId + '/' + route,
             { headers: { Authorization: 'Bearer synthetic-valid' } });
           assert.equal(foreign.status, 403);
           await foreign.arrayBuffer();
           assert.equal(riskReads, readsBeforeDenial.riskReads);
+          assert.deepEqual(sessionChecks.slice(sessionChecksBefore), [identity.sessionId, expiredIdentity.sessionId, identity.sessionId]);
           results.push({ route, authorized: 200, unauthenticated: 401, invalidToken: 401, insufficientAssurance: 403, crossOrganization: 403, status: body.status });
         }
-        console.log(JSON.stringify({ serviceInjected: true, results }));
+        console.log(JSON.stringify({ serviceInjected: true, sessionChecks: sessionChecks.length, results }));
       }
+      assert.deepEqual(sessionMutations, [], 'identity-risk reads must never extend or revoke sessions');
     } finally { await app.close(); }
   `
   const compiled = await build({
@@ -198,6 +231,7 @@ test('production esbuild negative control reproduces missing controller injectio
 test('production esbuild Nest DI serves guarded identity-risk HTTP envelopes with isolated scope', { timeout: 45_000 }, async () => {
   const result = await runRuntimeProbe(false)
   assert.equal(result.serviceInjected, true)
+  assert.equal(result.sessionChecks, 12)
   assert.equal(result.results.length, 4)
   assert.deepEqual(result.results.map((entry) => entry.status), ['NOT_EVALUATED', 'NOT_EVALUATED', 'UNAVAILABLE', 'NOT_EVALUATED'])
 })

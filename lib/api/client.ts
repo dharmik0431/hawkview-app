@@ -1,4 +1,5 @@
 import { buildHawkViewApiUrl } from '@/lib/config/public-runtime-config'
+import { assertIdleResponse, rejectIdleSession, requireIdleSession } from '@/lib/auth/idle-session-browser'
 
 const API_TIMEOUT_MS = 15_000
 
@@ -9,7 +10,9 @@ async function getIdentityToken() {
   const { data } = (await supabase?.auth.getSession()) ?? {
     data: { session: null },
   }
-  return data.session?.access_token ?? null
+  const token = data.session?.access_token ?? null
+  if (token) await requireIdleSession(token)
+  return token
 }
 
 interface FetchOptions extends RequestInit {
@@ -53,8 +56,9 @@ async function fetchApi<T>(
     : timeoutController.signal
 
   let response: Response
+  let identityToken: string | null = null
   try {
-    const identityToken = await getIdentityToken()
+    identityToken = await getIdentityToken()
     response = await fetch(url.href, {
       ...fetchOptions,
       signal,
@@ -80,6 +84,11 @@ async function fetchApi<T>(
 
   if (!response.ok) {
     const body = await response.json().catch(() => null)
+    const code = body?.error?.code ?? body?.code
+    if (response.status === 401 && identityToken &&
+      (code === 'SESSION_IDLE_EXPIRED' || code === 'SESSION_REAUTHENTICATION_REQUIRED')) {
+      rejectIdleSession(identityToken)
+    }
     throw new ApiError(
       response.status,
       body?.error?.message ||
@@ -101,7 +110,9 @@ async function fetchApi<T>(
     )
   }
 
-  return response.json() as Promise<T>
+  const result = await response.json() as T
+  if (identityToken) assertIdleResponse(identityToken)
+  return result
 }
 
 export const apiClient = {

@@ -96,6 +96,19 @@ enum MicrosoftConsentFlow {
   EXCHANGE_READ_ONLY
 }
 
+// Server-owned deadline and retained session tombstones. No user-deletion cascade.
+model ConsoleSession {
+  sessionId       String    @id @map("session_id") @db.Uuid
+  subject         String    @db.Uuid
+  authenticatedAt DateTime? @map("authenticated_at") @db.Timestamptz(6)
+  idleExpiresAt   DateTime  @map("idle_expires_at") @db.Timestamptz(6)
+  revokedAt       DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(dbgenerated("clock_timestamp()")) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @default(dbgenerated("clock_timestamp()")) @map("updated_at") @db.Timestamptz(6)
+
+  @@map("console_sessions")
+}
+
 model User {
   id                 String         @id @default(uuid()) @db.Uuid
   authProviderUserId String?        @unique @map("auth_provider_user_id") @db.VarChar(128)
