@@ -18,6 +18,7 @@ const expected = [
   "alerts/send-store.database-integration.test.ts",
   "alerts/suppressed-evidence-reader.database-integration.test.ts",
   "alerts/suppression-store.database-integration.test.ts",
+  "auth/console-session.database-integration.test.ts",
   "identity-risk/authentication-ingestion-capacity.database-integration.test.ts",
   "identity-risk/identity-risk-key.database-integration.test.ts",
   "identity-risk/native-alert-retention.database-integration.test.ts",
