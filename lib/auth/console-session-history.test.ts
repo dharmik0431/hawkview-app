@@ -198,7 +198,10 @@ async function mountPanel() {
   ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
   const pending: Pending[] = []
-  const calls: { signalAborted: () => boolean }[] = []
+  // E1: recording only `signalAborted` asserted my own bookkeeping, never the
+  // request. The endpoint and options are kept so the tests can check what the
+  // panel actually asked for.
+  const calls: { endpoint: string; options: any; signalAborted: () => boolean }[] = []
   let identityToken = 'identity-A'
   let signedIn = true
   let loading = false
@@ -212,15 +215,30 @@ async function mountPanel() {
   }
   const api = {
     apiClient: {
-      get: (_endpoint: string, options: any) => {
-        calls.push({ signalAborted: () => Boolean(options?.signal?.aborted) })
+      get: (endpoint: string, options: any) => {
+        calls.push({ endpoint, options, signalAborted: () => Boolean(options?.signal?.aborted) })
         return new Promise((resolve, reject) => pending.push({ resolve, reject }))
       },
+    },
+  }
+  // The panel's first act after admitting a reply is to parse it. Spying on the
+  // parser — delegating to the real one — is the only way a mounted test can see
+  // that an inadmissible reply was dropped: React 18 silently discards a state
+  // update into an unmounted tree, so an empty container proves nothing.
+  const parsed: unknown[] = []
+  const history = {
+    describeSessionState,
+    formatAsOfAge,
+    visibleForIdentity,
+    parseConsoleSessionHistory: (payload: unknown) => {
+      parsed.push(payload)
+      return parseConsoleSessionHistory(payload)
     },
   }
   const load = makeLoader({
     '@/components/providers/auth-provider': auth,
     '@/lib/api/client': api,
+    '@/lib/auth/console-session-history': history,
   })
 
   let root: any
@@ -248,9 +266,26 @@ async function mountPanel() {
       container,
       pending,
       calls,
+      parsed,
       release,
       settle: async (value: unknown) => { pending.shift()!.resolve(value); await act(async () => {}) },
       failNext: async (error: unknown) => { pending.shift()!.reject(error); await act(async () => {}) },
+      /** Settles a specific open request, so a reply can arrive out of order. */
+      settleAt: async (index: number, value: unknown) => {
+        pending.splice(index, 1)[0].resolve(value); await act(async () => {})
+      },
+      /** Unmounts without tearing down JSDOM, so a test can observe what
+       * unmounting does rather than only perform it in cleanup. */
+      unmount: async () => {
+        const current = root; root = null
+        await act(async () => { current.unmount() })
+      },
+      /** Drives the provider's readiness, which is what a session refresh or a
+       * sign-in check does in production. */
+      setReadiness: async (value: boolean) => {
+        loading = !value
+        await act(async () => { root.render(React.createElement(ConsoleSessionHistoryPanel)) })
+      },
       switchIdentity: async (token: string) => {
         identityToken = token
         await act(async () => { root.render(React.createElement(ConsoleSessionHistoryPanel)) })
@@ -335,13 +370,15 @@ test('mounted: old rows are not left on screen while a replacement is loading', 
   } finally { panel.release() }
 })
 
-test('mounted: a superseded reply is discarded when a newer request is in flight', async () => {
+test('mounted: a refresh replaces the previous result rather than merging it', async () => {
   const panel = await mountPanel()
   try {
     await panel.settle(envelope({ sessions: [row({ state: 'revoked' })] }))
     await panel.refresh()
     assert.equal(panel.pending.length, 1, 'the refresh issued a new request')
-    // Resolve the NEW request with distinguishable content, then the old one.
+    // This settles the refresh's own request. It does NOT witness a late prior
+    // reply — the first request was already resolved above — which is why the
+    // genuinely late case is a separate test below.
     await panel.settle(envelope({ sessions: [row({ state: 'expired' })] }))
     assert.match(panel.text(), /Ended by inactivity/)
     assert.doesNotMatch(panel.text(), /Signed out/)
@@ -360,6 +397,12 @@ test('mounted: A to B to A cannot paint the first identity’s rows', async () =
     stale.resolve(envelope({ sessions: [row({ state: 'revoked' })] }))
     await panel.settle(envelope({ returned: 0, sessions: [] }))
     assert.doesNotMatch(panel.text(), /Signed out/)
+    // E1: without this the test ends having painted nothing at all, so a panel
+    // that discarded *every* reply would pass it. The current A request must
+    // still be open, and its reply must be the one that renders.
+    assert.equal(panel.pending.length, 1, 'the second A read is still open')
+    await panel.settle(envelope({ sessions: [row({ state: 'expired' })] }))
+    assert.match(panel.text(), /Ended by inactivity/, 'the current A reply paints')
   } finally { panel.release() }
 })
 
@@ -441,5 +484,126 @@ test('mounted: a stale error after identity change does not overwrite the new st
     stale.reject(new Error('late failure'))
     await act(async () => {})
     assert.doesNotMatch(panel.text(), /cannot read your session history/)
+  } finally { panel.release() }
+})
+
+test('mounted: the read asks for the history endpoint, uncached, with its own abort signal', async () => {
+  // E1: the double previously recorded only whether a signal later aborted,
+  // which is an assertion about the double. A panel that requested the wrong
+  // path, omitted no-store or passed no signal at all would have passed.
+  const panel = await mountPanel()
+  try {
+    assert.equal(panel.calls.length, 1, 'mounting issues exactly one read')
+    const [first] = panel.calls
+    assert.equal(first.endpoint, '/auth/session/history')
+    // This pins what the panel asks for, not the guarantee: `lib/api/client.ts`
+    // spreads the caller's options and then sets `cache: 'no-store'` after the
+    // spread, so every request is uncached whatever the panel passes. Asserted
+    // anyway, because a panel that stopped asking would be relying on that
+    // client detail silently.
+    assert.equal(first.options.cache, 'no-store')
+    // The signal is not belt-and-braces: the client composes it with its own
+    // timeout via AbortSignal.any, so omitting it leaves nothing but the timeout
+    // able to cancel an in-flight read.
+    assert.ok(first.options.signal instanceof AbortSignal, 'an AbortSignal must be supplied')
+    assert.equal(first.signalAborted(), false, 'the signal is live while the read is in flight')
+
+    await panel.settle(envelope({ sessions: [row()] }))
+    await panel.refresh()
+    assert.equal(panel.calls.length, 2, 'refreshing issues a second read')
+    const [, second] = panel.calls
+    assert.equal(second.endpoint, '/auth/session/history')
+    assert.equal(second.options.cache, 'no-store')
+    assert.ok(second.options.signal instanceof AbortSignal)
+    // A shared controller would make one abort cancel an unrelated later read.
+    assert.notEqual(second.options.signal, first.options.signal, 'each read gets its own controller')
+  } finally { panel.release() }
+})
+
+test('mounted: unmounting with a read in flight aborts it, and a late success is dropped', async () => {
+  const panel = await mountPanel()
+  try {
+    // Positive control first: the spy demonstrably records an admitted reply in
+    // this very test, so the zero delta asserted below cannot come from a spy
+    // that never fires.
+    await panel.settle(envelope({ sessions: [row({ state: 'expired' })] }))
+    assert.equal(panel.parsed.length, 1, 'an admitted reply is parsed')
+
+    await panel.refresh()
+    assert.equal(panel.pending.length, 1, 'the refresh read is in flight')
+    await panel.unmount()
+    assert.equal(panel.calls[1].signalAborted(), true, 'unmounting aborts the in-flight read')
+
+    await panel.settle(envelope({ sessions: [row({ state: 'revoked' })] }))
+    // The decisive assertion. An empty container would be true either way —
+    // ReactDOM empties it on unmount and then discards the stale update — so the
+    // witness is that the reply was never even processed.
+    assert.equal(panel.parsed.length, 1, 'the post-unmount reply was never processed')
+    // Kept only as a sanity check on ReactDOM's own unmount contract; it is not
+    // evidence about the panel.
+    assert.equal(panel.container.textContent, '')
+  } finally { panel.release() }
+})
+
+test('mounted: unmounting with a read in flight swallows a late failure', async () => {
+  // The witness with teeth is the absence of an unhandled rejection: the read is
+  // fired as `void load()`, so a rejection the component does not handle escapes
+  // the process. What this test CANNOT witness is the admissibility guard on the
+  // failure path — nothing observable follows it, and React 18 discards the
+  // resulting state update in silence. That gap is stated in the report rather
+  // than papered over with a container assertion that cannot fail.
+  const unhandled: unknown[] = []
+  const record = (reason: unknown) => { unhandled.push(reason) }
+  process.on('unhandledRejection', record)
+  const panel = await mountPanel()
+  try {
+    assert.equal(panel.pending.length, 1)
+    await panel.unmount()
+    assert.equal(panel.calls[0].signalAborted(), true, 'unmounting aborts the in-flight read')
+    await panel.failNext(new Error('reply arrived after unmount'))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(unhandled, [], 'a late failure must be handled, not escape the component')
+  } finally { panel.release(); process.off('unhandledRejection', record) }
+})
+
+test('mounted: losing readiness while a read is pending aborts it and discards its reply', async () => {
+  const panel = await mountPanel()
+  try {
+    assert.equal(panel.pending.length, 1)
+    await panel.setReadiness(false)
+    assert.equal(panel.text(), '', 'nothing is rendered while readiness is lost')
+    assert.equal(panel.calls[0].signalAborted(), true, 'the pending read is aborted on readiness loss')
+
+    await panel.setReadiness(true)
+    assert.equal(panel.calls.length, 2, 'regaining readiness issues a fresh read')
+    // The reply to the pre-loss request arrives only now. Readiness returned and
+    // the identity never changed, so nothing but the generation guard stops it.
+    await panel.settle(envelope({ sessions: [row({ state: 'revoked' })] }))
+    assert.doesNotMatch(panel.text(), /Signed out/, 'the pre-loss reply must not paint')
+    await panel.settle(envelope({ sessions: [row({ state: 'expired' })] }))
+    assert.match(panel.text(), /Ended by inactivity/, 'the post-restore reply paints')
+  } finally { panel.release() }
+})
+
+test('mounted: a prior reply arriving after a newer one has painted does not overwrite it', async () => {
+  // E1: the test formerly named "a superseded reply" settled its first request
+  // before refreshing, so no late prior reply ever existed. The refresh control
+  // is disabled while loading — deliberately — so the only way to hold two
+  // same-identity reads open at once is a readiness transition.
+  const panel = await mountPanel()
+  try {
+    await panel.setReadiness(false)
+    await panel.setReadiness(true)
+    assert.equal(panel.pending.length, 2, 'the pre-loss read is still open alongside the new one')
+
+    // Newest reply first: it paints.
+    await panel.settleAt(1, envelope({ sessions: [row({ state: 'expired' })] }))
+    assert.match(panel.text(), /Ended by inactivity/)
+
+    // Now the genuinely late prior reply, with content chosen to be visible if
+    // it ever won.
+    await panel.settleAt(0, envelope({ sessions: [row({ state: 'revoked' })] }))
+    assert.match(panel.text(), /Ended by inactivity/, 'the newer result survives')
+    assert.doesNotMatch(panel.text(), /Signed out/, 'the late prior reply must not overwrite it')
   } finally { panel.release() }
 })
