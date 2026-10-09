@@ -3914,7 +3914,8 @@ function TenantDetailsWorkspace() {
     )
   }
 
-  function EntraPage({ bundle }: { bundle: any }) {
+  // Render directly so ordinary workspace updates preserve the collection-control subtree.
+  function renderEntraPage(bundle: any) {
     function HomePage() {
       return (
         <div className="mt-5 space-y-5">
@@ -5423,5 +5424,5 @@ function TenantDetailsWorkspace() {
       </div>
     )
   }
-  return <EntraPage bundle={bundle} />
+  return renderEntraPage(bundle)
 }
