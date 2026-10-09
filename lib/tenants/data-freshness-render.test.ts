@@ -49,7 +49,7 @@ function deferred() {
 function load(file: string): any {
   if (cache.has(file)) return cache.get(file)
   const exports: any = {}; cache.set(file, exports)
-  const js = ts.transpileModule(readFileSync(file, 'utf8'), { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true } }).outputText
+  const js = ts.transpileModule(readFileSync(file, 'utf8'), { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true }, fileName: file }).outputText
   new Function('require', 'exports', js)((name: string) => {
     if (name === '@/components/providers/auth-provider') return { useAuth: () => ({ cacheScope, isLoading: false }) }
     if (name === './client') return { apiClient: {
