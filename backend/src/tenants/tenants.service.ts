@@ -10,6 +10,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type VerificationPublication } from './connection-verification-store.js'
+import { captureCustomerConnectionVerification, publishCustomerConnectionVerification, CustomerConnectionVerificationSuperseded, type CustomerVerificationPublication } from './customer-connection-verification-store.js'
 import { readDirectoryRoleControl, setDirectoryRoleControl, directoryControlExpectation, removeManagedDirectoryTenant } from './directory-role-receipt-store.js'
 import { captureManagedAuthority } from '../microsoft/managed-connector-authority.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -22,7 +23,7 @@ import {
   SyncResourceType,
 } from '../generated/prisma/enums.js'
 import type { Prisma } from '../generated/prisma/client.js'
-import { CapturedVerificationCredentialsUnavailable, MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
+import { CapturedVerificationCredentialsUnavailable, CustomerVerificationCredentialsUnavailable, MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { issueConsentOperation, claimConsentOperation, finishConsentOperation, type ConsentOperationKey, type ConsentTerminal, type PreparedConsentResult } from '../microsoft/consent-operation-store.js'
 import { applyManagedConsentEffects } from '../microsoft/managed-consent-effects.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
@@ -534,88 +535,46 @@ export class TenantsService {
       throw new NotFoundException('Customer tenant connection was not found.')
     }
 
-    // Customer-managed credentials have no versioned capture seam. Preserve
-    // the existing path; its mutable-credential race is explicitly deferred.
     if (tenant.connection.connectionMode === 'CUSTOMER_MANAGED') {
-      const now = new Date()
+      const captured = await captureCustomerConnectionVerification(this.prisma, {
+        customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
+      })
+      if (!captured) {
+        throw new ServiceUnavailableException({ code: 'CUSTOMER_CONNECTION_VERIFICATION_UNAVAILABLE', message: 'This customer connection is unavailable for verification.' })
+      }
+      let result: CustomerVerificationPublication
       try {
         const verification = await this.microsoftConsent.verifyConnectedTenant({
-          microsoftTenantId: tenant.microsoftTenantId,
-          connectionMode:
-            tenant.connection.connectionMode === 'CUSTOMER_MANAGED'
-              ? 'CUSTOMER_MANAGED'
-              : 'HAWKVIEW_MANAGED',
-          clientId: tenant.connection.clientId,
-          credentialReference: tenant.connection.credentialReference,
+          microsoftTenantId: captured.tenant.microsoftTenantId,
+          connectionMode: 'CUSTOMER_MANAGED',
+          clientId: captured.connection.clientId,
+          credentialReference: captured.connection.credentialReference,
         })
-        const connected = verification.missingRequiredPermissions.length === 0
-
-        await this.prisma.$transaction([
-          this.prisma.customerTenant.update({
-            where: { id: tenant.id },
-            data: {
-              displayName: verification.displayName,
-              primaryDomain: verification.primaryDomain,
-              status: connected ? 'ACTIVE' : 'SUSPENDED',
-            },
-          }),
-          this.prisma.tenantConnection.update({
-            where: {
-              customerTenantId_organizationId: {
-                customerTenantId: tenant.id,
-                organizationId: tenant.organizationId,
-              },
-            },
-            data: {
-              status: connected ? 'CONNECTED' : 'ERROR',
-              consentedPermissions: preserveOptionalExchangeConsent(
-                verification.grantedPermissions,
-                tenant.connection.consentedPermissions
-              ),
-              lastVerifiedAt: now,
-              lastErrorCode: connected ? null : 'missing-permissions',
-              lastErrorMessage: connected
-                ? null
-                : `Missing connection-required permissions: ${verification.missingRequiredPermissions.join(', ')}`,
-            },
-          }),
-        ])
-
-        const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
-          where: { id: tenant.id },
-          select: this.tenantSelect(),
-        })
-        return { tenant: this.mapTenant(refreshed), connected }
+        result = { outcome: 'verified', ...verification }
       } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : 'Microsoft tenant verification failed.'
-        await this.prisma.$transaction([
-          this.prisma.customerTenant.update({
-            where: { id: tenant.id },
-            data: { status: 'SUSPENDED' },
-          }),
-          this.prisma.tenantConnection.update({
-            where: {
-              customerTenantId_organizationId: {
-                customerTenantId: tenant.id,
-                organizationId: tenant.organizationId,
-              },
-            },
-            data: {
-              status: 'ERROR',
-              consentedPermissions: [],
-              lastVerifiedAt: now,
-              lastErrorCode: 'connection-verification-failed',
-              lastErrorMessage: message.slice(0, 2000),
-            },
-          }),
-        ])
+        if (error instanceof CustomerVerificationCredentialsUnavailable) throw error
+        result = { outcome: 'failed', message: error instanceof Error ? error.message : 'Microsoft tenant verification failed.' }
+      }
+      // Publication, commit, response-read and mapping failures never become a second provider verdict.
+      let published: { connected: boolean }
+      try {
+        published = await publishCustomerConnectionVerification(this.prisma, captured, result)
+      } catch (error) {
+        if (error instanceof CustomerConnectionVerificationSuperseded) {
+          throw new ConflictException({ code: 'CONNECTION_VERIFICATION_SUPERSEDED', message: 'The connection changed during verification.' })
+        }
+        throw error
+      }
+      if (result.outcome === 'failed') {
         throw new BadGatewayException(
           'HawkView could not access this Microsoft tenant. Reauthorize the connection or remove the tenant.'
         )
       }
+      const refreshed = await this.prisma.customerTenant.findUniqueOrThrow({
+        where: { id: captured.tenant.id },
+        select: this.tenantSelect(),
+      })
+      return { tenant: this.mapTenant(refreshed), connected: published.connected }
     }
 
     const capture = await captureConnectionVerification(this.prisma, {

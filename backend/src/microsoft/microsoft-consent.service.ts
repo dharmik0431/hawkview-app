@@ -36,6 +36,13 @@ export class CapturedVerificationCredentialsUnavailable extends ServiceUnavailab
   }
 }
 
+/** Only customer credential resolution emits this; provider failures retain their existing policy. */
+export class CustomerVerificationCredentialsUnavailable extends ServiceUnavailableException {
+  constructor() {
+    super({ code: 'CUSTOMER_CREDENTIAL_UNAVAILABLE', message: 'Connection verification credentials are temporarily unavailable.' })
+  }
+}
+
 const GRAPH_RESOURCE_HOST = 'graph.microsoft.com'
 const MANAGEMENT_RESOURCE_HOST = 'manage.office.com'
 const SHAREPOINT_RESOURCE_APP_ID = '00000003-0000-0ff1-ce00-000000000000'
@@ -873,20 +880,23 @@ export class MicrosoftConsentService {
     clientId: string | null
     credentialReference: string | null
   }) {
-    const credentials =
-      input.connectionMode === 'CUSTOMER_MANAGED'
-        ? {
-            clientId: input.clientId ?? '',
-            clientSecret: input.credentialReference
-              ? await this.secretStore.access(input.credentialReference)
-              : '',
-          }
-        : await this.getManagedConnector()
-
-    if (!credentials.clientId || !credentials.clientSecret) {
-      throw new ServiceUnavailableException(
-        'The Microsoft tenant connection is incomplete.'
-      )
+    let credentials: { clientId: string; clientSecret: string }
+    if (input.connectionMode === 'CUSTOMER_MANAGED') {
+      const { clientId, credentialReference } = input
+      try {
+        if (!clientId || !credentialReference) throw new CustomerVerificationCredentialsUnavailable()
+        const clientSecret = await this.secretStore.access(credentialReference)
+        if (!clientSecret) throw new CustomerVerificationCredentialsUnavailable()
+        credentials = { clientId, clientSecret }
+      } catch {
+        // Secret-store errors are not Microsoft verdicts and must never expose storage details.
+        throw new CustomerVerificationCredentialsUnavailable()
+      }
+    } else {
+      credentials = await this.getManagedConnector()
+      if (!credentials.clientId || !credentials.clientSecret) {
+        throw new ServiceUnavailableException('The Microsoft tenant connection is incomplete.')
+      }
     }
 
     return this.verifyTenantWithCredentials(
