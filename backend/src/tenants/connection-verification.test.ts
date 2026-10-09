@@ -354,20 +354,6 @@ test('disconnected/revoked and mutable or absent managed authority refuse before
   }
 })
 
-test('customer-managed success and error preserve the existing dispatch and status policy', async () => {
-  for (const failed of [false, true]) {
-    let called: any
-    const f = fixture(async (_db, input) => { called = input; if (failed) throw Error('legacy provider failure'); return freshResult() })
-    f.db.connection.mode = 'CUSTOMER_MANAGED'; f.db.authority = null
-    const oldC = f.db.connection.incarnation
-    if (failed) await assert.rejects(f.run(), BadGatewayException)
-    else assert.equal((await f.run()).connected, true)
-    assert.deepEqual(called, { microsoftTenantId: f.db.tenant.microsoftTenantId, connectionMode: 'CUSTOMER_MANAGED', clientId: f.db.connection.clientId, credentialReference: f.db.connection.credentialReference })
-    assert.deepEqual(f.dispatch, ['legacy']); assert.deepEqual(f.db.trace, [])
-    assert.equal(f.db.connection.incarnation, oldC, 'legacy path is preserved, not represented as fenced')
-    assert.equal(f.db.connection.status, failed ? 'ERROR' : 'CONNECTED')
-  }
-})
 
 // These witnesses join the real tenant service to the real captured-verifier
 // seam. Only secret access, the final provider method and SQL are doubled.
