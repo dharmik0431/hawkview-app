@@ -152,7 +152,9 @@ test('database failure cannot return an optimistic extension', async () => {
 })
 
 test('actual guard enforces session checks on ordinary APIs and wires all three operations', async () => {
-  const { f, service, identity } = fixture(), controller = new ConsoleSessionController()
+  // The controller now takes the service for the self-only history read. The
+  // three operations asserted below still run through the guard unchanged.
+  const { f, service, identity } = fixture(), controller = new ConsoleSessionController(service)
   let verificationCalls = 0, currentIdentity = identity
   const guard = new IdentityAuthGuard(new Reflector(), { verify: async () => { verificationCalls++; return currentIdentity } } as never, service)
   const invoke = async (handler: Function, body?: unknown, query = {}) => {

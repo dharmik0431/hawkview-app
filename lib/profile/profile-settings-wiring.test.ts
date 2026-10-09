@@ -41,7 +41,18 @@ test('security page uses verified MFA factors and notification failures remain h
   const security = source('app/(protected)/profile/security/page.tsx')
   const mfaPanel = source('components/auth/mfa-security-panel.tsx')
   assert.match(security, /<MfaSecurityPanel \/>/)
-  assert.match(security, /Other active sessions are not listed/)
+  // The old sentence claimed other sessions are not listed. Recorded history is
+  // now listed below, so the current-browser block must only describe itself and
+  // must not re-assert the obsolete claim.
+  assert.match(security, /These details describe this browser only/)
+  assert.doesNotMatch(security, /Other active sessions are not listed/)
+  assert.match(security, /<ConsoleSessionHistoryPanel \/>/)
+  const historyPanel = source('components/auth/console-session-history-panel.tsx')
+  // The panel must keep saying what is not recorded, and must never claim the
+  // list proves anyone is signed in now.
+  assert.match(historyPanel, /no address, device or authentication method/)
+  assert.match(historyPanel, /not an organisation\s*\n?\s*access audit/)
+  assert.doesNotMatch(historyPanel, /currently online|active now/)
   assert.match(mfaPanel, /mfa\.factors\.map/)
   assert.match(mfaPanel, /supabase\.auth\.mfa\.unenroll/)
   assert.match(mfaPanel, /Required · Enabled/)

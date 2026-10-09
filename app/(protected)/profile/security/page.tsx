@@ -8,6 +8,7 @@ import { buildHawkViewAppUrl } from '@/lib/config/public-runtime-config'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { MfaSecurityPanel } from '@/components/auth/mfa-security-panel'
+import { ConsoleSessionHistoryPanel } from '@/components/auth/console-session-history-panel'
 import {
   KeyRound,
   Laptop,
@@ -283,11 +284,13 @@ export default function SecuritySettingsPage() {
           <div className="text-right text-xs text-muted-foreground">
             <p className="font-medium text-foreground">Signed in</p>
             <p className="text-[11px] text-muted-foreground">
-              Other active sessions are not listed
+              These details describe this browser only
             </p>
           </div>
         </div>
       </div>
+
+      <ConsoleSessionHistoryPanel />
 
       {/* RESET PASSWORD CONFIRMATION MODAL */}
       {isResetDialogOpen && (
