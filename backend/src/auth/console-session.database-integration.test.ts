@@ -130,6 +130,76 @@ test('console inactivity deadlines with actual migrated PostgreSQL transactions'
         await Promise.allSettled([pending]); blocker.release()
       }
     })
+
+    await t.test('self-only history isolation, ordering and truncation against actual SQL', async () => {
+      // The unit suite proves the reader's shape with a double, so removing the
+      // subject predicate there trips a SQL-shape assertion before any row is
+      // returned. Only real SQL shows that the predicate is what withholds
+      // another subject's rows, so the behavioural isolation proof lives here.
+      const mine = await identity(), theirs = await identity()
+      const base = await now()
+      const insert = (subject: string, sessionId: string, createdAt: Date) =>
+        observer.query(
+          `INSERT INTO ${schema}.console_sessions
+             (session_id,subject,authenticated_at,idle_expires_at,revoked_at,created_at,updated_at)
+           VALUES ($1::uuid,$2::uuid,$3::timestamptz,$4::timestamptz,NULL,$3::timestamptz,$3::timestamptz)`,
+          [sessionId, subject, createdAt, new Date(base.getTime() + 600000)]
+        )
+
+      await insert(theirs.subject, theirs.sessionId!, new Date(base.getTime() - 1000))
+
+      const empty = await service.history(mine)
+      assert.equal(empty.returned, 0, 'another subject’s rows must not be visible')
+      assert.equal(empty.sessions.length, 0)
+      assert.ok(Number.isFinite(Date.parse(empty.generatedAt)), 'clock returned even with zero rows')
+
+      // Tied created_at must break deterministically on session_id DESC.
+      // Asserting equal createdAt values could never fail, so each row carries a
+      // DISTINCT permitted field — its idle deadline — chosen by rank, making
+      // the resulting order observable without exposing any identifier.
+      const tied = new Date(base.getTime() - 500)
+      const ids = [randomUUID(), randomUUID()].sort()
+      const [lowerId, higherId] = ids
+      const deadlineFor = new Map<string, Date>([
+        [lowerId, new Date(base.getTime() + 300000)],
+        [higherId, new Date(base.getTime() + 900000)],
+      ])
+      for (const sessionId of ids) {
+        await observer.query(
+          `INSERT INTO ${schema}.console_sessions
+             (session_id,subject,authenticated_at,idle_expires_at,revoked_at,created_at,updated_at)
+           VALUES ($1::uuid,$2::uuid,$3::timestamptz,$4::timestamptz,NULL,$3::timestamptz,$3::timestamptz)`,
+          [sessionId, mine.subject, tied, deadlineFor.get(sessionId)]
+        )
+      }
+      const ordered = await service.history(mine)
+      assert.equal(ordered.returned, 2)
+      assert.equal(ordered.truncated, false)
+      // session_id DESC puts the higher id first; its distinct deadline proves it.
+      assert.deepEqual(
+        ordered.sessions.map(row => row.idleExpiresAt),
+        [deadlineFor.get(higherId)!.toISOString(), deadlineFor.get(lowerId)!.toISOString()],
+        'tied created_at must break on session_id DESC'
+      )
+      assert.deepEqual(ordered.sessions.map(row => row.createdAt), [tied.toISOString(), tied.toISOString()])
+
+      // 51 recorded rows report exactly 50 and flag truncation.
+      for (let index = 0; index < 49; index++) {
+        await insert(mine.subject, randomUUID(), new Date(base.getTime() - 2000 - index))
+      }
+      const atLimit = await service.history(mine)
+      assert.equal(atLimit.returned, 50)
+      assert.equal(atLimit.sessions.length, 50)
+      assert.equal(atLimit.truncated, true)
+
+      // The reader writes nothing: row count and updated_at are untouched.
+      const after = await observer.query(
+        `SELECT count(*)::int AS total, max(updated_at) AS newest FROM ${schema}.console_sessions WHERE subject=$1::uuid`,
+        [mine.subject]
+      )
+      assert.equal(after.rows[0].total, 51)
+      assert.equal(after.rows[0].newest.getTime(), tied.getTime())
+    })
   } finally {
     await prisma.$disconnect()
     if (created) await observer.query(`DROP SCHEMA ${schema} CASCADE`)

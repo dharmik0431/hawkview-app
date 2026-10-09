@@ -10,6 +10,80 @@ import { RiskHistoryRetention, riskHistoryRetentionConfig, HISTORY_BATCH_ROWS, H
 import { withRiskKeyTransaction, withRiskRetentionTransaction } from './mailbox-read-transaction.js'
 
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
+
+// PostgreSQL can implement the same bounded primary-key probe as either a
+// direct index scan or an exact bitmap heap/index pair. Validate the binding
+// and measured work, rather than assuming the parent node owns Index Cond.
+function assertUniqueParentProbe(scan: any) {
+  const bounded = (node: any) => {
+    assert.ok(Number.isInteger(node['Actual Rows']) && node['Actual Rows'] >= 0 && node['Actual Rows'] <= 1, 'Parent probe rows must remain at most one')
+    assert.ok(Number.isInteger(node['Actual Loops']) && node['Actual Loops'] > 0 && node['Actual Loops'] <= HISTORY_BATCH_ROWS, 'Parent probe loops must remain within the batch')
+  }
+  const binding = /^\(id = [a-zA-Z_][a-zA-Z_0-9]*\.matched_result_id\)$/
+  bounded(scan)
+  if (scan['Node Type'] === 'Bitmap Heap Scan') {
+    assert.equal(scan.Plans?.length, 1, 'Bitmap parent must have exactly one immediate index child')
+    const child = scan.Plans[0]
+    assert.equal(child['Node Type'], 'Bitmap Index Scan', 'Bitmap child must be a direct index scan, not a mixture')
+    assert.equal(child.Plans?.length ?? 0, 0, 'Bitmap index child must not wrap another plan')
+    assert.equal(child['Index Name'], 'identity_risk_matched_results_pkey', 'Bitmap child must use the unique primary key')
+    assert.match(child['Index Cond'] ?? '', binding, 'Bitmap index condition must bind the unique ID to this finding')
+    assert.match(scan['Recheck Cond'] ?? '', binding, 'Bitmap recheck must bind the unique ID to this finding')
+    assert.equal(scan['Recheck Cond'], child['Index Cond'], 'Bitmap parent and child must bind the same finding')
+    assert.equal(scan['Lossy Heap Blocks'], 0, 'Bitmap parent must not use lossy blocks')
+    assert.equal(scan['Rows Removed by Index Recheck'], 0, 'Bitmap recheck must not discard extra rows')
+    bounded(child)
+    assert.equal(child['Actual Loops'], scan['Actual Loops'], 'Bitmap parent and child loops must agree')
+  } else {
+    assert.ok(['Index Scan', 'Index Only Scan'].includes(scan['Node Type']), 'Unique parent probes must use an index')
+    assert.match(scan['Index Cond'] ?? '', binding, 'Parent index condition must bind the unique ID to this finding')
+  }
+}
+
+test('history: unique parent plan validation admits exact index probes and rejects broad alternatives', async t => {
+  // Structural fields from the failing disposable-CI plan; no tenant data or
+  // database connection. Each rejected arm has its own diagnostic witness.
+  const bitmap = () => ({
+    'Node Type': 'Bitmap Heap Scan', 'Relation Name': 'identity_risk_matched_results', Alias: 'p',
+    'Actual Rows': 1, 'Actual Loops': 256, 'Recheck Cond': '(id = x_2.matched_result_id)',
+    'Lossy Heap Blocks': 0, 'Rows Removed by Index Recheck': 0,
+    Plans: [{ 'Node Type': 'Bitmap Index Scan', 'Index Name': 'identity_risk_matched_results_pkey',
+      'Index Cond': '(id = x_2.matched_result_id)', 'Actual Rows': 1, 'Actual Loops': 256 }],
+  })
+  await t.test('captured exact primary-key bitmap probe is admitted', () => assertUniqueParentProbe(bitmap()))
+  for (const kind of ['Index Scan', 'Index Only Scan']) {
+    await t.test(`${kind} unique probe remains admitted`, () => assertUniqueParentProbe({
+      'Node Type': kind, 'Index Cond': '(id = x_2.matched_result_id)', 'Actual Rows': 1, 'Actual Loops': 256,
+    }))
+  }
+  const rejected: Array<[string, (plan: any) => void, RegExp]> = [
+    ['sequential scan', p => { p['Node Type'] = 'Seq Scan' }, /must use an index/],
+    ['wrong bitmap index', p => { p.Plans[0]['Index Name'] = 'tenant_scope_index' }, /unique primary key/],
+    ['unbound bitmap index condition', p => { p.Plans[0]['Index Cond'] = '(customer_tenant_id = x_2.customer_tenant_id)' }, /Bitmap index condition/],
+    ['unbound parent recheck', p => { p['Recheck Cond'] = '(customer_tenant_id = x_2.customer_tenant_id)' }, /Bitmap recheck must bind/],
+    ['different parent and child bindings', p => { p['Recheck Cond'] = '(id = other.matched_result_id)' }, /same finding/],
+    ['multiple immediate children', p => { p.Plans.push({ ...p.Plans[0] }) }, /exactly one immediate/],
+    ['missing immediate child', p => { p.Plans = [] }, /exactly one immediate/],
+    ['bitmap OR mixture', p => { p.Plans[0]['Node Type'] = 'BitmapOr' }, /not a mixture/],
+    ['bitmap AND mixture', p => { p.Plans[0]['Node Type'] = 'BitmapAnd' }, /not a mixture/],
+    ['nested bitmap child', p => { p.Plans[0].Plans = [{}] }, /must not wrap/],
+    ['lossy blocks', p => { p['Lossy Heap Blocks'] = 1 }, /must not use lossy/],
+    ['recheck discards rows', p => { p['Rows Removed by Index Recheck'] = 1 }, /must not discard/],
+    ['too many parent rows', p => { p['Actual Rows'] = 2 }, /rows must remain/],
+    ['too many child rows', p => { p.Plans[0]['Actual Rows'] = 2 }, /rows must remain/],
+    ['too many parent loops', p => { p['Actual Loops'] = HISTORY_BATCH_ROWS + 1 }, /loops must remain/],
+    ['too many child loops', p => { p.Plans[0]['Actual Loops'] = HISTORY_BATCH_ROWS + 1 }, /loops must remain/],
+    ['zero loops', p => { p['Actual Loops'] = 0 }, /loops must remain/],
+    ['disagreeing loops', p => { p.Plans[0]['Actual Loops'] = 1 }, /loops must agree/],
+    ['unbound direct index', p => { p['Node Type'] = 'Index Scan'; p['Index Cond'] = '(customer_tenant_id = x_2.customer_tenant_id)' }, /Parent index condition/],
+  ]
+  for (const [name, mutate, reason] of rejected) {
+    await t.test(`rejects ${name}`, () => {
+      const plan = bitmap(); mutate(plan)
+      assert.throws(() => assertUniqueParentProbe(plan), reason)
+    })
+  }
+})
 type Scope = { organizationId: string; customerTenantId: string }
 async function fixture(work: (f: { c: pg.Client; prisma: PrismaService; scopes: Scope[]; worker: RiskHistoryRetention; config: NonNullable<ReturnType<typeof riskHistoryRetentionConfig>>; lease: { key: string; id: string } }) => Promise<void>) {
   const url = assertDisposableTestDatabase()
@@ -564,12 +638,7 @@ test('history: real maximum normal graph drains incrementally with evaluation OF
     }
     visit(inspectedPlan)
     assert.ok(parentScans.length>0)
-    for(const scan of parentScans) {
-      assert.ok(String(scan['Node Type']).includes('Index'),'Unique parent probes must not scan all tenant matches')
-      assert.match(scan['Index Cond']??'',/\bid\s*=\s*[^=]*\bmatched_result_id\b/,'Parent index condition must bind the unique ID to this finding')
-      assert.ok(scan['Actual Rows']<=1)
-      assert.ok(scan['Actual Loops']>0 && scan['Actual Loops']<=HISTORY_BATCH_ROWS)
-    }
+    for(const scan of parentScans) assertUniqueParentProbe(scan)
     assert.equal(candidateSets.length,2)
     for(const set of candidateSets)assert.ok(set['Actual Rows']*set['Actual Loops']<=HISTORY_BATCH_ROWS)
     console.info(JSON.stringify({syntheticRetentionPlan:{parentRowsPerLoop:parentScans.map(s=>s['Actual Rows']),parentLoops:parentScans.map(s=>s['Actual Loops']),candidateRows:candidateSets.map(s=>s['Actual Rows']*s['Actual Loops'])}}))
