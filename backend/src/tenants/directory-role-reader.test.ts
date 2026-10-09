@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { before, after } from 'node:test'
+const originalFetch = globalThis.fetch
+before(() => { globalThis.fetch = async () => { throw new Error('External network forbidden') } })
+after(() => { globalThis.fetch = originalFetch })
 import { createHash } from 'node:crypto'
 import { readDirectoryRoleResults, DIRECTORY_ROLE_CURRENT_MS } from './directory-role-reader.js'
 
@@ -46,11 +49,12 @@ function db(rows: unknown[], authority: unknown[] = [{ configurationRevision: RE
     statements,
     $transaction: async (work: (tx: unknown) => Promise<unknown>) => work({
       $queryRawUnsafe: async (query: string) => {
+        assert.doesNotMatch(query, /\b(?:INSERT|UPDATE|DELETE|TRUNCATE|CREATE|ALTER|DROP)\b/i, 'reader query must be read-only')
         if (query.includes('directory-role-results:coherent-read')) { statements.push('coherent-read'); return rows }
         if (query.includes('pg_advisory')) { statements.push('authority-lock'); return [{ locked: 1 }] }
         statements.push('authority-row'); return authority
       },
-      $executeRawUnsafe: async () => 0,
+      $executeRawUnsafe: async () => { throw new Error('Reader must not write') },
     }),
   } as never
 }
@@ -165,3 +169,62 @@ test('age comes from the read clock against the receipt clock, and crosses into 
   assert.equal(result.observation?.checkedAt, old.toISOString())
   assert.equal(result.observation?.ageMs, READ_AT.getTime() - old.getTime())
 })
+
+
+// Every reason is tied to an existing trust refusal, rather than inferred provider diagnostics.
+const refusals: Array<[string, string, string, Record<string, unknown>]> = [
+  ['not-activated', 'ACTIVATION_EVIDENCE_UNAVAILABLE', 'REVIEW_SOURCE_CONTROL', { scopeVersion: null }],
+  ['not-activated', 'ACTIVATION_EVIDENCE_UNAVAILABLE', 'REVIEW_SOURCE_CONTROL', { scopeIncarnation: null }],
+  ['never-collected', 'NO_COMPLETE_RECEIPT', 'AWAIT_NORMAL_COLLECTION', { completeId: null }],
+  ['never-collected', 'NO_COMPLETE_RECEIPT', 'AWAIT_NORMAL_COLLECTION', { completeCheckedAt: null }],
+  ...[{ tenantStatus: 'SUSPENDED' }, { tenantStatus: 'DISCONNECTED' }, { connectionStatus: 'ERROR' }, { connectionStatus: 'REVOKED' }, { connectionMode: 'CUSTOMER_MANAGED' }, { connectionIncarnation: null }].map(overrides => ['superseded', 'CURRENT_ELIGIBILITY_UNAVAILABLE', 'REVIEW_CONNECTION_SETUP', overrides] as [string, string, string, Record<string, unknown>]),
+  ...[{ completeScopeVersion: 'old' }, { completeMicrosoftTenantId: PRINCIPAL }, { completeScope: PRINCIPAL }, { completeConnection: PRINCIPAL }, { completeConfiguration: PRINCIPAL }].map(overrides => ['superseded', 'RECEIPT_BINDING_CHANGED', 'REQUIRE_NEW_COMPLETE_OBSERVATION', overrides] as [string, string, string, Record<string, unknown>]),
+  ...[{ snapshotAttemptId: null }, { snapshotAttemptId: PRINCIPAL }, { snapshotObservedAt: null }].map(overrides => ['superseded', 'SNAPSHOT_BINDING_UNVERIFIED', 'REREAD_OR_REPORT', overrides] as [string, string, string, Record<string, unknown>]),
+  ['superseded', 'PUBLICATION_TIME_MISMATCH', 'REREAD_OR_REPORT', { snapshotObservedAt: new Date(CHECKED.getTime() + 1) }],
+  ['superseded', 'STORED_PAYLOAD_INVALID', 'REREAD_OR_REPORT', { snapshotPayload: [{}], completeCount: 0 }],
+  ['superseded', 'STORED_CONTENT_MISMATCH', 'REREAD_OR_REPORT', { completeDigest: 'private-digest' }],
+  ['superseded', 'STORED_CONTENT_MISMATCH', 'REREAD_OR_REPORT', { completeCount: 2 }],
+]
+for (const [status, reasonCode, recoveryCode, overrides] of refusals) {
+  test(`health explains ${reasonCode}: ${JSON.stringify(overrides)}`, async () => {
+    const result = await readDirectoryRoleResults(db([row(overrides)]), input)
+    assert.equal(result.status, status)
+    assert.equal(result.observation, null)
+    assert.deepEqual(result.health, { version: 1, reasonCode, recoveryCode })
+    for (const value of [ORG, TEN, REVISION, INCARNATION, SCOPE_INCARNATION, COMPLETE_ID, 'private-digest']) {
+      assert.equal(JSON.stringify(result.health).includes(value), false)
+    }
+  })
+}
+
+test('eligibility explanation wins over binding; absent and mutable authority fail eligibility', async () => {
+  for (const authority of [[], [{ configurationRevision: REVISION, clientId: 'c', homeTenantId: MSFT, credentialReference: 'encrypted-secret:other', operationId: null, fingerprint: null }]]) {
+    const result = await readDirectoryRoleResults(db([row({ completeConfiguration: PRINCIPAL })], authority), input)
+    assert.equal(result.health?.reasonCode, 'CURRENT_ELIGIBILITY_UNAVAILABLE')
+    assert.equal(result.observation, null)
+  }
+  assert.equal((await readDirectoryRoleResults(db([]), input)).health?.reasonCode, 'ACTIVATION_EVIDENCE_UNAVAILABLE')
+})
+
+for (const count of [0, 1]) for (const ageMs of [60_000, DIRECTORY_ROLE_CURRENT_MS, DIRECTORY_ROLE_CURRENT_MS + 1]) {
+  test(`complete health keeps exact boundary: ${count} rows at ${ageMs}ms`, async () => {
+    const checkedAt = new Date(READ_AT.getTime() - ageMs)
+    const result = await readDirectoryRoleResults(db([row({ snapshotPayload: count ? [ROW] : [], completeCheckedAt: checkedAt, snapshotObservedAt: checkedAt })]), input)
+    const stale = ageMs > DIRECTORY_ROLE_CURRENT_MS
+    assert.equal(result.status, stale ? 'stale' : 'current')
+    assert.deepEqual(result.health, { version: 1, reasonCode: stale ? 'COMPLETE_OBSERVATION_STALE' : count ? 'COMPLETE_OBSERVATION_CURRENT' : 'COMPLETE_EMPTY_CURRENT', recoveryCode: stale ? 'AWAIT_NORMAL_COLLECTION' : 'NONE' })
+    assert.equal(result.observation?.ageMs, ageMs)
+    assert.equal(result.observation?.verifiedCompleteEmpty, count === 0)
+  })
+}
+
+for (const outcome of ['FAILED', 'PARTIAL', 'EXPIRED', 'RUNNING']) for (const completed of [false, true]) {
+  test(`${outcome} remains separately recorded with prior complete=${completed}`, async () => {
+    const terminal = outcome === 'RUNNING' ? null : CHECKED
+    const result = await readDirectoryRoleResults(db([row({ attemptOutcome: outcome, attemptTerminalAt: terminal, ...(completed ? {} : { completeId: null }) })]), input)
+    assert.deepEqual(result.latestAttempt, { outcome, terminalAt: terminal?.toISOString() ?? null })
+    assert.equal(result.status, completed ? 'current' : 'never-collected')
+    assert.equal(result.health?.reasonCode, completed ? 'COMPLETE_OBSERVATION_CURRENT' : 'NO_COMPLETE_RECEIPT')
+    assert.equal(result.observation?.observedCount ?? null, completed ? 1 : null)
+  })
+}

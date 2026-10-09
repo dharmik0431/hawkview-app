@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, resolve as resolvePath } from 'node:path'
-import test from 'node:test'
+import test, { before, after } from 'node:test'
+const originalFetch = globalThis.fetch
+before(() => { globalThis.fetch = async () => { throw new Error('External network forbidden') } })
+after(() => { globalThis.fetch = originalFetch })
 import { parseDirectoryRoleResults } from './directory-role-results-view.ts'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -185,7 +188,7 @@ test('an unactivated tenant says HawkView cannot vouch, and never shows a zero',
   const panel = renderPanel({ data: view('not-activated', null) })
   try {
     const text = panel.text()
-    assert.match(text, /not switched on for this tenant/)
+    assert.match(text, /Usable activation evidence is unavailable/)
     assert.match(text, /cannot vouch for any stored results/)
     // The named source string contains "v1.0", so a bare digit check would match the source line
     // rather than a count. Scope the check to the text that is not the source attribution.
@@ -229,10 +232,11 @@ test('observed rows render identifiers, with an id as a valid name fallback', ()
   } finally { panel.cleanup() }
 })
 
-test('superseded reports the connection change instead of showing stale rows as current', () => {
+test('superseded without health refuses stored rows without guessing a connection change', () => {
   const panel = renderPanel({ data: view('superseded', null) })
   try {
-    assert.match(panel.text(), /connection changed after these results were stored/)
+    assert.match(panel.text(), /cannot currently verify the stored directory role results/)
+    assert.doesNotMatch(panel.text(), /connection changed|once a fresh collection completes/)
     assert.equal(panel.text().includes('assignment-SENTINEL-1'), false)
   } finally { panel.cleanup() }
 })
@@ -355,4 +359,87 @@ test('the panel asks for the tenant it was given, and renders nothing without on
   try {
     assert.equal(none.container.innerHTML, '')
   } finally { none.cleanup() }
+})
+
+
+const healthCases = [
+  ['not-activated', null, 'ACTIVATION_EVIDENCE_UNAVAILABLE', 'REVIEW_SOURCE_CONTROL'],
+  ['never-collected', null, 'NO_COMPLETE_RECEIPT', 'AWAIT_NORMAL_COLLECTION'],
+  ['superseded', null, 'CURRENT_ELIGIBILITY_UNAVAILABLE', 'REVIEW_CONNECTION_SETUP'],
+  ['superseded', null, 'RECEIPT_BINDING_CHANGED', 'REQUIRE_NEW_COMPLETE_OBSERVATION'],
+  ['superseded', null, 'SNAPSHOT_BINDING_UNVERIFIED', 'REREAD_OR_REPORT'],
+  ['superseded', null, 'PUBLICATION_TIME_MISMATCH', 'REREAD_OR_REPORT'],
+  ['superseded', null, 'STORED_PAYLOAD_INVALID', 'REREAD_OR_REPORT'],
+  ['superseded', null, 'STORED_CONTENT_MISMATCH', 'REREAD_OR_REPORT'],
+  ['current', observed([ROW]), 'COMPLETE_OBSERVATION_CURRENT', 'NONE'],
+  ['current', observed([]), 'COMPLETE_EMPTY_CURRENT', 'NONE'],
+  ['stale', observed([ROW], { ageMs: 7_200_000 }), 'COMPLETE_OBSERVATION_STALE', 'AWAIT_NORMAL_COLLECTION'],
+] as const
+function answer(status: string, observation: unknown, health?: unknown) {
+  return { responseVersion: RESPONSE_VERSION, source: SOURCE, status, observation, latestAttempt: { outcome: null, terminalAt: null }, ...(health === undefined ? {} : { health }) }
+}
+
+for (const [status, observation, reasonCode, recoveryCode] of healthCases) {
+  test(`actual parser admits only matching health: ${reasonCode}`, () => {
+    const health = { version: 1, reasonCode, recoveryCode }
+    const parsed = parseDirectoryRoleResults(answer(status, observation, health))!
+    assert.deepEqual(parsed.health, health)
+    assert.equal(parsed.status, status)
+    assert.deepEqual(parsed.observation, parseDirectoryRoleResults(answer(status, observation))?.observation)
+    // A valid explanation still cannot make an otherwise contradictory observation readable.
+    assert.equal(parseDirectoryRoleResults(answer(status, observation === null ? observed([]) : null, health)), null)
+  })
+
+  test(`invalid explanations render EXACTLY the no-health baseline for ${reasonCode}`, () => {
+    const baseline = parseDirectoryRoleResults(answer(status, observation))!
+    const plain = renderPanel({ data: baseline })
+    let expected: string
+    try { expected = plain.container.innerHTML } finally { plain.cleanup() }
+    for (const health of [null, [], 'current', {}, { version: 2, reasonCode, recoveryCode }, { version: 1, reasonCode: 'SECRET-unknown', recoveryCode }, { version: 1, reasonCode, recoveryCode: 'WRONG' }, { version: 1, reasonCode: status === 'superseded' ? 'COMPLETE_EMPTY_CURRENT' : 'STORED_CONTENT_MISMATCH', recoveryCode: status === 'superseded' ? 'NONE' : 'REREAD_OR_REPORT' }]) {
+      const parsed = parseDirectoryRoleResults(answer(status, observation, health))!
+      assert.deepEqual(parsed, baseline, JSON.stringify(health))
+      const panel = renderPanel({ data: parsed })
+      try { assert.equal(panel.container.innerHTML, expected!, JSON.stringify(health)) } finally { panel.cleanup() }
+    }
+  })
+}
+
+test('wrong current count explanation falls back byte-for-byte without discarding trusted rows', () => {
+  for (const [rows, reasonCode] of [[[], 'COMPLETE_OBSERVATION_CURRENT'], [[ROW], 'COMPLETE_EMPTY_CURRENT']] as const) {
+    const raw = answer('current', observed([...rows]), { version: 1, reasonCode, recoveryCode: 'NONE' })
+    const parsed = parseDirectoryRoleResults(raw)!
+    assert.deepEqual(parsed, parseDirectoryRoleResults(answer('current', raw.observation)))
+    const first = renderPanel({ data: parsed }); let rendered: string
+    try { rendered = first.container.innerHTML } finally { first.cleanup() }
+    const second = renderPanel({ data: parseDirectoryRoleResults(answer('current', raw.observation))! })
+    try { assert.equal(second.container.innerHTML, rendered!) } finally { second.cleanup() }
+  }
+})
+
+test('payload and publication verification explanations never diagnose connection changes', () => {
+  for (const reasonCode of ['SNAPSHOT_BINDING_UNVERIFIED', 'PUBLICATION_TIME_MISMATCH', 'STORED_PAYLOAD_INVALID', 'STORED_CONTENT_MISMATCH']) {
+    const panel = renderPanel({ data: parseDirectoryRoleResults(answer('superseded', null, { version: 1, reasonCode, recoveryCode: 'REREAD_OR_REPORT' }))! })
+    try {
+      assert.match(panel.text(), /stored|Stored/)
+      assert.match(panel.text(), /Re-read stored results.*report it for investigation/)
+      assert.doesNotMatch(panel.text(), /connection changed|reconnect|assignment-SENTINEL|RAW-UPSTREAM|digest-SENTINEL/)
+    } finally { panel.cleanup() }
+  }
+})
+
+test('locally aged health replaces CURRENT explanation and keeps failed attempt terminal clock separate', async () => {
+  const realNow = Date.now; let clock = Date.parse('2026-10-07T08:00:00Z'); Date.now = () => clock
+  const raw = { ...answer('current', observed([]), { version: 1, reasonCode: 'COMPLETE_EMPTY_CURRENT', recoveryCode: 'NONE' }), latestAttempt: { outcome: 'FAILED', terminalAt: '2026-10-07T07:00:00Z' } }
+  const panel = renderPanel({ data: parseDirectoryRoleResults(raw)!, dataUpdatedAt: clock })
+  try {
+    assert.match(panel.text(), /within the one-hour/)
+    assert.match(panel.text(), /most recent collection attempt failed/)
+    assert.equal(panel.container.querySelectorAll('time').length, 2)
+    clock += 3_600_000; panel.resume()
+    await act(async () => { await Promise.resolve() })
+    assert.match(panel.text(), /older than the one-hour/)
+    assert.match(panel.text(), /Normal scheduling is daily/)
+    assert.match(panel.text(), /No directory role assignments were found/)
+    assert.doesNotMatch(panel.text(), /within the one-hour|permission|throttl/i)
+  } finally { panel.cleanup(); Date.now = realNow }
 })
