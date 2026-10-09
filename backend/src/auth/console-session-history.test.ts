@@ -41,13 +41,26 @@ function fixture() {
           f.binds.push(values)
           assert.ok(!sql.includes('pg_advisory_xact_lock'), 'history must not take the advisory lock')
           assert.ok(!/FOR UPDATE/i.test(sql), 'history must not lock rows')
-          assert.match(sql, /FROM console_sessions/)
-          assert.match(sql, /WHERE subject=\$1::uuid/)
-          assert.match(sql, /ORDER BY created_at DESC, session_id DESC/)
-          assert.match(sql, new RegExp(`LIMIT ${CONSOLE_SESSION_HISTORY_LIMIT + 1}`))
-          assert.match(sql, /LEFT JOIN LATERAL/)
           const now = f.clockBroken ? new Date(NaN) : new Date(f.now)
-          const mine = stored.filter(row => row.subject === values[0])
+
+          // SQL-SEMANTIC WITNESS. The returned rows honour the predicate the
+          // statement actually contains, rather than filtering unconditionally.
+          // That is what makes the isolation mutation real: delete the subject
+          // predicate from the reader and another subject's rows genuinely
+          // arrive here and fail the isolation assertion, instead of tripping a
+          // shape assertion before any row is produced. SQL shape is asserted
+          // separately, in its own test, so it cannot pre-empt this one.
+          const scoped = /WHERE\s+subject=\$1::uuid/.test(sql)
+          const ordered = /ORDER BY created_at DESC, session_id DESC/.test(sql)
+          const limited = new RegExp(`LIMIT ${CONSOLE_SESSION_HISTORY_LIMIT + 1}`).test(sql)
+          const selected = scoped ? stored.filter(row => row.subject === values[0]) : [...stored]
+          const sequenced = ordered
+            ? [...selected].sort((left, right) => {
+                const byCreated = Number(right.createdAt) - Number(left.createdAt)
+                return byCreated !== 0 ? byCreated : (left.sessionId < right.sessionId ? 1 : -1)
+              })
+            : selected
+          const mine = limited ? sequenced.slice(0, CONSOLE_SESSION_HISTORY_LIMIT + 1) : sequenced
           if (mine.length === 0) {
             // The LATERAL join still yields the clock with null session columns.
             return [{
@@ -55,7 +68,7 @@ function fixture() {
               idleExpiresAt: null, revokedAt: null, createdAt: null,
             }] as T
           }
-          return mine.slice(0, CONSOLE_SESSION_HISTORY_LIMIT + 1).map(row => ({
+          return mine.map(row => ({
             now,
             sessionId: row.sessionId,
             authenticatedAt: row.authenticatedAt,
@@ -75,6 +88,7 @@ function fixture() {
   const sessionId = randomUUID()
   const identity: AuthenticatedIdentity = {
     subject, sessionId, email: 'synthetic@example.invalid', assuranceLevel: 'aal2',
+    authenticatedAt: new Date(instant - hour),
   }
   const add = (over: Partial<Stored> = {}) => {
     const row: Stored = {
@@ -93,19 +107,36 @@ function fixture() {
 }
 
 test('reads only the verified caller subject and takes no identity input', async () => {
+  // Behavioural isolation. The witness above honours whatever predicate the
+  // statement carries, so removing it from the reader lets the other subject's
+  // row reach this assertion and fail it.
   const { service, identity, subject, f, add } = fixture()
   add()
-  // A different subject's row must be invisible, and the only bind is the
-  // verified subject: there is no parameter a caller could supply.
   const other = randomUUID()
   f.stored.push({
     sessionId: randomUUID(), subject: other, authenticatedAt: new Date(instant),
     idleExpiresAt: new Date(instant + hour), revokedAt: null, createdAt: new Date(instant),
   })
   const result = await service.history(identity)
-  assert.equal(result.returned, 1)
+  assert.equal(result.returned, 1, 'another subject’s row must not be returned')
+  assert.equal(result.sessions.length, 1)
   assert.deepEqual(f.binds, [[subject]])
   assert.equal(f.statements.length, 1, 'exactly one statement, no separate count')
+})
+
+test('the statement keeps the shape the witness interprets', async () => {
+  // Shape lives in its own test so it can never pre-empt the isolation one.
+  const { service, identity, f, add } = fixture()
+  add()
+  await service.history(identity)
+  const [sql] = f.statements
+  assert.match(sql, /FROM console_sessions/)
+  assert.match(sql, /WHERE\s+subject=\$1::uuid/)
+  assert.match(sql, /ORDER BY created_at DESC, session_id DESC/)
+  assert.match(sql, new RegExp(`LIMIT ${CONSOLE_SESSION_HISTORY_LIMIT + 1}`))
+  assert.match(sql, /LEFT JOIN LATERAL/)
+  assert.ok(!/FOR UPDATE/i.test(sql))
+  assert.ok(!sql.includes('pg_advisory_xact_lock'))
 })
 
 test('zero recorded sessions still return a server clock, not an empty result', async () => {
@@ -146,11 +177,14 @@ test('exactly 50 rows is not truncated; 51 reports 50 and truncated', async () =
 })
 
 test('marks the caller current only for the signed session id', async () => {
+  // Distinct createdAt values so the expected order is deterministic rather
+  // than dependent on how the witness breaks a tie.
   const { service, identity, sessionId, add } = fixture()
-  add({ sessionId })
-  add()
+  add({ sessionId, createdAt: new Date(instant - minute) })
+  add({ createdAt: new Date(instant - hour) })
   const result = await service.history(identity)
   assert.deepEqual(result.sessions.map(row => row.isCurrent), [true, false])
+  assert.equal(result.sessions.filter(row => row.isCurrent).length, 1)
 })
 
 test('four states read only recorded evidence', async () => {

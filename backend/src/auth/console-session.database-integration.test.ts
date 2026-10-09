@@ -154,12 +154,33 @@ test('console inactivity deadlines with actual migrated PostgreSQL transactions'
       assert.ok(Number.isFinite(Date.parse(empty.generatedAt)), 'clock returned even with zero rows')
 
       // Tied created_at must break deterministically on session_id DESC.
+      // Asserting equal createdAt values could never fail, so each row carries a
+      // DISTINCT permitted field — its idle deadline — chosen by rank, making
+      // the resulting order observable without exposing any identifier.
       const tied = new Date(base.getTime() - 500)
       const ids = [randomUUID(), randomUUID()].sort()
-      for (const sessionId of ids) await insert(mine.subject, sessionId, tied)
+      const [lowerId, higherId] = ids
+      const deadlineFor = new Map<string, Date>([
+        [lowerId, new Date(base.getTime() + 300000)],
+        [higherId, new Date(base.getTime() + 900000)],
+      ])
+      for (const sessionId of ids) {
+        await observer.query(
+          `INSERT INTO ${schema}.console_sessions
+             (session_id,subject,authenticated_at,idle_expires_at,revoked_at,created_at,updated_at)
+           VALUES ($1::uuid,$2::uuid,$3::timestamptz,$4::timestamptz,NULL,$3::timestamptz,$3::timestamptz)`,
+          [sessionId, mine.subject, tied, deadlineFor.get(sessionId)]
+        )
+      }
       const ordered = await service.history(mine)
       assert.equal(ordered.returned, 2)
       assert.equal(ordered.truncated, false)
+      // session_id DESC puts the higher id first; its distinct deadline proves it.
+      assert.deepEqual(
+        ordered.sessions.map(row => row.idleExpiresAt),
+        [deadlineFor.get(higherId)!.toISOString(), deadlineFor.get(lowerId)!.toISOString()],
+        'tied created_at must break on session_id DESC'
+      )
       assert.deepEqual(ordered.sessions.map(row => row.createdAt), [tied.toISOString(), tied.toISOString()])
 
       // 51 recorded rows report exactly 50 and flag truncation.

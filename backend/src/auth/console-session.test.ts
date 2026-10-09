@@ -192,3 +192,72 @@ test('actual guard enforces session checks on ordinary APIs and wires all three 
   assert.equal((await invoke(publicHandler)).response, 'public service')
   assert.equal(verificationCalls, beforePublic); assert.equal(f.calls, callsAfterEnd)
 })
+
+test('the actual guard denies the history handler before any history read happens', async () => {
+  // What the reader returns is proven in console-session-history.test.ts against
+  // the real SQL, and physically in the gated DB suite. What is proven here is
+  // narrower and cannot be shown there: that a refusal arrives *before* the
+  // handler runs. So the reader is replaced by a recorder — a count of zero is
+  // then positive evidence of a denial, not merely an absent result.
+  const { f, service, identity } = fixture()
+  let reads = 0, lastCaller: string | null = null
+  ;(service as unknown as { history: unknown }).history = async (caller: AuthenticatedIdentity) => {
+    reads++; lastCaller = caller.subject; return { returned: 0 }
+  }
+  const controller = new ConsoleSessionController(service)
+  let currentIdentity: AuthenticatedIdentity = identity, tokenRejected = false
+  const guard = new IdentityAuthGuard(new Reflector(), { verify: async () => {
+    if (tokenRejected) throw new Error('synthetic token rejected'); return currentIdentity
+  } } as never, service)
+  const invoke = async (body?: unknown, query: Record<string, unknown> = {}) => {
+    const request = { headers: { authorization: 'Bearer synthetic' }, body, query } as AuthenticatedRequest
+    const context = { getHandler: () => ConsoleSessionController.prototype.history, getClass: () => ConsoleSessionController,
+      switchToHttp: () => ({ getRequest: () => request }) } as unknown as ExecutionContext
+    assert.equal(await guard.canActivate(context), true)
+    return ConsoleSessionController.prototype.history.call(controller, request)
+  }
+
+  // 0. A caller-supplied session override on a read. This is the case that makes
+  // the handler's 'read' operation metadata load-bearing: without it the guard
+  // skips assertNoSessionOverrides and this body is accepted.
+  for (const body of [{ sessionId: randomUUID() }, { subject: randomUUID() }, { timestamp: instant }]) {
+    await assert.rejects(invoke(body), /do not accept/)
+  }
+  await assert.rejects(invoke(undefined, { sessionId: randomUUID() }), /do not accept/)
+  assert.equal(reads, 0)
+
+  // 1. No interactive authentication on the verified claims.
+  currentIdentity = { ...identity, authenticatedAt: undefined }
+  await assert.rejects(invoke(), denied('SESSION_REAUTHENTICATION_REQUIRED'))
+  assert.equal(reads, 0)
+
+  // 2. Single-factor assurance: refused by the guard before any session work.
+  const callsBeforeAal1 = f.calls
+  currentIdentity = { ...identity, assuranceLevel: 'aal1' }
+  await assert.rejects(invoke(), /Multi-factor/)
+  assert.equal(reads, 0); assert.equal(f.calls, callsBeforeAal1)
+
+  // 2b. Token verification itself fails: no session work, no read.
+  const callsBeforeToken = f.calls
+  tokenRejected = true
+  await assert.rejects(invoke(), /synthetic token rejected/)
+  assert.equal(reads, 0); assert.equal(f.calls, callsBeforeToken)
+  tokenRejected = false
+
+  // 3. Admitted. The handler reads for the verified caller, nobody else.
+  currentIdentity = identity
+  assert.deepEqual(await invoke(), { returned: 0 })
+  assert.equal(reads, 1); assert.equal(lastCaller, identity.subject)
+
+  // 4. The same admitted identity, past its inactivity window.
+  f.now += hour
+  await assert.rejects(invoke(), denied('SESSION_IDLE_EXPIRED'))
+  assert.equal(reads, 1)
+
+  // 5. A revoked session, with the clock wound back inside the window so that
+  // revocation is the only remaining reason to refuse.
+  assert.deepEqual(await service.end(identity), { ended: true })
+  f.now = instant
+  await assert.rejects(invoke(), denied('SESSION_REAUTHENTICATION_REQUIRED'))
+  assert.equal(reads, 1)
+})

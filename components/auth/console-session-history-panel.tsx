@@ -9,14 +9,17 @@ import {
   describeSessionState,
   formatAsOfAge,
   parseConsoleSessionHistory,
+  visibleForIdentity,
   type ConsoleSessionHistory,
+  type IdentityBoundPhase,
 } from '@/lib/auth/console-session-history'
 
-type Phase =
-  | { kind: 'idle' }
-  | { kind: 'loading' }
-  | { kind: 'ready'; history: ConsoleSessionHistory }
-  | { kind: 'unreadable' }
+/** Every phase carries the identity token it was produced for.
+ *
+ * Without that binding, a render occurring after an account switch but before
+ * the effect clears state will paint the previous account's rows. Clearing in an
+ * effect is too late: the offending frame has already been shown. */
+type Phase = IdentityBoundPhase<ConsoleSessionHistory>
 
 /** Recorded sign-in history for this account only.
  *
@@ -32,7 +35,7 @@ type Phase =
  * a replacement is in flight: a stale table is worse than an honest spinner. */
 export function ConsoleSessionHistoryPanel() {
   const { session, isLoading, currentIdentityToken } = useAuth()
-  const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
+  const [phase, setPhase] = useState<Phase>({ kind: 'idle', token: null })
   const generation = useRef(0)
   const abort = useRef<AbortController | null>(null)
 
@@ -55,7 +58,7 @@ export function ConsoleSessionHistoryPanel() {
     abort.current?.abort()
     const controller = new AbortController()
     abort.current = controller
-    setPhase({ kind: 'loading' })
+    setPhase({ kind: 'loading', token })
 
     // A response is only admissible if BOTH the request generation and the
     // identity token still match. The generation alone would admit a reply that
@@ -71,12 +74,12 @@ export function ConsoleSessionHistoryPanel() {
       })
       if (!admissible()) return
       const history = parseConsoleSessionHistory(payload)
-      setPhase(history ? { kind: 'ready', history } : { kind: 'unreadable' })
+      setPhase(history ? { kind: 'ready', token, history } : { kind: 'unreadable', token })
     } catch {
       // Stale errors are suppressed for the same reason as stale successes: they
       // describe a request we no longer care about.
       if (!admissible()) return
-      setPhase({ kind: 'unreadable' })
+      setPhase({ kind: 'unreadable', token })
     }
   }, [ready, identityToken])
 
@@ -87,7 +90,7 @@ export function ConsoleSessionHistoryPanel() {
       // Losing readiness invalidates anything in flight and anything on screen.
       invalidate.current++
       inFlight.current?.abort()
-      setPhase({ kind: 'idle' })
+      setPhase({ kind: 'idle', token: null })
       return
     }
     void load()
@@ -98,6 +101,12 @@ export function ConsoleSessionHistoryPanel() {
   }, [load, ready])
 
   if (!ready) return null
+
+  // Suppressed synchronously, during the render that first sees the new token.
+  // The rule is a pure function so it can be tested where the stale frame is
+  // actually observable; a mounted test cannot see it, because effects flush
+  // before assertions.
+  const visible = visibleForIdentity<ConsoleSessionHistory>(phase, identityToken)
 
   return (
     <div className="rounded-xl border border-border bg-card p-4">
@@ -114,9 +123,9 @@ export function ConsoleSessionHistoryPanel() {
           variant="ghost"
           size="sm"
           onClick={() => void load()}
-          disabled={phase.kind === 'loading'}
+          disabled={visible.kind === 'loading'}
         >
-          {phase.kind === 'loading' ? (
+          {visible.kind === 'loading' ? (
             <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" aria-hidden />
           ) : (
             <RefreshCw className="mr-1.5 h-3.5 w-3.5" aria-hidden />
@@ -125,14 +134,14 @@ export function ConsoleSessionHistoryPanel() {
         </Button>
       </div>
 
-      {phase.kind === 'loading' && (
+      {visible.kind === 'loading' && (
         <p className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
           Reading your recorded sessions…
         </p>
       )}
 
-      {phase.kind === 'unreadable' && (
+      {visible.kind === 'unreadable' && (
         <p className="mt-3 flex items-start gap-1.5 text-xs text-foreground">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
           <span>
@@ -142,19 +151,22 @@ export function ConsoleSessionHistoryPanel() {
         </p>
       )}
 
-      {phase.kind === 'ready' && phase.history.sessions.length === 0 && (
+      {visible.kind === 'ready' && visible.history.sessions.length === 0 && (
         <p className="mt-3 text-xs text-muted-foreground">
           No sessions are recorded for this account.
         </p>
       )}
 
-      {phase.kind === 'ready' && phase.history.sessions.length > 0 && (
+      {visible.kind === 'ready' && visible.history.sessions.length > 0 && (
         <div className="mt-3 space-y-2">
-          {phase.history.sessions.map(row => {
-            const age = formatAsOfAge(row.createdAt, phase.history.generatedAt)
+          {visible.history.sessions.map((row, position) => {
+            const age = formatAsOfAge(row.createdAt, visible.history.generatedAt)
             return (
               <div
-                key={`${row.createdAt}-${row.idleExpiresAt}-${row.revokedAt ?? 'open'}`}
+                // Position within this response is the only unique, stable and
+                // non-sensitive key available: rows legitimately tie on every
+                // timestamp, and the session id must never reach the client.
+                key={`session-${position}`}
                 className="flex items-start justify-between gap-3 border-t border-border/60 pt-2 text-xs first:border-t-0 first:pt-0"
               >
                 <div>
@@ -173,7 +185,15 @@ export function ConsoleSessionHistoryPanel() {
                 </div>
                 <div className="text-right text-[11px] text-muted-foreground">
                   {row.revokedAt ? (
-                    <p>Signed out {row.revokedAt}</p>
+                    // An `unknown` row carries a revocation the server refused
+                    // to confirm — a future or contradictory one. Reporting it
+                    // as "Signed out" would assert exactly what the state
+                    // denies, so the timestamp is shown as unconfirmed instead.
+                    row.state === 'unknown' ? (
+                      <p>Unconfirmed sign-out recorded as {row.revokedAt}</p>
+                    ) : (
+                      <p>Signed out {row.revokedAt}</p>
+                    )
                   ) : (
                     <p>Inactivity deadline {row.idleExpiresAt}</p>
                   )}
@@ -183,8 +203,8 @@ export function ConsoleSessionHistoryPanel() {
             )
           })}
           <p className="pt-1 text-[11px] text-muted-foreground">
-            As of {phase.history.generatedAt} (server time).
-            {phase.history.truncated
+            As of {visible.history.generatedAt} (server time).
+            {visible.history.truncated
               ? ' Showing the 50 most recent recorded sessions; older ones are not listed.'
               : ''}
           </p>

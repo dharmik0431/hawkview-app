@@ -16,6 +16,8 @@ import {
   describeSessionState,
   formatAsOfAge,
   parseConsoleSessionHistory,
+  visibleForIdentity,
+  type IdentityBoundPhase,
 } from './console-session-history.ts'
 
 const nodeRequire = createRequire(import.meta.url)
@@ -114,6 +116,34 @@ test('ages are measured from the server sample and refuse to run backwards', () 
   // A record stamped after the reading is not given a negative age.
   assert.equal(formatAsOfAge('2026-10-09T12:00:30.000Z', asOf), null)
   assert.equal(formatAsOfAge('nonsense', asOf), null)
+})
+
+test('a phase produced for another identity is never visible', () => {
+  // E1 finding 1, tested where it is observable. The mounted suite cannot prove
+  // this: `act` flushes the clearing effect before any assertion runs, so the
+  // offending frame never appears there and a mutation of the rule still
+  // passes. Exercising the rule directly is what makes the control real.
+  const readyForA: IdentityBoundPhase<string> = { kind: 'ready', token: 'A', history: 'A rows' }
+
+  const sameIdentity = visibleForIdentity(readyForA, 'A')
+  assert.deepEqual(sameIdentity, readyForA, 'the owning identity still sees its own rows')
+
+  const switched = visibleForIdentity(readyForA, 'B')
+  assert.equal(switched.kind, 'loading', 'another identity must see loading, not rows')
+  assert.equal((switched as { token: string }).token, 'B')
+  assert.ok(!('history' in switched), 'no previous history may survive the switch')
+
+  // Signed out: nothing is attributable, so nothing is shown.
+  assert.deepEqual(visibleForIdentity(readyForA, null), { kind: 'idle', token: null })
+
+  // A failed read for the old identity must not leak either.
+  const failedForA: IdentityBoundPhase<string> = { kind: 'unreadable', token: 'A' }
+  assert.equal(visibleForIdentity(failedForA, 'B').kind, 'loading')
+
+  // Returning to A must not resurrect a phase still tagged B.
+  const loadingForB: IdentityBoundPhase<string> = { kind: 'loading', token: 'B' }
+  const backToA = visibleForIdentity(loadingForB, 'A')
+  assert.equal((backToA as { token: string }).token, 'A')
 })
 
 function makeLoader(mocks: Record<string, unknown>) {
@@ -341,6 +371,62 @@ test('mounted: signing out clears rows and aborts the in-flight read', async () 
     await panel.signOut()
     assert.equal(panel.text(), '', 'the panel renders nothing once signed out')
     assert.ok(panel.calls.some(call => call.signalAborted()), 'the in-flight read was aborted')
+  } finally { panel.release() }
+})
+
+test('mounted: visible rows vanish on the switching render, not an effect later', async () => {
+  // E1 finding 1. The earlier A→B→A test started from an in-flight request, so
+  // it never exercised the case that leaks: rows already on screen when the
+  // account changes. Suppression must happen during the switching render.
+  const panel = await mountPanel()
+  try {
+    await panel.settle(envelope({ sessions: [row({ state: 'revoked' })] }))
+    assert.match(panel.text(), /Signed out/, 'account A rows are visible')
+
+    await panel.switchIdentity('identity-B')
+    assert.doesNotMatch(panel.text(), /Signed out/, 'A’s rows must not survive the switch')
+    assert.match(panel.text(), /Reading your recorded sessions/)
+
+    // A pending replacement must not restore A's rows either.
+    assert.doesNotMatch(panel.text(), /Signed out/)
+    // Nor may a failed replacement fall back to them.
+    await panel.failNext(new Error('replacement failed'))
+    assert.match(panel.text(), /cannot read your session history/)
+    assert.doesNotMatch(panel.text(), /Signed out/)
+
+    // Returning to A must still re-read rather than reuse the old render.
+    await panel.switchIdentity('identity-A')
+    assert.doesNotMatch(panel.text(), /Signed out/)
+  } finally { panel.release() }
+})
+
+test('mounted: an unknown row never asserts a confirmed sign-out', async () => {
+  // E1 finding 5. A future or contradictory revocation is exactly what the
+  // server refused to confirm; the row must not state it as fact.
+  const panel = await mountPanel()
+  try {
+    await panel.settle(envelope({
+      sessions: [row({ state: 'unknown', revokedAt: '2026-10-09T23:00:00.000Z' })],
+    }))
+    assert.match(panel.text(), /Not reconciled/)
+    assert.match(panel.text(), /Unconfirmed sign-out recorded as 2026-10-09T23:00:00\.000Z/)
+    assert.doesNotMatch(panel.text(), /Signed out 2026-10-09T23:00:00\.000Z/)
+  } finally { panel.release() }
+})
+
+test('mounted: rows tied on every timestamp still render distinctly', async () => {
+  // E1 finding 5, second half: the previous key was derived from timestamps, so
+  // legitimately tied rows collided. Replacement must also be clean.
+  const panel = await mountPanel()
+  try {
+    const tied = [row({ state: 'revoked', revokedAt: '2026-10-09T11:30:00.000Z' }),
+                  row({ state: 'revoked', revokedAt: '2026-10-09T11:30:00.000Z' })]
+    await panel.settle(envelope({ returned: 2, sessions: tied }))
+    assert.equal(panel.container.querySelectorAll('[class*="border-t"]').length, 2)
+    await panel.refresh()
+    await panel.settle(envelope({ returned: 1, sessions: [row({ state: 'expired' })] }))
+    assert.match(panel.text(), /Ended by inactivity/)
+    assert.doesNotMatch(panel.text(), /Signed out/)
   } finally { panel.release() }
 })
 

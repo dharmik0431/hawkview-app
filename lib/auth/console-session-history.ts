@@ -97,6 +97,29 @@ export function parseConsoleSessionHistory(value: unknown): ConsoleSessionHistor
   }
 }
 
+/** Phases carry the identity they were produced for, so a render that happens
+ * after an account change can discard them before painting. */
+export type IdentityBoundPhase<TReady> =
+  | { kind: 'idle'; token: null }
+  | { kind: 'loading'; token: string }
+  | { kind: 'ready'; token: string; history: TReady }
+  | { kind: 'unreadable'; token: string }
+
+/** Decides what may be painted for `token`.
+ *
+ * Pure and synchronous on purpose. Clearing stale state in an effect is too
+ * late — the offending frame has already been shown — and a mounted test cannot
+ * observe that frame, because `act` flushes effects before assertions run. So
+ * the rule lives here, where removing it fails a test that actually exercises it.
+ */
+export function visibleForIdentity<TReady>(
+  phase: IdentityBoundPhase<TReady>,
+  token: string | null
+): IdentityBoundPhase<TReady> {
+  if (token === null) return { kind: 'idle', token: null }
+  return phase.token === token ? phase : { kind: 'loading', token }
+}
+
 /** Copy is chosen from recorded state only. Nothing here implies that a session
  * is online, and an expired session is never described as revoked. */
 export function describeSessionState(state: ConsoleSessionHistoryState): string {
