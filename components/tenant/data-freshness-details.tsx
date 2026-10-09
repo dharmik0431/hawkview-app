@@ -16,7 +16,7 @@ function RecordedTime({ value }: { value: string | null }) {
 
 }
 
-export function DataFreshnessDetails({ readiness, bundle }: { readiness?: CollectionReadinessView; bundle?: Record<string, any> }) {
+export function DataFreshnessDetails({ readiness, bundle, splitDirectoryRoles = false }: { readiness?: CollectionReadinessView; bundle?: Record<string, any>; splitDirectoryRoles?: boolean }) {
   if (bundle) {
     const context = { tenantId: bundle.tenant?.id, tenantName: bundle.tenant?.name }
     const signIns = (Array.isArray(bundle.signIns) ? bundle.signIns : []).map((event: any, index: number) => normalizeSignInEvent(event, { ...context, index }))
@@ -41,13 +41,22 @@ export function DataFreshnessDetails({ readiness, bundle }: { readiness?: Collec
       </div>
     </section>
     {readiness.workloads.length === 0 && <p role="status">Dataset collection details were not reported. This does not establish that the tenant has no datasets.</p>}
-    {readiness.workloads.map(workload => <section key={workload.key} aria-label={workload.workload} className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
-      <h2 className="text-lg font-semibold">{workload.workload}</h2>
-      <p className="mt-1 text-sm">{readinessLabel(workload.state)}</p>
-      {workload.reason && <p className="mt-2 text-sm">{readinessDiagnostic(workload.reasonCode, workload.reason)}</p>}
-      {workload.state !== 'READY' && workload.remediation && <p className="mt-2 text-sm">Next action: {workload.remediation}</p>}
-      {workload.datasets.length === 0 && <p className="mt-3 text-sm">Individual dataset details were not reported. Workload last success: <RecordedTime value={workload.lastSuccessfulAt} />.</p>}
+    {readiness.workloads.map(workload => {
+      const split = splitDirectoryRoles && workload.key === 'entra_directory'
+      const components = workload.components.filter(component => !splitDirectoryRoles || component.key !== 'DIRECTORY_ROLES')
+      return <section key={workload.key} aria-label={split ? 'Other directory inventory' : workload.workload} className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+      <h2 className="text-lg font-semibold">{split ? 'Other directory inventory' : workload.workload}</h2>
+      {split && <p className="mt-1 text-sm">Directory role health is shown separately from the other directory inventory below.</p>}
+      {!split && <p className="mt-1 text-sm">{readinessLabel(workload.state)}</p>}
+      {!split && workload.reason && <p className="mt-2 text-sm">{readinessDiagnostic(workload.reasonCode, workload.reason)}</p>}
+      {!split && workload.state !== 'READY' && workload.remediation && <p className="mt-2 text-sm">Next action: {workload.remediation}</p>}
+      {!split && workload.datasets.length === 0 && <p className="mt-3 text-sm">Individual dataset details were not reported. Workload last success: <RecordedTime value={workload.lastSuccessfulAt} />.</p>}
       <div className="mt-4 space-y-4">{workload.datasets.map(dataset => {
+        if (splitDirectoryRoles && dataset.key === 'entra_directory_roles') return <article key={dataset.key} className="rounded-lg border p-4">
+          <h3 className="font-semibold">Directory roles access requirements</h3>
+          <p className="text-sm">Collection evidence is shown in Directory role receipt health.</p>
+          <ul className="text-sm">{dataset.permissions.map(permission => <li key={`${permission.resource}-${permission.name}`}>{permission.name} ({readinessLabel(permission.resource)})</li>)}</ul>
+        </article>
         const cadence = datasetCadence(dataset.resourceTypes)
         return <article key={dataset.key} className="rounded-lg border border-slate-200 p-4 dark:border-slate-700">
           <h3 className="font-semibold">{dataset.label}</h3>
@@ -72,7 +81,7 @@ export function DataFreshnessDetails({ readiness, bundle }: { readiness?: Collec
         </article>
       })}</div>
       {workload.capabilities.map(capability => <p key={capability.key} className="mt-3 text-sm"><strong>{capability.label}:</strong> {capability.message}</p>)}
-      {workload.components.length > 0 && <details className="mt-4 text-sm"><summary className="cursor-pointer font-medium">Collector component details</summary>{workload.components.map(component => <div key={component.key} className="mt-3"><strong>{component.label}: {readinessLabel(component.state)}</strong><p>{readinessDiagnostic(component.reasonCode, component.reason)}</p><p>Last success: <RecordedTime value={component.lastSuccessfulAt} /> · Last attempt: <RecordedTime value={component.lastAttemptAt} /></p></div>)}</details>}
-    </section>)}
+      {components.length > 0 && <details className="mt-4 text-sm"><summary className="cursor-pointer font-medium">Collector component details</summary>{components.map(component => <div key={component.key} className="mt-3"><strong>{component.label}: {readinessLabel(component.state)}</strong><p>{readinessDiagnostic(component.reasonCode, component.reason)}</p><p>Last success: <RecordedTime value={component.lastSuccessfulAt} /> · Last attempt: <RecordedTime value={component.lastAttemptAt} /></p></div>)}</details>}
+    </section>})}
   </div>
 }

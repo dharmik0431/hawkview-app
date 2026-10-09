@@ -5,6 +5,7 @@
  * that decision is the server's `status`, which this parser carries through verbatim. */
 
 export const DIRECTORY_ROLE_RESPONSE_VERSION = 'directory-role-results/v1'
+export const DIRECTORY_ROLE_SOURCE = 'Microsoft Graph v1.0 /roleManagement/directory/roleAssignments'
 
 /** Mirrors the server union exactly. 'not-activated' and 'never-collected' are DIFFERENT from a
  * verified empty, and the view must never collapse them. */
@@ -40,6 +41,7 @@ export type DirectoryRoleResultsView = {
   readonly observation: DirectoryRoleObservationView | null
   /** Always separate from the observation: a failed attempt never stands in for one. */
   readonly latestAttempt: DirectoryRoleLatestAttemptView
+  readonly health?: DirectoryRoleHealthView
 }
 
 const isRecord = (v: unknown): v is Record<string, unknown> =>
@@ -50,6 +52,39 @@ const time = (v: unknown): Date | null => {
   if (typeof v !== 'string' || !v) return null
   const at = new Date(v)
   return Number.isFinite(at.getTime()) ? at : null
+}
+
+const HEALTH_PAIRS = {
+  ACTIVATION_EVIDENCE_UNAVAILABLE: ['not-activated', 'REVIEW_SOURCE_CONTROL'],
+  NO_COMPLETE_RECEIPT: ['never-collected', 'AWAIT_NORMAL_COLLECTION'],
+  CURRENT_ELIGIBILITY_UNAVAILABLE: ['superseded', 'REVIEW_CONNECTION_SETUP'],
+  RECEIPT_BINDING_CHANGED: ['superseded', 'REQUIRE_NEW_COMPLETE_OBSERVATION'],
+  SNAPSHOT_BINDING_UNVERIFIED: ['superseded', 'REREAD_OR_REPORT'],
+  PUBLICATION_TIME_MISMATCH: ['superseded', 'REREAD_OR_REPORT'],
+  STORED_PAYLOAD_INVALID: ['superseded', 'REREAD_OR_REPORT'],
+  STORED_CONTENT_MISMATCH: ['superseded', 'REREAD_OR_REPORT'],
+  COMPLETE_OBSERVATION_CURRENT: ['current', 'NONE'],
+  COMPLETE_EMPTY_CURRENT: ['current', 'NONE'],
+  COMPLETE_OBSERVATION_STALE: ['stale', 'AWAIT_NORMAL_COLLECTION'],
+} as const
+
+export type DirectoryRoleHealthView = {
+  readonly version: 1
+  readonly reasonCode: keyof typeof HEALTH_PAIRS
+  readonly recoveryCode: typeof HEALTH_PAIRS[keyof typeof HEALTH_PAIRS][1]
+}
+
+/** Optional explanations cannot change status or admit an observation. Reject the whole explanation
+ * on any mismatch, preserving exactly the rendering of an older response without health. */
+function parseHealth(raw: unknown, status: DirectoryRoleStatus, count: number | null): DirectoryRoleHealthView | undefined {
+  if (!isRecord(raw) || raw.version !== 1 || typeof raw.reasonCode !== 'string'
+    || !Object.prototype.hasOwnProperty.call(HEALTH_PAIRS, raw.reasonCode)) return undefined
+  const reasonCode = raw.reasonCode as keyof typeof HEALTH_PAIRS
+  const [expectedStatus, recoveryCode] = HEALTH_PAIRS[reasonCode]
+  if (expectedStatus !== status || raw.recoveryCode !== recoveryCode) return undefined
+  if (reasonCode === 'COMPLETE_EMPTY_CURRENT' && count !== 0) return undefined
+  if (reasonCode === 'COMPLETE_OBSERVATION_CURRENT' && !(count !== null && count > 0)) return undefined
+  return { version: 1, reasonCode, recoveryCode }
 }
 
 function assignment(value: unknown): DirectoryRoleAssignmentView | null {
@@ -97,7 +132,7 @@ export function parseDirectoryRoleResults(value: unknown): DirectoryRoleResultsV
   const mayObserve = status === 'current' || status === 'stale'
   if (!mayObserve) {
     if (raw !== null) return null
-    return { status, source, observation: null, latestAttempt }
+    return { status, source, observation: null, latestAttempt, health: parseHealth(value.health, status, null) }
   }
   if (!isRecord(raw)) return null
 
@@ -128,5 +163,6 @@ export function parseDirectoryRoleResults(value: unknown): DirectoryRoleResultsV
       verifiedCompleteEmpty: raw.verifiedCompleteEmpty,
     },
     latestAttempt,
+    health: parseHealth(value.health, status, assignments.length),
   }
 }

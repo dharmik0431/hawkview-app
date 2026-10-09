@@ -1,11 +1,12 @@
 'use client'
 
 import { useEffect, useState } from 'react'
-import { AlertTriangle, RefreshCw, ShieldQuestion } from 'lucide-react'
+import { AlertTriangle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { DirectoryRoleControl } from './directory-role-control'
 import { useDirectoryRoleResults } from '@/lib/api/directory-role-results-hooks'
-import type { DirectoryRoleResultsView } from '@/lib/tenants/directory-role-results-view'
+import { DIRECTORY_ROLE_SOURCE, type DirectoryRoleResultsView, type DirectoryRoleHealthView } from '@/lib/tenants/directory-role-results-view'
+import { tenantEntraPath } from '@/lib/tenants/navigation'
 import { cn } from '@/lib/utils'
 
 function storedTime(at: Date) {
@@ -60,7 +61,7 @@ function ageLabel(ageMs: number) {
 }
 
 const ATTEMPT_COPY: Record<'RUNNING' | 'FAILED' | 'PARTIAL' | 'EXPIRED', string> = {
-  RUNNING: 'A collection attempt is in progress.',
+  RUNNING: 'The latest recorded collection attempt reports running.',
   FAILED: 'The most recent collection attempt failed.',
   PARTIAL: 'The most recent collection attempt did not finish.',
   EXPIRED: 'The most recent collection attempt expired.',
@@ -104,105 +105,100 @@ function Assignments({ results }: { results: DirectoryRoleResultsView }) {
   )
 }
 
-/** Read-only view of stored directory role assignments.
- *
- * Every state below is the server's own `status`. The panel never infers a trustworthy result from
- * the absence of rows: only a verified complete-empty says "none found", and an unactivated or
- * superseded tenant says so instead of showing a zero. */
-export function DirectoryRoleAssignmentsPanel({ customerTenantId, className }: {
+const REASON_COPY: Record<DirectoryRoleHealthView['reasonCode'], string> = {
+  ACTIVATION_EVIDENCE_UNAVAILABLE: 'Usable activation evidence is unavailable for this source. HawkView cannot vouch for any stored results here.',
+  NO_COMPLETE_RECEIPT: 'No complete directory role observation has been recorded yet.',
+  CURRENT_ELIGIBILITY_UNAVAILABLE: 'The current tenant or connection setup cannot vouch for the stored receipt.',
+  RECEIPT_BINDING_CHANGED: 'The stored receipt no longer matches the current connection, authority, or collection scope.',
+  SNAPSHOT_BINDING_UNVERIFIED: 'The stored snapshot cannot be matched to its complete receipt.',
+  PUBLICATION_TIME_MISMATCH: 'The stored snapshot and receipt completion times do not match.',
+  STORED_PAYLOAD_INVALID: 'The stored assignment payload could not be verified.',
+  STORED_CONTENT_MISMATCH: 'The stored assignments do not match the receipt’s verified content or count.',
+  COMPLETE_OBSERVATION_CURRENT: 'Verified complete observation within the one-hour currentness window.',
+  COMPLETE_EMPTY_CURRENT: 'Verified complete check within the one-hour currentness window observed zero assignments.',
+  COMPLETE_OBSERVATION_STALE: 'The verified complete observation is older than the one-hour currentness window.',
+}
+const RECOVERY_COPY: Record<DirectoryRoleHealthView['recoveryCode'], string | null> = {
+  REVIEW_SOURCE_CONTROL: 'Review the collection setting in Entra directory results.',
+  AWAIT_NORMAL_COLLECTION: 'Await an eligible normal collection. Normal scheduling is daily; a stale receipt does not establish a missed daily collection. No next completion time is promised.',
+  REVIEW_CONNECTION_SETUP: 'Review the existing tenant and connection setup.',
+  REQUIRE_NEW_COMPLETE_OBSERVATION: 'A new complete observation matching the current setup is required before assignments can be shown.',
+  REREAD_OR_REPORT: 'Re-read stored results. If the verification issue remains, report it for investigation.',
+  NONE: null,
+}
+
+function explanation(data: DirectoryRoleResultsView, stale: boolean) {
+  // A response's CURRENT explanation expires with its locally aged observation.
+  if (stale) return { reason: REASON_COPY.COMPLETE_OBSERVATION_STALE, recovery: RECOVERY_COPY.AWAIT_NORMAL_COLLECTION }
+  if (data.health) return { reason: REASON_COPY[data.health.reasonCode], recovery: RECOVERY_COPY[data.health.recoveryCode] }
+  switch (data.status) {
+    case 'not-activated': return { reason: REASON_COPY.ACTIVATION_EVIDENCE_UNAVAILABLE, recovery: RECOVERY_COPY.REVIEW_SOURCE_CONTROL }
+    case 'never-collected': return { reason: 'No directory role results collected yet.', recovery: RECOVERY_COPY.AWAIT_NORMAL_COLLECTION }
+    case 'superseded': return { reason: 'HawkView cannot currently verify the stored directory role results.', recovery: RECOVERY_COPY.REREAD_OR_REPORT }
+    default: return { reason: data.observation?.verifiedCompleteEmpty ? REASON_COPY.COMPLETE_EMPTY_CURRENT : REASON_COPY.COMPLETE_OBSERVATION_CURRENT, recovery: null }
+  }
+}
+
+/** Both entry points consume the same scoped read and receipt clock. Compact mode adds no control
+ * or assignment payload display; the collection setting stays in its existing Entra location. */
+function DirectoryRoleStoredResults({ customerTenantId, className, compact = false }: {
   customerTenantId: string
   className?: string
+  compact?: boolean
 }) {
   const { data, dataUpdatedAt, isPending, isError, isFetching, refetch } = useDirectoryRoleResults(customerTenantId)
   const now = useWallClock(data?.observation !== undefined && data?.observation !== null)
   if (!customerTenantId) return null
-
-  const attempt = data?.latestAttempt.outcome
-  // Anchored to THIS response, so a replacement resets the display even when its age value repeats,
-  // and a long-open tab cannot accumulate session time onto a freshly accepted result.
-  const presented = data?.observation
-    ? elapsedPresentation(data.observation.ageMs, dataUpdatedAt, now)
-    : null
-  const agedStale = presented?.agedStale ?? false
-
+  const presented = data?.observation ? elapsedPresentation(data.observation.ageMs, dataUpdatedAt, now) : null
+  const stale = data?.status === 'stale' || (presented?.agedStale ?? false)
+  const copy = data ? explanation(data, stale) : null
+  const observation = data?.observation
+  const attempt = data?.latestAttempt
   return (
-    <section className={cn('rounded-xl border border-slate-200 p-4 dark:border-slate-700', className)}>
-      <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-        Directory role assignments
-      </h3>
+    <section aria-label={compact ? 'Directory role receipt health' : 'Directory role assignments'} className={cn('rounded-xl border border-slate-200 p-4 dark:border-slate-700', className)}>
+      <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{compact ? 'Directory role receipt health' : 'Directory role assignments'}</h3>
       <p className="mb-3 mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-        Stored results HawkView collected from {data?.source ?? 'Microsoft Graph'}. Assignments are
+        Stored results HawkView collected from {data?.source ?? DIRECTORY_ROLE_SOURCE}. Assignments are
         what was observed, not a statement about effective privilege.
       </p>
-
       {isPending && <p className="text-sm text-slate-500 dark:text-slate-400">Loading stored results…</p>}
-
-      {isError && (
-        <div className="space-y-2">
-          <p className="flex items-start gap-1.5 text-sm text-slate-700 dark:text-slate-200">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
-            <span>These results are unavailable right now.</span>
+      {isError && <p className="flex items-start gap-1.5 text-sm text-slate-700 dark:text-slate-200">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
+        <span>These results are unavailable right now.</span>
+      </p>}
+      {!isError && data && copy && <div className="space-y-2">
+        {stale && <p className="text-xs font-medium text-slate-600 dark:text-slate-300">Showing the last completed collection</p>}
+        <p className="text-sm text-slate-700 dark:text-slate-200">{copy.reason}</p>
+        {observation && <>
+          {compact
+            ? <p className="text-sm">{observation.verifiedCompleteEmpty ? 'Verified complete-empty observation: zero directory role assignments.' : `Complete observation: ${observation.observedCount} directory role assignment${observation.observedCount === 1 ? '' : 's'}.`}</p>
+            : <Assignments results={data} />}
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            Checked <time dateTime={observation.checkedAt.toISOString()}>{storedTime(observation.checkedAt)}</time> · {ageLabel(presented?.elapsedMs ?? observation.ageMs)}.
+            {' '}Receipt completion time; source change time is not reported.
           </p>
-          <Button variant="ghost" size="sm" onClick={() => void refetch()} disabled={isFetching}>
-            <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', isFetching && 'animate-spin')} aria-hidden />
-            Try again
-          </Button>
-        </div>
-      )}
-
-      {!isError && data?.status === 'not-activated' && (
-        <p className="flex items-start gap-1.5 text-sm text-slate-700 dark:text-slate-200">
-          <ShieldQuestion className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden />
-          <span>
-            Verified directory role collection is not switched on for this tenant, so HawkView cannot
-            vouch for any stored results here yet.
-          </span>
-        </p>
-      )}
-
-      {!isError && data?.status === 'never-collected' && (
-        <p className="text-sm text-slate-500 dark:text-slate-400">
-          No directory role results collected yet.
-        </p>
-      )}
-
-      {!isError && data?.status === 'superseded' && (
-        <p className="flex items-start gap-1.5 text-sm text-slate-700 dark:text-slate-200">
-          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500" aria-hidden />
-          <span>
-            The connection changed after these results were stored, so they are no longer current.
-            They will be shown again once a fresh collection completes.
-          </span>
-        </p>
-      )}
-
-      {!isError && (data?.status === 'current' || data?.status === 'stale') && (
-        <div className="space-y-2">
-          {(data.status === 'stale' || agedStale) && (
-            <p className="text-xs font-medium text-slate-600 dark:text-slate-300">
-              Showing the last completed collection
-            </p>
-          )}
-          <Assignments results={data} />
-          {data.observation && (
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Checked {storedTime(data.observation.checkedAt)} ·{' '}
-              {ageLabel(presented?.elapsedMs ?? data.observation.ageMs)}
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Latest attempt is always reported separately: it never replaces the stored results above
-          and never implies that there are none. */}
-      {!isError && attempt && (
-        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{ATTEMPT_COPY[attempt]}</p>
-      )}
-
-      {/* The durable opt-in, read and written separately from the stored results above. It is shown
-          whatever the results status is, because withdrawing collection must stay possible even when
-          no trustworthy result can be displayed. */}
-      <DirectoryRoleControl customerTenantId={customerTenantId} />
+        </>}
+        {copy.recovery && <p className="text-sm">Next step: {copy.recovery}</p>}
+        {attempt?.outcome && <p className="text-xs text-slate-500 dark:text-slate-400">
+          {ATTEMPT_COPY[attempt.outcome]}
+          {attempt.terminalAt && <> Recorded terminal time: <time dateTime={attempt.terminalAt.toISOString()}>{storedTime(attempt.terminalAt)}</time>.</>}
+        </p>}
+      </div>}
+      {(isError || compact) && <Button variant="ghost" size="sm" onClick={() => void refetch()} disabled={isFetching || isPending}>
+        <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', isFetching && 'animate-spin')} aria-hidden />
+        {isError ? 'Try again' : 'Re-read stored results'}
+      </Button>}
+      {compact
+        ? <a className="mt-2 block text-sm text-blue-700 hover:underline dark:text-blue-300" href={tenantEntraPath(customerTenantId, 'overview')}>Open Entra directory results and collection setting</a>
+        : <DirectoryRoleControl customerTenantId={customerTenantId} />}
     </section>
   )
+}
+
+export function DirectoryRoleAssignmentsPanel(props: { customerTenantId: string; className?: string }) {
+  return <DirectoryRoleStoredResults {...props} />
+}
+
+export function DirectoryRoleReceiptHealth(props: { customerTenantId: string; className?: string }) {
+  return <DirectoryRoleStoredResults {...props} compact />
 }

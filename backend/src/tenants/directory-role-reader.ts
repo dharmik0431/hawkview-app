@@ -39,6 +39,25 @@ export interface DirectoryRoleLatestAttempt {
   readonly terminalAt: string | null
 }
 
+const HEALTH_RECOVERY = {
+  ACTIVATION_EVIDENCE_UNAVAILABLE: 'REVIEW_SOURCE_CONTROL',
+  NO_COMPLETE_RECEIPT: 'AWAIT_NORMAL_COLLECTION',
+  CURRENT_ELIGIBILITY_UNAVAILABLE: 'REVIEW_CONNECTION_SETUP',
+  RECEIPT_BINDING_CHANGED: 'REQUIRE_NEW_COMPLETE_OBSERVATION',
+  SNAPSHOT_BINDING_UNVERIFIED: 'REREAD_OR_REPORT',
+  PUBLICATION_TIME_MISMATCH: 'REREAD_OR_REPORT',
+  STORED_PAYLOAD_INVALID: 'REREAD_OR_REPORT',
+  STORED_CONTENT_MISMATCH: 'REREAD_OR_REPORT',
+  COMPLETE_OBSERVATION_CURRENT: 'NONE',
+  COMPLETE_EMPTY_CURRENT: 'NONE',
+  COMPLETE_OBSERVATION_STALE: 'AWAIT_NORMAL_COLLECTION',
+} as const
+
+/** Explanation only: these codes disclose no stored identifiers or inferred provider cause. */
+function health(reasonCode: keyof typeof HEALTH_RECOVERY) {
+  return { version: 1, reasonCode, recoveryCode: HEALTH_RECOVERY[reasonCode] } as const
+}
+
 export interface DirectoryRoleResults {
   readonly responseVersion: typeof DIRECTORY_ROLE_RESPONSE_VERSION
   readonly source: typeof DIRECTORY_ROLE_SOURCE
@@ -51,6 +70,7 @@ export interface DirectoryRoleResults {
     readonly verifiedCompleteEmpty: boolean
   } | null
   readonly latestAttempt: DirectoryRoleLatestAttempt
+  readonly health?: ReturnType<typeof health>
 }
 
 interface CoherentRead {
@@ -134,10 +154,10 @@ export async function readDirectoryRoleResults(
   // FAIL CLOSED #1 — no usable activation evidence in THIS read. Nothing here establishes which
   // path wrote any stored row; the only claim made is that this evidence cannot be vouched for.
   if (!row || row.scopeVersion !== DIRECTORY_ROLE_RECEIPT_SCOPE || !row.scopeIncarnation) {
-    return { ...base, status: 'not-activated' }
+    return { ...base, status: 'not-activated', health: health('ACTIVATION_EVIDENCE_UNAVAILABLE') }
   }
   if (!row.completeId || !row.completeCheckedAt) {
-    return { ...base, status: 'never-collected' }
+    return { ...base, status: 'never-collected', health: health('NO_COMPLETE_RECEIPT') }
   }
 
   // FAIL CLOSED #2 — current eligibility, read at the same point as the payload. The receipt store
@@ -157,16 +177,17 @@ export async function readDirectoryRoleResults(
     && row.completeScope === row.scopeIncarnation
     && row.completeConnection === row.connectionIncarnation
     && !!authority && row.completeConfiguration === authority.configurationRevision
-  if (!eligible || !bound) return { ...base, status: 'superseded' }
+  if (!eligible) return { ...base, status: 'superseded', health: health('CURRENT_ELIGIBILITY_UNAVAILABLE') }
+  if (!bound) return { ...base, status: 'superseded', health: health('RECEIPT_BINDING_CHANGED') }
 
   // FAIL CLOSED #4 — the stored payload must bind to the receipt by publication id, by the SAME
   // publication clock, and by the canonical digest and count of the WHOLE payload.
   if (row.snapshotAttemptId !== row.completeId || !row.snapshotObservedAt) {
-    return { ...base, status: 'superseded' }
+    return { ...base, status: 'superseded', health: health('SNAPSHOT_BINDING_UNVERIFIED') }
   }
   const checkedAt = new Date(row.completeCheckedAt)
   if (new Date(row.snapshotObservedAt).getTime() !== checkedAt.getTime()) {
-    return { ...base, status: 'superseded' }
+    return { ...base, status: 'superseded', health: health('PUBLICATION_TIME_MISMATCH') }
   }
   // Reuses the collection canonicalization contract unchanged: it rejects the whole payload if ANY
   // row is malformed, rebuilds each row with fixed key order (so JSONB key order cannot change the
@@ -175,11 +196,11 @@ export async function readDirectoryRoleResults(
   try {
     canonical = prepareDirectoryRoles(row.snapshotPayload as readonly unknown[])
   } catch {
-    return { ...base, status: 'superseded' }
+    return { ...base, status: 'superseded', health: health('STORED_PAYLOAD_INVALID') }
   }
   if (canonical.contentDigest !== row.completeDigest
     || row.completeCount !== canonical.rows.length) {
-    return { ...base, status: 'superseded' }
+    return { ...base, status: 'superseded', health: health('STORED_CONTENT_MISMATCH') }
   }
 
   const assignments: DirectoryRoleAssignment[] = canonical.rows.map(value => {
@@ -199,6 +220,8 @@ export async function readDirectoryRoleResults(
   return {
     ...base,
     status: ageMs <= DIRECTORY_ROLE_CURRENT_MS ? 'current' : 'stale',
+    health: health(ageMs > DIRECTORY_ROLE_CURRENT_MS ? 'COMPLETE_OBSERVATION_STALE'
+      : assignments.length === 0 ? 'COMPLETE_EMPTY_CURRENT' : 'COMPLETE_OBSERVATION_CURRENT'),
     observation: {
       checkedAt: checkedAt.toISOString(),
       ageMs,
