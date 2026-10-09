@@ -1,5 +1,6 @@
 import {
   Body,
+  ConflictException,
   Controller,
   Delete,
   Get,
@@ -15,6 +16,11 @@ import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { Public } from '../auth/public.decorator.js'
 import { TenantsService } from './tenants.service.js'
 import { TenantSyncService } from './tenant-sync.service.js'
+import {
+  DIRECTORY_ROLE_EXPORT_FILENAME,
+  assertNoExportInputs,
+  buildDirectoryRoleExport,
+} from './directory-role-export.js'
 
 @Controller('api/tenants')
 export class TenantsController {
@@ -258,5 +264,39 @@ export class TenantsController {
       request.auth,
       customerTenantId
     )
+  }
+
+  /** Derived export of the already-admitted projection. The tenant read
+   *  entitlement is exactly the results route's: the same service call, which
+   *  completes accessible-organisation and nondisclosing tenant authorization
+   *  before any payload is read. No admin-only policy and no broader access. */
+  @Get(':id/directory-roles/export')
+  async exportDirectoryRoles(
+    @Req() request: AuthenticatedRequest,
+    @Param('id') customerTenantId: string,
+    @Res({ passthrough: true }) response: Response
+  ) {
+    assertNoExportInputs(request.body, request.query)
+    const results = await this.tenantsService.getDirectoryRoleResultsForIdentity(
+      request.auth,
+      customerTenantId
+    )
+    const outcome = buildDirectoryRoleExport({
+      results,
+      customerTenantId,
+      generatedAt: new Date(),
+    })
+    if (!outcome.ok) {
+      // A refusal is returned as a refusal: finite code, no attachment headers
+      // and no downloadable error file to be mistaken for data.
+      throw new ConflictException({ statusCode: 409, code: outcome.code, refusal: outcome.refusal })
+    }
+    response.setHeader('Cache-Control', 'no-store')
+    response.setHeader('Content-Type', 'application/json; charset=utf-8')
+    response.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${DIRECTORY_ROLE_EXPORT_FILENAME}"`
+    )
+    return outcome.envelope
   }
 }
