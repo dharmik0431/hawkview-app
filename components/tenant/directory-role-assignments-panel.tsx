@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { AlertTriangle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { DirectoryRoleControl } from './directory-role-control'
+import { DirectoryRoleExportButton } from './directory-role-export-button'
 import { useDirectoryRoleResults } from '@/lib/api/directory-role-results-hooks'
 import { DIRECTORY_ROLE_SOURCE, type DirectoryRoleResultsView, type DirectoryRoleHealthView } from '@/lib/tenants/directory-role-results-view'
 import { tenantEntraPath } from '@/lib/tenants/navigation'
@@ -177,6 +178,9 @@ function DirectoryRoleStoredResults({ customerTenantId, className, compact = fal
             Checked <time dateTime={observation.checkedAt.toISOString()}>{storedTime(observation.checkedAt)}</time> · {ageLabel(presented?.elapsedMs ?? observation.ageMs)}.
             {' '}Receipt completion time; source change time is not reported.
           </p>
+          {/* Only where an admitted observation is actually on screen, and only
+              on the full view: the compact health card states no assignments. */}
+          {!compact && <DirectoryRoleExportButton customerTenantId={customerTenantId} />}
         </>}
         {copy.recovery && <p className="text-sm">Next step: {copy.recovery}</p>}
         {attempt?.outcome && <p className="text-xs text-slate-500 dark:text-slate-400">

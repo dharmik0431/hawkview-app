@@ -85,7 +85,7 @@ const observed = (rows: Record<string, unknown>[], extra: Record<string, unknown
 
 type State = { data?: unknown; isPending?: boolean; isError?: boolean; isFetching?: boolean; dataUpdatedAt?: number }
 
-function renderPanel(state: State, customerTenantId = 'tenant-A') {
+function renderPanel(state: State, customerTenantId = 'tenant-A', options: { compact?: boolean } = {}) {
   let current: State = state
   const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://hawkview.invalid', pretendToBeVisual: true })
   const previous = new Map<string, PropertyDescriptor | undefined>()
@@ -114,11 +114,28 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
     './client': { ApiError: class ApiError extends Error {}, apiClient: {} },
   })(resolvePath(repoRoot, 'lib/api/directory-role-control-hooks.ts'))
 
+  const exportCalls: { endpoint: string; options: any }[] = []
   const load = makeLoader({
     '@/components/providers/auth-provider': {
       // No membership: the control renders nothing, so every assertion below is about the
       // results panel exactly as before this child was added.
-      useAuth: () => ({ session: { user: { memberships: [] } } }),
+      // isLoading and currentIdentityToken are required by the export child,
+      // which reads only when signed in and not loading.
+      useAuth: () => ({
+        session: { user: { memberships: [] } },
+        isLoading: false,
+        currentIdentityToken: () => 'identity-A',
+      }),
+    },
+    '@/lib/api/client': {
+      // The export child's transport. Held open: no assertion here depends on a
+      // reply, and a real client must never be reached from a test.
+      apiClient: {
+        get: (endpoint: string, getOptions: any) => {
+          exportCalls.push({ endpoint, options: getOptions })
+          return new Promise(() => {})
+        },
+      },
     },
     '@/lib/api/directory-role-control-hooks': {
       ...realControlHooks,
@@ -154,7 +171,8 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
   let root: ReturnType<typeof createRoot> | undefined
   let Panel: any
   try {
-    Panel = load(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx')).DirectoryRoleAssignmentsPanel
+    const panelModule = load(resolvePath(repoRoot, 'components/tenant/directory-role-assignments-panel.tsx'))
+    Panel = options.compact ? panelModule.DirectoryRoleReceiptHealth : panelModule.DirectoryRoleAssignmentsPanel
     const target = dom.window.document.getElementById('root') as HTMLElement
     root = createRoot(target)
     act(() => { root!.render(React.createElement(Panel, { customerTenantId })) })
@@ -167,7 +185,7 @@ function renderPanel(state: State, customerTenantId = 'tenant-A') {
   const container = dom.window.document.getElementById('root') as HTMLElement
   const cleanup = () => release(root)
   return {
-    container, text: () => container.textContent ?? '', refetches, asked, cleanup,
+    container, text: () => container.textContent ?? '', refetches, asked, cleanup, exportCalls,
     listeners: () => listeners,
     buttons: () => Array.from(container.querySelectorAll('button')) as any[],
     click: (node: any) => act(() => { node.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })) }),
@@ -442,4 +460,80 @@ test('locally aged health replaces CURRENT explanation and keeps failed attempt 
     assert.match(panel.text(), /No directory role assignments were found/)
     assert.doesNotMatch(panel.text(), /within the one-hour|permission|throttl/i)
   } finally { panel.cleanup(); Date.now = realNow }
+})
+
+/** H integration — the one controlled place the export control appears. */
+
+test('the export control appears only where an admitted observation is actually shown', () => {
+  const shown = renderPanel({ data: view('current', observed([ROW])) })
+  try {
+    assert.match(shown.text(), /Download stored results/)
+    // It must state what the file is, beside the control that produces it.
+    assert.match(shown.text(), /not provider-original data/)
+    assert.match(shown.text(), /not proof of who holds a role now/)
+  } finally { shown.cleanup() }
+
+  const stale = renderPanel({ data: view('stale', observed([ROW], { ageMs: 7_200_000 })) })
+  try {
+    // A stale observation is exportable, carrying its own qualification.
+    assert.match(stale.text(), /Download stored results/)
+  } finally { stale.cleanup() }
+
+  const empty = renderPanel({ data: view('current', observed([])) })
+  try {
+    assert.match(empty.text(), /Download stored results/, 'a verified-empty observation is exportable')
+  } finally { empty.cleanup() }
+})
+
+test('the export control is absent wherever there is nothing admitted to export', () => {
+  for (const status of ['not-activated', 'never-collected', 'superseded'] as const) {
+    const panel = renderPanel({ data: view(status, null) })
+    try {
+      assert.equal(panel.text().includes('Download stored results'), false, status)
+    } finally { panel.cleanup() }
+  }
+  const failing = renderPanel({ data: view('current', observed([ROW])), isError: true })
+  try {
+    // An active result error means the rows on screen are not trustworthy, so
+    // there is nothing to offer a download of.
+    assert.equal(failing.text().includes('Download stored results'), false)
+    assert.match(failing.text(), /These results are unavailable right now/)
+  } finally { failing.cleanup() }
+
+  const pending = renderPanel({ data: undefined, isPending: true })
+  try {
+    assert.equal(pending.text().includes('Download stored results'), false)
+  } finally { pending.cleanup() }
+})
+
+test('the compact receipt-health card offers no download', () => {
+  const compact = renderPanel({ data: view('current', observed([ROW])) }, 'tenant-A', { compact: true })
+  try {
+    assert.match(compact.text(), /Directory role receipt health/)
+    assert.match(compact.text(), /Complete observation: 1 directory role assignment\./)
+    // The compact card reports a count and no rows, so a file from it would
+    // carry more than the card ever showed.
+    assert.equal(compact.text().includes('Download stored results'), false)
+  } finally { compact.cleanup() }
+})
+
+test('clicking the export control re-reads the export endpoint and never the view or a collection', () => {
+  const panel = renderPanel({ data: view('current', observed([ROW])) })
+  try {
+    const control = panel.buttons().find(node => (node.textContent ?? '').includes('Download stored results'))
+    assert.ok(control, 'the export control is present')
+    const refetchesBefore = panel.refetches.length
+    const askedBefore = panel.asked.length
+    panel.click(control)
+    assert.equal(panel.exportCalls.length, 1, 'exactly one export request')
+    assert.equal(panel.exportCalls[0].endpoint, '/tenants/tenant-A/directory-roles/export')
+    assert.equal(panel.exportCalls[0].options.cache, 'no-store')
+    assert.ok(panel.exportCalls[0].options.signal instanceof AbortSignal)
+    // The rows on screen are not what gets saved, and nothing is collected. The
+    // click does not touch the results hook at all — not a refetch and not even
+    // a re-read, because the export child owns its own state and the panel does
+    // not re-render.
+    assert.equal(panel.refetches.length, refetchesBefore, 'the view is not refetched')
+    assert.equal(panel.asked.length, askedBefore, 'the results hook is not consulted by the click')
+  } finally { panel.cleanup() }
 })
