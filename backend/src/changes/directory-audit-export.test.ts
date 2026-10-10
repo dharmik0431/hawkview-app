@@ -9,9 +9,13 @@ import {
   DIRECTORY_AUDIT_EXPORT_TOO_LARGE,
   DIRECTORY_AUDIT_EXPORT_VERSION,
   EXPORTED_DIRECTORY_FIELDS,
-  OMITTED_DIRECTORY_FIELDS,
+  DIRECTORY_AUDIT_EXPORT_REDACTED,
+  OMITTED_TOP_LEVEL_DIRECTORY_FIELDS,
   UNBOUNDED_WINDOW,
   assertNoExportExtras,
+  exportRequestSuppliedBody,
+  redactSensitiveDetailPairs,
+  sensitiveNameRuleAgrees,
   buildDirectoryAuditExportEnvelope,
   directoryAuditExportFilename,
   envelopeByteLength,
@@ -20,6 +24,9 @@ import {
   singleExportValue,
 } from './directory-audit-export.js'
 import { classifyEvidence, PRIMARY_CHANGE_CLASSIFICATIONS } from './change-classification.js'
+import { Module } from '@nestjs/common'
+import { NestFactory } from '@nestjs/core'
+import { request as httpRequest } from 'node:http'
 import { ChangesController } from './changes.controller.js'
 import { ChangesService } from './changes.service.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
@@ -133,22 +140,105 @@ test('the envelope declares what it is, and what it leaves out', () => {
   assert.equal(envelope.returned + envelope.excludedByClassification, envelope.candidates)
   // Fidelity, stated rather than implied.
   assert.match(envelope.fidelity.storedRepresentation, /not original wire bytes/)
-  assert.match(envelope.fidelity.redaction, /\[REDACTED\]/)
+  assert.match(envelope.fidelity.storedRepresentation, /not the complete stored row/)
   assert.match(envelope.fidelity.availability, /from ingestion rather than from when the event occurred/)
   assert.match(envelope.fidelity.coverage, /not a claim that every retained Microsoft event is included/)
-  // resultReason is stored but not exported; its absence is declared.
-  assert.deepEqual(envelope.fidelity.omittedFields, OMITTED_DIRECTORY_FIELDS)
-  assert.ok(envelope.fidelity.omittedFields.includes('resultReason'))
+  // The two redaction timings are stated separately, because they differ: only
+  // the parsed `raw` copy was redacted at write.
+  assert.match(envelope.fidelity.redactionAtWrite, /Only the parsed "raw" copy/)
+  assert.match(envelope.fidelity.redactionAtWrite, /stored as they were received/)
+  assert.match(envelope.fidelity.redactionOnRead, /does not alter or correct what remains stored/)
+  // The omission is scoped to the column, and says so.
+  assert.deepEqual(envelope.fidelity.omittedTopLevelFields, OMITTED_TOP_LEVEL_DIRECTORY_FIELDS)
+  assert.ok(envelope.fidelity.omittedTopLevelFields.includes('resultReason'))
   assert.equal(envelope.fidelity.includedFields.includes('resultReason'), false)
+  assert.match(envelope.fidelity.omissionScope, /Only the top-level "resultReason" column is omitted/)
+  assert.match(envelope.fidelity.omissionScope, /may still be present inside the exported "raw" copy/)
   assert.equal(envelopeByteLength(envelope), Buffer.byteLength(JSON.stringify(envelope), 'utf8'))
 })
 
 test('a request body or an unexpected parameter is refused rather than ignored', () => {
-  assert.doesNotThrow(() => assertNoExportExtras(undefined, { tenantId: TENANT_A, since: 'x', until: 'y' }))
-  assert.doesNotThrow(() => assertNoExportExtras({}, {}))
-  assert.throws(() => assertNoExportExtras({ tenantId: TENANT_B }, {}), /does not accept a request body/)
-  assert.throws(() => assertNoExportExtras(undefined, { organizationId: ORG_B }), /does not accept organizationId/)
-  assert.throws(() => assertNoExportExtras(undefined, { cursor: 'x' }), /does not accept cursor/)
+  const noBody = { headers: {}, body: undefined }
+  assert.doesNotThrow(() => assertNoExportExtras(noBody, { tenantId: TENANT_A, since: 'x', until: 'y' }))
+  assert.doesNotThrow(() => assertNoExportExtras(noBody, {}))
+  assert.throws(() => assertNoExportExtras(noBody, { organizationId: ORG_B }), /does not accept organizationId/)
+  assert.throws(() => assertNoExportExtras(noBody, { cursor: 'x' }), /does not accept cursor/)
+})
+
+test('an explicitly supplied empty JSON body is a body, and nothing sent is not', async () => {
+  // A parsed value cannot tell these apart: both can arrive as `{}`. The
+  // framing can.
+  assert.equal(exportRequestSuppliedBody({ headers: {}, body: undefined }), false)
+  assert.equal(exportRequestSuppliedBody({ headers: {}, body: {} }), false)
+  assert.equal(exportRequestSuppliedBody({ headers: { 'content-length': '0' } }), false)
+  // `{}` is two bytes on the wire.
+  assert.equal(exportRequestSuppliedBody({
+    headers: { 'content-length': '2', 'content-type': 'application/json' }, body: {},
+  }), true)
+  assert.equal(exportRequestSuppliedBody({ headers: { 'transfer-encoding': 'chunked' }, body: {} }), true)
+  // A parser that consumed the framing still cannot hide a non-empty body.
+  assert.equal(exportRequestSuppliedBody({ headers: {}, body: { tenantId: TENANT_B } }), true)
+  assert.throws(
+    () => assertNoExportExtras({ headers: { 'content-length': '2' }, body: {} }, { tenantId: TENANT_A }),
+    /does not accept a request body/)
+  assert.throws(
+    () => assertNoExportExtras({ headers: {}, body: { tenantId: TENANT_B } }, {}),
+    /does not accept a request body/)
+})
+
+test('a sensitive-named detail pair is redacted where property-name redaction cannot see it', async () => {
+  // The exact shape the reviewer demonstrated: the property names here are
+  // `key` and `value`, so the storage-time rule walks straight past it.
+  const detail = [{ key: 'Authorization', value: 'Bearer leaked-token-value' }]
+  assert.deepEqual(redactSensitiveDetailPairs(detail), [{ key: 'Authorization', value: DIRECTORY_AUDIT_EXPORT_REDACTED }])
+
+  // Nested inside the parsed raw copy, and in modified-property form.
+  const nested = {
+    activity: 'kept',
+    additionalDetails: [
+      { key: 'Client-Secret', value: 'nested-secret-value' },
+      { key: 'Correlation', value: 'kept-correlation' },
+    ],
+    targetResources: [{
+      type: 'User',
+      modifiedProperties: [
+        { displayName: 'Included Updated Properties', oldValue: 'kept-old', newValue: 'kept-new' },
+        { displayName: 'Refresh Token Valid From', oldValue: 'secret-old', newValue: 'secret-new' },
+      ],
+    }],
+  }
+  const safe = JSON.stringify(redactSensitiveDetailPairs(nested))
+  for (const leak of ['nested-secret-value', 'secret-old', 'secret-new']) {
+    assert.doesNotMatch(safe, new RegExp(leak), leak)
+  }
+  // Non-sensitive data is preserved, not collaterally destroyed.
+  for (const kept of ['kept', 'kept-correlation', 'kept-old', 'kept-new', 'Included Updated Properties']) {
+    assert.match(safe, new RegExp(kept), kept)
+  }
+  // A pair whose name is not sensitive keeps its value even when a sibling is.
+  assert.deepEqual(
+    redactSensitiveDetailPairs([{ key: 'Note', value: 'keep-me' }]),
+    [{ key: 'Note', value: 'keep-me' }])
+  // Scalars, arrays and null pass through unchanged.
+  assert.deepEqual(redactSensitiveDetailPairs(null), null)
+  assert.deepEqual(redactSensitiveDetailPairs(['a', 1, null]), ['a', 1, null])
+})
+
+test('the export safeguard uses the same sensitive-name rule as storage', async () => {
+  // Pinned so the two cannot silently diverge: the safeguard is a read-time
+  // application of the existing rule to a shape it cannot see, not a new policy.
+  for (const name of [
+    'password', 'clientSecret', 'refresh_token', 'Authorization', 'credential',
+    'private-key', 'assertion', 'certificate',
+  ]) {
+    assert.ok(sensitiveNameRuleAgrees(name), name)
+    assert.deepEqual(
+      redactSensitiveDetailPairs([{ key: name, value: 'x' }]),
+      [{ key: name, value: DIRECTORY_AUDIT_EXPORT_REDACTED }], name)
+  }
+  for (const name of ['Note', 'Correlation', 'activityDisplayName', 'resultReason']) {
+    assert.equal(sensitiveNameRuleAgrees(name), false, name)
+  }
 })
 
 test('the static export route is declared before the parameter route that would capture it', () => {
@@ -511,8 +601,13 @@ test('another tenant in the same organization is not exported', async () => {
 
 // --------------------------------------------------------------- what is sent
 
-test('an exported record carries the declared fields, and resultReason is not among them', async () => {
-  const row = audit({ resultReason: 'operator-visible reason text' })
+test('an exported record carries exactly the declared top-level fields', async () => {
+  // `raw` here deliberately does NOT echo the column, so this case isolates the
+  // column omission; the ingestion-shaped case covers the raw copy.
+  const row = audit({
+    resultReason: 'operator-visible reason text',
+    raw: { activityDisplayName: 'Reset user password', correlationId: 'c-1' },
+  })
   const { service } = harness({ audits: [row] })
   const { envelope, filename } = await service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
   assert.equal(envelope.returned, 1)
@@ -520,6 +615,29 @@ test('an exported record carries the declared fields, and resultReason is not am
   assert.equal('resultReason' in (envelope.records[0] as Record<string, unknown>), false)
   assert.doesNotMatch(JSON.stringify(envelope), /operator-visible reason text/)
   assert.equal(filename, directoryAuditExportFilename(TENANT_A, UNBOUNDED_WINDOW))
+})
+
+test('the omission is the top-level column, and the raw copy is preserved', async () => {
+  // Ingestion-shaped: the collector stores `resultReason` as a column AND
+  // stores the whole parsed row in `raw`, so the same text is in both places.
+  // Omitting the column does not remove it from the file, and claiming
+  // otherwise is the overstatement the reviewer caught.
+  const reason = 'Microsoft stated reason text'
+  const row = audit({
+    resultReason: reason,
+    raw: { activityDisplayName: 'Reset user password', resultReason: reason, correlationId: 'c-1' },
+  })
+  const { service } = harness({ audits: [row] })
+  const { envelope } = await service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
+  const record = envelope.records[0] as Record<string, unknown>
+  // The column is absent from the record.
+  assert.equal('resultReason' in record, false)
+  // And the same text IS still present, inside the preserved raw copy.
+  assert.equal((record.raw as Record<string, unknown>).resultReason, reason)
+  assert.match(JSON.stringify(envelope), new RegExp(reason))
+  // So the declaration must scope the omission rather than imply absence.
+  assert.match(envelope.fidelity.omissionScope, /may still be present inside the exported "raw" copy/)
+  assert.equal(envelope.fidelity.omittedTopLevelFields.includes('resultReason'), true)
 })
 
 test('a stored microsecond instant is exported unrounded', async () => {
@@ -543,9 +661,35 @@ test('values matching the redaction rule are replaced on the way out', async () 
   })
   const { envelope } = await service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
   const text = JSON.stringify(envelope)
-  for (const leak of ['super-secret-value', 'leaked-refresh-value']) assert.doesNotMatch(text, new RegExp(leak))
+  // The bearer value is asserted against the COMPLETE serialized envelope.
+  // My first version built this exact detail and then checked only the other
+  // two strings, so it passed while the token was still in the file.
+  for (const leak of ['super-secret-value', 'leaked-refresh-value', 'Bearer leaked-token-value', 'leaked-token-value']) {
+    assert.doesNotMatch(text, new RegExp(leak), leak)
+  }
   assert.match(text, /\[REDACTED\]/)
   assert.match(text, /kept/)
+})
+
+test('a sensitive detail nested in the stored raw copy does not reach the file', async () => {
+  const { service } = harness({
+    audits: [audit({
+      additionalDetails: [{ key: 'Note', value: 'kept-detail' }],
+      raw: {
+        activityDisplayName: 'Reset user password',
+        additionalDetails: [{ key: 'Authorization', value: 'Bearer nested-bearer-value' }],
+        targetResources: [{
+          modifiedProperties: [{ displayName: 'Client Secret', oldValue: 'old-nested-secret', newValue: 'new-nested-secret' }],
+        }],
+      },
+    })],
+  })
+  const { envelope } = await service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
+  const text = JSON.stringify(envelope)
+  for (const leak of ['nested-bearer-value', 'old-nested-secret', 'new-nested-secret']) {
+    assert.doesNotMatch(text, new RegExp(leak), leak)
+  }
+  assert.match(text, /kept-detail/)
 })
 
 test('records are ordered newest first and tie-broken by identifier', async () => {
@@ -740,7 +884,7 @@ test('a successful download is marked no-store and named as an attachment', asyn
   const controller = new ChangesController(service)
   const { headers, response } = responseDouble()
   const envelope = await controller.exportDirectoryAudit(
-    { auth: IDENTITY, body: undefined } as never,
+    { auth: IDENTITY, body: undefined, headers: {} } as never,
     { tenantId: TENANT_A },
     response as never)
   assert.equal(headers['Cache-Control'], 'no-store')
@@ -754,7 +898,7 @@ test('a refused download announces no attachment and sets no headers', async () 
   const controller = new ChangesController(service)
   const { headers, response } = responseDouble()
   await assert.rejects(() => controller.exportDirectoryAudit(
-    { auth: IDENTITY, body: undefined } as never,
+    { auth: IDENTITY, body: undefined, headers: {} } as never,
     { tenantId: TENANT_B },
     response as never))
   assert.deepEqual(headers, {})
@@ -765,9 +909,152 @@ test('an unexpected parameter is refused before anything is read', async () => {
   const controller = new ChangesController(service)
   const { headers, response } = responseDouble()
   await assert.rejects(() => controller.exportDirectoryAudit(
-    { auth: IDENTITY, body: undefined } as never,
+    { auth: IDENTITY, body: undefined, headers: {} } as never,
     { tenantId: TENANT_A, organizationId: ORG_B },
     response as never), /does not accept organizationId/)
   assert.equal(statements.length, 0)
   assert.deepEqual(headers, {})
+})
+
+// ------------------------------------------------ actual HTTP dispatch seam
+//
+// The earlier route-order check read decorator metadata, which is structural
+// evidence about the source rather than a dispatch witness. This boots a real
+// Nest/Express application over the existing dependencies -- no new package,
+// no change to global route or parser policy -- and issues real requests. The
+// service is stubbed on purpose: what is under test is dispatch, framing and
+// response headers, not service logic. A GET body is written through
+// `node:http`, because `fetch` refuses to send one.
+
+type HttpResult = { status: number; headers: Record<string, string | string[] | undefined>; text: string }
+
+function httpGet(port: number, path: string, body?: string): Promise<HttpResult> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({
+      host: '127.0.0.1',
+      port,
+      path,
+      method: 'GET',
+      headers: body === undefined
+        ? {}
+        : { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) },
+    }, (response) => {
+      let text = ''
+      response.setEncoding('utf8')
+      response.on('data', (chunk) => { text += chunk })
+      response.on('end', () => resolve({
+        status: response.statusCode ?? 0,
+        headers: response.headers as HttpResult['headers'],
+        text,
+      }))
+    })
+    request.on('error', reject)
+    if (body !== undefined) request.write(body)
+    request.end()
+  })
+}
+
+async function exportApp(stub: Partial<Record<'list' | 'detail' | 'exportDirectoryAudit', unknown>>) {
+  @Module({
+    controllers: [ChangesController],
+    providers: [{ provide: ChangesService, useValue: stub }],
+  })
+  class ExportDispatchModule {}
+
+  const app = await NestFactory.create(ExportDispatchModule, { logger: false })
+  // The verified identity normally arrives from the application's own auth
+  // layer; this supplies it so dispatch can be exercised in isolation.
+  app.use((request: Record<string, unknown>, _response: unknown, next: () => void) => {
+    request.auth = IDENTITY
+    next()
+  })
+  await app.listen(0)
+  const address = app.getHttpServer().address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+  return { app, port }
+}
+
+test('over real HTTP, /api/changes/export reaches the export handler and not :id', async (context) => {
+  const calls: string[] = []
+  const { app, port } = await exportApp({
+    list: async () => { calls.push('list'); return {} },
+    detail: async (_identity: unknown, id: string) => { calls.push(`detail:${id}`); return { id } },
+    exportDirectoryAudit: async () => {
+      calls.push('export')
+      const { service } = harness({ audits: [audit()] })
+      return service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
+    },
+  })
+  context.after(async () => { await app.close() })
+
+  const exported = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}`)
+  assert.equal(exported.status, 200)
+  assert.deepEqual(calls, ['export'])
+  assert.equal(exported.headers['cache-control'], 'no-store')
+  assert.equal(exported.headers['content-type'], 'application/json; charset=utf-8')
+  assert.match(
+    String(exported.headers['content-disposition']),
+    /^attachment; filename="hawkview_directory_audit_stored_redacted_/)
+  assert.equal(JSON.parse(exported.text).qualification, DIRECTORY_AUDIT_EXPORT_QUALIFICATION)
+
+  // The parameter route still works and is not shadowed in the other direction.
+  const detail = await httpGet(port, `/api/changes/${TENANT_B}?tenantId=${TENANT_A}`)
+  assert.equal(detail.status, 200)
+  assert.deepEqual(calls, ['export', `detail:${TENANT_B}`])
+})
+
+test('over real HTTP, an explicitly supplied empty JSON body is refused with no attachment', async (context) => {
+  const calls: string[] = []
+  const { app, port } = await exportApp({
+    detail: async () => ({}),
+    exportDirectoryAudit: async () => {
+      calls.push('export')
+      const { service } = harness({ audits: [audit()] })
+      return service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW })
+    },
+  })
+  context.after(async () => { await app.close() })
+
+  // Control: the same request without a body succeeds, so the refusal below is
+  // caused by the body and not by the request being malformed.
+  const allowed = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}`)
+  assert.equal(allowed.status, 200)
+  assert.equal(calls.length, 1)
+
+  const refused = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}`, '{}')
+  assert.equal(refused.status, 400)
+  assert.match(refused.text, /does not accept a request body/)
+  // The service was never reached, and nothing announced an attachment.
+  assert.equal(calls.length, 1)
+  assert.equal(refused.headers['content-disposition'], undefined)
+
+  const populated = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}`, '{"tenantId":"other"}')
+  assert.equal(populated.status, 400)
+  assert.equal(populated.headers['content-disposition'], undefined)
+  assert.equal(calls.length, 1)
+})
+
+test('over real HTTP, a refusal and an unexpected parameter announce no attachment', async (context) => {
+  const { app, port } = await exportApp({
+    detail: async () => ({}),
+    exportDirectoryAudit: async () => {
+      const { service } = harness({ audits: [audit(), audit()] })
+      // Two candidates against a cap of one: the real refusal path.
+      return service.exportDirectoryAudit(IDENTITY, TENANT_A, undefined, undefined, { now: NOW, candidateCap: 1 })
+    },
+  })
+  context.after(async () => { await app.close() })
+
+  const refused = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}`)
+  assert.equal(refused.status, 409)
+  const body = JSON.parse(refused.text)
+  assert.equal(body.code, DIRECTORY_AUDIT_EXPORT_TOO_LARGE)
+  assert.equal(body.refusal, 'CANDIDATE_CAP_EXCEEDED')
+  assert.equal(refused.headers['content-disposition'], undefined)
+  assert.notEqual(refused.headers['cache-control'], 'no-store')
+
+  const widened = await httpGet(port, `/api/changes/export?tenantId=${TENANT_A}&organizationId=${ORG_B}`)
+  assert.equal(widened.status, 400)
+  assert.match(widened.text, /does not accept organizationId/)
+  assert.equal(widened.headers['content-disposition'], undefined)
 })

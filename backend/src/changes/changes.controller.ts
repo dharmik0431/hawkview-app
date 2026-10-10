@@ -21,7 +21,7 @@ export class ChangesController {
     @Query() query: Record<string, unknown>,
     @Res({ passthrough: true }) response: Response,
   ) {
-    assertNoExportExtras(request.body, query)
+    assertNoExportExtras(request, query)
     const { envelope, filename } = await this.changes.exportDirectoryAudit(
       request.auth,
       query.tenantId,

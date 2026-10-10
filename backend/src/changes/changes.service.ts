@@ -23,6 +23,7 @@ import {
   envelopeByteLength,
   parseExportTenantId,
   parseExportWindow,
+  redactSensitiveDetailPairs,
   refuseDirectoryAuditExport,
   type DirectoryAuditExportEnvelope,
 } from './directory-audit-export.js'
@@ -289,6 +290,13 @@ function normalizedEvidenceProjection(event: Parameters<typeof normalizedEvidenc
     presentation: sourcePresentation(event),
     trust,
   }
+}
+
+/** Both redactions, in order: the existing object-property rule, then the
+ *  export-local safeguard for sensitive-NAMED detail pairs that the first rule
+ *  cannot see. The order matters only for clarity; neither undoes the other. */
+function exportSafeValue(value: unknown): unknown {
+  return redactSensitiveDetailPairs(redactSensitiveValues(value))
 }
 
 function directoryAuditProjection(log: {
@@ -746,11 +754,14 @@ export class ChangesService {
         result: row.result,
         correlationId: row.correlationId,
         loggedByService: row.loggedByService,
-        // Redacted again on read, exactly as the detail reader does.
-        initiatedBy: redactSensitiveValues(row.initiatedBy),
-        targetResources: redactSensitiveValues(row.targetResources),
-        additionalDetails: redactSensitiveValues(row.additionalDetails),
-        raw: redactSensitiveValues(row.raw),
+        // Property-name redaction again on read, exactly as the detail reader
+        // does -- and then the export-local pair safeguard over the result,
+        // because a detail named "Authorization" carries its bearer token in an
+        // ordinary `value` property that property-name redaction walks past.
+        initiatedBy: exportSafeValue(row.initiatedBy),
+        targetResources: exportSafeValue(row.targetResources),
+        additionalDetails: exportSafeValue(row.additionalDetails),
+        raw: exportSafeValue(row.raw),
         ingestedAt: row.ingestedAt,
         expiresAt: row.expiresAt,
       })
