@@ -67,6 +67,8 @@ import {
   type DisplayStatusKey,
 } from '@/components/tenants/tenant-status-badge'
 import { TenantOnboardingDialog } from '@/components/tenants/tenant-onboarding-dialog'
+import { DirectoryHealthDialog } from '@/components/tenants/directory-health-dialog'
+import { selectedDirectoryHealthTenant, type DirectoryHealthSelection } from '@/lib/tenants/directory-health-selection'
 
 type Provider = 'microsoft' | 'google'
 type ProviderFilter = 'all' | 'microsoft' | 'google'
@@ -262,8 +264,49 @@ function TenantIdPill({ tenantId }: { tenantId: string }) {
 export default function TenantsPage() {
   const queryClient = useQueryClient()
   const router = useRouter()
-  const { session } = useAuth()
-  const { data, isLoading, isFetching, error, refetch } = useTenants()
+  const { session, cacheScope, isLoading: authLoading, currentIdentityToken } = useAuth()
+  const { data, isLoading, isFetching, isSuccess, error, refetch } = useTenants()
+  const identityToken = currentIdentityToken()
+  const [directorySelection, setDirectorySelection] = useState<DirectoryHealthSelection | null>(null)
+  const directoryTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const directoryTenant = selectedDirectoryHealthTenant({
+    selection: directorySelection, cacheScope, identityToken, authLoading,
+    listSuccessful: isSuccess && !error, tenants: data?.tenants,
+  })
+
+  // Render admission removes the reader immediately; clearing intent also prevents reopening
+  // when a removed tenant, failed list or previous workspace later becomes available again.
+  useEffect(() => {
+    if (directorySelection && !directoryTenant) {
+      setDirectorySelection(null)
+      directoryTriggerRef.current = null
+    }
+  }, [directorySelection, directoryTenant])
+
+  function openDirectoryHealth(tenantId: string, trigger: HTMLButtonElement) {
+    directoryTriggerRef.current = trigger
+    setDirectorySelection({ tenantId, cacheScope, identityToken: currentIdentityToken() })
+  }
+
+  function closeDirectoryHealth() {
+    setDirectorySelection(null)
+    if (directoryTenant && directorySelection?.identityToken === currentIdentityToken()
+      && directoryTriggerRef.current?.isConnected) directoryTriggerRef.current.focus()
+    directoryTriggerRef.current = null
+  }
+
+  function directoryHealthAction(tenant: Tenant) {
+    if (tenant.provider !== 'microsoft') return null
+    return (
+      <Button type="button" variant="outline" size="sm"
+        className="h-8 px-3 text-xs font-semibold"
+        aria-label={`Directory health for ${tenant.name}`} aria-haspopup="dialog"
+        disabled={authLoading || !isSuccess || Boolean(error)}
+        onClick={(event) => openDirectoryHealth(tenant.id, event.currentTarget)}>
+        Directory health
+      </Button>
+    )
+  }
 
   // Scope the affordance to the workspace represented by this directory.
   // A role in another workspace must never make tenant administration actions
@@ -1734,6 +1777,8 @@ export default function TenantsPage() {
 
                         {/* Context-Sensitive Primary Action */}
                         <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                          <div className="flex items-center justify-end gap-2">
+                          {directoryHealthAction(tenant)}
                           {tenant.onboarding?.complete === false ? (
                             <Button
                               size="sm"
@@ -1764,6 +1809,7 @@ export default function TenantsPage() {
                               </Button>
                             </Link>
                           )}
+                          </div>
                         </td>
                       </tr>
                     )
@@ -1847,6 +1893,7 @@ export default function TenantsPage() {
                     <AffectedServices tenant={tenant} compact />
                   </div>
 
+                  <div className="flex justify-end">{directoryHealthAction(tenant)}</div>
                   <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
                     <TenantIdPill tenantId={tenant.microsoftTenantId || tenant.id} />
                     {tenant.onboarding?.complete === false ? (
@@ -1936,6 +1983,15 @@ export default function TenantsPage() {
             Clear Active Filters
           </Button>
         </div>
+      )}
+
+      {directoryTenant && directorySelection && (
+        <DirectoryHealthDialog
+          key={`${identityToken}:${cacheScope}:${directoryTenant.id}`}
+          tenantId={directoryTenant.id}
+          tenantName={directoryTenant.name}
+          onClose={closeDirectoryHealth}
+        />
       )}
 
       {/* 7. Tenant Issue Details Drawer */}
