@@ -14,6 +14,19 @@ import {
 import { classifyEvidenceTrust, classifyLegacyDirectoryProjection } from './evidence-trust-catalog.js'
 import { readDirectoryAuditMetadata } from './directory-audit-projection-metadata.js'
 import { productGuidanceForSnapshot } from './microsoft-admin-change-catalog.js'
+import {
+  DIRECTORY_AUDIT_EXPORT_CANDIDATE_CAP,
+  DIRECTORY_AUDIT_EXPORT_READ_BUDGET_BYTES,
+  DIRECTORY_AUDIT_EXPORT_ENVELOPE_BYTES,
+  buildDirectoryAuditExportEnvelope,
+  directoryAuditExportFilename,
+  envelopeByteLength,
+  parseExportTenantId,
+  parseExportWindow,
+  redactSensitiveDetailPairs,
+  refuseDirectoryAuditExport,
+  type DirectoryAuditExportEnvelope,
+} from './directory-audit-export.js'
 
 type JsonObject = Record<string, unknown>
 type TimelineEvent = {
@@ -277,6 +290,13 @@ function normalizedEvidenceProjection(event: Parameters<typeof normalizedEvidenc
     presentation: sourcePresentation(event),
     trust,
   }
+}
+
+/** Both redactions, in order: the existing object-property rule, then the
+ *  export-local safeguard for sensitive-NAMED detail pairs that the first rule
+ *  cannot see. The order matters only for clarity; neither undoes the other. */
+function exportSafeValue(value: unknown): unknown {
+  return redactSensitiveDetailPairs(redactSensitiveValues(value))
 }
 
 function directoryAuditProjection(log: {
@@ -552,6 +572,219 @@ export class ChangesService {
     }
     if (pageSize) events = events.slice((page - 1) * pageSize, page * pageSize)
     return { sourceAvailability, collectionCompleteness: 'unknown' as const, changes: events, tenants: allTenants.map((tenant) => ({ id: tenant.id, name: names.get(tenant.id)! })), summary, range: { from: from.toISOString(), to: to.toISOString() }, ...(pageSize ? { pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } } : {}) }
+  }
+
+  /** Bounded download of the stored, redacted directory-audit records.
+   *
+   * The guard below is one statement, so the candidate count, the byte tally and
+   * the payload share a single snapshot: a scalar preflight followed by a
+   * separate fetch would be an unchecked race. The payload `json_agg` sits in
+   * the un-taken `CASE` branch whenever either ceiling is exceeded, so no
+   * payload or classification value crosses into this process after a refusal.
+   * PostgreSQL still examines stored values to compute those byte lengths; that
+   * is not a claim of zero database-side reads.
+   */
+  async exportDirectoryAudit(
+    identity: AuthenticatedIdentity,
+    requestedTenantId: unknown,
+    requestedSince: unknown,
+    requestedUntil: unknown,
+    internals: { now?: () => Date; candidateCap?: number; readBudgetBytes?: number } = {}
+  ): Promise<{ envelope: DirectoryAuditExportEnvelope; filename: string }> {
+    const customerTenantId = parseExportTenantId(requestedTenantId)
+    const window = parseExportWindow(requestedSince, requestedUntil)
+    const organizationIds = await this.organizationIds(identity)
+
+    // Nondisclosing, and worded exactly as the existing detail reader: outside
+    // the caller's organizations is indistinguishable from absent.
+    const scopedTenant = await this.prisma.customerTenant.findFirst({
+      where: { id: customerTenantId, organizationId: { in: organizationIds } },
+      select: { id: true },
+    })
+    if (!scopedTenant) {
+      throw new BadRequestException('This investigation event is unavailable or outside retention.')
+    }
+
+    const observedNow = (internals.now ?? (() => new Date()))()
+    const candidateCap = internals.candidateCap ?? DIRECTORY_AUDIT_EXPORT_CANDIDATE_CAP
+    const readBudgetBytes = internals.readBudgetBytes ?? DIRECTORY_AUDIT_EXPORT_READ_BUDGET_BYTES
+
+    const values: unknown[] = [organizationIds, customerTenantId, observedNow]
+    const windowClauses: string[] = []
+    if (window.since !== null) {
+      values.push(window.since)
+      windowClauses.push(`AND d.event_date_time >= $${values.length}::timestamptz`)
+    }
+    if (window.until !== null) {
+      // Half-open: `until` is exclusive.
+      values.push(window.until)
+      windowClauses.push(`AND d.event_date_time < $${values.length}::timestamptz`)
+    }
+    values.push(candidateCap + 1)
+    const probeIndex = values.length
+    values.push(candidateCap)
+    const capIndex = values.length
+    values.push(readBudgetBytes)
+    const budgetIndex = values.length
+
+    // Assembled from literal fragments only; every value is bound.
+    const sql = `
+      WITH candidates AS (
+        SELECT d.id AS "id",
+               d.microsoft_audit_id AS "microsoftAuditId",
+               d.event_date_time AS "eventDateTime",
+               d.activity_display_name AS "activityDisplayName",
+               d.category AS "category",
+               d.operation_type AS "operationType",
+               d.result AS "result",
+               d.correlation_id AS "correlationId",
+               d.logged_by_service AS "loggedByService",
+               d.initiated_by AS "initiatedBy",
+               d.target_resources AS "targetResources",
+               d.additional_details AS "additionalDetails",
+               d.raw AS "raw",
+               d.ingested_at AS "ingestedAt",
+               d.expires_at AS "expiresAt"
+        FROM directory_audit_logs d
+        WHERE d.organization_id = ANY($1::uuid[])
+          AND d.customer_tenant_id = $2::uuid
+          AND d.expires_at > $3::timestamptz
+          ${windowClauses.join('\n          ')}
+        ORDER BY d.event_date_time DESC, d.id DESC
+        LIMIT $${probeIndex}
+      ), joined AS (
+        SELECT c.*,
+               e.source AS "projectedSource",
+               e.operation_name AS "projectedOperationName",
+               e.category AS "projectedCategory",
+               e.workload AS "projectedWorkload",
+               e.target_type AS "projectedTargetType",
+               e.result AS "projectedResult",
+               e.actor_principal_name AS "projectedActorPrincipalName",
+               e.actor_display_name AS "projectedActorDisplayName",
+               e.target_display_name AS "projectedTargetDisplayName",
+               e.raw AS "projectedRaw",
+               e.before_state AS "projectedBeforeState",
+               e.after_state AS "projectedAfterState"
+        FROM candidates c
+        LEFT JOIN change_evidence_events e
+          ON  e.customer_tenant_id = $2::uuid
+          AND e.source = 'DIRECTORY_AUDIT'
+          AND e.source_event_id = c."microsoftAuditId"
+          AND e.organization_id = ANY($1::uuid[])
+      ), tally AS (
+        SELECT count(*)::int AS candidate_count,
+               coalesce(sum(octet_length(row_to_json(j)::text)), 0)::bigint AS selected_bytes
+        FROM joined j
+      )
+      SELECT t.candidate_count,
+             t.selected_bytes,
+             CASE WHEN t.candidate_count <= $${capIndex} AND t.selected_bytes <= $${budgetIndex}
+                  THEN (SELECT json_agg(j ORDER BY j."eventDateTime" DESC, j."id" DESC) FROM joined j)
+             END AS records
+      FROM tally t`
+
+    const [guard] = await this.prisma.$queryRawUnsafe<
+      { candidate_count: number; selected_bytes: bigint | number; records: unknown }[]
+    >(sql, ...values)
+
+    const candidateCount = Number(guard?.candidate_count ?? 0)
+    const selectedBytes = Number(guard?.selected_bytes ?? 0)
+
+    // The cap governs CANDIDATES, before classification. Capping candidates and
+    // then reporting overflow about eligible rows would silently omit older
+    // eligible records.
+    if (candidateCount > candidateCap) {
+      refuseDirectoryAuditExport('CANDIDATE_CAP_EXCEEDED', {
+        candidateCap,
+        observedAtLeast: candidateCap + 1,
+        message: 'Narrow the requested date range for this export.',
+      })
+    }
+    if (selectedBytes > readBudgetBytes) {
+      // Refused on input even if exclusion or redaction could have made the
+      // output small: the budget is about what would have had to be read.
+      refuseDirectoryAuditExport('READ_BUDGET_EXCEEDED', {
+        readBudgetBytes,
+        observedBytes: selectedBytes,
+        message: 'Narrow the requested date range for this export.',
+      })
+    }
+
+    const joined = Array.isArray(guard?.records) ? (guard!.records as JsonObject[]) : []
+    const records: JsonObject[] = []
+    let excludedByClassification = 0
+    for (const row of joined) {
+      // The same preference the detail reader applies: a matching projected
+      // event decides, otherwise the directory record itself does.
+      const classification = row.projectedSource
+        ? normalizedEvidenceClassification({
+            source: text(row.projectedSource) ?? 'DIRECTORY_AUDIT',
+            operationName: text(row.projectedOperationName) ?? '',
+            category: text(row.projectedCategory),
+            workload: text(row.projectedWorkload),
+            targetType: text(row.projectedTargetType),
+            result: text(row.projectedResult),
+            raw: row.projectedRaw,
+            actorPrincipalName: text(row.projectedActorPrincipalName),
+            actorDisplayName: text(row.projectedActorDisplayName),
+            targetDisplayName: text(row.projectedTargetDisplayName),
+            beforeState: row.projectedBeforeState,
+            afterState: row.projectedAfterState,
+          })
+        : directoryAuditProjection({
+            activityDisplayName: text(row.activityDisplayName) ?? '',
+            category: text(row.category) ?? null,
+            operationType: text(row.operationType) ?? null,
+            result: text(row.result) ?? null,
+            targetResources: row.targetResources,
+            initiatedBy: row.initiatedBy,
+          }).classification
+      if (!PRIMARY_CHANGE_CLASSIFICATIONS.has(classification)) {
+        excludedByClassification += 1
+        continue
+      }
+      records.push({
+        id: row.id,
+        microsoftAuditId: row.microsoftAuditId,
+        eventDateTime: row.eventDateTime,
+        activityDisplayName: row.activityDisplayName,
+        category: row.category,
+        operationType: row.operationType,
+        result: row.result,
+        correlationId: row.correlationId,
+        loggedByService: row.loggedByService,
+        // Property-name redaction again on read, exactly as the detail reader
+        // does -- and then the export-local pair safeguard over the result,
+        // because a detail named "Authorization" carries its bearer token in an
+        // ordinary `value` property that property-name redaction walks past.
+        initiatedBy: exportSafeValue(row.initiatedBy),
+        targetResources: exportSafeValue(row.targetResources),
+        additionalDetails: exportSafeValue(row.additionalDetails),
+        raw: exportSafeValue(row.raw),
+        ingestedAt: row.ingestedAt,
+        expiresAt: row.expiresAt,
+      })
+    }
+
+    const envelope = buildDirectoryAuditExportEnvelope({
+      customerTenantId,
+      generatedAt: observedNow,
+      window,
+      candidates: candidateCount,
+      records,
+      excludedByClassification,
+    })
+    const bytes = envelopeByteLength(envelope)
+    if (bytes > DIRECTORY_AUDIT_EXPORT_ENVELOPE_BYTES) {
+      refuseDirectoryAuditExport('ENVELOPE_CEILING_EXCEEDED', {
+        envelopeByteCeiling: DIRECTORY_AUDIT_EXPORT_ENVELOPE_BYTES,
+        observedBytes: bytes,
+        message: 'Narrow the requested date range for this export.',
+      })
+    }
+
+    return { envelope, filename: directoryAuditExportFilename(customerTenantId, window) }
   }
 
   async detail(identity: AuthenticatedIdentity, sourceId: string, requestedTenantId: unknown) {
