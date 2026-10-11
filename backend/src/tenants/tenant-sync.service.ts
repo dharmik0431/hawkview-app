@@ -1695,10 +1695,11 @@ export class TenantSyncService {
 
   async getBundleForIdentity(
     identity: AuthenticatedIdentity,
-    customerTenantId: string
+    customerTenantId: string,
+    options: { now?: () => Date } = {},
   ) {
     const tenant = await this.getReadableTenant(identity, customerTenantId)
-    return this.buildBundle(tenant)
+    return this.buildBundle(tenant, options)
   }
 
   async getRelatedExchangeRuleAuditForIdentity(
@@ -5728,7 +5729,10 @@ export class TenantSyncService {
       onboardingCompletedAt: Date | null
       exchangeReadOnlyEnabledAt: Date | null
     } | null
-  }) {
+  }, options: { now?: () => Date } = {}) {
+    // Saved expiry governs visibility even when collection-coupled cleanup
+    // has not run. Capture once for both capped log queries and every caller.
+    const expiryNow = options.now?.() ?? new Date()
     const m365AuditToday = m365AuditUsageDate()
     const m365AuditMonthStart = new Date(Date.UTC(
       m365AuditToday.getUTCFullYear(),
@@ -5825,6 +5829,7 @@ export class TenantSyncService {
         where: {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
+          expiresAt: { gt: expiryNow },
         },
         orderBy: { eventDateTime: 'desc' },
         take: 5000,
@@ -5833,6 +5838,7 @@ export class TenantSyncService {
         where: {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
+          expiresAt: { gt: expiryNow },
         },
         orderBy: { eventDateTime: 'desc' },
         take: 5000,
