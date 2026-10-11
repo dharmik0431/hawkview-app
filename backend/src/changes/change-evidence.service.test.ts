@@ -78,6 +78,197 @@ const range = {
   to: '2026-08-02T00:00:00.000Z',
 }
 
+// Synthetic query adapter for expiry output witnesses. It applies predicates,
+// ordering and cursor/take before returning rows; it is not physical DB proof.
+const EXPIRY_CLOCK = new Date('2026-10-11T12:00:00.000Z')
+const expiryDate = (offset: number) => new Date(EXPIRY_CLOCK.getTime() + offset)
+const expiryNow = () => EXPIRY_CLOCK
+const expiryRange = { from: expiryDate(-3_600_000).toISOString(), to: EXPIRY_CLOCK.toISOString() }
+type ExpiryRow = Record<string, any>
+
+function expiryMatches(row: ExpiryRow, where: ExpiryRow = {}): boolean {
+  return Object.entries(where).every(([key, condition]) => {
+    if (key === 'OR') return condition.some((part: ExpiryRow) => expiryMatches(row, part))
+    if (key === 'AND') return condition.every((part: ExpiryRow) => expiryMatches(row, part))
+    if (condition === undefined) return true
+    let value = row[key]
+    if (condition === null || typeof condition !== 'object' || condition instanceof Date) return value === condition
+    if (condition.path) value = condition.path.reduce((v: any, part: string) => v?.[part], value)
+    return Object.entries(condition).every(([operator, expected]: [string, any]) => {
+      switch (operator) {
+        case 'gt': return value > expected
+        case 'gte': return value >= expected
+        case 'lt': return value < expected
+        case 'lte': return value <= expected
+        case 'in': return expected.includes(value)
+        case 'equals': return condition.mode === 'insensitive'
+          ? String(value).toLowerCase() === String(expected).toLowerCase() : value === expected
+        case 'path': case 'mode': return true
+        default: throw new Error(`Unsupported fixture operator: ${operator}`)
+      }
+    })
+  })
+}
+
+function expiryStore(rows: ExpiryRow[], afterRead: () => void = () => {}) {
+  const findMany = async (args: any = {}) => {
+    let selected = rows.filter((row) => expiryMatches(row, args.where))
+    const order = args.orderBy ? (Array.isArray(args.orderBy) ? args.orderBy : [args.orderBy]) : []
+    selected.sort((a, b) => {
+      for (const term of order) for (const [key, direction] of Object.entries(term)) {
+        const cmp = a[key] < b[key] ? -1 : a[key] > b[key] ? 1 : 0
+        if (cmp) return direction === 'desc' ? -cmp : cmp
+      }
+      return 0
+    })
+    if (args.cursor) {
+      const index = selected.findIndex((row) => row.id === args.cursor.id)
+      selected = index < 0 ? [] : selected.slice(index + (args.skip ?? 0))
+    }
+    selected = selected.slice(0, args.take ?? selected.length)
+    afterRead()
+    return selected
+  }
+  return { findMany, findFirst: async (args: any) => (await findMany({ ...args, take: 1 }))[0] ?? null }
+}
+
+function expiryAudit(id: string, offset = 1, overrides: ExpiryRow = {}): ExpiryRow {
+  return {
+    id, microsoftAuditId: id, organizationId: 'org-1', customerTenantId: 'tenant-1',
+    eventDateTime: expiryDate(-300_000), ingestedAt: expiryDate(-200_000), expiresAt: expiryDate(offset),
+    activityDisplayName: 'Reset user password', category: 'UserManagement', operationType: 'Update', result: 'success',
+    resultReason: null, initiatedBy: { user: { userPrincipalName: 'owner@example.test' } },
+    targetResources: [{ type: 'User', userPrincipalName: 'target@example.test' }], additionalDetails: [],
+    raw: { clientSecret: 'never-expose' }, correlationId: null, ...overrides,
+  }
+}
+
+function expiryEvent(id: string, offset = 1, overrides: ExpiryRow = {}): ExpiryRow {
+  return {
+    id, source: 'DIRECTORY_AUDIT', sourceEventId: id, organizationId: 'org-1', customerTenantId: 'tenant-1',
+    eventDateTime: expiryDate(-300_000), ingestedAt: expiryDate(-200_000), expiresAt: expiryDate(offset),
+    category: 'Groups', severity: 'Medium', operationName: 'Add member to group', summary: 'Success',
+    actorId: 'actor-1', actorPrincipalName: 'owner@example.test', actorDisplayName: null,
+    targetId: 'target-1', targetDisplayName: 'target@example.test', correlationId: null,
+    changedFields: [], workload: 'Microsoft Entra ID', result: 'success', location: null,
+    beforeState: {}, afterState: {}, raw: {}, ...overrides,
+  }
+}
+
+function expiryService(stores: { audits?: ExpiryRow[]; events?: ExpiryRow[]; signIns?: ExpiryRow[]; mailbox?: ExpiryRow[] } = {}, afterRead?: () => void) {
+  return new ChangesService(changesPrisma({
+    directoryAuditLog: expiryStore(stores.audits ?? [], afterRead),
+    changeEvidenceEvent: expiryStore(stores.events ?? [], afterRead),
+    signInLog: expiryStore(stores.signIns ?? [], afterRead),
+    m365AuditRecord: expiryStore(stores.mailbox ?? [], afterRead),
+  }) as never)
+}
+
+test('evidence expiry: list excludes both stores at the strict boundary before summaries and deduplication', async () => {
+  const audits = [-1, 0, 1].map((offset) => expiryAudit(`raw-${offset}`, offset))
+  const events = [-1, 0, 1].map((offset) => expiryEvent(`projected-${offset}`, offset))
+  // Expired normalized evidence must not override the retained raw presentation.
+  events.push(expiryEvent('raw-1', 0))
+  audits.push(expiryAudit('foreign-org', 1, { organizationId: 'other-org' }))
+  events.push(expiryEvent('foreign-tenant', 1, { customerTenantId: 'other-tenant' }))
+  const result = await expiryService({ audits, events }).list(identity, expiryRange, { now: expiryNow })
+  assert.deepEqual(result.changes.map((row) => row.id).sort(), ['audit:projected-1', 'audit:raw-1'])
+  assert.equal(result.summary.total, 2)
+  assert.equal(result.summary.highRisk, 1)
+  assert.equal(result.changes.find((row) => row.id === 'audit:raw-1')?.category, 'Passwords')
+})
+
+test('evidence expiry: expired authority cannot suppress an unexpired snapshot', async () => {
+  const snapshot = expiryEvent('snapshot', 1, {
+    source: 'SNAPSHOT_DIFFERENCE', operationName: 'Microsoft Entra group configuration changed',
+    beforeState: { displayName: 'Old group' }, afterState: { displayName: 'New group' }, changedFields: ['displayName'],
+    actorId: null, actorPrincipalName: null, raw: { evidenceOrigin: 'hawkview_snapshot_difference' },
+  })
+  const raw = expiryAudit('expired-authority', 0, {
+    activityDisplayName: 'Add group', category: 'GroupManagement', operationType: 'Add',
+    targetResources: [{ id: 'target-1', type: 'Group', displayName: 'target@example.test' }],
+  })
+  const result = await expiryService({ audits: [raw], events: [snapshot, expiryEvent('expired-projection', 0)] })
+    .list(identity, expiryRange, { now: expiryNow })
+  assert.deepEqual(result.changes.map((row) => row.id), ['evidence:SNAPSHOT_DIFFERENCE:snapshot'])
+})
+
+test('evidence expiry: primary and raw fallback use independent persisted expiry and classification', async () => {
+  // Defensive seeded divergence; not a claim of live data or writer atomicity.
+  const hiddenProjection = expiryEvent('fallback', 0, { operationName: 'Successful sign-in', category: 'Authentication' })
+  const service = expiryService({
+    audits: [expiryAudit('fallback'), expiryAudit('projection', 0), expiryAudit('equal'), expiryAudit('expired', 0), expiryAudit('older', -1),
+      expiryAudit('hidden-raw', 1, { activityDisplayName: 'Read user', operationType: 'Read' }),
+      expiryAudit('foreign', 1, { organizationId: 'other-org' })],
+    events: [hiddenProjection, expiryEvent('projection'), expiryEvent('equal'), expiryEvent('expired', 0), expiryEvent('older', -1),
+      expiryEvent('hidden-raw', 0), expiryEvent('foreign', 1, { organizationId: 'other-org' })],
+  })
+  const fallback = await service.detail(identity, 'audit:fallback', 'tenant-1', { now: expiryNow })
+  assert.deepEqual([fallback.classification, fallback.event.category, fallback.event.severity], ['administrative_action', 'Passwords', 'High'])
+  assert.equal((fallback.event.raw as any).clientSecret, '[REDACTED]')
+  const projected = await service.detail(identity, 'audit:projection', 'tenant-1', { now: expiryNow })
+  assert.deepEqual([projected.classification, projected.event.category, projected.event.severity], ['identity_change', 'Groups', 'Medium'])
+  assert.equal((await service.detail(identity, 'audit:equal', 'tenant-1', { now: expiryNow })).event.id, 'equal')
+  for (const id of ['expired', 'older', 'foreign']) {
+    await assert.rejects(service.detail(identity, `audit:${id}`, 'tenant-1', { now: expiryNow }), /unavailable or outside retention/)
+  }
+  await assert.rejects(service.detail(identity, 'audit:hidden-raw', 'tenant-1', { now: expiryNow }), /telemetry/)
+  await assert.rejects(service.detail(identity, 'audit:fallback', 'other-tenant', { now: expiryNow }), /unavailable or outside retention/)
+})
+
+test('evidence expiry: supporting reads exclude expired rows before caps and preserve non-causal labels', async () => {
+  const primary = expiryEvent('primary', 1, { correlationId: 'corr-1' })
+  const expired = Array.from({ length: 210 }, (_, i) => expiryEvent(`old-${i}`, i % 2 ? -1 : 0, {
+    eventDateTime: expiryDate(-600_000), correlationId: 'corr-1',
+  }))
+  const valid = expiryEvent('related', 1, { correlationId: 'corr-1' })
+  const signIns = [-1, 0, 1].map((offset) => ({
+    ...expiryEvent(`signin-${offset}`, offset), microsoftSignInId: `signin-${offset}`,
+    raw: { correlationId: 'corr-1' }, userPrincipalName: 'owner@example.test', statusErrorCode: '0',
+  }))
+  const mailboxRow = (id: string, offset: number) => ({
+    ...expiryEvent(id, offset), microsoftRecordId: id, operation: 'MoveToDeletedItems', workload: 'Exchange',
+    actorId: 'owner@example.test', objectId: 'target@example.test', correlationId: 'corr-1',
+    raw: { Operation: 'MoveToDeletedItems', Workload: 'Exchange' },
+  })
+  const mailbox: ExpiryRow[] = Array.from({ length: 2001 }, (_, i) => ({ ...mailboxRow(`mail-old-${i}`, i % 2 ? -1 : 0), eventDateTime: expiryDate(-600_000) }))
+  mailbox.push(mailboxRow('mail-valid', 1))
+  const foreign = expiryEvent('foreign', 1, { organizationId: 'other-org', correlationId: 'corr-1' })
+  const otherTenant = expiryEvent('other-tenant', 1, { customerTenantId: 'other-tenant', correlationId: 'corr-1' })
+  const result = await expiryService({ events: [primary, ...expired, valid, foreign, otherTenant], signIns, mailbox })
+    .detail(identity, 'audit:primary', 'tenant-1', { now: expiryNow })
+  assert.deepEqual(result.relatedEvents.map((row) => row.id), ['related'])
+  assert.deepEqual(result.relatedSignIns.map((row) => row.id), ['signin-1'])
+  assert.match(result.relatedSignIns[0]!.relationship, /supporting evidence and does not establish causation/)
+  assert.deepEqual(result.associatedChanges.map((row) => row.id), ['audit:related'])
+  assert.equal(result.associatedChangesTruncated, false)
+  assert.deepEqual(result.relatedMailboxActivity.map((row) => row.sampleMicrosoftRecordIds), [['mail-valid']])
+  assert.equal(result.relatedMailboxActivity[0]?.count, 1)
+  assert.match(result.relatedMailboxActivity[0]!.relationship, /supporting evidence and does not establish causation/)
+  assert.equal(result.relatedMailboxActivityTruncated, false)
+})
+
+test('evidence expiry: all list pages and detail reads retain the first request clock as ambient time advances', async (context) => {
+  context.mock.timers.enable({ apis: ['Date'], now: EXPIRY_CLOCK.getTime() })
+  let clockCalls = 0
+  const now = () => { clockCalls++; return new Date() }
+  const advance = () => context.mock.timers.tick(10)
+  const audits = Array.from({ length: 1001 }, (_, i) => expiryAudit(`page-raw-${i}`))
+  const events = Array.from({ length: 1001 }, (_, i) => expiryEvent(`page-event-${i}`))
+  const result = await expiryService({ audits, events }, advance).list(identity, expiryRange, { now })
+  assert.equal(result.changes.length, 2002)
+  assert.equal(result.summary.total, 2002)
+  assert.equal(clockCalls, 1)
+  assert.ok(Date.now() > expiryDate(1).getTime())
+  context.mock.timers.setTime(EXPIRY_CLOCK.getTime())
+  clockCalls = 0
+  const detail = await expiryService({ events: [expiryEvent('primary', 1, { correlationId: 'corr-1' }), expiryEvent('related', 1, { correlationId: 'corr-1' })] }, advance)
+    .detail(identity, 'audit:primary', 'tenant-1', { now })
+  assert.deepEqual(detail.relatedEvents.map((row) => row.id), ['related'])
+  assert.deepEqual(detail.associatedChanges.map((row) => row.id), ['audit:related'])
+  assert.equal(clockCalls, 1)
+})
+
 test('classifies evidence and keeps authentication telemetry out of the primary timeline', () => {
   assert.equal(classifyEvidence({ source: 'SIGN_IN', activity: 'Successful sign-in' }), 'authentication_evidence')
   assert.equal(classifyEvidence({ source: 'DIRECTORY_AUDIT', activity: 'Update conditional access policy', operationType: 'Update', targetResourceTypes: ['conditionalAccessPolicy'] }), 'security_control_change')
@@ -267,11 +458,12 @@ test('shows only exact successful role assignments and external invitations in W
       findFirst: async () => null,
     },
   }) as never)
-  const result = await service.list(identity, range)
+  const result = await service.list(identity, range, { now: expiryNow })
   assert.deepEqual(auditQuery.where, {
     organizationId: { in: ['org-1'] },
     customerTenantId: { in: ['tenant-1'] },
     eventDateTime: { gte: new Date(range.from), lte: new Date(range.to) },
+    expiresAt: { gt: EXPIRY_CLOCK },
   })
   assert.deepEqual(result.changes.map((event) => ({
     id: event.id, title: event.title, classification: event.classification,
@@ -466,8 +658,8 @@ test('requires tenant identity and resolves a shared Microsoft event ID only ins
     () => service.detail(identity, 'audit:shared:detail:id', undefined),
     /Select a tenant for this investigation event/,
   )
-  const tenantOneDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-1')
-  const tenantTwoDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-2')
+  const tenantOneDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-1', { now: expiryNow })
+  const tenantTwoDetail = await service.detail(identity, 'audit:shared:detail:id', 'tenant-2', { now: expiryNow })
   assert.equal(tenantOneDetail.event.customerTenantId, 'tenant-1')
   assert.equal(tenantOneDetail.event.targetDisplayName, 'App 1')
   assert.equal(tenantTwoDetail.event.customerTenantId, 'tenant-2')
@@ -477,6 +669,7 @@ test('requires tenant identity and resolves a shared Microsoft event ID only ins
     sourceEventId: 'shared:detail:id',
     customerTenantId,
     organizationId: { in: ['org-1'] },
+    expiresAt: { gt: EXPIRY_CLOCK },
   })))
 
   await assert.rejects(
@@ -870,6 +1063,9 @@ test('projects directory evidence with deduplication and redacted configuration 
     [{ microsoftAuditId: 'audit-1', eventDateTime: new Date('2026-08-01T12:00:00.000Z'), activityDisplayName: 'Update application credential', category: 'ApplicationManagement', operationType: 'Update', targetResources: [{ id: 'app-1', type: 'Application', displayName: 'Example app', modifiedProperties: [{ displayName: 'clientSecret', oldValue: 'old-secret', newValue: 'new-secret' }] }], initiatedBy: {}, raw: { clientSecret: 'new-secret' }, ingestedAt: new Date('2026-08-01T12:00:01.000Z'), expiresAt: new Date('2027-02-01T12:00:00.000Z') }]
   )
   assert.equal(createManyArgs.skipDuplicates, true)
+  // Writer-local copying only: separate raw/projection writes can diverge on retry.
+  assert.equal(createManyArgs.data[0].ingestedAt.toISOString(), '2026-08-01T12:00:01.000Z')
+  assert.equal(createManyArgs.data[0].expiresAt.toISOString(), '2027-02-01T12:00:00.000Z')
   assert.equal(createManyArgs.data[0].raw.clientSecret, '[REDACTED]')
   assert.equal(createManyArgs.data[0].afterState.clientSecret, '[REDACTED]')
   assert.equal(createManyArgs.data[0].raw.evidenceOrigin, 'microsoft_audit_event')

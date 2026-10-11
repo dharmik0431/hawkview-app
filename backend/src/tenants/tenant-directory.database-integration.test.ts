@@ -4,10 +4,177 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangesService } from '../changes/changes.service.js'
+import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantsService } from './tenants.service.js'
 
 const databaseIntegrationEnabled =
   process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
+
+// Read-side expiry tests run only in the registered disposable CI suite. The
+// dates are relative to one injected clock; expired rows remain physically
+// present before AND after reads. Mismatched pairs are defensive seeded states,
+// not production observations or a claim of atomic raw/projection insertion.
+const READ_CLOCK = new Date('2026-10-11T12:00:00.000Z')
+const readDate = (offset: number) => new Date(READ_CLOCK.getTime() + offset)
+const readNow = () => READ_CLOCK
+const readWindow = { from: readDate(-3_600_000).toISOString(), to: READ_CLOCK.toISOString() }
+
+function retainedAudit(workspace: ExportWorkspace, sourceId: string, offset: number) {
+  return {
+    ...exportAuditRow(workspace, 0),
+    id: randomUUID(), microsoftAuditId: sourceId, eventDateTime: readDate(-300_000),
+    ingestedAt: readDate(-200_000), expiresAt: readDate(offset), correlationId: null,
+  }
+}
+
+function retainedEvent(workspace: ExportWorkspace, sourceId: string, offset: number) {
+  return {
+    id: randomUUID(), organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+    source: 'DIRECTORY_AUDIT', sourceEventId: sourceId, eventDateTime: readDate(-300_000),
+    ingestedAt: readDate(-200_000), expiresAt: readDate(offset), operationName: 'Add member to group',
+    category: 'Groups', severity: 'Medium', summary: 'Expiry fixture', result: 'success',
+    actorId: 'actor-1', actorPrincipalName: 'admin@example.test', targetId: 'target-1',
+    targetDisplayName: 'target@example.test', raw: {},
+  }
+}
+
+async function assertPersistedExpiry(
+  model: { findMany: (args: any) => Promise<Array<{ id: string; expiresAt: Date }>> },
+  ids: string[], expectedTotal: number, expectedUnexpired: number,
+) {
+  assert.equal(ids.length, expectedTotal)
+  const rows = await model.findMany({ where: { id: { in: ids } }, select: { id: true, expiresAt: true } })
+  assert.deepEqual(rows.map((row) => row.id).sort(), [...ids].sort(), 'every exact seeded row still exists, including expired rows')
+  assert.equal(rows.filter((row) => row.expiresAt > READ_CLOCK).length, expectedUnexpired, 'unexpired population at the fixed clock')
+  assert.equal(rows.filter((row) => row.expiresAt <= READ_CLOCK).length, expectedTotal - expectedUnexpired)
+}
+
+test('physical evidence expiry: list boundaries, workspace scope and fresh writer copying', { skip: !databaseIntegrationEnabled }, async (context) => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, 'expiry-list', run, track)
+  const foreign = await seedExportWorkspace(prisma, 'expiry-foreign', run, track)
+  const otherTenant = await prisma.customerTenant.create({ data: {
+    organizationId: mine.organizationId, microsoftTenantId: randomUUID(), displayName: 'Unselected tenant', status: 'ACTIVE',
+  } })
+  const unselected = { ...mine, tenantId: otherTenant.id }
+  const audits = [-1, 0, 1].map((offset) => retainedAudit(mine, `raw-${offset}`, offset))
+  const events = [-1, 0, 1].map((offset) => retainedEvent(mine, `projection-${offset}`, offset))
+  for (const workspace of [foreign, unselected]) {
+    audits.push(retainedAudit(workspace, 'foreign', 1))
+    events.push(retainedEvent(workspace, 'foreign', 1))
+  }
+  await prisma.directoryAuditLog.createMany({ data: audits })
+  await prisma.changeEvidenceEvent.createMany({ data: events })
+  // Actual writer on a fresh raw row: copies input dates, then skips duplicates.
+  const raw = audits[2]!
+  const projector = new ChangeEvidenceService(prisma)
+  await projector.projectDirectoryAudits({ id: mine.tenantId, organizationId: mine.organizationId }, [raw])
+  await projector.projectDirectoryAudits({ id: mine.tenantId, organizationId: mine.organizationId }, [{ ...raw, expiresAt: readDate(50), ingestedAt: readDate(10) }])
+  const pair = await prisma.changeEvidenceEvent.findMany({ where: { customerTenantId: mine.tenantId, source: 'DIRECTORY_AUDIT', sourceEventId: raw.microsoftAuditId } })
+  assert.equal(pair.length, 1)
+  assert.equal(pair[0]!.expiresAt.getTime(), raw.expiresAt.getTime())
+  assert.equal(pair[0]!.ingestedAt.getTime(), raw.ingestedAt.getTime())
+  const auditIds = audits.map((row) => row.id)
+  const eventIds = [...events.map((row) => row.id), pair[0]!.id]
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5, 3)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 6, 4)
+  const result = await new ChangesService(prisma).list(identityOf(mine), { ...readWindow, tenantId: mine.tenantId }, { now: readNow })
+  assert.deepEqual(result.changes.map((row) => row.id).sort(), ['audit:projection-1', 'audit:raw-1'])
+  assert.equal(result.summary.total, 2)
+  assert.equal(result.changes.every((row) => row.tenantId === mine.tenantId), true)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5, 3)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 6, 4)
+})
+
+test('physical evidence expiry: independent primary and raw fallback boundaries and presentation', { skip: !databaseIntegrationEnabled }, async (context) => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, 'expiry-detail', run, track)
+  const foreign = await seedExportWorkspace(prisma, 'expiry-detail-foreign', run, track)
+  const audits = [retainedAudit(mine, 'fallback', 1), retainedAudit(mine, 'projected', 0), retainedAudit(mine, 'equal', 1),
+    retainedAudit(mine, 'expired', 0), retainedAudit(mine, 'older', -1),
+    { ...retainedAudit(mine, 'hidden-raw', 1), activityDisplayName: 'Read user', operationType: 'Read' },
+    retainedAudit(foreign, 'foreign', 1)]
+  const events = [{ ...retainedEvent(mine, 'fallback', 0), operationName: 'Successful sign-in', category: 'Authentication' },
+    retainedEvent(mine, 'projected', 1), retainedEvent(mine, 'equal', 1), retainedEvent(mine, 'expired', 0),
+    retainedEvent(mine, 'older', -1), retainedEvent(mine, 'hidden-raw', 0), retainedEvent(foreign, 'foreign', 1)]
+  await prisma.directoryAuditLog.createMany({ data: audits })
+  await prisma.changeEvidenceEvent.createMany({ data: events })
+  const auditIds = audits.map((row) => row.id), eventIds = events.map((row) => row.id)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 7, 4)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 7, 3)
+  const service = new ChangesService(prisma)
+  const fallback = await service.detail(identityOf(mine), 'audit:fallback', mine.tenantId, { now: readNow })
+  assert.equal(fallback.event.id, audits[0]!.id)
+  assert.deepEqual([fallback.classification, fallback.event.category, fallback.event.severity], ['administrative_action', 'Passwords', 'High'])
+  const projected = await service.detail(identityOf(mine), 'audit:projected', mine.tenantId, { now: readNow })
+  assert.equal(projected.event.id, events[1]!.id)
+  assert.deepEqual([projected.classification, projected.event.category, projected.event.severity], ['identity_change', 'Groups', 'Medium'])
+  assert.equal((await service.detail(identityOf(mine), 'audit:equal', mine.tenantId, { now: readNow })).event.id, events[2]!.id)
+  for (const id of ['expired', 'older', 'foreign']) {
+    await assert.rejects(service.detail(identityOf(mine), `audit:${id}`, mine.tenantId, { now: readNow }), /unavailable or outside retention/)
+  }
+  await assert.rejects(service.detail(identityOf(mine), 'audit:hidden-raw', mine.tenantId, { now: readNow }), /telemetry/)
+  await assert.rejects(service.detail(identityOf(mine), 'audit:fallback', foreign.tenantId, { now: readNow }), /unavailable or outside retention/)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 7, 4)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 7, 3)
+})
+
+test('physical evidence expiry: supporting candidates are filtered before take and remain stored', { skip: !databaseIntegrationEnabled }, async (context) => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, 'expiry-support', run, track)
+  const foreign = await seedExportWorkspace(prisma, 'expiry-support-foreign', run, track)
+  const events = [
+    { ...retainedEvent(mine, 'primary', 1), correlationId: 'expiry-correlation' },
+    ...Array.from({ length: 210 }, (_, i) => ({ ...retainedEvent(mine, `expired-${i}`, i % 2 ? -1 : 0), correlationId: 'expiry-correlation', eventDateTime: readDate(-600_000) })),
+    { ...retainedEvent(mine, 'related', 1), correlationId: 'expiry-correlation' },
+    { ...retainedEvent(foreign, 'foreign', 1), correlationId: 'expiry-correlation' },
+  ]
+  const signIn = (workspace: ExportWorkspace, id: string, offset: number) => ({
+    id: randomUUID(), organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+    microsoftSignInId: id, eventDateTime: readDate(-300_000), ingestedAt: readDate(-200_000), expiresAt: readDate(offset),
+    raw: { correlationId: 'expiry-correlation' }, userPrincipalName: 'admin@example.test', statusErrorCode: '0',
+  })
+  const signIns = [-1, 0, 1].map((offset) => signIn(mine, `signin-${offset}`, offset))
+  signIns.push(signIn(foreign, 'signin-foreign', 1))
+  const mailboxRow = (workspace: ExportWorkspace, id: string, offset: number) => ({
+    id: randomUUID(), organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+    microsoftRecordId: id, contentType: 'Audit.Exchange', operation: 'MoveToDeletedItems', workload: 'Exchange',
+    actorId: 'admin@example.test', objectId: 'target@example.test', correlationId: 'expiry-correlation',
+    eventDateTime: readDate(-300_000), ingestedAt: readDate(-200_000), expiresAt: readDate(offset),
+    raw: { Operation: 'MoveToDeletedItems', Workload: 'Exchange' },
+  })
+  const mailbox = Array.from({ length: 2001 }, (_, i) => ({ ...mailboxRow(mine, `old-mail-${i}`, i % 2 ? -1 : 0), eventDateTime: readDate(-600_000) }))
+  mailbox.push(mailboxRow(mine, 'mail-valid', 1), mailboxRow(foreign, 'mail-foreign', 1))
+  await prisma.changeEvidenceEvent.createMany({ data: events })
+  await prisma.signInLog.createMany({ data: signIns })
+  await prisma.m365AuditRecord.createMany({ data: mailbox })
+  const eventIds = events.map((row) => row.id), signInIds = signIns.map((row) => row.id), mailboxIds = mailbox.map((row) => row.id)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 213, 3)
+  await assertPersistedExpiry(prisma.signInLog, signInIds, 4, 2)
+  await assertPersistedExpiry(prisma.m365AuditRecord, mailboxIds, 2003, 2)
+  const result = await new ChangesService(prisma).detail(identityOf(mine), 'audit:primary', mine.tenantId, { now: readNow })
+  assert.deepEqual(result.relatedEvents.map((row) => row.sourceEventId), ['related'])
+  assert.deepEqual(result.relatedSignIns.map((row) => row.id), ['signin-1'])
+  assert.match(result.relatedSignIns[0]!.relationship, /supporting evidence and does not establish causation/)
+  assert.deepEqual(result.associatedChanges.map((row) => row.id), ['audit:related'])
+  assert.equal(result.associatedChangesTruncated, false)
+  assert.deepEqual(result.relatedMailboxActivity.map((row) => row.sampleMicrosoftRecordIds), [['mail-valid']])
+  assert.equal(result.relatedMailboxActivity[0]?.count, 1)
+  assert.match(result.relatedMailboxActivity[0]!.relationship, /supporting evidence and does not establish causation/)
+  assert.equal(result.relatedMailboxActivityTruncated, false)
+  await assertPersistedExpiry(prisma.changeEvidenceEvent, eventIds, 213, 3)
+  await assertPersistedExpiry(prisma.signInLog, signInIds, 4, 2)
+  await assertPersistedExpiry(prisma.m365AuditRecord, mailboxIds, 2003, 2)
+})
 
 test(
   'a migrated PostgreSQL database returns only the authenticated MSP workspace tenants',

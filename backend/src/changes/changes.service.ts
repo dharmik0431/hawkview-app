@@ -423,8 +423,10 @@ export class ChangesService {
     }
   }
 
-  async list(identity: AuthenticatedIdentity, query: Record<string, unknown>) {
-    const organizationIds = await this.organizationIds(identity); const now = new Date()
+  async list(identity: AuthenticatedIdentity, query: Record<string, unknown>, internals: { now?: () => Date } = {}) {
+    // Expiry eligibility is one request snapshot, shared by every page/store.
+    const now = new Date(internals.now?.() ?? new Date())
+    const organizationIds = await this.organizationIds(identity)
     const from = new Date(text(query.from) ?? now.getTime() - 86_400_000); const to = new Date(text(query.to) ?? now)
     if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from > to) throw new BadRequestException('Enter a valid investigation time range.')
     if (to.getTime() - from.getTime() > 183 * 86_400_000) throw new BadRequestException('Investigations are limited to HawkView\'s six-month retention window.')
@@ -437,9 +439,9 @@ export class ChangesService {
     const where = { organizationId: { in: organizationIds }, customerTenantId: { in: tenantIds }, eventDateTime: { gte: from, lte: to } }
     const [auditRead, evidenceRead] = await Promise.all([
       this.loadAllPages((cursor) => this.prisma.directoryAuditLog
-        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
+        .findMany({ where: { ...where, expiresAt: { gt: now } }, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
       this.loadAllPages((cursor) => this.prisma.changeEvidenceEvent
-        .findMany({ where, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
+        .findMany({ where: { ...where, expiresAt: { gt: now } }, orderBy: [{ eventDateTime: 'desc' }, { id: 'desc' }], take: 1000, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })),
     ])
     const sourceAvailability = {
       directoryAudit: { status: auditRead.status, evidenceClasses: ['DIRECTORY_AUDIT'] },
@@ -787,7 +789,9 @@ export class ChangesService {
     return { envelope, filename: directoryAuditExportFilename(customerTenantId, window) }
   }
 
-  async detail(identity: AuthenticatedIdentity, sourceId: string, requestedTenantId: unknown) {
+  async detail(identity: AuthenticatedIdentity, sourceId: string, requestedTenantId: unknown, internals: { now?: () => Date } = {}) {
+    // Primary, fallback and supporting reads use the same request snapshot.
+    const now = new Date(internals.now?.() ?? new Date())
     const customerTenantId = text(requestedTenantId)
     if (!customerTenantId) throw new BadRequestException('Select a tenant for this investigation event.')
     const separator = sourceId.indexOf(':')
@@ -816,12 +820,12 @@ export class ChangesService {
       throw new BadRequestException('This investigation event is unavailable or outside retention.')
     }
     const projectedEvent = await this.prisma.changeEvidenceEvent.findFirst({
-      where: { source, sourceEventId, customerTenantId, organizationId: { in: organizationIds } },
+      where: { source, sourceEventId, customerTenantId, organizationId: { in: organizationIds }, expiresAt: { gt: now } },
     })
     const fallbackAudit = projectedEvent || source !== 'DIRECTORY_AUDIT'
       ? null
       : await this.prisma.directoryAuditLog.findFirst({
-          where: { microsoftAuditId: sourceEventId, customerTenantId, organizationId: { in: organizationIds } },
+          where: { microsoftAuditId: sourceEventId, customerTenantId, organizationId: { in: organizationIds }, expiresAt: { gt: now } },
         })
     if (!projectedEvent && !fallbackAudit) throw new BadRequestException('This investigation event is unavailable or outside retention.')
 
@@ -868,7 +872,7 @@ export class ChangesService {
     }
     const related = event.correlationId
       ? await this.prisma.changeEvidenceEvent.findMany({
-          where: { organizationId: { in: organizationIds }, customerTenantId: event.customerTenantId, correlationId: event.correlationId },
+          where: { organizationId: { in: organizationIds }, customerTenantId: event.customerTenantId, correlationId: event.correlationId, expiresAt: { gt: now } },
           orderBy: [{ eventDateTime: 'asc' }, { id: 'asc' }],
           take: 100,
         })
@@ -878,6 +882,7 @@ export class ChangesService {
           where: {
             organizationId: { in: organizationIds },
             customerTenantId: event.customerTenantId,
+            expiresAt: { gt: now },
             OR: [
               { raw: { path: ['correlationId'], equals: event.correlationId } },
               { raw: { path: ['correlation_id'], equals: event.correlationId } },
@@ -938,6 +943,7 @@ export class ChangesService {
             where: {
               organizationId: { in: organizationIds },
               customerTenantId: event.customerTenantId,
+              expiresAt: { gt: now },
               eventDateTime: { gte: incidentStart, lte: incidentEnd },
               OR: auditAssociationPredicates,
             },
@@ -948,6 +954,7 @@ export class ChangesService {
             where: {
               organizationId: { in: organizationIds },
               customerTenantId: event.customerTenantId,
+              expiresAt: { gt: now },
               eventDateTime: { gte: incidentStart, lte: incidentEnd },
               OR: changeAssociationPredicates,
             },
