@@ -4,8 +4,13 @@ import {
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
   selectScheduledTenantWork,
+  shouldRunHourlyInventoryRefresh,
   shouldRunTargetedTransientRetry,
   targetedTransientRetryDelayMs,
+  HOURLY_INVENTORY_FIRST_RETRY_MS,
+  HOURLY_INVENTORY_REFRESH_MS,
+  HOURLY_INVENTORY_RESOURCES,
+  TARGETED_TRANSIENT_RETRY_RESOURCES,
 } from './scheduled-sync-selection.js'
 
 const now = new Date('2026-08-17T16:00:00.000Z')
@@ -243,4 +248,345 @@ test('keeps a 1,000-tenant due population moving after each 25-tenant batch', ()
     : candidate), now, 25)
   assert.equal(second[0]?.tenantId, 'tenant-0025')
   assert.equal(second.some((item) => completed.has(item.tenantId)), false)
+})
+
+// ---------------------------------------------- hourly inventory eligibility
+
+const ago = (ms: number) => new Date(now.getTime() - ms)
+const HOUR = HOURLY_INVENTORY_REFRESH_MS
+
+test('hourly inventory eligibility is inclusive at exactly one hour', () => {
+  assert.equal(shouldRunHourlyInventoryRefresh(
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', ago(HOUR)), now), true)
+  // One millisecond short is not due, so the boundary is pinned on both sides
+  // rather than only from the due direction.
+  assert.equal(shouldRunHourlyInventoryRefresh(
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', ago(HOUR - 1)), now), false)
+  assert.equal(shouldRunHourlyInventoryRefresh(
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', ago(HOUR + 1)), now), true)
+})
+
+test('the hourly rule and the candidate query agree on the boundary millisecond', () => {
+  // The rule is `elapsed >= H`; the query must therefore use `lte`, not `lt`.
+  const where = scheduledSyncTenantWhere(now) as unknown as {
+    AND: { OR?: Array<Record<string, unknown>> }[]
+  }
+  const branches = where.AND[1]!.OR!
+  const hourly = branches.find((branch) => {
+    const some = (branch as { syncStates?: { some?: Record<string, unknown> } }).syncStates?.some
+    return some !== undefined && 'lastSuccessfulAt' in some
+      && (some as { lastSuccessfulAt?: Record<string, unknown> }).lastSuccessfulAt?.lte !== undefined
+  }) as { syncStates: { some: {
+    resourceType: { in: string[] }
+    status: { notIn: string[] }
+    lastSuccessfulAt: { lte: Date }
+  } } } | undefined
+  assert.ok(hourly, 'the candidate query must carry an hourly inventory branch')
+  const some = hourly!.syncStates.some
+  assert.deepEqual([...some.resourceType.in].sort(), [...HOURLY_INVENTORY_RESOURCES].sort())
+  assert.deepEqual([...some.status.notIn].sort(), ['FAILED', 'RUNNING'])
+  // Exactly `now - H`, so a row on the boundary is included by `lte` just as
+  // the pure rule includes it with `>=`.
+  assert.equal(some.lastSuccessfulAt.lte.getTime(), now.getTime() - HOUR)
+})
+
+test('an unhealthy, missing or impossible timestamp is never hourly due', () => {
+  const stale = ago(6 * HOUR)
+  // FAILED keeps its own targeted retry schedule and must not take this path.
+  assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'FAILED', stale), now), false)
+  // RUNNING must not be duplicated.
+  assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'RUNNING', stale), now), false)
+  // Never collected belongs to the initial/daily path, or it would re-attempt
+  // on every tick.
+  assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'SUCCEEDED', null), now), false)
+  // A future timestamp is an anomaly to report, not an immediate retry signal.
+  assert.equal(shouldRunHourlyInventoryRefresh(
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', new Date(now.getTime() + 60_000)), now), false)
+  assert.equal(shouldRunHourlyInventoryRefresh(
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', new Date(Number.NaN)), now), false)
+  assert.equal(shouldRunHourlyInventoryRefresh(undefined, now), false)
+})
+
+test('anchors, heavy collectors and held resources are never hourly due however stale', () => {
+  const ancient = ago(30 * 24 * HOUR)
+  for (const resource of [
+    'LICENSES', 'DOMAINS',
+    'GROUPS', 'DEVICES', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SHAREPOINT_SITES',
+    'DIRECTORY_ROLES',
+    'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT',
+    'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOXES', 'AUTH_REGISTRATIONS',
+    'SECURE_SCORES', 'SHAREPOINT_USAGE', 'DOMAIN_DNS_HEALTH',
+  ]) {
+    assert.equal(
+      shouldRunHourlyInventoryRefresh(state(resource, 'SUCCEEDED', ancient), now),
+      false,
+      `${resource} must never be hourly due`,
+    )
+  }
+  // And every allowlisted resource IS due at the same staleness, so the case
+  // above cannot pass by the rule rejecting everything.
+  for (const resource of HOURLY_INVENTORY_RESOURCES) {
+    assert.equal(
+      shouldRunHourlyInventoryRefresh(state(resource, 'SUCCEEDED', ancient), now),
+      true,
+      `${resource} must be hourly due`,
+    )
+  }
+})
+
+test('the hourly allowlist stays inside the existing targeted dispatch set', () => {
+  // The dispatch query selects TARGETED_TRANSIENT_RETRY_RESOURCES only, so an
+  // allowlist member outside that set would be silently never dispatched.
+  for (const resource of HOURLY_INVENTORY_RESOURCES) {
+    assert.ok(
+      (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource),
+      `${resource} must already be dispatchable through the targeted module set`,
+    )
+  }
+  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('LICENSES'), false)
+  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAINS'), false)
+  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('RISKY_USERS'), false)
+  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 7)
+})
+
+test('a tenant is selected for hourly inventory while USERS and both anchors are fresh', () => {
+  const fresh = ago(60_000)
+  const work = selectScheduledTenantWork([{
+    id: 'tenant-hourly',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', fresh),
+      state('LICENSES', 'SUCCEEDED', fresh),
+      state('DOMAINS', 'SUCCEEDED', fresh),
+      state('NAMED_LOCATIONS', 'SUCCEEDED', ago(2 * HOUR)),
+    ],
+  }], now, 10)
+  assert.equal(work.length, 1)
+  assert.equal(work[0]!.tenantId, 'tenant-hourly')
+  // The daily clock is untouched: this selection must not pull a full pass in.
+  assert.equal(work[0]!.fullInventoryDue, false)
+})
+
+test('a fresh allowlisted resource with everything else fresh selects no work', () => {
+  const fresh = ago(60_000)
+  assert.deepEqual(selectScheduledTenantWork([{
+    id: 'tenant-idle',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', fresh),
+      state('LICENSES', 'SUCCEEDED', fresh),
+      state('DOMAINS', 'SUCCEEDED', fresh),
+      state('NAMED_LOCATIONS', 'SUCCEEDED', ago(HOUR - 60_000)),
+    ],
+  }], now, 10), [])
+})
+
+test('an hourly refresh does not postpone an overdue daily inventory', () => {
+  // The trap this plan exists to avoid: hourly work must never advance the
+  // timestamps the daily pass reads.
+  const states = [
+    state('USERS', 'SUCCEEDED', ago(60_000)),
+    state('LICENSES', 'SUCCEEDED', ago(26 * HOUR)),
+    state('DOMAINS', 'SUCCEEDED', ago(26 * HOUR)),
+    // Just refreshed by an hourly pass.
+    state('CONDITIONAL_ACCESS', 'SUCCEEDED', ago(1_000)),
+  ]
+  assert.equal(requiresDailyInventoryRefresh(states, now), true)
+  const work = selectScheduledTenantWork([{ id: 'tenant-daily', syncStates: states }], now, 10)
+  assert.equal(work.length, 1)
+  assert.equal(work[0]!.fullInventoryDue, true)
+})
+
+// ------------------------------------- hourly rule beside the failure path
+
+test('a failed allowlisted resource keeps exactly its existing retry schedule', () => {
+  // The existing first-failure delay for these resources is 15 minutes, which
+  // is SHORTER than the hourly interval. So a failure must not be routed to the
+  // hourly rule, and a stale hourly age must not shortcut a longer backoff.
+  const fifteen = 15 * 60 * 1000
+  assert.equal(targetedTransientRetryDelayMs(
+    { ...state('CONDITIONAL_ACCESS', 'FAILED', null, ago(fifteen)), consecutiveFailures: 1 }), fifteen)
+  assert.ok(fifteen < HOUR, 'this case only means something while the retry is faster than hourly')
+
+  // Before due: neither rule fires.
+  const before = {
+    ...state('CONDITIONAL_ACCESS', 'FAILED', ago(2 * HOUR), ago(10 * 60 * 1000)),
+    consecutiveFailures: 1,
+  }
+  assert.equal(shouldRunHourlyInventoryRefresh(before, now), false)
+  assert.equal(shouldRunTargetedTransientRetry(before, now), false)
+
+  // Due: the existing targeted retry fires, and the hourly rule still does not.
+  const due = {
+    ...state('CONDITIONAL_ACCESS', 'FAILED', ago(2 * HOUR), ago(fifteen)),
+    consecutiveFailures: 1,
+  }
+  assert.equal(shouldRunHourlyInventoryRefresh(due, now), false)
+  assert.equal(shouldRunTargetedTransientRetry(due, now), true)
+})
+
+test('a backoff longer than an hour is not bypassed by hourly age', () => {
+  const twoHours = 120 * 60 * 1000
+  const fourFailures = {
+    ...state('CONDITIONAL_ACCESS', 'FAILED', ago(6 * HOUR), ago(90 * 60 * 1000)),
+    consecutiveFailures: 4,
+  }
+  assert.equal(targetedTransientRetryDelayMs(fourFailures), twoHours)
+  // The resource has been unsuccessful for six hours, so the hourly rule would
+  // report it due if it applied to FAILED states. It must not.
+  assert.equal(shouldRunHourlyInventoryRefresh(fourFailures, now), false)
+  assert.equal(shouldRunTargetedTransientRetry(fourFailures, now), false)
+  assert.deepEqual(selectScheduledTenantWork([{
+    id: 'tenant-backoff',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', ago(60_000)),
+      state('LICENSES', 'SUCCEEDED', ago(60_000)),
+      state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+      fourFailures,
+    ],
+  }], now, 10), [])
+})
+
+test('the existing targeted retry progression is unchanged', () => {
+  const minutes = (value: number) => value * 60 * 1000
+  const light = (failures: number) => targetedTransientRetryDelayMs({
+    ...state('CONDITIONAL_ACCESS', 'FAILED', null, ago(1)), consecutiveFailures: failures,
+  })
+  assert.deepEqual([1, 2, 3, 4, 5].map(light), [
+    minutes(15), minutes(30), minutes(60), minutes(120), minutes(240),
+  ])
+  // The six-hour cap holds beyond that, including at the clamped maximum.
+  assert.equal(light(6), minutes(360))
+  assert.equal(light(8), minutes(360))
+  assert.equal(light(99), minutes(360))
+})
+
+// ------------------------------- failed-retry candidacy for the seven
+
+/** The two FAILED candidacy branches of the real query, by their own shape. */
+function failedCandidacyBranches(at: Date) {
+  const where = scheduledSyncTenantWhere(at) as unknown as {
+    AND: { OR?: Array<Record<string, unknown>> }[]
+  }
+  const branches = (where.AND[1]!.OR ?? []).map((branch) =>
+    (branch as { syncStates?: { some?: Record<string, unknown> } }).syncStates?.some)
+  const failed = branches.filter((some): some is Record<string, unknown> =>
+    some !== undefined && some.status === 'FAILED') as Array<{
+      resourceType: { in: string[] }
+      lastErrorCode: { notIn: string[] }
+      lastAttemptAt: { lt?: Date; lte?: Date }
+    }>
+  return failed
+}
+
+test('the selected resources become candidates at their own first-retry delay', () => {
+  // The defect this replaces: candidacy waited for the 30-minute base while
+  // these resources become due at 15 minutes, so a due retry between the two
+  // was invisible whenever USERS and both anchors were fresh.
+  assert.equal(HOURLY_INVENTORY_FIRST_RETRY_MS, 15 * 60 * 1000)
+  // Derived from the formula, so it cannot drift from the deciding predicate.
+  for (const resource of HOURLY_INVENTORY_RESOURCES) {
+    assert.equal(
+      targetedTransientRetryDelayMs({
+        ...state(resource, 'FAILED', null, ago(1)), consecutiveFailures: 1,
+      }),
+      HOURLY_INVENTORY_FIRST_RETRY_MS,
+      `${resource} first retry must equal the candidacy bound`,
+    )
+  }
+
+  const failed = failedCandidacyBranches(now)
+  assert.equal(failed.length, 2, 'one branch for the selected seven, one for the rest')
+  const selected = failed.find((branch) =>
+    branch.resourceType.in.length === HOURLY_INVENTORY_RESOURCES.length)
+  assert.ok(selected, 'the query must carry a branch scoped to the selected seven')
+  assert.deepEqual([...selected!.resourceType.in].sort(), [...HOURLY_INVENTORY_RESOURCES].sort())
+  // Inclusive at exactly the first-retry delay, matching the predicate's `>=`.
+  assert.equal(selected!.lastAttemptAt.lte?.getTime(), now.getTime() - HOURLY_INVENTORY_FIRST_RETRY_MS)
+  assert.equal(selected!.lastAttemptAt.lt, undefined)
+})
+
+test('both failed candidacy branches carry an identical error exclusion list', () => {
+  // Compared branch to branch rather than against a copy of the list, so a
+  // future edit to one cannot silently diverge from the other.
+  const failed = failedCandidacyBranches(now)
+  assert.equal(failed.length, 2)
+  assert.deepEqual([...failed[0]!.lastErrorCode.notIn].sort(), [...failed[1]!.lastErrorCode.notIn].sort())
+  for (const code of ['401', '403', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_PERMISSION_REQUIRED']) {
+    assert.ok(failed[0]!.lastErrorCode.notIn.includes(code), code)
+  }
+})
+
+test('the other targeted resources keep their existing candidacy bound', () => {
+  const failed = failedCandidacyBranches(now)
+  const broad = failed.find((branch) =>
+    branch.resourceType.in.length === TARGETED_TRANSIENT_RETRY_RESOURCES.length)
+  assert.ok(broad, 'the existing broad branch must remain')
+  // Unchanged: the 30-minute base, still exclusive.
+  assert.equal(broad!.lastAttemptAt.lt?.getTime(), now.getTime() - 30 * 60 * 1000)
+  assert.equal(broad!.lastAttemptAt.lte, undefined)
+  // And the narrower branch does not reach any heavier resource.
+  const selected = failed.find((branch) => branch !== broad)!
+  for (const heavier of ['GROUPS', 'DEVICES', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SHAREPOINT_SITES']) {
+    assert.equal(selected.resourceType.in.includes(heavier), false, heavier)
+  }
+})
+
+test('a wider coarse candidacy does not loosen the deciding predicate', () => {
+  // Two consecutive failures mean a 30-minute delay. Twenty minutes of age now
+  // passes the coarse branch, and selection must still refuse it.
+  const twoFailures = {
+    ...state('CONDITIONAL_ACCESS', 'FAILED', ago(3 * HOUR), ago(20 * 60 * 1000)),
+    consecutiveFailures: 2,
+  }
+  assert.equal(targetedTransientRetryDelayMs(twoFailures), 30 * 60 * 1000)
+  assert.equal(shouldRunTargetedTransientRetry(twoFailures, now), false)
+  assert.equal(shouldRunHourlyInventoryRefresh(twoFailures, now), false)
+  assert.deepEqual(selectScheduledTenantWork([{
+    id: 'tenant-two-failures',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', ago(60_000)),
+      state('LICENSES', 'SUCCEEDED', ago(60_000)),
+      state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+      twoFailures,
+    ],
+  }], now, 10), [])
+
+  // Past its own 30-minute delay it is selected, by the unchanged predicate.
+  const due = { ...twoFailures, lastAttemptAt: ago(31 * 60 * 1000) }
+  assert.equal(shouldRunTargetedTransientRetry(due, now), true)
+  const work = selectScheduledTenantWork([{
+    id: 'tenant-two-failures',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', ago(60_000)),
+      state('LICENSES', 'SUCCEEDED', ago(60_000)),
+      state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+      due,
+    ],
+  }], now, 10)
+  assert.equal(work.length, 1)
+  assert.equal(work[0]!.fullInventoryDue, false)
+})
+
+test('a first failure is selected at exactly fifteen minutes and not before', () => {
+  const at = (attemptedAgoMs: number) => {
+    const failed = {
+      ...state('CONDITIONAL_ACCESS', 'FAILED', ago(3 * HOUR), ago(attemptedAgoMs)),
+      consecutiveFailures: 1,
+    }
+    return {
+      predicate: shouldRunTargetedTransientRetry(failed, now),
+      selected: selectScheduledTenantWork([{
+        id: 'tenant-first-failure',
+        syncStates: [
+          state('USERS', 'SUCCEEDED', ago(60_000)),
+          state('LICENSES', 'SUCCEEDED', ago(60_000)),
+          state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+          failed,
+        ],
+      }], now, 10).length,
+    }
+  }
+  assert.deepEqual(at(HOURLY_INVENTORY_FIRST_RETRY_MS), { predicate: true, selected: 1 })
+  assert.deepEqual(at(HOURLY_INVENTORY_FIRST_RETRY_MS - 1), { predicate: false, selected: 0 })
+  // And the formerly hidden window is now selectable rather than invisible.
+  assert.deepEqual(at(20 * 60 * 1000), { predicate: true, selected: 1 })
 })

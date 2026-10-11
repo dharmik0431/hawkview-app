@@ -16,6 +16,13 @@ export const DAILY_INVENTORY_ANCHORS = [
 export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
 export const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
 export const USER_INCREMENTAL_REFRESH_MS = 5 * 60 * 1000
+/**
+ * Periodic catch-up for healthy current-state inventory. This is an
+ * ELIGIBILITY interval, not a freshness guarantee: a resource becomes eligible
+ * one hour after its last success and is refreshed on the next admitted visit,
+ * after its serialized position in that visit.
+ */
+export const HOURLY_INVENTORY_REFRESH_MS = 60 * 60 * 1000
 /** The durable USERS RUNNING row is the tenant-wide scheduler lease. */
 export const TENANT_SYNC_LEASE_MS = 15 * 60 * 1000
 /**
@@ -50,6 +57,31 @@ const HEAVIER_RETRY_RESOURCES = new Set<string>([
   SyncResourceType.APPLICATIONS,
   SyncResourceType.SHAREPOINT_SITES,
 ])
+
+/**
+ * Healthy-state hourly catch-up, restricted to resources that satisfy all four
+ * admission criteria: already dispatchable through the existing targeted module
+ * map, so no collector is newly wired and daily-only collectors stay
+ * structurally undispatchable; NOT a daily-pass anchor, so no hourly write can
+ * advance the timestamps the daily clock reads; NOT in
+ * HEAVIER_RETRY_RESOURCES, whose collectors can retain multi-page payloads; and
+ * not under an operational hold that source cannot consult, which excludes
+ * DIRECTORY_ROLES.
+ *
+ * RISKY_USERS is deliberately absent: it is the only otherwise-eligible
+ * resource on the general 50-page collection limits rather than the
+ * small-collection limits, so its worst-case request count exceeds all the
+ * others combined.
+ */
+export const HOURLY_INVENTORY_RESOURCES = [
+  SyncResourceType.ORGANIZATION_CONFIGURATION,
+  SyncResourceType.AUTH_METHOD_POLICIES,
+  SyncResourceType.SECURITY_DEFAULTS,
+  SyncResourceType.SHAREPOINT_SETTINGS,
+  SyncResourceType.CONDITIONAL_ACCESS,
+  SyncResourceType.AUTHENTICATION_STRENGTHS,
+  SyncResourceType.NAMED_LOCATIONS,
+] as const
 
 export type DailyInventoryState = {
   resourceType: string
@@ -117,6 +149,40 @@ export function targetedTransientRetryDelayMs(state: DailyInventoryState) {
   )
 }
 
+/**
+ * The earliest delay the existing retry formula can produce for an allowlisted
+ * resource: a first failure on a resource outside HEAVIER_RETRY_RESOURCES.
+ *
+ * Derived from `targetedTransientRetryDelayMs` rather than written as a
+ * literal, because the coarse candidacy bound below must never be narrower
+ * than the predicate that actually decides. It previously was: candidacy
+ * waited for the full 30-minute base while these resources become due at half
+ * of it, so a failure between the two was due and invisible.
+ */
+export const HOURLY_INVENTORY_FIRST_RETRY_MS = targetedTransientRetryDelayMs({
+  resourceType: HOURLY_INVENTORY_RESOURCES[0],
+  status: SyncStateStatus.FAILED,
+  lastAttemptAt: null,
+  lastSuccessfulAt: null,
+  consecutiveFailures: 1,
+})
+
+/**
+ * Permanent authorization and capacity shapes, which wait for a normal
+ * inventory or reconfiguration signal rather than any retry path. Shared by
+ * both candidacy branches so they cannot diverge.
+ */
+const TARGETED_RETRY_EXCLUDED_ERROR_CODES = [
+  '401',
+  '403',
+  'sharepoint_sites-capacity',
+  'MICROSOFT_AUTHENTICATION_REQUIRED',
+  'MICROSOFT_PERMISSION_REQUIRED',
+  'HAWKVIEW_CAPACITY_GUARD',
+  'MICROSOFT_INVALID_RESPONSE',
+  'HAWKVIEW_INTERNAL_FAILURE',
+] as const
+
 export function shouldRunTargetedTransientRetry(
   state: DailyInventoryState | undefined,
   now: Date,
@@ -127,6 +193,36 @@ export function shouldRunTargetedTransientRetry(
   // normal inventory/reconfiguration signal, never a five-minute hot loop.
   if (!retryableFailure(state) || !state.lastAttemptAt) return false
   return now.getTime() - state.lastAttemptAt.getTime() >= targetedTransientRetryDelayMs(state)
+}
+
+/**
+ * Healthy-state hourly eligibility. Deliberately orthogonal to the failure
+ * path rather than a replacement for it:
+ *
+ *   - FAILED always makes this false, so a failed resource keeps its existing
+ *     targeted retry schedule. That schedule is FASTER than hourly for these
+ *     resources (15 minutes on a first failure), so routing failures here
+ *     would delay them, and a stale hourly age must never shortcut a longer
+ *     accumulated backoff.
+ *   - RUNNING makes this false, so an in-flight collection is not duplicated.
+ *   - A missing lastSuccessfulAt makes this false. A never-collected resource
+ *     belongs to the initial/daily path; admitting it here would re-attempt it
+ *     on every scheduler tick.
+ *   - A future or otherwise invalid lastSuccessfulAt makes this false, for the
+ *     same reason the USERS rule documents: it is an anomaly to report, not an
+ *     immediate retry signal.
+ */
+export function shouldRunHourlyInventoryRefresh(
+  state: DailyInventoryState | undefined,
+  now: Date,
+) {
+  if (!state) return false
+  if (!(HOURLY_INVENTORY_RESOURCES as readonly string[]).includes(state.resourceType)) return false
+  if (state.status === SyncStateStatus.RUNNING || state.status === SyncStateStatus.FAILED) return false
+  if (!validPastTime(state.lastSuccessfulAt, now)) return false
+  // Inclusive at exactly one hour, matching the `lte` bound the candidate
+  // query uses, so the pure rule and the database filter agree on the boundary.
+  return now.getTime() - state.lastSuccessfulAt!.getTime() >= HOURLY_INVENTORY_REFRESH_MS
 }
 
 function validPastTime(value: Date | null | undefined, now: Date) {
@@ -161,12 +257,16 @@ export function selectScheduledTenantWork(
         now.getTime() - users.lastSuccessfulAt.getTime() >= USER_INCREMENTAL_REFRESH_MS
       ))
     const targetedDue = candidate.syncStates.some((state) => shouldRunTargetedTransientRetry(state, now))
+    // Healthy inventory can be due on its own, with USERS and both anchors
+    // fresh. `fullInventoryDue` is deliberately NOT affected: the daily pass
+    // keeps its own clock, so daily-only work behind it cannot be postponed.
+    const hourlyDue = candidate.syncStates.some((state) => shouldRunHourlyInventoryRefresh(state, now))
 
-    if (!fullInventoryDue && !userDue && !targetedDue) return []
+    if (!fullInventoryDue && !userDue && !targetedDue && !hourlyDue) return []
     const dueStates = candidate.syncStates.filter((state) => {
       if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) return fullInventoryDue
       if (state.resourceType === SyncResourceType.USERS) return userDue
-      return shouldRunTargetedTransientRetry(state, now)
+      return shouldRunTargetedTransientRetry(state, now) || shouldRunHourlyInventoryRefresh(state, now)
     })
     return [{
       tenantId: candidate.id,
@@ -234,6 +334,18 @@ export function scheduledSyncTenantWhere(
   const targetedRetryBefore = new Date(
     now.getTime() - TARGETED_TRANSIENT_RETRY_BASE_MS,
   )
+  // `lte`, not `lt`: the pure rule is `elapsed >= H`, which is exactly
+  // `lastSuccessfulAt <= now - H`. Using `lt` here would drop a row sitting on
+  // the boundary millisecond out of candidacy while the rule called it due.
+  const hourlyStaleBefore = new Date(
+    now.getTime() - HOURLY_INVENTORY_REFRESH_MS,
+  )
+  // Inclusive, and at the FIRST retry delay rather than the base, so candidacy
+  // is never narrower than `shouldRunTargetedTransientRetry`, which remains the
+  // final gate for what actually runs.
+  const hourlyRetryBefore = new Date(
+    now.getTime() - HOURLY_INVENTORY_FIRST_RETRY_MS,
+  )
 
   return {
     status: 'ACTIVE' as const,
@@ -282,20 +394,38 @@ export function scheduledSyncTenantWhere(
       {
         syncStates: {
           some: {
+            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            status: { notIn: [SyncStateStatus.RUNNING, SyncStateStatus.FAILED] },
+            // A null lastSuccessfulAt never satisfies `lte`, so a
+            // never-collected resource is excluded here as well as in the rule.
+            lastSuccessfulAt: { lte: hourlyStaleBefore },
+          },
+        },
+      },
+      {
+        // A failed selected resource becomes a candidate at its own existing
+        // first-retry delay. Without this the broad branch below, which waits
+        // for the 30-minute base, hid a due retry between 15 and 30 minutes
+        // whenever USERS and both anchors were fresh. The exact per-resource
+        // backoff is still applied by the predicate, so a higher failure
+        // counter passes here and is then refused by selection and dispatch.
+        syncStates: {
+          some: {
+            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            status: SyncStateStatus.FAILED,
+            lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
+            lastAttemptAt: { lte: hourlyRetryBefore },
+          },
+        },
+      },
+      {
+        // Unchanged: every other targeted resource keeps its existing
+        // 30-minute candidacy and admission behaviour.
+        syncStates: {
+          some: {
             resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
             status: SyncStateStatus.FAILED,
-            lastErrorCode: {
-              notIn: [
-                '401',
-                '403',
-                'sharepoint_sites-capacity',
-                'MICROSOFT_AUTHENTICATION_REQUIRED',
-                'MICROSOFT_PERMISSION_REQUIRED',
-                'HAWKVIEW_CAPACITY_GUARD',
-                'MICROSOFT_INVALID_RESPONSE',
-                'HAWKVIEW_INTERNAL_FAILURE',
-              ],
-            },
+            lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
             lastAttemptAt: { lt: targetedRetryBefore },
           },
         },

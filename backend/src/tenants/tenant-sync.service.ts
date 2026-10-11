@@ -121,6 +121,7 @@ import {
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
   selectScheduledTenantWork,
+  shouldRunHourlyInventoryRefresh,
   shouldRunTargetedTransientRetry,
   TARGETED_TRANSIENT_RETRY_RESOURCES,
   TENANT_SYNC_LEASE_MS,
@@ -2170,8 +2171,15 @@ export class TenantSyncService {
         },
       ]
       // Retry only explicitly safe, non-per-user inventory resources between
-      // daily full collections. The USERS row claim above serializes this with
-      // other tenant syncs. Permission failures never enter this path.
+      // daily full collections, and refresh the healthy hourly-eligible subset
+      // of the same set. The USERS row claim above serializes this with other
+      // tenant syncs. Permission failures never enter this path.
+      //
+      // HOURLY_INVENTORY_RESOURCES is a strict subset of
+      // TARGETED_TRANSIENT_RETRY_RESOURCES, so this selection already covers
+      // both rules and needs no widening; `hourly-inventory-dispatch.test.ts`
+      // pins that subset relationship so a future allowlist edit cannot
+      // silently fall outside this query.
       const targetedRetryStates = await this.prisma.syncState.findMany({
         where: {
           organizationId: tenant.organizationId,
@@ -2189,7 +2197,12 @@ export class TenantSyncService {
         },
       })
       for (const state of targetedRetryStates) {
-        if (!shouldRunTargetedTransientRetry(state, now)) continue
+        // Mutually exclusive by construction: the targeted rule requires
+        // FAILED and the hourly rule excludes it, so a single state can never
+        // contribute two modules to one visit.
+        const due = shouldRunTargetedTransientRetry(state, now)
+          || shouldRunHourlyInventoryRefresh(state, now)
+        if (!due) continue
         const module = this.targetedTransientRetryModule(
           tenant,
           accessToken,
