@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangesService } from '../changes/changes.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantsService } from './tenants.service.js'
+import { TenantSyncService } from './tenant-sync.service.js'
 
 const databaseIntegrationEnabled =
   process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
@@ -18,6 +19,95 @@ const READ_CLOCK = new Date('2026-10-11T12:00:00.000Z')
 const readDate = (offset: number) => new Date(READ_CLOCK.getTime() + offset)
 const readNow = () => READ_CLOCK
 const readWindow = { from: readDate(-3_600_000).toISOString(), to: READ_CLOCK.toISOString() }
+
+const bundleReader = (prisma: PrismaService) => new TenantSyncService(
+  prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
+)
+function bundleSignIn(workspace: ExportWorkspace, id: string, expiry: number, event = -300_000) {
+  return {
+    id: randomUUID(), organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+    microsoftSignInId: id, eventDateTime: readDate(event), ingestedAt: readDate(-200_000),
+    expiresAt: readDate(expiry), raw: {}, userDisplayName: 'Stored fixture',
+    userPrincipalName: 'fixture@example.invalid', ipAddress: '192.0.2.1', statusErrorCode: '0',
+  }
+}
+
+test('physical tenant bundle expiry: boundary, scope, stored presence and access refusals', { skip: !databaseIntegrationEnabled }, async context => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, 'bundle-boundary', run, track)
+  const foreign = await seedExportWorkspace(prisma, 'bundle-foreign', run, track)
+  const other = await prisma.customerTenant.create({ data: {
+    organizationId: mine.organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE',
+  } })
+  const signIns = [-1, 0, 1].map(offset => bundleSignIn(mine, `bundle-sign-${offset}`, offset))
+  const audits = [-1, 0, 1].map(offset => retainedAudit(mine, `bundle-audit-${offset}`, offset))
+  for (const workspace of [foreign, { ...mine, tenantId: other.id }]) {
+    signIns.push(bundleSignIn(workspace, 'outside-sign', 1))
+    audits.push(retainedAudit(workspace, 'outside-audit', 1))
+  }
+  await prisma.signInLog.createMany({ data: signIns })
+  await prisma.directoryAuditLog.createMany({ data: audits })
+  const signIds = signIns.map(r => r.id), auditIds = audits.map(r => r.id)
+  await assertPersistedExpiry(prisma.signInLog, signIds, 5, 3)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5, 3)
+  const service = bundleReader(prisma)
+  let clockReads = 0
+  const { bundle } = await service.getBundleForIdentity(identityOf(mine), mine.tenantId, {
+    now: () => readDate(clockReads++ * 2),
+  })
+  assert.deepEqual(bundle.signIns.map(r => r.id), ['bundle-sign-1'])
+  assert.deepEqual(bundle.auditLogs.map(r => r.id), ['bundle-audit-1'])
+  assert.equal(clockReads, 1, 'one shared expiry clock before both real queries')
+  assert.equal(bundle.signIns[0]!.ipAddress, '192.0.2.1')
+  assert.deepEqual(bundle.auditLogs[0]!.initiatedBy, audits[2]!.initiatedBy)
+  await assert.rejects(service.getBundleForIdentity(identityOf(mine), foreign.tenantId, { now: readNow }), /not found/)
+  await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: READ_CLOCK } })
+  await assert.rejects(service.getBundleForIdentity(identityOf(mine), mine.tenantId, { now: readNow }), /cannot access/)
+  await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: null } })
+  await prisma.membership.deleteMany({ where: { organizationId: mine.organizationId } })
+  await assert.rejects(service.getBundleForIdentity(identityOf(mine), mine.tenantId, { now: readNow }), /not found/)
+  await assertPersistedExpiry(prisma.signInLog, signIds, 5, 3)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5, 3)
+})
+
+test('physical tenant bundle expiry: both pre-take crowd-out witnesses remain stored', { skip: !databaseIntegrationEnabled }, async context => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const mine = await seedExportWorkspace(prisma, 'bundle-cap', randomUUID(), track)
+  // Exactly 5004 rows per model (10008 total): 5001 expired newer, one equal
+  // boundary, two eligible older. Existing disposable CI only; no cleanup call.
+  const specs = [...Array.from({ length: 5001 }, (_, i) => ({ id: `expired-${i}`, expiry: -1, event: -i })),
+    { id: 'boundary', expiry: 0, event: -6000 },
+    { id: 'eligible-newer', expiry: 1, event: -7000 },
+    { id: 'eligible-older', expiry: 2, event: -8000 }]
+  const signs = specs.map(s => bundleSignIn(mine, s.id, s.expiry, s.event))
+  const audits = specs.map(s => ({ ...retainedAudit(mine, s.id, s.expiry), eventDateTime: readDate(s.event) }))
+  for (let start = 0; start < specs.length; start += 500) {
+    await prisma.signInLog.createMany({ data: signs.slice(start, start + 500) })
+    await prisma.directoryAuditLog.createMany({ data: audits.slice(start, start + 500) })
+  }
+  const signIds = signs.map(r => r.id), auditIds = audits.map(r => r.id)
+  await assertPersistedExpiry(prisma.signInLog, signIds, 5004, 2)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5004, 2)
+  const where = { organizationId: mine.organizationId, customerTenantId: mine.tenantId }
+  for (const model of [prisma.signInLog, prisma.directoryAuditLog]) {
+    // Pin the real ordering precondition: without eligibility neither positive
+    // witness can appear in the first5000. This is not just an expected count.
+    const first = await (model.findMany as any)({ where, orderBy: { eventDateTime: 'desc' }, take: 5000 })
+    assert.equal(first.length, 5000)
+    assert.equal(first.every((r: any) => r.expiresAt < READ_CLOCK), true)
+    assert.equal(first.every((r: any) => r.eventDateTime > readDate(-7000)), true)
+  }
+  const { bundle } = await bundleReader(prisma).getBundleForIdentity(identityOf(mine), mine.tenantId, { now: readNow })
+  assert.deepEqual(bundle.signIns.map(r => r.id), ['eligible-newer', 'eligible-older'], 'real sign-in eligibility precedes take5000')
+  assert.deepEqual(bundle.auditLogs.map(r => r.id), ['eligible-newer', 'eligible-older'], 'real audit eligibility precedes take5000')
+  await assertPersistedExpiry(prisma.signInLog, signIds, 5004, 2)
+  await assertPersistedExpiry(prisma.directoryAuditLog, auditIds, 5004, 2)
+})
 
 function retainedAudit(workspace: ExportWorkspace, sourceId: string, offset: number) {
   return {
