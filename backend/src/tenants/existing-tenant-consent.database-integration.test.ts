@@ -9,7 +9,7 @@ import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.
 import { TenantsService } from './tenants.service.js'
 import { publishManagedAuthority } from '../microsoft/managed-connector-authority.js'
 import { applyManagedConsentEffects } from '../microsoft/managed-consent-effects.js'
-import { scheduledSyncTenantWhere, selectScheduledTenantWork } from './scheduled-sync-selection.js'
+import { HOURLY_INVENTORY_FIRST_RETRY_MS, scheduledSyncTenantWhere, selectScheduledTenantWork } from './scheduled-sync-selection.js'
 
 const skip = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1'
 function gate() { let release!: () => void; const promise = new Promise<void>(r => { release = r }); return { promise, release } }
@@ -343,6 +343,9 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
   /** Fixed, valid, and later than every fixture timestamp below. */
   const CLOCK = new Date(Date.UTC(2026, 2, 15, 12, 0, 0))
   const HOUR = 60 * 60 * 1000
+  /** The existing first-retry delay for these resources, taken from the
+   *  formula rather than written as a literal. */
+  const FIRST_RETRY = HOURLY_INVENTORY_FIRST_RETRY_MS
   const before = (ms: number) => new Date(CLOCK.getTime() - ms)
 
   const testRun = randomUUID()
@@ -460,33 +463,49 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     }
   })
 
-  await t.test('a FAILED resource inside its own retry delay is not a candidate', async () => {
-    // A FAILED row is NOT globally ineligible: it has its own targeted retry
-    // eligibility, which for these resources is fifteen minutes. The fixture
-    // must therefore sit INSIDE that delay, or this case would fail for the
-    // right reason. Do not "fix" a failure here by widening the assertion.
+  const failedInventory = async (attemptedAgoMs: number, consecutiveFailures: number) => {
     await setInventory(workspace, {
       status: 'FAILED',
       lastSuccessfulAt: before(6 * HOUR),
-      lastAttemptAt: before(5 * 60 * 1000),
-      consecutiveFailures: 1,
-      lastErrorCode: 'MICROSOFT_THROTTLED',
-    })
-    assert.deepEqual(await candidateFound(workspace), [])
-
-    // And the same row past its existing delay IS a candidate, through the
-    // unchanged targeted retry path rather than the hourly rule — which is what
-    // makes the assertion above about the delay and not about FAILED itself.
-    await setInventory(workspace, {
-      status: 'FAILED',
-      lastSuccessfulAt: before(6 * HOUR),
-      lastAttemptAt: before(45 * 60 * 1000),
-      consecutiveFailures: 1,
+      lastAttemptAt: before(attemptedAgoMs),
+      consecutiveFailures,
       lastErrorCode: 'MICROSOFT_THROTTLED',
     })
     const found = await candidateFound(workspace)
-    assert.equal(found.length, 1)
-    assert.equal(selectScheduledTenantWork(found as never, CLOCK, 10)[0]!.fullInventoryDue, false)
+    return { candidates: found.length, selected: selectScheduledTenantWork(found as never, CLOCK, 10) }
+  }
+
+  await t.test('a first failure is a candidate at exactly fifteen minutes and not one millisecond before', async () => {
+    // A FAILED row is NOT globally ineligible: it has its own targeted retry
+    // eligibility, which for these resources is fifteen minutes. This pins the
+    // query at that exact boundary, which is the regression the previous
+    // forty-five-minute fixture passed straight over.
+    const justBefore = await failedInventory(FIRST_RETRY - 1, 1)
+    assert.equal(justBefore.candidates, 0)
+
+    const atBoundary = await failedInventory(FIRST_RETRY, 1)
+    assert.equal(atBoundary.candidates, 1)
+    assert.equal(atBoundary.selected.length, 1)
+    assert.equal(atBoundary.selected[0]!.fullInventoryDue, false)
+
+    // Well inside the delay stays invisible, and the window that used to be
+    // hidden between fifteen and thirty minutes is now reachable.
+    assert.equal((await failedInventory(5 * 60 * 1000, 1)).candidates, 0)
+    assert.equal((await failedInventory(20 * 60 * 1000, 1)).candidates, 1)
+  })
+
+  await t.test('a higher failure counter may be a candidate but is not selected before its own backoff', async () => {
+    // Two consecutive failures mean a thirty-minute delay. The widened coarse
+    // branch admits it at twenty minutes, and the unchanged predicate must
+    // still refuse to select it — candidacy is deliberately a superset.
+    const coarseOnly = await failedInventory(20 * 60 * 1000, 2)
+    assert.equal(coarseOnly.candidates, 1, 'the coarse branch admits it')
+    assert.deepEqual(coarseOnly.selected, [], 'the predicate still refuses it')
+
+    const pastItsDelay = await failedInventory(31 * 60 * 1000, 2)
+    assert.equal(pastItsDelay.candidates, 1)
+    assert.equal(pastItsDelay.selected.length, 1)
+    assert.equal(pastItsDelay.selected[0]!.fullInventoryDue, false)
   })
 
   await t.test('an excluded resource at the same staleness is not a candidate', async () => {

@@ -149,6 +149,40 @@ export function targetedTransientRetryDelayMs(state: DailyInventoryState) {
   )
 }
 
+/**
+ * The earliest delay the existing retry formula can produce for an allowlisted
+ * resource: a first failure on a resource outside HEAVIER_RETRY_RESOURCES.
+ *
+ * Derived from `targetedTransientRetryDelayMs` rather than written as a
+ * literal, because the coarse candidacy bound below must never be narrower
+ * than the predicate that actually decides. It previously was: candidacy
+ * waited for the full 30-minute base while these resources become due at half
+ * of it, so a failure between the two was due and invisible.
+ */
+export const HOURLY_INVENTORY_FIRST_RETRY_MS = targetedTransientRetryDelayMs({
+  resourceType: HOURLY_INVENTORY_RESOURCES[0],
+  status: SyncStateStatus.FAILED,
+  lastAttemptAt: null,
+  lastSuccessfulAt: null,
+  consecutiveFailures: 1,
+})
+
+/**
+ * Permanent authorization and capacity shapes, which wait for a normal
+ * inventory or reconfiguration signal rather than any retry path. Shared by
+ * both candidacy branches so they cannot diverge.
+ */
+const TARGETED_RETRY_EXCLUDED_ERROR_CODES = [
+  '401',
+  '403',
+  'sharepoint_sites-capacity',
+  'MICROSOFT_AUTHENTICATION_REQUIRED',
+  'MICROSOFT_PERMISSION_REQUIRED',
+  'HAWKVIEW_CAPACITY_GUARD',
+  'MICROSOFT_INVALID_RESPONSE',
+  'HAWKVIEW_INTERNAL_FAILURE',
+] as const
+
 export function shouldRunTargetedTransientRetry(
   state: DailyInventoryState | undefined,
   now: Date,
@@ -306,6 +340,12 @@ export function scheduledSyncTenantWhere(
   const hourlyStaleBefore = new Date(
     now.getTime() - HOURLY_INVENTORY_REFRESH_MS,
   )
+  // Inclusive, and at the FIRST retry delay rather than the base, so candidacy
+  // is never narrower than `shouldRunTargetedTransientRetry`, which remains the
+  // final gate for what actually runs.
+  const hourlyRetryBefore = new Date(
+    now.getTime() - HOURLY_INVENTORY_FIRST_RETRY_MS,
+  )
 
   return {
     status: 'ACTIVE' as const,
@@ -363,22 +403,29 @@ export function scheduledSyncTenantWhere(
         },
       },
       {
+        // A failed selected resource becomes a candidate at its own existing
+        // first-retry delay. Without this the broad branch below, which waits
+        // for the 30-minute base, hid a due retry between 15 and 30 minutes
+        // whenever USERS and both anchors were fresh. The exact per-resource
+        // backoff is still applied by the predicate, so a higher failure
+        // counter passes here and is then refused by selection and dispatch.
+        syncStates: {
+          some: {
+            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            status: SyncStateStatus.FAILED,
+            lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
+            lastAttemptAt: { lte: hourlyRetryBefore },
+          },
+        },
+      },
+      {
+        // Unchanged: every other targeted resource keeps its existing
+        // 30-minute candidacy and admission behaviour.
         syncStates: {
           some: {
             resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
             status: SyncStateStatus.FAILED,
-            lastErrorCode: {
-              notIn: [
-                '401',
-                '403',
-                'sharepoint_sites-capacity',
-                'MICROSOFT_AUTHENTICATION_REQUIRED',
-                'MICROSOFT_PERMISSION_REQUIRED',
-                'HAWKVIEW_CAPACITY_GUARD',
-                'MICROSOFT_INVALID_RESPONSE',
-                'HAWKVIEW_INTERNAL_FAILURE',
-              ],
-            },
+            lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
             lastAttemptAt: { lt: targetedRetryBefore },
           },
         },

@@ -297,13 +297,21 @@ test('a failed resource waits for its existing retry delay and is not refreshed 
     lastErrorCode: 'MICROSOFT_THROTTLED',
   })
 
-  // Before the existing 15-minute delay: no request at all.
-  const early = await runIncrementalVisit([failed(10, 1)])
-  assert.equal(requested(early.urls, ENDPOINT.conditionalAccess), 0)
+  // The visit takes its own real-clock `now`, which advances by milliseconds
+  // between building these fixtures and evaluating the predicate. Exact
+  // millisecond boundaries are therefore pinned in the fixed-clock selection
+  // and physical tests; this case uses values on either side of the boundary
+  // with a margin far larger than a visit takes.
 
-  // At the existing delay: exactly the existing retry, not an hourly refresh.
-  // This is the assertion a blanket "no request after an hour" would break.
-  const due = await runIncrementalVisit([failed(16, 1)])
+  // Before the existing 15-minute delay: no request at all.
+  const early = await runIncrementalVisit([failed(14, 1)])
+  assert.equal(requested(early.urls, ENDPOINT.conditionalAccess), 0)
+  assert.ok(early.urls.some((url) => /\/users/.test(url)),
+    'the visit still performs its own work, so the absence above is about this resource')
+
+  // At the existing 15-minute delay: exactly the existing retry, not an hourly
+  // refresh. This is the assertion a blanket "no request after an hour" broke.
+  const due = await runIncrementalVisit([failed(15, 1)])
   assert.equal(requested(due.urls, ENDPOINT.conditionalAccess), 1)
 
   // A backoff longer than an hour is not shortcut by hourly staleness:
@@ -311,6 +319,14 @@ test('a failed resource waits for its existing retry delay and is not refreshed 
   // passed.
   const backedOff = await runIncrementalVisit([failed(90, 4)])
   assert.equal(requested(backedOff.urls, ENDPOINT.conditionalAccess), 0)
+
+  // And a higher counter that now passes the widened coarse candidacy is still
+  // refused at dispatch until its own longer delay: two failures mean thirty
+  // minutes, and twenty have passed.
+  const coarseOnly = await runIncrementalVisit([failed(20, 2)])
+  assert.equal(requested(coarseOnly.urls, ENDPOINT.conditionalAccess), 0)
+  const pastItsDelay = await runIncrementalVisit([failed(31, 2)])
+  assert.equal(requested(pastItsDelay.urls, ENDPOINT.conditionalAccess), 1)
 })
 
 test('the allowlist stays inside the set the dispatch query selects', async () => {

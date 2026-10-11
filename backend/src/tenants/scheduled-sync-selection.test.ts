@@ -7,6 +7,7 @@ import {
   shouldRunHourlyInventoryRefresh,
   shouldRunTargetedTransientRetry,
   targetedTransientRetryDelayMs,
+  HOURLY_INVENTORY_FIRST_RETRY_MS,
   HOURLY_INVENTORY_REFRESH_MS,
   HOURLY_INVENTORY_RESOURCES,
   TARGETED_TRANSIENT_RETRY_RESOURCES,
@@ -456,4 +457,136 @@ test('the existing targeted retry progression is unchanged', () => {
   assert.equal(light(6), minutes(360))
   assert.equal(light(8), minutes(360))
   assert.equal(light(99), minutes(360))
+})
+
+// ------------------------------- failed-retry candidacy for the seven
+
+/** The two FAILED candidacy branches of the real query, by their own shape. */
+function failedCandidacyBranches(at: Date) {
+  const where = scheduledSyncTenantWhere(at) as unknown as {
+    AND: { OR?: Array<Record<string, unknown>> }[]
+  }
+  const branches = (where.AND[1]!.OR ?? []).map((branch) =>
+    (branch as { syncStates?: { some?: Record<string, unknown> } }).syncStates?.some)
+  const failed = branches.filter((some): some is Record<string, unknown> =>
+    some !== undefined && some.status === 'FAILED') as Array<{
+      resourceType: { in: string[] }
+      lastErrorCode: { notIn: string[] }
+      lastAttemptAt: { lt?: Date; lte?: Date }
+    }>
+  return failed
+}
+
+test('the selected resources become candidates at their own first-retry delay', () => {
+  // The defect this replaces: candidacy waited for the 30-minute base while
+  // these resources become due at 15 minutes, so a due retry between the two
+  // was invisible whenever USERS and both anchors were fresh.
+  assert.equal(HOURLY_INVENTORY_FIRST_RETRY_MS, 15 * 60 * 1000)
+  // Derived from the formula, so it cannot drift from the deciding predicate.
+  for (const resource of HOURLY_INVENTORY_RESOURCES) {
+    assert.equal(
+      targetedTransientRetryDelayMs({
+        ...state(resource, 'FAILED', null, ago(1)), consecutiveFailures: 1,
+      }),
+      HOURLY_INVENTORY_FIRST_RETRY_MS,
+      `${resource} first retry must equal the candidacy bound`,
+    )
+  }
+
+  const failed = failedCandidacyBranches(now)
+  assert.equal(failed.length, 2, 'one branch for the selected seven, one for the rest')
+  const selected = failed.find((branch) =>
+    branch.resourceType.in.length === HOURLY_INVENTORY_RESOURCES.length)
+  assert.ok(selected, 'the query must carry a branch scoped to the selected seven')
+  assert.deepEqual([...selected!.resourceType.in].sort(), [...HOURLY_INVENTORY_RESOURCES].sort())
+  // Inclusive at exactly the first-retry delay, matching the predicate's `>=`.
+  assert.equal(selected!.lastAttemptAt.lte?.getTime(), now.getTime() - HOURLY_INVENTORY_FIRST_RETRY_MS)
+  assert.equal(selected!.lastAttemptAt.lt, undefined)
+})
+
+test('both failed candidacy branches carry an identical error exclusion list', () => {
+  // Compared branch to branch rather than against a copy of the list, so a
+  // future edit to one cannot silently diverge from the other.
+  const failed = failedCandidacyBranches(now)
+  assert.equal(failed.length, 2)
+  assert.deepEqual([...failed[0]!.lastErrorCode.notIn].sort(), [...failed[1]!.lastErrorCode.notIn].sort())
+  for (const code of ['401', '403', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_PERMISSION_REQUIRED']) {
+    assert.ok(failed[0]!.lastErrorCode.notIn.includes(code), code)
+  }
+})
+
+test('the other targeted resources keep their existing candidacy bound', () => {
+  const failed = failedCandidacyBranches(now)
+  const broad = failed.find((branch) =>
+    branch.resourceType.in.length === TARGETED_TRANSIENT_RETRY_RESOURCES.length)
+  assert.ok(broad, 'the existing broad branch must remain')
+  // Unchanged: the 30-minute base, still exclusive.
+  assert.equal(broad!.lastAttemptAt.lt?.getTime(), now.getTime() - 30 * 60 * 1000)
+  assert.equal(broad!.lastAttemptAt.lte, undefined)
+  // And the narrower branch does not reach any heavier resource.
+  const selected = failed.find((branch) => branch !== broad)!
+  for (const heavier of ['GROUPS', 'DEVICES', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SHAREPOINT_SITES']) {
+    assert.equal(selected.resourceType.in.includes(heavier), false, heavier)
+  }
+})
+
+test('a wider coarse candidacy does not loosen the deciding predicate', () => {
+  // Two consecutive failures mean a 30-minute delay. Twenty minutes of age now
+  // passes the coarse branch, and selection must still refuse it.
+  const twoFailures = {
+    ...state('CONDITIONAL_ACCESS', 'FAILED', ago(3 * HOUR), ago(20 * 60 * 1000)),
+    consecutiveFailures: 2,
+  }
+  assert.equal(targetedTransientRetryDelayMs(twoFailures), 30 * 60 * 1000)
+  assert.equal(shouldRunTargetedTransientRetry(twoFailures, now), false)
+  assert.equal(shouldRunHourlyInventoryRefresh(twoFailures, now), false)
+  assert.deepEqual(selectScheduledTenantWork([{
+    id: 'tenant-two-failures',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', ago(60_000)),
+      state('LICENSES', 'SUCCEEDED', ago(60_000)),
+      state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+      twoFailures,
+    ],
+  }], now, 10), [])
+
+  // Past its own 30-minute delay it is selected, by the unchanged predicate.
+  const due = { ...twoFailures, lastAttemptAt: ago(31 * 60 * 1000) }
+  assert.equal(shouldRunTargetedTransientRetry(due, now), true)
+  const work = selectScheduledTenantWork([{
+    id: 'tenant-two-failures',
+    syncStates: [
+      state('USERS', 'SUCCEEDED', ago(60_000)),
+      state('LICENSES', 'SUCCEEDED', ago(60_000)),
+      state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+      due,
+    ],
+  }], now, 10)
+  assert.equal(work.length, 1)
+  assert.equal(work[0]!.fullInventoryDue, false)
+})
+
+test('a first failure is selected at exactly fifteen minutes and not before', () => {
+  const at = (attemptedAgoMs: number) => {
+    const failed = {
+      ...state('CONDITIONAL_ACCESS', 'FAILED', ago(3 * HOUR), ago(attemptedAgoMs)),
+      consecutiveFailures: 1,
+    }
+    return {
+      predicate: shouldRunTargetedTransientRetry(failed, now),
+      selected: selectScheduledTenantWork([{
+        id: 'tenant-first-failure',
+        syncStates: [
+          state('USERS', 'SUCCEEDED', ago(60_000)),
+          state('LICENSES', 'SUCCEEDED', ago(60_000)),
+          state('DOMAINS', 'SUCCEEDED', ago(60_000)),
+          failed,
+        ],
+      }], now, 10).length,
+    }
+  }
+  assert.deepEqual(at(HOURLY_INVENTORY_FIRST_RETRY_MS), { predicate: true, selected: 1 })
+  assert.deepEqual(at(HOURLY_INVENTORY_FIRST_RETRY_MS - 1), { predicate: false, selected: 0 })
+  // And the formerly hidden window is now selectable rather than invisible.
+  assert.deepEqual(at(20 * 60 * 1000), { predicate: true, selected: 1 })
 })
