@@ -2,6 +2,12 @@
 
 This directory supplements the engineer-facing [root README](../README.md). Linked documents below exist in the repository. A document can describe implemented, proposed, or staged behavior; read its status before treating anything as deployed or enabled.
 
+## Database operations documentation
+
+| Document | Audience | Purpose |
+| --- | --- | --- |
+| [Database backup and restore evidence](database-backup-restore.md) | Platform/database operators | Provider-neutral acceptance procedure and blank receipt; actual backup/restore proof remains unconfirmed |
+
 ## Identity-risk documentation
 
 | Document | Audience | Purpose |
@@ -29,7 +35,7 @@ Operator procedures are restricted internal material. Do not expose Swagger, deb
 | Internal audit-event catalog and auditability runbook | Engineering, support, security, compliance | P0 after auditability reaches `main` | Backend/security owner | No |
 | Internal secrets, key rotation, and connector recovery runbook | On-call/platform | P0 | Platform/security owner | No |
 | Internal release and rollback runbook | Release/on-call | P0 | Platform/release owner | No |
-| Internal database backup, restore, migration, and disaster-recovery runbook | Platform/database operators | P0 | Platform/database owner | No |
+| Internal database migration and disaster-recovery runbook; the bounded backup/restore evidence procedure is linked above, with operational proof still unconfirmed | Platform/database operators | P0 | Platform/database owner | No |
 | Internal monitoring, alerting, correlation, and incident runbook | On-call/support | P1 | SRE/platform owner | No |
 | Internal Microsoft collector catalog: cadence, retention, cost, failures | Engineering, support, product | P1 | Microsoft integration owner | No |
 | Internal data classification, retention, deletion, and privacy procedure | Engineering, security, legal, support | P1 | Security/privacy owner | No |
