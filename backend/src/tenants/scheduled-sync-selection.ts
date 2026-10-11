@@ -16,6 +16,13 @@ export const DAILY_INVENTORY_ANCHORS = [
 export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
 export const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
 export const USER_INCREMENTAL_REFRESH_MS = 5 * 60 * 1000
+/**
+ * Periodic catch-up for healthy current-state inventory. This is an
+ * ELIGIBILITY interval, not a freshness guarantee: a resource becomes eligible
+ * one hour after its last success and is refreshed on the next admitted visit,
+ * after its serialized position in that visit.
+ */
+export const HOURLY_INVENTORY_REFRESH_MS = 60 * 60 * 1000
 /** The durable USERS RUNNING row is the tenant-wide scheduler lease. */
 export const TENANT_SYNC_LEASE_MS = 15 * 60 * 1000
 /**
@@ -50,6 +57,31 @@ const HEAVIER_RETRY_RESOURCES = new Set<string>([
   SyncResourceType.APPLICATIONS,
   SyncResourceType.SHAREPOINT_SITES,
 ])
+
+/**
+ * Healthy-state hourly catch-up, restricted to resources that satisfy all four
+ * admission criteria: already dispatchable through the existing targeted module
+ * map, so no collector is newly wired and daily-only collectors stay
+ * structurally undispatchable; NOT a daily-pass anchor, so no hourly write can
+ * advance the timestamps the daily clock reads; NOT in
+ * HEAVIER_RETRY_RESOURCES, whose collectors can retain multi-page payloads; and
+ * not under an operational hold that source cannot consult, which excludes
+ * DIRECTORY_ROLES.
+ *
+ * RISKY_USERS is deliberately absent: it is the only otherwise-eligible
+ * resource on the general 50-page collection limits rather than the
+ * small-collection limits, so its worst-case request count exceeds all the
+ * others combined.
+ */
+export const HOURLY_INVENTORY_RESOURCES = [
+  SyncResourceType.ORGANIZATION_CONFIGURATION,
+  SyncResourceType.AUTH_METHOD_POLICIES,
+  SyncResourceType.SECURITY_DEFAULTS,
+  SyncResourceType.SHAREPOINT_SETTINGS,
+  SyncResourceType.CONDITIONAL_ACCESS,
+  SyncResourceType.AUTHENTICATION_STRENGTHS,
+  SyncResourceType.NAMED_LOCATIONS,
+] as const
 
 export type DailyInventoryState = {
   resourceType: string
@@ -129,6 +161,36 @@ export function shouldRunTargetedTransientRetry(
   return now.getTime() - state.lastAttemptAt.getTime() >= targetedTransientRetryDelayMs(state)
 }
 
+/**
+ * Healthy-state hourly eligibility. Deliberately orthogonal to the failure
+ * path rather than a replacement for it:
+ *
+ *   - FAILED always makes this false, so a failed resource keeps its existing
+ *     targeted retry schedule. That schedule is FASTER than hourly for these
+ *     resources (15 minutes on a first failure), so routing failures here
+ *     would delay them, and a stale hourly age must never shortcut a longer
+ *     accumulated backoff.
+ *   - RUNNING makes this false, so an in-flight collection is not duplicated.
+ *   - A missing lastSuccessfulAt makes this false. A never-collected resource
+ *     belongs to the initial/daily path; admitting it here would re-attempt it
+ *     on every scheduler tick.
+ *   - A future or otherwise invalid lastSuccessfulAt makes this false, for the
+ *     same reason the USERS rule documents: it is an anomaly to report, not an
+ *     immediate retry signal.
+ */
+export function shouldRunHourlyInventoryRefresh(
+  state: DailyInventoryState | undefined,
+  now: Date,
+) {
+  if (!state) return false
+  if (!(HOURLY_INVENTORY_RESOURCES as readonly string[]).includes(state.resourceType)) return false
+  if (state.status === SyncStateStatus.RUNNING || state.status === SyncStateStatus.FAILED) return false
+  if (!validPastTime(state.lastSuccessfulAt, now)) return false
+  // Inclusive at exactly one hour, matching the `lte` bound the candidate
+  // query uses, so the pure rule and the database filter agree on the boundary.
+  return now.getTime() - state.lastSuccessfulAt!.getTime() >= HOURLY_INVENTORY_REFRESH_MS
+}
+
 function validPastTime(value: Date | null | undefined, now: Date) {
   return value instanceof Date && Number.isFinite(value.getTime()) && value <= now
 }
@@ -161,12 +223,16 @@ export function selectScheduledTenantWork(
         now.getTime() - users.lastSuccessfulAt.getTime() >= USER_INCREMENTAL_REFRESH_MS
       ))
     const targetedDue = candidate.syncStates.some((state) => shouldRunTargetedTransientRetry(state, now))
+    // Healthy inventory can be due on its own, with USERS and both anchors
+    // fresh. `fullInventoryDue` is deliberately NOT affected: the daily pass
+    // keeps its own clock, so daily-only work behind it cannot be postponed.
+    const hourlyDue = candidate.syncStates.some((state) => shouldRunHourlyInventoryRefresh(state, now))
 
-    if (!fullInventoryDue && !userDue && !targetedDue) return []
+    if (!fullInventoryDue && !userDue && !targetedDue && !hourlyDue) return []
     const dueStates = candidate.syncStates.filter((state) => {
       if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) return fullInventoryDue
       if (state.resourceType === SyncResourceType.USERS) return userDue
-      return shouldRunTargetedTransientRetry(state, now)
+      return shouldRunTargetedTransientRetry(state, now) || shouldRunHourlyInventoryRefresh(state, now)
     })
     return [{
       tenantId: candidate.id,
@@ -234,6 +300,12 @@ export function scheduledSyncTenantWhere(
   const targetedRetryBefore = new Date(
     now.getTime() - TARGETED_TRANSIENT_RETRY_BASE_MS,
   )
+  // `lte`, not `lt`: the pure rule is `elapsed >= H`, which is exactly
+  // `lastSuccessfulAt <= now - H`. Using `lt` here would drop a row sitting on
+  // the boundary millisecond out of candidacy while the rule called it due.
+  const hourlyStaleBefore = new Date(
+    now.getTime() - HOURLY_INVENTORY_REFRESH_MS,
+  )
 
   return {
     status: 'ACTIVE' as const,
@@ -279,6 +351,17 @@ export function scheduledSyncTenantWhere(
           },
         },
       ]),
+      {
+        syncStates: {
+          some: {
+            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            status: { notIn: [SyncStateStatus.RUNNING, SyncStateStatus.FAILED] },
+            // A null lastSuccessfulAt never satisfies `lte`, so a
+            // never-collected resource is excluded here as well as in the rule.
+            lastSuccessfulAt: { lte: hourlyStaleBefore },
+          },
+        },
+      },
       {
         syncStates: {
           some: {

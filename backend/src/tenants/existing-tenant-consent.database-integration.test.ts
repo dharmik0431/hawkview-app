@@ -320,3 +320,185 @@ test('existing tenant public consent route with physical transaction and synthet
     await prisma.$disconnect();observer.release();await pool.end()
   }
 })
+
+/**
+ * Hourly current-state inventory candidate selection, against the REAL
+ * `scheduledSyncTenantWhere` query and `selectScheduledTenantWork` on migrated
+ * PostgreSQL. Runs only in the existing disposable CI database; locally it
+ * skips, so a green local run says nothing about it.
+ *
+ * The fixture is complete and isolated — its own organization, user, membership
+ * and tenant — and every comparison is made against a FIXED clock, so the
+ * boundary cases stay deterministic on any future date.
+ */
+test('a migrated PostgreSQL database selects hourly inventory while USERS and both anchors are fresh', { skip, timeout: 90000 }, async (t) => {
+  const url = assertDisposableTestDatabase()
+  // Constructed exactly as this suite's existing case does, including the UTC
+  // session option: these timestamptz boundary comparisons depend on it, and
+  // the case cannot be run locally to discover a difference.
+  const prisma = new PrismaClient({
+    adapter: new PrismaPg({ connectionString: url.toString(), max: 4, options: '-c timezone=UTC' }),
+  })
+
+  /** Fixed, valid, and later than every fixture timestamp below. */
+  const CLOCK = new Date(Date.UTC(2026, 2, 15, 12, 0, 0))
+  const HOUR = 60 * 60 * 1000
+  const before = (ms: number) => new Date(CLOCK.getTime() - ms)
+
+  const testRun = randomUUID()
+  const organizationIds: string[] = []
+  const userIds: string[] = []
+  t.after(async () => {
+    await prisma.organization.deleteMany({ where: { id: { in: organizationIds } } })
+    await prisma.user.deleteMany({ where: { id: { in: userIds } } })
+    await prisma.$disconnect()
+  })
+
+  const seedWorkspace = async (label: string) => {
+    const user = await prisma.user.create({
+      data: {
+        authProviderUserId: randomUUID(),
+        email: `hourly-${label}-${testRun}@integration.hawkview.invalid`,
+        displayName: `Hourly Owner ${label}`,
+      },
+    })
+    userIds.push(user.id)
+    const organization = await prisma.organization.create({
+      data: { name: `Hourly MSP ${label}`, slug: `hourly-${label}-${testRun}`, onboardingCompletedAt: new Date() },
+    })
+    organizationIds.push(organization.id)
+    await prisma.membership.create({
+      data: { userId: user.id, organizationId: organization.id, role: 'MSP_OWNER', status: 'ACTIVE' },
+    })
+    const tenant = await prisma.customerTenant.create({
+      data: {
+        organizationId: organization.id,
+        microsoftTenantId: randomUUID(),
+        displayName: `Hourly Customer ${label}`,
+        primaryDomain: `${label}.${testRun}.example`,
+        status: 'ACTIVE',
+        connection: {
+          create: {
+            connectionMode: 'HAWKVIEW_MANAGED',
+            status: 'CONNECTED',
+            consentedPermissions: [],
+            onboardingCompletedAt: new Date(),
+          },
+        },
+      },
+    })
+    // Fresh USERS and both daily anchors, so nothing except the hourly rule can
+    // make this tenant a candidate.
+    for (const resourceType of ['USERS', 'LICENSES', 'DOMAINS'] as const) {
+      await prisma.syncState.create({
+        data: {
+          organizationId: organization.id,
+          customerTenantId: tenant.id,
+          resourceType,
+          status: 'SUCCEEDED',
+          lastSuccessfulAt: before(60_000),
+          lastAttemptAt: before(60_000),
+        },
+      })
+    }
+    return { organizationId: organization.id, tenantId: tenant.id }
+  }
+
+  const candidateFound = async (workspace: { organizationId: string; tenantId: string }) =>
+    prisma.customerTenant.findMany({
+      where: { AND: [scheduledSyncTenantWhere(CLOCK), { organizationId: workspace.organizationId, id: workspace.tenantId }] },
+      select: { id: true, syncStates: { select: {
+        resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true,
+        lastErrorCode: true, lastErrorMessage: true, consecutiveFailures: true,
+      } } },
+    })
+
+  const setInventory = async (
+    workspace: { organizationId: string; tenantId: string },
+    data: Record<string, unknown>,
+    resourceType: 'CONDITIONAL_ACCESS' | 'LICENSES' = 'CONDITIONAL_ACCESS',
+  ) => {
+    await prisma.syncState.upsert({
+      where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType } },
+      create: { organizationId: workspace.organizationId, customerTenantId: workspace.tenantId, resourceType, ...data },
+      update: data,
+    })
+  }
+
+  const workspace = await seedWorkspace('a')
+
+  await t.test('the control: nothing is due before the hourly boundary', async () => {
+    // One millisecond short of the boundary. Pinning this first means the
+    // positive case below cannot pass because the tenant was always a candidate.
+    await setInventory(workspace, {
+      status: 'SUCCEEDED', lastSuccessfulAt: before(HOUR - 1), lastAttemptAt: before(HOUR - 1),
+    })
+    assert.deepEqual(await candidateFound(workspace), [])
+  })
+
+  await t.test('exactly one hour of age makes it a candidate without pulling the daily pass in', async () => {
+    await setInventory(workspace, {
+      status: 'SUCCEEDED', lastSuccessfulAt: before(HOUR), lastAttemptAt: before(HOUR),
+    })
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    const work = selectScheduledTenantWork(found as never, CLOCK, 10)
+    assert.equal(work.length, 1)
+    assert.equal(work[0]!.tenantId, workspace.tenantId)
+    // The daily anchor clock is untouched by hourly eligibility.
+    assert.equal(work[0]!.fullInventoryDue, false)
+  })
+
+  await t.test('RUNNING, never-collected and future timestamps are not candidates', async () => {
+    for (const data of [
+      { status: 'RUNNING', lastSuccessfulAt: before(6 * HOUR), lastAttemptAt: before(6 * HOUR) },
+      { status: 'SUCCEEDED', lastSuccessfulAt: null, lastAttemptAt: before(6 * HOUR) },
+      { status: 'SUCCEEDED', lastSuccessfulAt: new Date(CLOCK.getTime() + HOUR), lastAttemptAt: before(60_000) },
+    ]) {
+      await setInventory(workspace, data)
+      assert.deepEqual(await candidateFound(workspace), [], JSON.stringify(data))
+    }
+  })
+
+  await t.test('a FAILED resource inside its own retry delay is not a candidate', async () => {
+    // A FAILED row is NOT globally ineligible: it has its own targeted retry
+    // eligibility, which for these resources is fifteen minutes. The fixture
+    // must therefore sit INSIDE that delay, or this case would fail for the
+    // right reason. Do not "fix" a failure here by widening the assertion.
+    await setInventory(workspace, {
+      status: 'FAILED',
+      lastSuccessfulAt: before(6 * HOUR),
+      lastAttemptAt: before(5 * 60 * 1000),
+      consecutiveFailures: 1,
+      lastErrorCode: 'MICROSOFT_THROTTLED',
+    })
+    assert.deepEqual(await candidateFound(workspace), [])
+
+    // And the same row past its existing delay IS a candidate, through the
+    // unchanged targeted retry path rather than the hourly rule — which is what
+    // makes the assertion above about the delay and not about FAILED itself.
+    await setInventory(workspace, {
+      status: 'FAILED',
+      lastSuccessfulAt: before(6 * HOUR),
+      lastAttemptAt: before(45 * 60 * 1000),
+      consecutiveFailures: 1,
+      lastErrorCode: 'MICROSOFT_THROTTLED',
+    })
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    assert.equal(selectScheduledTenantWork(found as never, CLOCK, 10)[0]!.fullInventoryDue, false)
+  })
+
+  await t.test('an excluded resource at the same staleness is not a candidate', async () => {
+    // Put CONDITIONAL_ACCESS back inside the boundary so only the anchor is old.
+    await setInventory(workspace, {
+      status: 'SUCCEEDED', lastSuccessfulAt: before(HOUR - 1), lastAttemptAt: before(HOUR - 1),
+    })
+    // LICENSES is an anchor: two hours of age must not make it due, because the
+    // daily interval governs it.
+    await setInventory(workspace, {
+      status: 'SUCCEEDED', lastSuccessfulAt: before(2 * HOUR), lastAttemptAt: before(2 * HOUR),
+    }, 'LICENSES')
+    assert.deepEqual(await candidateFound(workspace), [])
+  })
+})
