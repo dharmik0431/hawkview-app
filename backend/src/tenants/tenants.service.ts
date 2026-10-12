@@ -680,7 +680,7 @@ export class TenantsService {
     } as const satisfies Prisma.CustomerTenantSelect
   }
 
-  async listForIdentity(identity: AuthenticatedIdentity) {
+  async listForIdentity(identity: AuthenticatedIdentity, internals: { now?: () => Date } = {}) {
     const organizationIds = await this.getAccessibleOrganizationIds(identity)
     if (organizationIds.length === 0) return { tenants: [] }
 
@@ -691,13 +691,17 @@ export class TenantsService {
     })
 
     const tenantIds = tenants.map((tenant) => tenant.id)
+    // Event recency and saved retention are independent eligibility rules.
+    // Capture once for this query; HTTP callers never supply the clock.
+    const auditReadAt = internals.now?.() ?? new Date()
     const auditEvents = await this.prisma.directoryAuditLog.findMany({
         where: {
           organizationId: { in: organizationIds },
           customerTenantId: { in: tenantIds },
           eventDateTime: {
-            gte: new Date(Date.now() - 24 * 60 * 60 * 1000),
+            gte: new Date(auditReadAt.getTime() - 24 * 60 * 60 * 1000),
           },
+          expiresAt: { gt: auditReadAt },
         },
         orderBy: { eventDateTime: 'desc' },
         take: 500,
