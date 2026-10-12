@@ -46,6 +46,7 @@ import {
 } from '@/lib/tenants/navigation'
 
 import type { TenantBundle } from '@/types/tenant-data'
+import { ConditionalAccessTargets, type ConditionalAccessDisplayTarget } from '@/components/tenant/conditional-access-targets'
 import { apiClient } from '@/lib/api/client'
 
 import {
@@ -917,6 +918,8 @@ type CaPlatform = 'Windows' | 'macOS' | 'iOS' | 'Android' | 'Linux'
 type CaAssignmentBlock = {
   include: string[]
   exclude?: string[]
+  includeTargets?: ConditionalAccessDisplayTarget[]
+  excludeTargets?: ConditionalAccessDisplayTarget[]
 }
 
 type ConditionalAccessPolicy = {
@@ -1083,16 +1086,12 @@ function PolicyDetailsView({ policy }: { policy: ConditionalAccessPolicy }) {
           <DetailCard title="Users and Groups">
             <div className="space-y-2 text-sm">
               <Row label="Include">
-                {policy.assignments.usersAndGroups.include.map((x) => (
-                  <Chip key={x}>{x}</Chip>
-                ))}
+                <ConditionalAccessTargets ids={policy.assignments.usersAndGroups.include} targets={policy.assignments.usersAndGroups.includeTargets} />
               </Row>
 
               {policy.assignments.usersAndGroups.exclude?.length ? (
                 <Row label="Exclude">
-                  {policy.assignments.usersAndGroups.exclude!.map((x) => (
-                    <Chip key={x}>{x}</Chip>
-                  ))}
+                  <ConditionalAccessTargets ids={policy.assignments.usersAndGroups.exclude!} targets={policy.assignments.usersAndGroups.excludeTargets} />
                 </Row>
               ) : null}
             </div>

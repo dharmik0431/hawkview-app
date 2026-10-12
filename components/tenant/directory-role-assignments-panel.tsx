@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { DirectoryRoleControl } from './directory-role-control'
@@ -9,6 +9,7 @@ import { useDirectoryRoleResults } from '@/lib/api/directory-role-results-hooks'
 import { DIRECTORY_ROLE_SOURCE, type DirectoryRoleResultsView, type DirectoryRoleHealthView } from '@/lib/tenants/directory-role-results-view'
 import { tenantEntraPath } from '@/lib/tenants/navigation'
 import { cn } from '@/lib/utils'
+import { storedPrincipalNames, storedPrincipalName } from '@/lib/tenants/stored-principal-name'
 
 function storedTime(at: Date) {
   return at.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
@@ -68,7 +69,7 @@ const ATTEMPT_COPY: Record<'RUNNING' | 'FAILED' | 'PARTIAL' | 'EXPIRED', string>
   EXPIRED: 'The most recent collection attempt expired.',
 }
 
-function Assignments({ results }: { results: DirectoryRoleResultsView }) {
+function Assignments({ results, names }: { results: DirectoryRoleResultsView; names: ReadonlyMap<string, string | null> }) {
   const observation = results.observation
   if (!observation) return null
   if (observation.verifiedCompleteEmpty) {
@@ -92,16 +93,19 @@ function Assignments({ results }: { results: DirectoryRoleResultsView }) {
         <tbody className="text-slate-700 dark:text-slate-200">
           {observation.assignments.map((row) => (
             <tr key={row.id} className="border-t border-slate-100 dark:border-slate-800">
-              {/* An identifier is a valid display fallback. HawkView does not read users or groups
-                  to resolve a name, and shows no name it did not actually observe. */}
+              {/* Enrichment uses the tenant bundle, not the role receipt or a new collection. */}
               <td className="py-1 pr-3 font-mono">{row.roleDisplayName ?? row.roleDefinitionId ?? '—'}</td>
-              <td className="py-1 pr-3 font-mono">{row.principalId ?? '—'}</td>
+              <td className="py-1 pr-3">
+                <span className="block font-medium">{storedPrincipalName(names, row.principalId) ?? 'Name unavailable'}</span>
+                <span className="block font-mono text-slate-500 dark:text-slate-400">{row.principalId ?? '—'}</span>
+              </td>
               <td className="py-1 pr-3 font-mono">{row.directoryScopeId ?? row.appScopeId ?? '—'}</td>
               <td className="py-1 font-mono">{row.id}</td>
             </tr>
           ))}
         </tbody>
       </table>
+      <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">Names come from stored directory data and may differ from names when these assignments were collected.</p>
     </div>
   )
 }
@@ -142,11 +146,13 @@ function explanation(data: DirectoryRoleResultsView, stale: boolean) {
 
 /** Both entry points consume the same scoped read and receipt clock. Compact mode adds no control
  * or assignment payload display; the collection setting stays in its existing Entra location. */
-function DirectoryRoleStoredResults({ customerTenantId, className, compact = false }: {
+function DirectoryRoleStoredResults({ customerTenantId, className, compact = false, bundle }: {
   customerTenantId: string
   className?: string
   compact?: boolean
+  bundle?: unknown
 }) {
+  const names = useMemo(() => storedPrincipalNames(bundle, customerTenantId), [bundle, customerTenantId])
   const { data, dataUpdatedAt, isPending, isError, isFetching, refetch } = useDirectoryRoleResults(customerTenantId)
   const now = useWallClock(data?.observation !== undefined && data?.observation !== null)
   if (!customerTenantId) return null
@@ -173,7 +179,7 @@ function DirectoryRoleStoredResults({ customerTenantId, className, compact = fal
         {observation && <>
           {compact
             ? <p className="text-sm">{observation.verifiedCompleteEmpty ? 'Verified complete-empty observation: zero directory role assignments.' : `Complete observation: ${observation.observedCount} directory role assignment${observation.observedCount === 1 ? '' : 's'}.`}</p>
-            : <Assignments results={data} />}
+            : <Assignments results={data} names={names} />}
           <p className="text-xs text-slate-500 dark:text-slate-400">
             Checked <time dateTime={observation.checkedAt.toISOString()}>{storedTime(observation.checkedAt)}</time> · {ageLabel(presented?.elapsedMs ?? observation.ageMs)}.
             {' '}Receipt completion time; source change time is not reported.
@@ -199,7 +205,7 @@ function DirectoryRoleStoredResults({ customerTenantId, className, compact = fal
   )
 }
 
-export function DirectoryRoleAssignmentsPanel(props: { customerTenantId: string; className?: string }) {
+export function DirectoryRoleAssignmentsPanel(props: { customerTenantId: string; className?: string; bundle?: unknown }) {
   return <DirectoryRoleStoredResults {...props} />
 }
 
