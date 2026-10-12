@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  DAILY_INVENTORY_RESOURCES,
+  dailyInventoryResourceDueAt,
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
   selectScheduledTenantWork,
@@ -14,6 +16,7 @@ import {
 } from './scheduled-sync-selection.js'
 
 const now = new Date('2026-08-17T16:00:00.000Z')
+const dailyCoverage = () => DAILY_INVENTORY_RESOURCES.map(resource => state(resource, 'SUCCEEDED', now, now))
 
 function state(
   resourceType: string,
@@ -26,7 +29,7 @@ function state(
 
 test('does not request a daily inventory while both anchors are current', () => {
   assert.equal(
-    requiresDailyInventoryRefresh([state('LICENSES'), state('DOMAINS')], now),
+    requiresDailyInventoryRefresh([...dailyCoverage(), state('LICENSES'), state('DOMAINS')], now),
     false,
   )
 })
@@ -34,7 +37,7 @@ test('does not request a daily inventory while both anchors are current', () => 
 test('requests a daily inventory when one anchor is stale even if the other is current', () => {
   assert.equal(
     requiresDailyInventoryRefresh(
-      [
+      [...dailyCoverage(),
         state('LICENSES', 'SUCCEEDED', new Date('2026-08-16T14:00:00.000Z')),
         state('DOMAINS'),
       ],
@@ -47,7 +50,7 @@ test('requests a daily inventory when one anchor is stale even if the other is c
 test('waits for a running daily collector instead of scheduling a duplicate run', () => {
   assert.equal(
     requiresDailyInventoryRefresh(
-      [state('LICENSES', 'RUNNING', null, new Date('2026-08-17T15:59:00.000Z')), state('DOMAINS')],
+      [...dailyCoverage(), state('LICENSES', 'RUNNING', null, new Date('2026-08-17T15:59:00.000Z')), state('DOMAINS')],
       now,
     ),
     false,
@@ -101,15 +104,13 @@ test('a retired Exchange Admin collector can never schedule targeted work', () =
   }
 
   assert.equal(shouldRunTargetedTransientRetry(historicalFailure, now), false)
-  assert.doesNotMatch(
-    JSON.stringify(scheduledSyncTenantWhere(now)),
-    /EXCHANGE_MAILBOX_CONFIGURATION/,
-  )
+  // Optional Exchange is a daily candidate only when its existing flag is on.
+  assert.match(JSON.stringify(scheduledSyncTenantWhere(now)), /exchangeReadOnlyEnabledAt/)
   assert.deepEqual(
     selectScheduledTenantWork(
       [{
         id: 'retired-exchange-admin-state',
-        syncStates: [
+        syncStates: [...dailyCoverage(),
           state('USERS', 'SUCCEEDED', now, now),
           state('LICENSES'),
           state('DOMAINS'),
@@ -167,7 +168,7 @@ test('uses stable failure codes and cost-aware retry windows', () => {
 test('selects a tenant for an eligible Named Locations retry without forcing full inventory', () => {
   const selected = selectScheduledTenantWork([{
     id: 'named-locations-retry',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', now, now),
       state('LICENSES'),
       state('DOMAINS'),
@@ -199,7 +200,7 @@ test('never hot-loops bounded SharePoint capacity failures or invalid retry time
 test('ranks due work by durable resource attempt time with a stable tenant tie-break', () => {
   const candidates = Array.from({ length: 30 }, (_, index) => ({
     id: `tenant-${String(index).padStart(2, '0')}`,
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', new Date('2026-08-17T15:00:00.000Z')),
       state('LICENSES'), state('DOMAINS'),
     ],
@@ -210,7 +211,7 @@ test('ranks due work by durable resource attempt time with a stable tenant tie-b
   // Once the first cohort was attempted, their per-resource timestamp moves
   // forward and the next cohort wins even if CustomerTenant.updatedAt did not.
   const next = selectScheduledTenantWork(candidates.map((candidate, index) => index < 25
-    ? { ...candidate, syncStates: [state('USERS', 'SUCCEEDED', now, now), state('LICENSES'), state('DOMAINS')] }
+    ? { ...candidate, syncStates: [...dailyCoverage(), state('USERS', 'SUCCEEDED', now, now), state('LICENSES'), state('DOMAINS')] }
     : candidate), now, 25)
   assert.equal(next[0]?.tenantId, 'tenant-25')
 })
@@ -218,7 +219,7 @@ test('ranks due work by durable resource attempt time with a stable tenant tie-b
 test('does not let authorization, capacity, or future timestamps consume targeted retry slots', () => {
   const retry = (id: string, error: string, lastAttemptAt: Date) => ({
     id,
-    syncStates: [{
+    syncStates: [...dailyCoverage(), {
       ...state('SHAREPOINT_SITES', 'FAILED', null, lastAttemptAt),
       lastErrorCode: '500', lastErrorMessage: error, consecutiveFailures: 1,
     }, state('LICENSES'), state('DOMAINS'), state('USERS', 'SUCCEEDED', now, now)],
@@ -235,7 +236,7 @@ test('does not let authorization, capacity, or future timestamps consume targete
 test('keeps a 1,000-tenant due population moving after each 25-tenant batch', () => {
   const population = Array.from({ length: 1_000 }, (_, index) => ({
     id: `tenant-${String(index).padStart(4, '0')}`,
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', new Date('2026-08-17T15:00:00.000Z')),
       state('LICENSES'), state('DOMAINS'),
     ],
@@ -244,7 +245,7 @@ test('keeps a 1,000-tenant due population moving after each 25-tenant batch', ()
   assert.equal(first.length, 25)
   const completed = new Set(first.map((item) => item.tenantId))
   const second = selectScheduledTenantWork(population.map((candidate) => completed.has(candidate.id)
-    ? { ...candidate, syncStates: [state('USERS', 'SUCCEEDED', now, now), state('LICENSES'), state('DOMAINS')] }
+    ? { ...candidate, syncStates: [...dailyCoverage(), state('USERS', 'SUCCEEDED', now, now), state('LICENSES'), state('DOMAINS')] }
     : candidate), now, 25)
   assert.equal(second[0]?.tenantId, 'tenant-0025')
   assert.equal(second.some((item) => completed.has(item.tenantId)), false)
@@ -353,7 +354,7 @@ test('a tenant is selected for hourly inventory while USERS and both anchors are
   const fresh = ago(60_000)
   const work = selectScheduledTenantWork([{
     id: 'tenant-hourly',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', fresh),
       state('LICENSES', 'SUCCEEDED', fresh),
       state('DOMAINS', 'SUCCEEDED', fresh),
@@ -370,7 +371,7 @@ test('a fresh allowlisted resource with everything else fresh selects no work', 
   const fresh = ago(60_000)
   assert.deepEqual(selectScheduledTenantWork([{
     id: 'tenant-idle',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', fresh),
       state('LICENSES', 'SUCCEEDED', fresh),
       state('DOMAINS', 'SUCCEEDED', fresh),
@@ -436,7 +437,7 @@ test('a backoff longer than an hour is not bypassed by hourly age', () => {
   assert.equal(shouldRunTargetedTransientRetry(fourFailures, now), false)
   assert.deepEqual(selectScheduledTenantWork([{
     id: 'tenant-backoff',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', ago(60_000)),
       state('LICENSES', 'SUCCEEDED', ago(60_000)),
       state('DOMAINS', 'SUCCEEDED', ago(60_000)),
@@ -542,7 +543,7 @@ test('a wider coarse candidacy does not loosen the deciding predicate', () => {
   assert.equal(shouldRunHourlyInventoryRefresh(twoFailures, now), false)
   assert.deepEqual(selectScheduledTenantWork([{
     id: 'tenant-two-failures',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', ago(60_000)),
       state('LICENSES', 'SUCCEEDED', ago(60_000)),
       state('DOMAINS', 'SUCCEEDED', ago(60_000)),
@@ -555,7 +556,7 @@ test('a wider coarse candidacy does not loosen the deciding predicate', () => {
   assert.equal(shouldRunTargetedTransientRetry(due, now), true)
   const work = selectScheduledTenantWork([{
     id: 'tenant-two-failures',
-    syncStates: [
+    syncStates: [...dailyCoverage(),
       state('USERS', 'SUCCEEDED', ago(60_000)),
       state('LICENSES', 'SUCCEEDED', ago(60_000)),
       state('DOMAINS', 'SUCCEEDED', ago(60_000)),
@@ -576,7 +577,7 @@ test('a first failure is selected at exactly fifteen minutes and not before', ()
       predicate: shouldRunTargetedTransientRetry(failed, now),
       selected: selectScheduledTenantWork([{
         id: 'tenant-first-failure',
-        syncStates: [
+        syncStates: [...dailyCoverage(),
           state('USERS', 'SUCCEEDED', ago(60_000)),
           state('LICENSES', 'SUCCEEDED', ago(60_000)),
           state('DOMAINS', 'SUCCEEDED', ago(60_000)),
@@ -589,4 +590,54 @@ test('a first failure is selected at exactly fifteen minutes and not before', ()
   assert.deepEqual(at(HOURLY_INVENTORY_FIRST_RETRY_MS - 1), { predicate: false, selected: 0 })
   // And the formerly hidden window is now selectable rather than invisible.
   assert.deepEqual(at(20 * 60 * 1000), { predicate: true, selected: 1 })
+})
+
+// New daily-coverage regressions use production inputs directly, including
+// intentionally absent rows; existing anchor-only fixtures above are complete.
+test('each daily dataset owns its inclusive daily boundary despite fresh anchors', () => {
+  for (const resource of DAILY_INVENTORY_RESOURCES) {
+    for (const delta of [-1, 0, 1]) {
+      const old = new Date(now.getTime() - 24 * HOUR - delta)
+      const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS'), state(resource, 'SUCCEEDED', old)]
+      const result = selectScheduledTenantWork([{ id: resource, syncStates: states }], now, 10)
+      assert.equal(result.length, delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
+      if (result.length) assert.equal(result[0]!.fullInventoryDue, true)
+    }
+  }
+})
+
+test('missing daily data is due, but a failed attempt waits a day and preserves targeted policy', () => {
+  assert.ok(dailyInventoryResourceDueAt(undefined, now))
+  const old = new Date(now.getTime() - 2 * 24 * HOUR)
+  for (const status of ['FAILED', 'IDLE']) {
+    for (const delta of [-1, 0, 1]) {
+      const attempt = new Date(now.getTime() - 24 * HOUR - delta)
+      assert.equal(Boolean(dailyInventoryResourceDueAt(state('SHAREPOINT_USAGE', status, status === 'FAILED' ? old : null, attempt), now)), delta >= 0)
+    }
+  }
+  for (const overrides of [
+    { status: 'RUNNING' },
+    { lastAttemptAt: new Date(now.getTime() + 1) },
+    { lastSuccessfulAt: new Date(now.getTime() + 1) },
+    { lastAttemptAt: new Date('invalid') },
+    { lastSuccessfulAt: new Date('invalid') },
+  ]) assert.equal(dailyInventoryResourceDueAt({ ...state('GROUPS', 'SUCCEEDED', old), ...overrides }, now), null)
+})
+
+test('missing optional Exchange and held role data cannot force collection', () => {
+  const candidate = { id: 'tenant', syncStates: [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS')] }
+  assert.deepEqual(selectScheduledTenantWork([candidate], now, 1), [])
+  assert.equal(selectScheduledTenantWork([{ ...candidate, connection: { exchangeReadOnlyEnabledAt: now } }], now, 1)[0]?.fullInventoryDue, true)
+  const staleRole = state('DIRECTORY_ROLES', 'SUCCEEDED', new Date(now.getTime() - 10 * 24 * HOUR))
+  assert.deepEqual(selectScheduledTenantWork([{ ...candidate, syncStates: [...candidate.syncStates, staleRole] }], now, 1), [])
+  assert.equal(selectScheduledTenantWork([{ ...candidate, syncStates: candidate.syncStates.filter(s => s.resourceType !== 'SECURE_SCORES') }], now, 1)[0]?.fullInventoryDue, true)
+})
+
+test('fair ranking uses the overdue non-anchor rather than fresh licence/domain clocks', () => {
+  const base = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS')]
+  const result = selectScheduledTenantWork([
+    { id: 'a-anchor', syncStates: [...base, state('LICENSES', 'SUCCEEDED', new Date(now.getTime() - 25 * HOUR))] },
+    { id: 'z-daily', syncStates: [...base, state('SECURE_SCORES', 'SUCCEEDED', new Date(now.getTime() - 48 * HOUR))] },
+  ], now, 1)
+  assert.equal(result[0]?.tenantId, 'z-daily')
 })
