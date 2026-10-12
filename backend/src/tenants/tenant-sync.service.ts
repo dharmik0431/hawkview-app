@@ -118,6 +118,7 @@ import {
   RELATED_EXCHANGE_RULE_AUDIT_WINDOW_DAYS,
 } from './exchange-rule-related-audit.js'
 import {
+  DAILY_INVENTORY_RESOURCES,
   DAILY_INVENTORY_ANCHORS,
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
@@ -1855,6 +1856,8 @@ export class TenantSyncService {
               in: [
                 'USERS',
                 ...DAILY_INVENTORY_ANCHORS,
+                ...DAILY_INVENTORY_RESOURCES,
+                'EXCHANGE_MAILBOX_CONFIGURATION',
                 ...TARGETED_TRANSIENT_RETRY_RESOURCES,
               ],
             },
@@ -1895,7 +1898,7 @@ export class TenantSyncService {
         // per day (or retry a failed daily inventory anchor after an hour).
         // This prevents a tenant from remaining permanently stale unless an
         // administrator manually presses Sync Now.
-        const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(tenant.syncStates, now)
+        const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(tenant.syncStates, now, Boolean(tenant.connection?.exchangeReadOnlyEnabledAt))
         const result = await this.syncConnectedTenant(tenant, false, {
           incrementalOnly: !fullInventoryDue,
           includeBundle: false,

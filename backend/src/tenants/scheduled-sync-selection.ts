@@ -83,6 +83,32 @@ export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.NAMED_LOCATIONS,
 ] as const
 
+/** Existing daily-pass datasets whose own clock must survive unrelated
+ * licence/domain event refreshes. No new collectors or hourly work. */
+export const DAILY_INVENTORY_RESOURCES = [
+  SyncResourceType.GROUPS,
+  SyncResourceType.AUTH_REGISTRATIONS,
+  SyncResourceType.DEVICES,
+  SyncResourceType.SERVICE_PRINCIPALS,
+  SyncResourceType.APPLICATIONS,
+  SyncResourceType.SECURE_SCORES,
+  SyncResourceType.RISKY_USERS,
+  SyncResourceType.SHAREPOINT_SITES,
+  SyncResourceType.SHAREPOINT_USAGE,
+  SyncResourceType.EXCHANGE_MAILBOXES,
+  SyncResourceType.EXCHANGE_MAILBOX_SETTINGS,
+  SyncResourceType.EXCHANGE_MAILBOX_USAGE,
+  SyncResourceType.EXCHANGE_ACCEPTED_DOMAINS,
+  SyncResourceType.EXCHANGE_MAILBOX_RULES,
+  SyncResourceType.DOMAIN_DNS_HEALTH,
+] as const
+
+export function dailyInventoryResources(exchangeReadOnlyEnabled = false): SyncResourceType[] {
+  return exchangeReadOnlyEnabled
+    ? [...DAILY_INVENTORY_RESOURCES, SyncResourceType.EXCHANGE_MAILBOX_CONFIGURATION]
+    : [...DAILY_INVENTORY_RESOURCES]
+}
+
 export type DailyInventoryState = {
   resourceType: string
   status: string
@@ -96,6 +122,7 @@ export type DailyInventoryState = {
 export type ScheduledTenantCandidate = {
   id: string
   syncStates: DailyInventoryState[]
+  connection?: { exchangeReadOnlyEnabledAt?: Date | null } | null
 }
 
 export type ScheduledTenantWork = {
@@ -234,6 +261,23 @@ function earliestDue(values: Array<Date | null | undefined>, now: Date) {
   return valid.sort((left, right) => left.getTime() - right.getTime())[0] ?? new Date(0)
 }
 
+/** Missing data gets an initial opportunity. A failed/never-successful
+ * collector then waits a day from its attempt; permission/capacity failures
+ * cannot turn this guard into a five-minute full-pass loop. Existing targeted
+ * retries remain independent and unchanged. RUNNING/anomalous clocks do not
+ * manufacture a retry. */
+export function dailyInventoryResourceDueAt(state: DailyInventoryState | undefined, now: Date): Date | null {
+  if (!state) return new Date(0)
+  if (state.status === SyncStateStatus.RUNNING) return null
+  if (state.lastAttemptAt != null && !validPastTime(state.lastAttemptAt, now)) return null
+  if (state.lastSuccessfulAt != null && !validPastTime(state.lastSuccessfulAt, now)) return null
+  const clock = state.status === SyncStateStatus.FAILED || !state.lastSuccessfulAt
+    ? state.lastAttemptAt
+    : state.lastSuccessfulAt
+  if (!clock) return new Date(0)
+  return now.getTime() - clock.getTime() >= DAILY_INVENTORY_REFRESH_MS ? clock : null
+}
+
 /**
  * Produces one durable due-work record per tenant and orders it fairly.  This
  * stays pure so the DB query can be broad enough to find due tenants while the
@@ -246,7 +290,11 @@ export function selectScheduledTenantWork(
 ) {
   const work = candidates.flatMap((candidate): ScheduledTenantWork[] => {
     const byResource = new Map(candidate.syncStates.map((state) => [state.resourceType, state]))
-    const fullInventoryDue = requiresDailyInventoryRefresh(candidate.syncStates, now)
+    const exchangeEnabled = Boolean(candidate.connection?.exchangeReadOnlyEnabledAt)
+    const dailyDueDates = dailyInventoryResources(exchangeEnabled)
+      .map((resource) => dailyInventoryResourceDueAt(byResource.get(resource), now))
+      .filter((date): date is Date => date !== null)
+    const fullInventoryDue = requiresDailyInventoryRefresh(candidate.syncStates, now, exchangeEnabled)
     const users = byResource.get(SyncResourceType.USERS)
     // A future/invalid durable timestamp is not an immediate retry signal:
     // attempting it ahead of every other tenant would create starvation. The
@@ -271,7 +319,7 @@ export function selectScheduledTenantWork(
     return [{
       tenantId: candidate.id,
       fullInventoryDue,
-      dueAt: earliestDue(dueStates.flatMap((state) => [state.lastAttemptAt, state.lastSuccessfulAt]), now),
+      dueAt: earliestDue([...dailyDueDates, ...dueStates.flatMap((state) => [state.lastAttemptAt, state.lastSuccessfulAt])], now),
     }]
   })
 
@@ -283,10 +331,13 @@ export function selectScheduledTenantWork(
 export function requiresDailyInventoryRefresh(
   states: DailyInventoryState[],
   now: Date,
+  exchangeReadOnlyEnabled = false,
 ) {
   const byResource = new Map(states.map((state) => [state.resourceType, state]))
 
-  return DAILY_INVENTORY_ANCHORS.some((resourceType) => {
+  return dailyInventoryResources(exchangeReadOnlyEnabled).some((resource) =>
+    dailyInventoryResourceDueAt(byResource.get(resource), now) !== null) ||
+    DAILY_INVENTORY_ANCHORS.some((resourceType) => {
     const state = byResource.get(resourceType)
     if (!state) return true
     if (state.status === SyncStateStatus.RUNNING) return false
@@ -304,6 +355,28 @@ export function requiresDailyInventoryRefresh(
         DAILY_INVENTORY_REFRESH_MS && retryIsDue
     )
   })
+}
+
+function dailyResourceCandidate(resourceType: SyncResourceType, now: Date): Prisma.CustomerTenantWhereInput {
+  const cutoff = new Date(now.getTime() - DAILY_INVENTORY_REFRESH_MS)
+  return { OR: [
+    { syncStates: { none: { resourceType: resourceType } } },
+    { syncStates: { some: {
+      resourceType: resourceType,
+      status: { not: SyncStateStatus.RUNNING },
+      AND: [
+        { OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lte: now } }] },
+        { OR: [{ lastSuccessfulAt: null }, { lastSuccessfulAt: { lte: now } }] },
+        { OR: [
+          { status: { not: SyncStateStatus.FAILED }, lastSuccessfulAt: { lte: cutoff } },
+          { AND: [
+            { OR: [{ status: SyncStateStatus.FAILED }, { lastSuccessfulAt: null }] },
+            { OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lte: cutoff } }] },
+          ] },
+        ] },
+      ],
+    } } },
+  ] }
 }
 
 /**
@@ -362,6 +435,11 @@ export function scheduledSyncTenantWhere(
       },
     }, {
       OR: [
+      ...DAILY_INVENTORY_RESOURCES.map((resource) => dailyResourceCandidate(resource, now)),
+      { AND: [
+        { connection: { exchangeReadOnlyEnabledAt: { not: null } } },
+        dailyResourceCandidate(SyncResourceType.EXCHANGE_MAILBOX_CONFIGURATION, now),
+      ] },
       { syncStates: { none: { resourceType: 'USERS' } } },
       {
         syncStates: {

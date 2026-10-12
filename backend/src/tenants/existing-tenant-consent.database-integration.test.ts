@@ -9,7 +9,7 @@ import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.
 import { TenantsService } from './tenants.service.js'
 import { publishManagedAuthority } from '../microsoft/managed-connector-authority.js'
 import { applyManagedConsentEffects } from '../microsoft/managed-consent-effects.js'
-import { HOURLY_INVENTORY_FIRST_RETRY_MS, scheduledSyncTenantWhere, selectScheduledTenantWork } from './scheduled-sync-selection.js'
+import { DAILY_INVENTORY_RESOURCES, HOURLY_INVENTORY_FIRST_RETRY_MS, scheduledSyncTenantWhere, selectScheduledTenantWork } from './scheduled-sync-selection.js'
 
 const skip = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1'
 function gate() { let release!: () => void; const promise = new Promise<void>(r => { release = r }); return { promise, release } }
@@ -392,7 +392,7 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     })
     // Fresh USERS and both daily anchors, so nothing except the hourly rule can
     // make this tenant a candidate.
-    for (const resourceType of ['USERS', 'LICENSES', 'DOMAINS'] as const) {
+    for (const resourceType of ['USERS', 'LICENSES', 'DOMAINS', ...DAILY_INVENTORY_RESOURCES] as const) {
       await prisma.syncState.create({
         data: {
           organizationId: organization.id,
@@ -410,7 +410,7 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
   const candidateFound = async (workspace: { organizationId: string; tenantId: string }) =>
     prisma.customerTenant.findMany({
       where: { AND: [scheduledSyncTenantWhere(CLOCK), { organizationId: workspace.organizationId, id: workspace.tenantId }] },
-      select: { id: true, syncStates: { select: {
+      select: { id: true, connection: { select: { exchangeReadOnlyEnabledAt: true } }, syncStates: { select: {
         resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true,
         lastErrorCode: true, lastErrorMessage: true, consecutiveFailures: true,
       } } },
@@ -419,7 +419,7 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
   const setInventory = async (
     workspace: { organizationId: string; tenantId: string },
     data: Record<string, unknown>,
-    resourceType: 'CONDITIONAL_ACCESS' | 'LICENSES' = 'CONDITIONAL_ACCESS',
+    resourceType: typeof DAILY_INVENTORY_RESOURCES[number] | 'EXCHANGE_MAILBOX_CONFIGURATION' | 'CONDITIONAL_ACCESS' | 'LICENSES' = 'CONDITIONAL_ACCESS',
   ) => {
     await prisma.syncState.upsert({
       where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType } },
@@ -520,4 +520,53 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     }, 'LICENSES')
     assert.deepEqual(await candidateFound(workspace), [])
   })
+
+  await t.test('daily guard candidate and pure rule agree for every existing daily resource', async () => {
+    for (const resource of DAILY_INVENTORY_RESOURCES) {
+      for (const delta of [-1, 0, 1]) {
+        await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(24 * HOUR + delta), lastAttemptAt: before(24 * HOUR + delta) }, resource)
+        const found = await candidateFound(workspace)
+        assert.equal(found.length, delta >= 0 ? 1 : 0, `${resource}: ${delta}`)
+        if (found.length) assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, true)
+      }
+      await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000) }, resource)
+    }
+  })
+
+  await t.test('failed daily permission checks wait a day; missing data is not hidden by fresh anchors', async () => {
+    for (const delta of [-1, 0, 1]) {
+      await setInventory(workspace, { status: 'FAILED', lastSuccessfulAt: null, lastAttemptAt: before(24 * HOUR + delta), lastErrorCode: 'MICROSOFT_PERMISSION_REQUIRED' }, 'SHAREPOINT_USAGE')
+      const found = await candidateFound(workspace)
+      assert.equal(found.length, delta >= 0 ? 1 : 0)
+      if (found.length) assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, true)
+    }
+    for (const data of [
+      { status: 'RUNNING', lastAttemptAt: before(48 * HOUR), lastSuccessfulAt: null },
+      { status: 'FAILED', lastAttemptAt: new Date(CLOCK.getTime() + HOUR), lastSuccessfulAt: null },
+      { status: 'SUCCEEDED', lastAttemptAt: before(HOUR), lastSuccessfulAt: new Date(CLOCK.getTime() + HOUR) },
+      { status: 'IDLE', lastAttemptAt: before(HOUR), lastSuccessfulAt: null },
+    ]) {
+      await setInventory(workspace, data, 'SHAREPOINT_USAGE')
+      assert.deepEqual(await candidateFound(workspace), [])
+    }
+    await prisma.syncState.delete({ where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType: 'SHAREPOINT_USAGE' } } })
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, true)
+    await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null }, 'SHAREPOINT_USAGE')
+  })
+
+  await t.test('optional Exchange guard mirrors the existing connection flag and active-tenant gate', async () => {
+    assert.deepEqual(await candidateFound(workspace), [])
+    await prisma.tenantConnection.update({ where: { customerTenantId_organizationId: { customerTenantId: workspace.tenantId, organizationId: workspace.organizationId } }, data: { exchangeReadOnlyEnabledAt: before(HOUR) } })
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, true)
+    await prisma.customerTenant.update({ where: { id: workspace.tenantId }, data: { status: 'SUSPENDED' } })
+    assert.deepEqual(await candidateFound(workspace), [])
+    await prisma.customerTenant.update({ where: { id: workspace.tenantId }, data: { status: 'ACTIVE' } })
+    await prisma.tenantConnection.update({ where: { customerTenantId_organizationId: { customerTenantId: workspace.tenantId, organizationId: workspace.organizationId } }, data: { exchangeReadOnlyEnabledAt: null } })
+    assert.deepEqual(await candidateFound(workspace), [])
+  })
+
 })
