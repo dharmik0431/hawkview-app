@@ -20,6 +20,81 @@ const readDate = (offset: number) => new Date(READ_CLOCK.getTime() + offset)
 const readNow = () => READ_CLOCK
 const readWindow = { from: readDate(-3_600_000).toISOString(), to: READ_CLOCK.toISOString() }
 
+const tenantListReader = (prisma: PrismaService) => new TenantsService(prisma, {
+  getRequiredPermissions: () => [],
+  getAccessContract: () => ({ connectionRequiredPermissions: [], capabilities: [] }),
+} as never, {} as never)
+const listAuditKeys = (value: { attention: Array<{ key: string }> }) =>
+  value.attention.filter(item => item.key.startsWith('audit-')).map(item => item.key)
+function listAudit(workspace: ExportWorkspace, id: string, expiry: number, event = -300_000) {
+  return { ...retainedAudit(workspace, id, expiry), eventDateTime: readDate(event),
+    activityDisplayName: 'Update authentication method',
+    targetResources: [{ type: 'authenticationMethod', displayName: id }] }
+}
+
+// These are defensive saved-expiry states. Correctly ordered event <= ingestion
+// with six-month expiry cannot be expired and inside a recent24h window. This
+// proves the read contract, not a production occurrence or physical deletion.
+test('physical tenant list expiry: saved boundary, event window, workspace scope and stored presence', { skip: !databaseIntegrationEnabled }, async context => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, 'list-boundary', run, track)
+  const foreign = await seedExportWorkspace(prisma, 'list-foreign', run, track)
+  const other = await prisma.customerTenant.create({ data: {
+    organizationId: mine.organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE',
+  } })
+  const rows = [-1, 0, 1].map(offset => listAudit(mine, `boundary-${offset}`, offset))
+  rows.push(listAudit(mine, 'outside-window', 1, -86_400_001),
+    listAudit(foreign, 'foreign', 1), listAudit({ ...mine, tenantId: other.id }, 'second-tenant', 1))
+  await prisma.directoryAuditLog.createMany({ data: rows })
+  const ids = rows.map(row => row.id)
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, 6, 4)
+  const service = tenantListReader(prisma)
+  const result = await service.listForIdentity(identityOf(mine), { now: readNow })
+  assert.deepEqual(result.tenants.map(t => t.id).sort(), [mine.tenantId, other.id].sort())
+  assert.deepEqual(listAuditKeys(result.tenants.find(t => t.id === mine.tenantId)!), ['audit-auth-boundary-1'])
+  assert.deepEqual(listAuditKeys(result.tenants.find(t => t.id === other.id)!), ['audit-auth-second-tenant'])
+  const snapshot = await prisma.tenantHealthSnapshot.findFirstOrThrow({ where: {
+    organizationId: mine.organizationId, customerTenantId: mine.tenantId,
+  } })
+  assert.deepEqual(listAuditKeys(snapshot.payload as any), ['audit-auth-boundary-1'])
+  await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: READ_CLOCK } })
+  await assert.rejects(service.listForIdentity(identityOf(mine), { now: readNow }), /disabled/)
+  await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: null } })
+  await prisma.membership.deleteMany({ where: { organizationId: mine.organizationId } })
+  assert.deepEqual(await service.listForIdentity(identityOf(mine), { now: readNow }), { tenants: [] })
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, 6, 4)
+})
+
+test('physical tenant list expiry: positive attention survives expired pre-take crowd-out', { skip: !databaseIntegrationEnabled }, async context => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const mine = await seedExportWorkspace(prisma, 'list-cap', randomUUID(), track)
+  const rows = [...Array.from({ length: 501 }, (_, i) => listAudit(mine, `expired-${i}`, -1, -i)),
+    listAudit(mine, 'equal', 0, -600), listAudit(mine, 'eligible-newer', 1, -700),
+    listAudit(mine, 'eligible-older', 2, -800)]
+  await prisma.directoryAuditLog.createMany({ data: rows })
+  const ids = rows.map(row => row.id)
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, 504, 2)
+  const first = await prisma.directoryAuditLog.findMany({ where: {
+    organizationId: mine.organizationId, customerTenantId: mine.tenantId,
+    eventDateTime: { gte: readDate(-86_400_000) },
+  }, orderBy: { eventDateTime: 'desc' }, take: 500 })
+  assert.equal(first.length, 500)
+  assert.equal(first.every(row => row.expiresAt < READ_CLOCK), true)
+  assert.equal(first.every(row => row.eventDateTime > readDate(-700)), true, 'both eligible witnesses outside unfiltered first500')
+  const result = await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: readNow })
+  assert.deepEqual(listAuditKeys(result.tenants[0]!), ['audit-auth-eligible-newer', 'audit-auth-eligible-older'])
+  const snapshot = await prisma.tenantHealthSnapshot.findFirstOrThrow({ where: {
+    organizationId: mine.organizationId, customerTenantId: mine.tenantId,
+  } })
+  assert.deepEqual(listAuditKeys(snapshot.payload as any), ['audit-auth-eligible-newer', 'audit-auth-eligible-older'])
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, 504, 2)
+})
+
 const bundleReader = (prisma: PrismaService) => new TenantSyncService(
   prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
 )
