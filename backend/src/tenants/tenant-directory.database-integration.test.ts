@@ -11,6 +11,183 @@ import { TenantSyncService } from './tenant-sync.service.js'
 const databaseIntegrationEnabled =
   process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
 
+// Physical deletion is distinct from read-side invisibility. Each case owns
+// fresh workspaces; no earlier prune or teardown can satisfy its assertions.
+const CLEANUP_CLOCK = Date.UTC(2030, 0, 2, 12)
+const cleanupDate = (offset = 0) => new Date(CLEANUP_CLOCK + offset)
+type CleanupFamily = 'SIGN_INS' | 'AUDIT_LOGS'
+type CleanupRow = { id: string; organizationId: string; customerTenantId: string; expiresAt: Date }
+const cleanupIdentity = (row: CleanupRow) => ({
+  id: row.id, organizationId: row.organizationId,
+  customerTenantId: row.customerTenantId, expiresAt: row.expiresAt.toISOString(),
+})
+const byCleanupId = <T extends { id: string }>(rows: T[]) =>
+  [...rows].sort((a, b) => a.id.localeCompare(b.id))
+
+async function readCleanupRows(prisma: PrismaService, organizationIds: string[]) {
+  const where = { organizationId: { in: organizationIds } }
+  const [signIns, audits, projections] = await Promise.all([
+    prisma.signInLog.findMany({ where }),
+    prisma.directoryAuditLog.findMany({ where }),
+    prisma.changeEvidenceEvent.findMany({ where }),
+  ])
+  return { signIns: byCleanupId(signIns), audits: byCleanupId(audits), projections: byCleanupId(projections) }
+}
+
+async function cleanupFixture(context: import('node:test').TestContext, label: string) {
+  assertDisposableTestDatabase()
+  const network = context.mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Unexpected external request in physical cleanup proof')
+  })
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const run = randomUUID()
+  const mine = await seedExportWorkspace(prisma, `cleanup-${label}`, run, track)
+  const foreign = await seedExportWorkspace(prisma, `cleanup-${label}-foreign`, run, track)
+  const otherTenant = await prisma.customerTenant.create({ data: {
+    organizationId: mine.organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE',
+  } })
+  const scopes = [mine, { ...mine, tenantId: otherTenant.id }, foreign]
+  const specimens = scopes.flatMap(workspace => [-1, 0, 1].map(offset => ({
+    workspace, offset, id: randomUUID(),
+    dates: { eventDateTime: cleanupDate(-300_000), ingestedAt: cleanupDate(-200_000), expiresAt: cleanupDate(offset) },
+  })))
+  const signs = specimens.map(s => ({ ...bundleSignIn(s.workspace, s.id, s.offset), ...s.dates }))
+  const audits = specimens.map(s => ({ ...retainedAudit(s.workspace, s.id, s.offset), ...s.dates }))
+  const projections = specimens.map(s => ({
+    ...retainedEvent(s.workspace, s.id, s.offset), ...s.dates,
+    // Real prune is tenant-scoped, not restricted to the collector's family.
+    source: s.offset === 0 ? 'DIRECTORY_SNAPSHOT' : 'DIRECTORY_AUDIT',
+  }))
+  await prisma.signInLog.createMany({ data: signs })
+  await prisma.directoryAuditLog.createMany({ data: audits })
+  await prisma.changeEvidenceEvent.createMany({ data: projections })
+  const before = await readCleanupRows(prisma, track.organizationIds)
+  const seeded = { signIns: signs, audits, projections }
+  for (const key of ['signIns', 'audits', 'projections'] as const) {
+    assert.equal(before[key].length, 9, `${key}: nonempty before/equal/after in all three scopes`)
+    assert.deepEqual(before[key].map(cleanupIdentity), byCleanupId<CleanupRow>(seeded[key]).map(cleanupIdentity))
+  }
+  const forbidden = new Proxy({}, { get: (_target, name) => () => {
+    throw new Error(`Unexpected external collaborator: ${String(name)}`)
+  } })
+  const service = new TenantSyncService(prisma, forbidden as never, forbidden as never, {
+    resolveIncident: async () => {}, publishIncident: async () => {},
+  } as never, new ChangeEvidenceService(prisma), forbidden as never) as unknown as {
+    fetchGraphCollection: () => Promise<unknown[]>
+    syncSignInLogs: (tenant: { id: string; organizationId: string }, token: string) => Promise<void>
+    syncDirectoryAuditLogs: (tenant: { id: string; organizationId: string }, token: string) => Promise<void>
+  }
+  let providerResult: 'error' | 'empty' | 'invalid' = 'error'
+  const provider = context.mock.method(service, 'fetchGraphCollection', async () => {
+    assert.equal(Date.now(), CLEANUP_CLOCK)
+    assert.equal(new Date().getTime(), CLEANUP_CLOCK, 'collector uses this same fixed Date for ingestedAt')
+    if (providerResult === 'error') throw new Error('Synthetic provider read failed before cleanup')
+    if (providerResult === 'invalid') return [{ id: 'synthetic-invalid', createdDateTime: 'invalid' }]
+    return []
+  })
+  const tenant = { id: mine.tenantId, organizationId: mine.organizationId }
+  const state = (family: CleanupFamily) => prisma.syncState.findUniqueOrThrow({ where: {
+    customerTenantId_resourceType: { customerTenantId: mine.tenantId, resourceType: family },
+  } })
+  const window = () => prisma.tenantEntraSnapshot.findUnique({ where: {
+    customerTenantId_resourceType: { customerTenantId: mine.tenantId, resourceType: 'SIGN_INS' },
+  } })
+  return {
+    prisma, before, mine, network, provider, state, window,
+    setProvider: (result: typeof providerResult) => { providerResult = result },
+    run: (family: CleanupFamily) => family === 'SIGN_INS'
+      ? service.syncSignInLogs(tenant, 'synthetic-cleanup-token')
+      : service.syncDirectoryAuditLogs(tenant, 'synthetic-cleanup-token'),
+    read: () => readCleanupRows(prisma, track.organizationIds),
+    async assertDeleted(family: CleanupFamily) {
+      const after = await readCleanupRows(prisma, track.organizationIds)
+      for (const key of ['signIns', 'audits', 'projections'] as const) {
+        const selectedFamily = key === 'projections' || (family === 'SIGN_INS' ? key === 'signIns' : key === 'audits')
+        const deleted = (row: CleanupRow) => selectedFamily && row.customerTenantId === mine.tenantId && row.expiresAt.getTime() <= CLEANUP_CLOCK
+        const expectedDeleted = before[key].filter(deleted).map(row => row.id)
+        assert.equal(expectedDeleted.length, selectedFamily ? 2 : 0)
+        assert.deepEqual(before[key].filter(row => !after[key].some(retained => retained.id === row.id)).map(row => row.id), expectedDeleted)
+        // Compare full saved contents, including DB-owned timestamps, with the
+        // preflight readback. Database defaults need not equal Node's clock.
+        assert.deepEqual(after[key], before[key].filter(row => !deleted(row)), `${key}: exact positive/control/foreign survivors`)
+      }
+      assert.equal(network.mock.callCount(), 0)
+      return after
+    },
+  }
+}
+
+for (const family of ['SIGN_INS', 'AUDIT_LOGS'] as const) {
+  test(`physical collector cleanup: ${family} inclusive expiry, scope, failed-read preservation and idempotence`,
+    { skip: !databaseIntegrationEnabled, concurrency: false }, async context => {
+      const h = await cleanupFixture(context, family.toLowerCase())
+      context.mock.timers.enable({ apis: ['Date'], now: CLEANUP_CLOCK })
+      try {
+        // This failure is injected at provider read, before either deletion.
+        await assert.rejects(h.run(family))
+        assert.equal(h.provider.mock.callCount(), 1)
+        assert.deepEqual(await h.read(), h.before)
+        const failed = await h.state(family)
+        assert.equal(failed.status, 'FAILED')
+        assert.equal(failed.lastSuccessfulAt, null)
+        assert.equal(failed.lastAttemptAt?.getTime(), CLEANUP_CLOCK)
+        assert.equal(await h.window(), null)
+
+        // Both production collectors place cleanup outside records.length > 0.
+        // Thus this empty complete result still reaches real raw + projection deletion.
+        h.setProvider('empty')
+        await h.run(family)
+        const after = await h.assertDeleted(family)
+        const succeeded = await h.state(family)
+        assert.equal(succeeded.status, 'SUCCEEDED')
+        assert.equal(succeeded.lastSuccessfulAt?.getTime(), CLEANUP_CLOCK)
+        assert.equal(succeeded.lastAttemptAt?.getTime(), CLEANUP_CLOCK)
+        assert.equal(succeeded.lastErrorCode, null)
+        assert.equal(succeeded.consecutiveFailures, 0)
+        if (family === 'SIGN_INS') {
+          const window = await h.window()
+          assert.ok(window)
+          assert.equal(window.observedAt.getTime(), CLEANUP_CLOCK)
+          assert.equal((window.payload as { end: string }).end, cleanupDate().toISOString())
+          assert.equal((window.payload as { observedEvents: number }).observedEvents, 0)
+          assert.equal((window.payload as { paginationComplete: boolean }).paginationComplete, true)
+        } else assert.equal(await h.window(), null)
+        await h.run(family)
+        assert.deepEqual(await h.assertDeleted(family), after, 'repeated cleanup is idempotent')
+        assert.equal(h.provider.mock.callCount(), 3)
+      } finally {
+        context.mock.timers.reset()
+        context.mock.restoreAll()
+      }
+    })
+}
+
+test('physical collector cleanup: invalid sign-in records reject after deleting expired rows',
+  { skip: !databaseIntegrationEnabled, concurrency: false }, async context => {
+    const h = await cleanupFixture(context, 'partial')
+    context.mock.timers.enable({ apis: ['Date'], now: CLEANUP_CLOCK })
+    try {
+      assert.equal(await h.window(), null)
+      h.setProvider('invalid')
+      // Zero validated records out of one provider row triggers the real core
+      // partial check AFTER cleanup, without inserting unrelated new evidence.
+      await assert.rejects(h.run('SIGN_INS'), /coverage remains incomplete/)
+      await h.assertDeleted('SIGN_INS')
+      const failed = await h.state('SIGN_INS')
+      assert.equal(failed.status, 'FAILED')
+      assert.equal(failed.lastErrorCode, 'sign-ins-record-validation-partial')
+      assert.equal(failed.lastSuccessfulAt, null)
+      assert.equal(failed.lastAttemptAt?.getTime(), CLEANUP_CLOCK)
+      assert.equal(failed.consecutiveFailures, 1)
+      assert.equal(await h.window(), null, 'a partial pass cannot certify a completed authentication window')
+      assert.equal(h.provider.mock.callCount(), 1)
+    } finally {
+      context.mock.timers.reset()
+      context.mock.restoreAll()
+    }
+  })
+
 // Read-side expiry tests run only in the registered disposable CI suite. The
 // dates are relative to one injected clock; expired rows remain physically
 // present before AND after reads. Mismatched pairs are defensive seeded states,
