@@ -85,7 +85,7 @@ const observed = (rows: Record<string, unknown>[], extra: Record<string, unknown
 
 type State = { data?: unknown; isPending?: boolean; isError?: boolean; isFetching?: boolean; dataUpdatedAt?: number }
 
-function renderPanel(state: State, customerTenantId = 'tenant-A', options: { compact?: boolean } = {}) {
+function renderPanel(state: State, customerTenantId = 'tenant-A', options: { compact?: boolean; bundle?: unknown } = {}) {
   let current: State = state
   const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://hawkview.invalid', pretendToBeVisual: true })
   const previous = new Map<string, PropertyDescriptor | undefined>()
@@ -175,7 +175,7 @@ function renderPanel(state: State, customerTenantId = 'tenant-A', options: { com
     Panel = options.compact ? panelModule.DirectoryRoleReceiptHealth : panelModule.DirectoryRoleAssignmentsPanel
     const target = dom.window.document.getElementById('root') as HTMLElement
     root = createRoot(target)
-    act(() => { root!.render(React.createElement(Panel, { customerTenantId })) })
+    act(() => { root!.render(React.createElement(Panel, { customerTenantId, bundle: options.bundle })) })
   } catch (error) {
     // Release the globals, DOM and timers before propagating, so a fixture failure fails the test
     // instead of leaving the process alive.
@@ -197,7 +197,7 @@ function renderPanel(state: State, customerTenantId = 'tenant-A', options: { com
      *  not moved, the clock state is identical and React correctly bails out of the re-render. */
     replace: (next: State) => {
       current = next
-      act(() => { root!.render(React.createElement(Panel, { customerTenantId })) })
+      act(() => { root!.render(React.createElement(Panel, { customerTenantId, bundle: options.bundle })) })
     },
   }
 }
@@ -535,5 +535,33 @@ test('clicking the export control re-reads the export endpoint and never the vie
     // not re-render.
     assert.equal(panel.refetches.length, refetchesBefore, 'the view is not refetched')
     assert.equal(panel.asked.length, askedBefore, 'the results hook is not consulted by the click')
+  } finally { panel.cleanup() }
+})
+
+
+test('role principals show stored names and original IDs without changing receipt or export', () => {
+  const bundle = { tenant: { id: 'tenant-A' }, users: [{ id: ROW.principalId, name: 'Alice <Ops>' }] }
+  const panel = renderPanel({ data: view('current', observed([ROW])) }, 'tenant-A', { bundle })
+  try {
+    const cell = panel.container.querySelectorAll('tbody td')[1]
+    assert.equal(cell?.firstElementChild?.textContent, 'Alice <Ops>')
+    assert.equal(cell?.lastElementChild?.textContent, ROW.principalId)
+    assert.equal(cell?.querySelector('ops'), null, 'names are text, never HTML')
+    assert.match(panel.text(), /Names come from stored directory data/)
+    assert.match(panel.text(), /assignment-SENTINEL-1/)
+    assert.equal(panel.exportCalls.length, 0, 'naming causes no export or extra API read')
+    panel.replace({ data: view('superseded', null) })
+    assert.doesNotMatch(panel.text(), /Alice <Ops>/, 'enrichment cannot bypass receipt admission')
+  } finally { panel.cleanup() }
+})
+
+test('a bundle from another tenant cannot label the current role principals', () => {
+  const panel = renderPanel({ data: view('current', observed([ROW])) }, 'tenant-B', {
+    bundle: { tenant: { id: 'tenant-A' }, users: [{ id: ROW.principalId, name: 'Wrong tenant name' }] },
+  })
+  try {
+    assert.doesNotMatch(panel.text(), /Wrong tenant name/)
+    assert.match(panel.text(), /Name unavailable/)
+    assert.match(panel.text(), /principal-SENTINEL-1/)
   } finally { panel.cleanup() }
 })

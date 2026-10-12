@@ -778,7 +778,7 @@ export default function EntraOverviewSection({
           </div>
         </div>
       </div>
-      <DirectoryRoleAssignmentsPanel customerTenantId={resolvedTenantId} className="mt-6" />
+      <DirectoryRoleAssignmentsPanel bundle={bundle} customerTenantId={resolvedTenantId} className="mt-6" />
       <PimScheduleObservationsPanel customerTenantId={resolvedTenantId} className="mt-6" />
     </div>
   )

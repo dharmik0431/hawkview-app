@@ -1,3 +1,4 @@
+import { storedObjectLabels, principalTargetSummary } from './stored-object-labels.js'
 import {
   cancelBoundedStream,
   MicrosoftCollectionBudget,
@@ -5895,20 +5896,10 @@ export class TenantSyncService {
     const snapshotObservedAtByResource = new Map(
       entraSnapshots.map((snapshot) => [snapshot.resourceType, snapshot.observedAt])
     )
-    const servicePrincipalNameByAppId = new Map<string, string>(
-      (snapshotByResource.get('SERVICE_PRINCIPALS') ?? [])
-        .filter(
-          (principal) =>
-            typeof principal?.appId === 'string' &&
-            typeof principal?.displayName === 'string'
-        )
-        .map((principal) => [
-          principal.appId.toLowerCase(),
-          principal.displayName.trim(),
-        ])
-    )
     const servicePrincipals = snapshotByResource.get('SERVICE_PRINCIPALS') ?? []
     const applications = snapshotByResource.get('APPLICATIONS') ?? []
+    const objectLabels = storedObjectLabels({ users, groups: directoryGroups, servicePrincipals,
+      roleAssignments: snapshotByResource.get('DIRECTORY_ROLES') ?? [] })
     const resourceApiByAppId = new Map<
       string,
       {
@@ -5941,19 +5932,7 @@ export class TenantSyncService {
     }
     const securityDefaults = (snapshotByResource.get('SECURITY_DEFAULTS') ??
       [])[0]
-    const conditionalAccessTargetNames: Record<string, string> = {
-      All: 'All cloud apps',
-      Office365: 'Office 365',
-      MicrosoftAdminPortals: 'Microsoft Admin Portals',
-    }
-    const resolveApplicationTarget = (target: unknown) => {
-      if (typeof target !== 'string') return String(target ?? '')
-      return (
-        conditionalAccessTargetNames[target] ??
-        servicePrincipalNameByAppId.get(target.toLowerCase()) ??
-        target
-      )
-    }
+
     const sharePointSites = (
       snapshotByResource.get('SHAREPOINT_SITES') ?? []
     ).filter(isCustomerFacingSharePointSite)
@@ -6219,21 +6198,6 @@ export class TenantSyncService {
         signIn.eventDateTime.getTime() > current.eventDateTime.getTime()
       ) {
         latestSignInByUserId.set(signIn.userId, signIn)
-      }
-    }
-    const directoryUserNameByIdentity = new Map<string, string>()
-    for (const user of users) {
-      for (const identity of [
-        user.microsoftUserId,
-        user.userPrincipalName,
-        user.mail,
-      ]) {
-        if (typeof identity === 'string' && identity.trim()) {
-          directoryUserNameByIdentity.set(
-            identity.trim().toLowerCase(),
-            user.displayName
-          )
-        }
       }
     }
     const syncStateByResource = new Map(
@@ -6694,10 +6658,10 @@ export class TenantSyncService {
           userDisplayName:
             signIn.userDisplayName ??
             (typeof signIn.userId === 'string'
-              ? directoryUserNameByIdentity.get(signIn.userId.toLowerCase())
+              ? objectLabels.userIdentityName(signIn.userId.toLowerCase())
               : undefined) ??
             (typeof signIn.userPrincipalName === 'string'
-              ? directoryUserNameByIdentity.get(
+              ? objectLabels.userIdentityName(
                   signIn.userPrincipalName.toLowerCase()
                 )
               : undefined) ??
@@ -7359,7 +7323,7 @@ export class TenantSyncService {
                   )
                   .map(
                     (assignment: any) =>
-                      assignment.principalDisplayName ?? assignment.principalId
+                      objectLabels.assignmentName('User', assignment.principalId, assignment.principalDisplayName)
                   )
               : [],
             assignedGroups: Array.isArray(principal.appRoleAssignedTo)
@@ -7369,7 +7333,7 @@ export class TenantSyncService {
                   )
                   .map(
                     (assignment: any) =>
-                      assignment.principalDisplayName ?? assignment.principalId
+                      objectLabels.assignmentName('Group', assignment.principalId, assignment.principalDisplayName)
                   )
               : [],
             assignedServicePrincipals: Array.isArray(
@@ -7382,7 +7346,7 @@ export class TenantSyncService {
                   )
                   .map(
                     (assignment: any) =>
-                      assignment.principalDisplayName ?? assignment.principalId
+                      objectLabels.assignmentName('ServicePrincipal', assignment.principalId, assignment.principalDisplayName)
                   )
               : [],
             delegatedGrants: [],
@@ -7465,7 +7429,7 @@ export class TenantSyncService {
               owners: Array.isArray(application.owners)
                 ? application.owners.map(
                     (owner: any) =>
-                      owner.displayName ?? owner.userPrincipalName ?? owner.id
+                      objectLabels.ownerName(owner)
                   )
                 : [],
               credentials,
@@ -7478,6 +7442,16 @@ export class TenantSyncService {
               const includeGroups =
                 policy?.conditions?.users?.includeGroups ?? []
               const includeRoles = policy?.conditions?.users?.includeRoles ?? []
+              const includeTargets = [
+                ...includeUsers.map((id: string) => objectLabels.principalTarget('User', id)),
+                ...includeGroups.map((id: string) => objectLabels.principalTarget('Group', id)),
+                ...includeRoles.map((id: string) => objectLabels.principalTarget('Role', id)),
+              ]
+              const excludeTargets = [
+                ...(policy?.conditions?.users?.excludeUsers ?? []).map((id: string) => objectLabels.principalTarget('User', id)),
+                ...(policy?.conditions?.users?.excludeGroups ?? []).map((id: string) => objectLabels.principalTarget('Group', id)),
+                ...(policy?.conditions?.users?.excludeRoles ?? []).map((id: string) => objectLabels.principalTarget('Role', id)),
+              ]
               const grants = policy?.grantControls?.builtInControls ?? []
               const state =
                 policy?.state === 'enabled'
@@ -7490,9 +7464,7 @@ export class TenantSyncService {
                 name: policy.displayName ?? 'Unnamed policy',
                 state,
                 origin: policy.templateId ? 'MICROSOFT_TEMPLATE' : 'CUSTOM',
-                targetSummary: includeUsers.includes('All')
-                  ? 'All Users'
-                  : `${includeUsers.length + includeGroups.length + includeRoles.length} targets`,
+                targetSummary: principalTargetSummary(includeTargets),
                 grantSummary:
                   grants.length > 0
                     ? grants
@@ -7507,6 +7479,8 @@ export class TenantSyncService {
                     : 'No grant controls',
                 assignments: {
                   usersAndGroups: {
+                    includeTargets,
+                    excludeTargets,
                     include: [
                       ...includeUsers,
                       ...includeGroups,
@@ -7522,11 +7496,11 @@ export class TenantSyncService {
                     include: (
                       policy?.conditions?.applications?.includeApplications ??
                       []
-                    ).map(resolveApplicationTarget),
+                    ).map(objectLabels.applicationTarget),
                     exclude: (
                       policy?.conditions?.applications?.excludeApplications ??
                       []
-                    ).map(resolveApplicationTarget),
+                    ).map(objectLabels.applicationTarget),
                   },
                 },
                 conditions: {
