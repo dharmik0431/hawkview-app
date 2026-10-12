@@ -298,6 +298,130 @@ function successfulFetch({ riskResponseOverride } = {}) {
   return { calls, fetchImpl }
 }
 
+const readinessEnvironment = {
+  EXPECTED_REVISION: revision,
+  ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token?api-version=1',
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
+}
+
+function readinessHarness(healthResponse, override) {
+  const { fetchImpl: baseFetch } = successfulFetch()
+  const paths = []
+  const sleeps = []
+  let healthCalls = 0
+  const fetchImpl = async (input, init) => {
+    const url = new URL(String(input))
+    assert.ok(url.origin === API_ORIGIN || url.origin === 'https://oidc.example.test')
+    paths.push(url.pathname)
+    if (url.pathname === '/health') {
+      assert.ok(init.signal instanceof AbortSignal)
+      assert.equal(init.method ?? 'GET', 'GET')
+      assert.equal(init.headers.Authorization, undefined)
+      return healthResponse(++healthCalls)
+    }
+    if (override) {
+      const response = override(url.pathname)
+      if (response) return response
+    }
+    return baseFetch(input, init)
+  }
+  return {
+    paths, sleeps,
+    run: () => runAuthenticatedCanary({
+      fetchImpl, environment: readinessEnvironment,
+      sleep: async ms => {
+        assert.ok(paths.every(path => path === '/health'), 'no authenticated or database work before readiness')
+        sleeps.push(ms)
+      },
+    }),
+  }
+}
+
+test('waits for the expected revision before any database or authenticated request', async () => {
+  const harness = readinessHarness(attempt => jsonResponse({
+    status: 'ok', revision: attempt === 1 ? 'b'.repeat(40) : revision,
+  }))
+  await harness.run()
+  assert.deepEqual(harness.paths.slice(0, 3), ['/health', '/health', '/health/database'])
+  assert.deepEqual(harness.sleeps, [10_000])
+  assert.equal(harness.paths.filter(path => path === '/api/internal/canary/sessions').length, 1)
+  assert.equal(harness.paths.filter(path => path === '/auth/bootstrap').length, 2)
+})
+
+test('already-ready revision is single-shot and readiness can succeed on its sixth attempt', async () => {
+  for (const readyAt of [1, 6]) {
+    const harness = readinessHarness(attempt => jsonResponse({
+      status: 'ok', revision: attempt < readyAt ? 'b'.repeat(40) : revision,
+    }))
+    await harness.run()
+    assert.equal(harness.paths.filter(path => path === '/health').length, readyAt)
+    assert.deepEqual(harness.sleeps, Array(readyAt - 1).fill(10_000))
+    assert.equal(harness.paths[readyAt], '/health/database')
+  }
+})
+
+test('readiness exhaustion is bounded, classified and never enters authentication', async t => {
+  const privateText = 'private-canary-response-value'
+  const cases = [
+    ['wrong revision', () => jsonResponse({ status: 'ok', revision: 'b'.repeat(40) }), 'revision', 'ok', 'b'.repeat(40)],
+    ['degraded status with right revision', () => jsonResponse({ status: 'degraded', revision }), 'status', 'not-ok', revision],
+    ['untrusted status', () => jsonResponse({ status: privateText, revision }), 'status', 'not-ok', revision],
+    ['missing status', () => jsonResponse({ revision }), 'status', 'absent', revision],
+    ['invalid status', () => jsonResponse({ status: { secret: privateText }, revision }), 'status', 'invalid', revision],
+    ['absent revision', () => jsonResponse({ status: 'ok' }), 'revision', 'ok', 'absent'],
+    ['untrusted revision', () => jsonResponse({ status: 'ok', revision: privateText }), 'revision', 'ok', 'invalid'],
+    ['revision newline', () => jsonResponse({ status: 'ok', revision: revision + '\n' }), 'revision', 'ok', 'invalid'],
+    ['null body', () => jsonResponse(null), 'shape', 'unavailable', 'unavailable'],
+    ['array body', () => jsonResponse([{ status: 'ok', revision }]), 'shape', 'unavailable', 'unavailable'],
+    ['primitive body', () => jsonResponse(privateText), 'shape', 'unavailable', 'unavailable'],
+    ['invalid JSON', () => new Response(privateText, { headers: { 'content-type': 'application/json' } }), 'body', 'unavailable', 'unavailable'],
+    ['oversized JSON', () => jsonResponse(privateText.repeat(200_000)), 'body', 'unavailable', 'unavailable'],
+    ['non-JSON media', () => new Response(privateText, { headers: { 'content-type': 'text/html' } }), 'media-type', 'unavailable', 'unavailable'],
+    ['HTTP failure', () => jsonResponse({ status: privateText }, 503), 'http-status', 'unavailable', 'unavailable'],
+    ['transport failure', () => { throw new Error(privateText) }, 'transport', 'unavailable', 'unavailable'],
+  ]
+  for (const [name, response, reason, status, observedRevision] of cases) {
+    await t.test(name, async () => {
+      const harness = readinessHarness(response)
+      await assert.rejects(harness.run(), error => {
+        assert.equal(error.message, `API readiness failed after 6 attempts: reason=${reason}; status=${status}; revision=${observedRevision}; expected=${revision}`)
+        assert.equal(error.message.includes(privateText), false)
+        return true
+      })
+      assert.deepEqual(harness.paths, Array(6).fill('/health'))
+      assert.deepEqual(harness.sleeps, Array(5).fill(10_000))
+    })
+  }
+})
+
+test('downstream database and authenticated failures remain single-shot', async () => {
+  for (const failingPath of ['/health/database', '/token', '/api/internal/canary/sessions', '/auth/bootstrap', '/api/tenants']) {
+    const harness = readinessHarness(
+      () => jsonResponse({ status: 'ok', revision }),
+      path => path === failingPath ? jsonResponse({ error: 'private-downstream-value' }, 503) : undefined,
+    )
+    await assert.rejects(harness.run(), error => {
+      assert.equal(error.message.includes('readiness'), false)
+      assert.equal(error.message.includes('private-downstream-value'), false)
+      return true
+    })
+    assert.equal(harness.paths.filter(path => path === failingPath).length, 1)
+    assert.equal(harness.paths.filter(path => path === '/health').length, 1)
+    assert.equal(harness.paths.at(-1), failingPath)
+    assert.deepEqual(harness.sleeps, [])
+  }
+})
+
+test('invalid expected revision fails before any readiness read', async () => {
+  let calls = 0
+  await assert.rejects(runAuthenticatedCanary({
+    environment: { EXPECTED_REVISION: 'not-a-revision' },
+    fetchImpl: async () => { calls += 1; throw new Error('unexpected network call') },
+    sleep: async () => { throw new Error('unexpected sleep') },
+  }), /Expected deployment revision is invalid/)
+  assert.equal(calls, 0)
+})
+
 test('accepts truthful no-source and unavailable v1 risk envelopes for two isolated MSPs', async () => {
   const { calls, fetchImpl } = successfulFetch()
   await runAuthenticatedCanary({
@@ -933,13 +1057,14 @@ test('fails before authentication when the live revision differs', async () => {
   await assert.rejects(
     runAuthenticatedCanary({
       fetchImpl,
+      sleep: async () => {},
       environment: {
         EXPECTED_REVISION: revision,
         ACTIONS_ID_TOKEN_REQUEST_URL: 'https://oidc.example.test/token',
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-oidc-request-token',
       },
     }),
-    /expected API revision is not live/i,
+    /API readiness failed after 6 attempts: reason=revision/,
   )
 })
 
