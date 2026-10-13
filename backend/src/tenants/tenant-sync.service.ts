@@ -2176,6 +2176,10 @@ export class TenantSyncService {
       capturedManaged = refreshed.context
     }
 
+    // A collector can reject before its FAILED state is persisted (including
+    // when that write itself fails). Preserve those outcomes for this pass
+    // without manufacturing state that would affect backoff or watermarks.
+    const rejectedResources = new Set<string>()
     if (incrementalOnly) {
       // These sources are time-window based and retain their own watermarks,
       // so they fetch only newly available activity rather than a complete
@@ -2248,6 +2252,7 @@ export class TenantSyncService {
       incrementalResults.forEach((result, index) => {
         if (result.status === 'rejected') {
           const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
+          rejectedResources.add(resource)
           this.logOperationalFailure(resource, 'INCREMENTAL', 'COLLECTION_UNAVAILABLE')
         }
       })
@@ -2261,9 +2266,10 @@ export class TenantSyncService {
         },
         select: { resourceType: true, status: true },
       })
-      const failedResources = attemptedStates
+      const persistedFailedResources = attemptedStates
         .filter((state) => state.status === 'FAILED')
         .map((state) => state.resourceType)
+      const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
       return {
         bundle: includeBundle ? await this.buildBundle(tenant) : null,
         status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
@@ -2368,6 +2374,7 @@ export class TenantSyncService {
     snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
+        rejectedResources.add(resource)
         this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
@@ -2377,6 +2384,7 @@ export class TenantSyncService {
     try {
       await this.syncDomainDnsHealth(tenant)
     } catch (error) {
+      rejectedResources.add('DOMAIN_DNS_HEALTH')
       this.logOperationalFailure('DOMAIN_DNS_HEALTH', 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
     }
 
@@ -2446,6 +2454,7 @@ export class TenantSyncService {
     entraResults.forEach((result, index) => {
       if (result.status === 'rejected') {
         const resource = entraModules[index]?.resource ?? 'UNKNOWN'
+        rejectedResources.add(resource)
         this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
@@ -2469,7 +2478,9 @@ export class TenantSyncService {
     const failedStates = attemptedStates.filter(
       (state) => state.status === 'FAILED',
     )
-    const failedResources = failedStates.map((state) => state.resourceType)
+    const persistedFailedResources = new Set<string>(failedStates.map((state) => state.resourceType))
+    const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
+    const unclassifiedResources = failedResources.filter((resource) => !persistedFailedResources.has(resource))
     const actionRequiredResources = failedStates
       .filter(initialSyncStateRequiresAction)
       .map((state) => state.resourceType)
@@ -2478,6 +2489,7 @@ export class TenantSyncService {
       .map((state) => state.resourceType)
     const initialSync = !existingState?.lastSuccessfulAt
     if (initialSync) {
+      const unclassified = unclassifiedResources.length > 0
       const actionRequired = actionRequiredResources.length > 0
       const retrying = !actionRequired && retryingResources.length > 0
       if (!capturedManaged) await this.notifications.publishIncident({
@@ -2485,29 +2497,34 @@ export class TenantSyncService {
         customerTenantId: tenant.id,
         eventType: actionRequired
           ? 'tenant.initial_sync_action_required'
-          : retrying
+          : retrying || unclassified
             ? 'tenant.initial_sync_in_progress'
             : 'tenant.initial_sync_completed',
-        category: actionRequired ? 'warning' : retrying ? 'info' : 'success',
+        category: unclassified || actionRequired ? 'warning' : retrying ? 'info' : 'success',
         severity: actionRequired ? 'medium' : 'info',
         title:
-          actionRequired
-            ? 'Initial tenant sync needs attention'
-            : retrying
-              ? 'Initial tenant sync in progress'
-              : 'Initial tenant sync completed',
+          unclassified
+            ? 'Initial tenant sync incomplete'
+            : actionRequired
+              ? 'Initial tenant sync needs attention'
+              : retrying
+                ? 'Initial tenant sync in progress'
+                : 'Initial tenant sync completed',
         description:
-          actionRequired
-            ? `${actionRequiredResources.length} data source${actionRequiredResources.length === 1 ? '' : 's'} requires administrator action before collection can finish.`
-            : retrying
-              ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
-              : 'HawkView finished collecting the tenant data required for monitoring.',
+          unclassified
+            ? 'Some data sources did not finish collection. Review their sync status for available details.'
+            : actionRequired
+              ? `${actionRequiredResources.length} data source${actionRequiredResources.length === 1 ? '' : 's'} requires administrator action before collection can finish.`
+              : retrying
+                ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
+                : 'HawkView finished collecting the tenant data required for monitoring.',
         dedupeKey: `tenant:${tenant.id}:initial-sync`,
         source: 'tenant-sync',
         actionUrl: `/tenants/${tenant.id}`,
         actionLabel: 'View tenant',
         metadata: {
           failedResources,
+          unclassifiedResources,
           retryingResources,
           actionRequiredResources,
         },

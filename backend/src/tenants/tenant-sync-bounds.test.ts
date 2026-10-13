@@ -493,7 +493,8 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
   ])
 })
 
-test('actual full sync continues from a failed sign-in collector to audit without overlap and logs one safe outcome', async () => {
+test('actual full sync continues from a failed sign-in collector to audit without overlap and logs one safe outcome', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
   const tenant = {
     id: 'tenant-private', organizationId: 'org-private', microsoftTenantId: 'microsoft-private',
     displayName: null, primaryDomain: null, status: 'ACTIVE',
@@ -544,7 +545,8 @@ test('actual full sync continues from a failed sign-in collector to audit withou
   const messages: string[] = []
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
-  assert.equal(result.status, 'SUCCEEDED')
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['SIGN_INS'])
   assert.deepEqual(order, ['sign-in:start', 'sign-in:failed', 'audit:ran'])
   assert.equal(messages.length, 1)
   assert.deepEqual(JSON.parse(messages[0]!), {
@@ -556,6 +558,128 @@ test('actual full sync continues from a failed sign-in collector to audit withou
   })
   assert.equal(messages[0]!.includes('private'), false)
   assert.equal(messages[0]!.includes('secret'), false)
+})
+
+// Exercise the real orchestrator with synthetic collector boundaries. Only the
+// USERS lease/success may be written: secondary failure must not be synthesized
+// into persisted state just to repair the aggregate result.
+function aggregateSyncFixture(options: {
+  rejected?: string[]
+  persistedFailures?: Array<{ resourceType: string; lastErrorCode?: string }>
+  initial?: boolean
+} = {}) {
+  const tenant = {
+    ...boundedTenant,
+    connection: { ...boundedTenant.connection, connectionMode: 'CUSTOMER_MANAGED', exchangeReadOnlyEnabledAt: null },
+  }
+  const calls: string[] = []
+  const messages: string[] = []
+  const incidents: any[] = []
+  const stateWrites: string[] = []
+  const prisma = utcTestDatabase({
+    syncState: {
+      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: options.initial ? null : new Date(), deltaLink: 'previous-delta' }),
+      updateMany: async () => { stateWrites.push('USERS:RUNNING'); return { count: 1 } },
+      update: async ({ where, data }: any) => {
+        assert.equal(where.customerTenantId_resourceType.resourceType, 'USERS')
+        assert.equal(data.deltaLink, 'next-delta')
+        stateWrites.push(`USERS:${data.status}`)
+        return {}
+      },
+      findMany: async ({ where }: any) => {
+        assert.equal(where.organizationId, tenant.organizationId)
+        assert.equal(where.customerTenantId, tenant.id)
+        if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
+        assert.ok(where.lastAttemptAt.gte instanceof Date)
+        return (options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null }))
+      },
+    },
+    tenantConnection: { update: async () => ({}) },
+  })
+  const service = new TenantSyncService(prisma as any,
+    { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
+    { publishIncident: async (incident: any) => { incidents.push(incident) } } as any, {} as any, {} as any)
+  ;(service as any).synchronizeUsers = async (_tenant: unknown, _token: string, delta: string) => {
+    assert.equal(delta, 'previous-delta')
+    return { deltaLink: 'next-delta' }
+  }
+  const collect = async (resource: string) => {
+    calls.push(resource)
+    if (options.rejected?.includes(resource)) throw new Error('access_token=secret private@example.invalid')
+  }
+  for (const [method, resource] of Object.entries({
+    syncLicenses: 'LICENSES', syncOrganizationConfiguration: 'ORGANIZATION_CONFIGURATION',
+    syncDomains: 'DOMAINS', syncGroups: 'GROUPS', syncSharePointSites: 'SHAREPOINT_SITES',
+    syncSharePointSettings: 'SHAREPOINT_SETTINGS', syncSharePointUsage: 'SHAREPOINT_USAGE',
+    syncExchangeMailboxDirectory: 'EXCHANGE_MAILBOXES', syncExchangeMailboxSettings: 'EXCHANGE_MAILBOX_SETTINGS',
+    syncExchangeAcceptedDomains: 'EXCHANGE_ACCEPTED_DOMAINS', syncExchangeMailboxUsage: 'EXCHANGE_MAILBOX_USAGE',
+    syncExchangeMailboxRules: 'EXCHANGE_MAILBOX_RULES', syncDomainDnsHealth: 'DOMAIN_DNS_HEALTH',
+    syncAuthenticationRegistrations: 'AUTH_REGISTRATIONS', syncAuthenticationMethodPolicy: 'AUTH_METHOD_POLICIES',
+    syncSignInLogs: 'SIGN_INS', syncDirectoryAuditLogs: 'AUDIT_LOGS', syncM365AuditActivity: 'M365_AUDIT',
+    syncDirectoryRoles: 'DIRECTORY_ROLES', syncCurrentSecureScore: 'SECURE_SCORES', syncSecurityDefaults: 'SECURITY_DEFAULTS',
+  })) (service as any)[method] = () => collect(resource)
+  ;(service as any).syncEntraCollection = (_tenant: unknown, _token: string, resource: string) => collect(resource)
+  ;(service as any).refreshCollectionFieldStates = async () => undefined
+  ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
+  return { calls, messages, incidents, stateWrites,
+    run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
+  }
+}
+
+test('actual sync aggregates rejected collectors with current persisted failures', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const scenario of [
+    { name: 'incremental rejection without state', incremental: true, rejected: ['SIGN_INS'], persisted: [], expected: ['SIGN_INS'] },
+    { name: 'incremental union deduplicates', incremental: true, rejected: ['SIGN_INS'], persisted: ['SIGN_INS', 'AUDIT_LOGS'], expected: ['AUDIT_LOGS', 'SIGN_INS'] },
+    { name: 'snapshot rejection continues through DNS and Entra', incremental: false, rejected: ['SHAREPOINT_USAGE'], persisted: [], expected: ['SHAREPOINT_USAGE'] },
+    { name: 'DNS rejection continues through Entra', incremental: false, rejected: ['DOMAIN_DNS_HEALTH'], persisted: [], expected: ['DOMAIN_DNS_HEALTH'] },
+    { name: 'full union includes all rejection paths and deduplicates', incremental: false, rejected: ['LICENSES', 'DOMAIN_DNS_HEALTH', 'DIRECTORY_ROLES'], persisted: ['LICENSES', 'GROUPS'], expected: ['DIRECTORY_ROLES', 'DOMAIN_DNS_HEALTH', 'GROUPS', 'LICENSES'] },
+    { name: 'persisted failure alone remains partial', incremental: false, rejected: [], persisted: ['GROUPS'], expected: ['GROUPS'] },
+    { name: 'clean full pass succeeds', incremental: false, rejected: [], persisted: [], expected: [] },
+    { name: 'clean incremental pass succeeds', incremental: true, rejected: [], persisted: [], expected: [] },
+  ]) await t.test(scenario.name, async () => {
+    const fixture = aggregateSyncFixture({ rejected: scenario.rejected,
+      persistedFailures: scenario.persisted.map((resourceType) => ({ resourceType })) })
+    const result = await fixture.run(scenario.incremental)
+    assert.equal(result.status, scenario.expected.length ? 'PARTIAL' : 'SUCCEEDED')
+    assert.deepEqual(result.failedResources, scenario.expected)
+    assert.deepEqual(fixture.stateWrites, ['USERS:RUNNING', 'USERS:SUCCEEDED'])
+    assert.ok(fixture.calls.includes('AUDIT_LOGS'))
+    assert.ok(fixture.calls.includes('M365_AUDIT'))
+    if (!scenario.incremental) assert.ok(fixture.calls.includes('SECURITY_DEFAULTS'))
+    assert.deepEqual(fixture.messages.map((message) => JSON.parse(message).resource).sort(), [...scenario.rejected].sort())
+    assert.doesNotMatch(JSON.stringify({ result, messages: fixture.messages }), /secret|private@example/)
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('initial sync notifications distinguish unclassified rejections from persisted dispositions', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`unclassified rejection with ${known ?? 'no persisted failure'}`, async () => {
+    const fixture = aggregateSyncFixture({ initial: true, rejected: ['SIGN_INS'],
+      persistedFailures: known ? [{ resourceType: 'GROUPS', lastErrorCode: known }] : [] })
+    assert.equal((await fixture.run()).status, 'PARTIAL')
+    assert.equal(fixture.incidents.length, 1)
+    const incident = fixture.incidents[0]
+    assert.notEqual(incident.eventType, 'tenant.initial_sync_completed')
+    assert.equal(incident.category, 'warning')
+    assert.equal(incident.title, 'Initial tenant sync incomplete')
+    assert.doesNotMatch(incident.description, /automatically retry|No action is required|requires administrator action|finished collecting/)
+    assert.deepEqual(incident.metadata.unclassifiedResources, ['SIGN_INS'])
+    assert.deepEqual(incident.metadata.actionRequiredResources, known === 'PERMISSION_REQUIRED' ? ['GROUPS'] : [])
+    assert.deepEqual(incident.metadata.retryingResources, known === 'HTTP_503' ? ['GROUPS'] : [])
+    assert.doesNotMatch(JSON.stringify(incident), /secret|private@example/)
+  })
+  for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`persisted-only disposition ${known ?? 'clean success'}`, async () => {
+    const fixture = aggregateSyncFixture({ initial: true,
+      persistedFailures: known ? [{ resourceType: 'GROUPS', lastErrorCode: known }] : [] })
+    await fixture.run()
+    assert.equal(fixture.incidents.length, 1)
+    assert.equal(fixture.incidents[0].eventType, known === 'PERMISSION_REQUIRED' ? 'tenant.initial_sync_action_required'
+      : known === 'HTTP_503' ? 'tenant.initial_sync_in_progress' : 'tenant.initial_sync_completed')
+    assert.deepEqual(fixture.incidents[0].metadata.unclassifiedResources, [])
+  })
+  assert.equal(network.mock.callCount(), 0)
 })
 
 // MUST RUN FROM `backend/`. This spawns a child process with a RELATIVE probe
