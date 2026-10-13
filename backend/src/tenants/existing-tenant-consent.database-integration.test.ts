@@ -539,13 +539,31 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null }, 'DOMAIN_DNS_HEALTH')
   })
 
+  await t.test('secure-score alone is hourly eligible at the exact boundary and retains its daily failure policy', async () => {
+    for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+      await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(age), lastAttemptAt: before(age) }, 'SECURE_SCORES')
+      const found = await candidateFound(workspace)
+      assert.equal(found.length, age >= HOUR ? 1 : 0)
+      const work = selectScheduledTenantWork(found, CLOCK, 1)
+      assert.equal(work.length, age >= HOUR ? 1 : 0)
+      if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+    }
+    for (const age of [FIRST_RETRY, 31 * 60_000, 6 * HOUR, 24 * HOUR - 1, 24 * HOUR]) {
+      await setInventory(workspace, { status: 'FAILED', lastSuccessfulAt: before(48 * HOUR), lastAttemptAt: before(age), lastErrorCode: 'MICROSOFT_TRANSIENT' }, 'SECURE_SCORES')
+      const found = await candidateFound(workspace)
+      assert.equal(found.length, age >= 24 * HOUR ? 1 : 0, `failed secure-score age ${age}`)
+      if (found.length) assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, true)
+    }
+    await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null }, 'SECURE_SCORES')
+  })
+
   await t.test('daily guard candidate and pure rule agree for every existing daily resource', async () => {
     for (const resource of DAILY_INVENTORY_RESOURCES) {
       for (const delta of [-1, 0, 1]) {
         await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(24 * HOUR + delta), lastAttemptAt: before(24 * HOUR + delta) }, resource)
         const found = await candidateFound(workspace)
-        // DNS may already be hourly due; only the daily flag changes at 24h.
-        assert.equal(found.length, resource === 'DOMAIN_DNS_HEALTH' || delta >= 0 ? 1 : 0, `${resource}: ${delta}`)
+        // DNS and secure scores may already be hourly due; only the daily flag changes at 24h.
+        assert.equal(found.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES'].includes(resource) || delta >= 0 ? 1 : 0, `${resource}: ${delta}`)
         if (found.length) assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, delta >= 0)
       }
       await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000) }, resource)

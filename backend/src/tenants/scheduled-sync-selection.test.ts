@@ -316,7 +316,7 @@ test('anchors, heavy collectors and held resources are never hourly due however 
     'DIRECTORY_ROLES',
     'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT',
     'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOXES', 'AUTH_REGISTRATIONS',
-    'SECURE_SCORES', 'SHAREPOINT_USAGE',
+    'SHAREPOINT_USAGE',
   ]) {
     assert.equal(
       shouldRunHourlyInventoryRefresh(state(resource, 'SUCCEEDED', ancient), now),
@@ -338,7 +338,7 @@ test('anchors, heavy collectors and held resources are never hourly due however 
 test('DNS hourly catch-up does not grant targeted failure retry membership', () => {
   assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), true)
   assert.equal((TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), false)
-  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 8)
+  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 9)
 })
 
 test('healthy DNS alone selects incremental work at one hour, not one millisecond before', () => {
@@ -628,7 +628,7 @@ test('each daily dataset owns its inclusive daily boundary despite fresh anchors
       const old = new Date(now.getTime() - 24 * HOUR - delta)
       const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS'), state(resource, 'SUCCEEDED', old)]
       const result = selectScheduledTenantWork([{ id: resource, syncStates: states }], now, 10)
-      assert.equal(result.length, resource === 'DOMAIN_DNS_HEALTH' || delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
+      assert.equal(result.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES'].includes(resource) || delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
       if (result.length) assert.equal(result[0]!.fullInventoryDue, delta >= 0)
     }
   }
@@ -668,4 +668,41 @@ test('fair ranking uses the overdue non-anchor rather than fresh licence/domain 
     { id: 'z-daily', syncStates: [...base, state('SECURE_SCORES', 'SUCCEEDED', new Date(now.getTime() - 48 * HOUR))] },
   ], now, 1)
   assert.equal(result[0]?.tenantId, 'z-daily')
+})
+
+
+test('healthy secure-score alone selects incremental work at its one-hour boundary', () => {
+  for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+    const score = state('SECURE_SCORES', 'SUCCEEDED', ago(age))
+    const states = [...dailyCoverage().filter(s => s.resourceType !== 'SECURE_SCORES'),
+      state('USERS', 'SUCCEEDED', now), state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now), score]
+    assert.equal(shouldRunHourlyInventoryRefresh(score, now), age >= HOUR)
+    const work = selectScheduledTenantWork([{ id: 'score-only', syncStates: states }], now, 1)
+    assert.equal(work.length, age >= HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+  }
+})
+
+test('secure-score failure policy excludes retry candidacy and retains its daily opportunity', () => {
+  assert.equal((TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes('SECURE_SCORES'), false)
+  for (const branch of failedCandidacyBranches(now)) assert.equal(branch.resourceType.in.includes('SECURE_SCORES'), false)
+  for (const age of [15 * 60_000, 31 * 60_000, 6 * HOUR, 24 * HOUR - 1, 24 * HOUR]) {
+    const score = { ...state('SECURE_SCORES', 'FAILED', ago(48 * HOUR), ago(age)), lastErrorCode: 'MICROSOFT_TRANSIENT' }
+    assert.equal(shouldRunHourlyInventoryRefresh(score, now), false)
+    assert.equal(shouldRunTargetedTransientRetry(score, now), false)
+    const states = [...dailyCoverage().filter(s => s.resourceType !== 'SECURE_SCORES'),
+      state('USERS', 'SUCCEEDED', now), state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now), score]
+    const work = selectScheduledTenantWork([{ id: 'score-failed', syncStates: states }], now, 1)
+    assert.equal(work.length, age >= 24 * HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, true)
+  }
+})
+
+test('secure-score running, missing, invalid and future success never enters hourly refresh', () => {
+  for (const score of [state('SECURE_SCORES', 'RUNNING', ago(6 * HOUR)),
+    state('SECURE_SCORES', 'SUCCEEDED', null),
+    state('SECURE_SCORES', 'SUCCEEDED', new Date(NaN)),
+    state('SECURE_SCORES', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
+    assert.equal(shouldRunHourlyInventoryRefresh(score, now), false)
+  }
 })

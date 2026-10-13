@@ -25,12 +25,15 @@ const ENDPOINT = {
   securityDefaults: 'identitySecurityDefaultsEnforcementPolicy',
   sharePointSettings: 'admin/sharepoint/settings',
   organization: 'v1.0/organization',
+  secureScore: 'security/secureScores?$top=1',
   // Excluded resources, asserted absent.
   licenses: 'subscribedSkus',
   directoryRoles: 'roleManagement/directory/roleAssignments',
 } as const
 
 const MINUTE = 60 * 1000
+const CURRENT_SCORE_URL = 'https://graph.microsoft.com/v1.0/security/secureScores?$top=1'
+const currentScore = { id: 'current-score', createdDateTime: '2020-01-01T00:00:00Z', currentScore: 45, maxScore: 100 }
 
 function tenant() {
   return {
@@ -183,7 +186,10 @@ async function runIncrementalVisit(
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input)
     urls.push(url)
-    return respond?.(url) ?? graphPage({
+    const response = respond?.(url)
+    if (response) return response
+    if (url === CURRENT_SCORE_URL) return graphPage({ value: [currentScore] })
+    return graphPage({
       value: [],
       '@odata.deltaLink': 'https://graph.microsoft.com/v1.0/users/delta?$deltatoken=new',
     })
@@ -251,7 +257,7 @@ test('every allowlisted resource is reachable through the real module map', asyn
   for (const fragment of [
     ENDPOINT.organization, ENDPOINT.authMethodPolicies, ENDPOINT.securityDefaults,
     ENDPOINT.sharePointSettings, ENDPOINT.conditionalAccess, ENDPOINT.authStrengths,
-    ENDPOINT.namedLocations,
+    ENDPOINT.namedLocations, ENDPOINT.secureScore,
   ]) {
     assert.equal(requested(urls, fragment), 1, `${fragment} must be requested exactly once`)
   }
@@ -273,7 +279,6 @@ test('stale excluded resources are never collected by an incremental visit', asy
     healthy('EXCHANGE_MAILBOX_RULES', stale),
     healthy('EXCHANGE_MAILBOXES', stale),
     healthy('AUTH_REGISTRATIONS', stale),
-    healthy('SECURE_SCORES', stale),
   ])
   assert.equal(requested(urls, ENDPOINT.licenses), 0)
   assert.equal(requested(urls, ENDPOINT.directoryRoles), 0)
@@ -419,5 +424,49 @@ test('fresh, failed or running DNS never dispatches through hourly or targeted r
     assert.deepEqual(dnsCalls, [])
     assert.deepEqual(domainReads, [])
     assert.equal(writes.some(w => writtenResource(w) === 'DOMAIN_DNS_HEALTH'), false)
+  }
+})
+
+
+test('hourly secure-score reaches the real resource-state query independently of its map', async () => {
+  const { resourceReads } = await runIncrementalVisit([healthy('SECURE_SCORES', 61 * MINUTE)])
+  assert.equal(resourceReads.length, 1)
+  assert.ok(resourceReads[0]!.includes('SECURE_SCORES'), 'hourly-only score must enter the actual state filter')
+  assert.equal(new Set(resourceReads[0]).size, resourceReads[0]!.length)
+})
+
+test('hourly secure-score persists the existing current-score collector once without advancing anchors', async () => {
+  const states = [healthy('SECURE_SCORES', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
+  const before = structuredClone(states)
+  const { urls, writes, dnsCalls, domainReads } = await runIncrementalVisit(states, url =>
+    url === CURRENT_SCORE_URL ? graphPage({ value: [currentScore],
+      '@odata.nextLink': 'https://graph.microsoft.com/v1.0/security/secureScores?$skiptoken=unused',
+    }) : undefined)
+  assert.deepEqual(urls.filter(url => url.includes('/security/secureScores')), [CURRENT_SCORE_URL],
+    'current-score query runs once and does not fetch history or continuation')
+  const snapshots = writes.filter(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) === 'SECURE_SCORES')
+  assert.equal(snapshots.length, 1, 'a persisted result is required, not just a request')
+  assert.deepEqual((snapshots[0]!.data as { payload: unknown }).payload, [currentScore])
+  const scoreStates = writes.filter(w => w.model === 'syncState' && writtenResource(w) === 'SECURE_SCORES')
+  assert.deepEqual(scoreStates.map(w => (w.data as { status: string }).status), ['RUNNING', 'SUCCEEDED'])
+  assert.ok((scoreStates[1]!.data as { lastSuccessfulAt: Date }).lastSuccessfulAt instanceof Date)
+  assert.equal(writes.some(w => ['LICENSES', 'DOMAINS'].includes(writtenResource(w) ?? '')), false)
+  assert.equal(writes.some(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) !== 'SECURE_SCORES'), false)
+  assert.deepEqual(states, before)
+  assert.deepEqual(dnsCalls, [])
+  assert.deepEqual(domainReads, [])
+  assert.ok(urls.some(url => /\/users/.test(url)), 'coupled users work remains')
+})
+
+test('fresh, failed, running or undated secure-score never dispatches hourly or as a targeted retry', async () => {
+  for (const score of [healthy('SECURE_SCORES', 5 * MINUTE),
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), status: 'FAILED', lastAttemptAt: new Date(Date.now() - 31 * MINUTE), lastErrorCode: 'MICROSOFT_TRANSIENT' },
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), lastSuccessfulAt: null },
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(NaN) },
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(Date.now() + 60 * MINUTE) }]) {
+    const { urls, writes } = await runIncrementalVisit([score])
+    assert.equal(requested(urls, '/security/secureScores'), 0)
+    assert.equal(writes.some(w => writtenResource(w) === 'SECURE_SCORES'), false)
   }
 })

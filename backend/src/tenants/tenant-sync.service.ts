@@ -1972,6 +1972,7 @@ export class TenantSyncService {
       ORGANIZATION_CONFIGURATION: () => this.syncOrganizationConfiguration(tenant, accessToken),
       DOMAINS: () => this.syncDomains(tenant, accessToken),
       DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant),
+      SECURE_SCORES: () => this.syncCurrentSecureScore(tenant, accessToken),
       GROUPS: () => this.syncGroups(tenant, accessToken),
       AUTH_METHOD_POLICIES: () => this.syncAuthenticationMethodPolicy(tenant, accessToken),
       CONDITIONAL_ACCESS: () => this.syncEntraCollection(
@@ -2204,7 +2205,7 @@ export class TenantSyncService {
         },
       ]
       // Read the union for dispatch reachability; each resource still needs
-      // its own hourly or targeted-retry predicate. Hourly-only DNS must not
+      // its own hourly or targeted-retry predicate. Hourly-only resources must not
       // gain targeted failure retries. The existing USERS claim serializes
       // this work with other tenant syncs.
       const incrementalInventoryStates = await this.prisma.syncState.findMany({
