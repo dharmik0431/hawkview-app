@@ -316,7 +316,7 @@ test('anchors, heavy collectors and held resources are never hourly due however 
     'DIRECTORY_ROLES',
     'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT',
     'EXCHANGE_MAILBOX_RULES', 'EXCHANGE_MAILBOXES', 'AUTH_REGISTRATIONS',
-    'SECURE_SCORES', 'SHAREPOINT_USAGE', 'DOMAIN_DNS_HEALTH',
+    'SECURE_SCORES', 'SHAREPOINT_USAGE',
   ]) {
     assert.equal(
       shouldRunHourlyInventoryRefresh(state(resource, 'SUCCEEDED', ancient), now),
@@ -335,19 +335,45 @@ test('anchors, heavy collectors and held resources are never hourly due however 
   }
 })
 
-test('the hourly allowlist stays inside the existing targeted dispatch set', () => {
-  // The dispatch query selects TARGETED_TRANSIENT_RETRY_RESOURCES only, so an
-  // allowlist member outside that set would be silently never dispatched.
-  for (const resource of HOURLY_INVENTORY_RESOURCES) {
-    assert.ok(
-      (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource),
-      `${resource} must already be dispatchable through the targeted module set`,
-    )
+test('DNS hourly catch-up does not grant targeted failure retry membership', () => {
+  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), true)
+  assert.equal((TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), false)
+  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 8)
+})
+
+test('healthy DNS alone selects incremental work at one hour, not one millisecond before', () => {
+  for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+    const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now),
+      state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now)]
+      .map(s => s.resourceType === 'DOMAIN_DNS_HEALTH' ? state(s.resourceType, 'SUCCEEDED', ago(age)) : s)
+    const work = selectScheduledTenantWork([{ id: 'dns-only', syncStates: states }], now, 1)
+    assert.equal(shouldRunHourlyInventoryRefresh(states.find(s => s.resourceType === 'DOMAIN_DNS_HEALTH'), now), age >= HOUR)
+    assert.equal(work.length, age >= HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
   }
-  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('LICENSES'), false)
-  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAINS'), false)
-  assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('RISKY_USERS'), false)
-  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 7)
+})
+
+test('DNS failures retain daily handling without hourly or targeted retry eligibility', () => {
+  for (const age of [15 * 60_000, 31 * 60_000, 6 * HOUR, 24 * HOUR - 1, 24 * HOUR]) {
+    const dns = { ...state('DOMAIN_DNS_HEALTH', 'FAILED', ago(48 * HOUR), ago(age)), lastErrorCode: 'MICROSOFT_TRANSIENT' }
+    assert.equal(shouldRunHourlyInventoryRefresh(dns, now), false)
+    assert.equal(shouldRunTargetedTransientRetry(dns, now), false)
+    const states = [...dailyCoverage().filter(s => s.resourceType !== 'DOMAIN_DNS_HEALTH'),
+      state('USERS', 'SUCCEEDED', now), state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now), dns]
+    const work = selectScheduledTenantWork([{ id: 'dns-failed', syncStates: states }], now, 1)
+    assert.equal(work.length, age >= 24 * HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, true)
+  }
+  for (const branch of failedCandidacyBranches(now)) assert.equal(branch.resourceType.in.includes('DOMAIN_DNS_HEALTH'), false)
+})
+
+test('DNS running, missing, invalid and future success never enters hourly refresh', () => {
+  for (const dns of [state('DOMAIN_DNS_HEALTH', 'RUNNING', ago(6 * HOUR)),
+    state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', null),
+    state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', new Date(NaN)),
+    state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
+    assert.equal(shouldRunHourlyInventoryRefresh(dns, now), false)
+  }
 })
 
 test('a tenant is selected for hourly inventory while USERS and both anchors are fresh', () => {
@@ -484,7 +510,9 @@ test('the selected resources become candidates at their own first-retry delay', 
   // was invisible whenever USERS and both anchors were fresh.
   assert.equal(HOURLY_INVENTORY_FIRST_RETRY_MS, 15 * 60 * 1000)
   // Derived from the formula, so it cannot drift from the deciding predicate.
-  for (const resource of HOURLY_INVENTORY_RESOURCES) {
+  const retryResources = HOURLY_INVENTORY_RESOURCES.filter(resource =>
+    (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource))
+  for (const resource of retryResources) {
     assert.equal(
       targetedTransientRetryDelayMs({
         ...state(resource, 'FAILED', null, ago(1)), consecutiveFailures: 1,
@@ -497,9 +525,9 @@ test('the selected resources become candidates at their own first-retry delay', 
   const failed = failedCandidacyBranches(now)
   assert.equal(failed.length, 2, 'one branch for the selected seven, one for the rest')
   const selected = failed.find((branch) =>
-    branch.resourceType.in.length === HOURLY_INVENTORY_RESOURCES.length)
+    branch.resourceType.in.length === retryResources.length)
   assert.ok(selected, 'the query must carry a branch scoped to the selected seven')
-  assert.deepEqual([...selected!.resourceType.in].sort(), [...HOURLY_INVENTORY_RESOURCES].sort())
+  assert.deepEqual([...selected!.resourceType.in].sort(), [...retryResources].sort())
   // Inclusive at exactly the first-retry delay, matching the predicate's `>=`.
   assert.equal(selected!.lastAttemptAt.lte?.getTime(), now.getTime() - HOURLY_INVENTORY_FIRST_RETRY_MS)
   assert.equal(selected!.lastAttemptAt.lt, undefined)
@@ -600,8 +628,8 @@ test('each daily dataset owns its inclusive daily boundary despite fresh anchors
       const old = new Date(now.getTime() - 24 * HOUR - delta)
       const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS'), state(resource, 'SUCCEEDED', old)]
       const result = selectScheduledTenantWork([{ id: resource, syncStates: states }], now, 10)
-      assert.equal(result.length, delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
-      if (result.length) assert.equal(result[0]!.fullInventoryDue, true)
+      assert.equal(result.length, resource === 'DOMAIN_DNS_HEALTH' || delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
+      if (result.length) assert.equal(result[0]!.fullInventoryDue, delta >= 0)
     }
   }
 })

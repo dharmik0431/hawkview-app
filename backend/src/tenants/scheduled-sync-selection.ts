@@ -59,19 +59,12 @@ const HEAVIER_RETRY_RESOURCES = new Set<string>([
 ])
 
 /**
- * Healthy-state hourly catch-up, restricted to resources that satisfy all four
- * admission criteria: already dispatchable through the existing targeted module
- * map, so no collector is newly wired and daily-only collectors stay
- * structurally undispatchable; NOT a daily-pass anchor, so no hourly write can
- * advance the timestamps the daily clock reads; NOT in
- * HEAVIER_RETRY_RESOURCES, whose collectors can retain multi-page payloads; and
- * not under an operational hold that source cannot consult, which excludes
- * DIRECTORY_ROLES.
- *
- * RISKY_USERS is deliberately absent: it is the only otherwise-eligible
- * resource on the general 50-page collection limits rather than the
- * small-collection limits, so its worst-case request count exceeds all the
- * others combined.
+ * Healthy-state hourly catch-up for the selected bounded inventory collectors.
+ * The original seven use the targeted retry map; DNS uses the existing stored
+ * domain collector and can change without a recognized Microsoft audit event.
+ * Hourly dispatch does not itself grant targeted failure retry eligibility.
+ * Anchors, heavier Graph collectors and held DIRECTORY_ROLES remain excluded.
+ * RISKY_USERS retains its daily policy and larger collection bounds.
  */
 export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.ORGANIZATION_CONFIGURATION,
@@ -81,10 +74,11 @@ export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.CONDITIONAL_ACCESS,
   SyncResourceType.AUTHENTICATION_STRENGTHS,
   SyncResourceType.NAMED_LOCATIONS,
+  SyncResourceType.DOMAIN_DNS_HEALTH,
 ] as const
 
 /** Existing daily-pass datasets whose own clock must survive unrelated
- * licence/domain event refreshes. No new collectors or hourly work. */
+ * licence/domain event refreshes, including resources with hourly catch-up. */
 export const DAILY_INVENTORY_RESOURCES = [
   SyncResourceType.GROUPS,
   SyncResourceType.AUTH_REGISTRATIONS,
@@ -227,8 +221,8 @@ export function shouldRunTargetedTransientRetry(
  * path rather than a replacement for it:
  *
  *   - FAILED always makes this false, so a failed resource keeps its existing
- *     targeted retry schedule. That schedule is FASTER than hourly for these
- *     resources (15 minutes on a first failure), so routing failures here
+ *     failure policy. Targeted retries are FASTER than hourly for the original
+ *     seven resources (15 minutes on a first failure), so routing failures here
  *     would delay them, and a stale hourly age must never shortcut a longer
  *     accumulated backoff.
  *   - RUNNING makes this false, so an in-flight collection is not duplicated.
@@ -489,7 +483,11 @@ export function scheduledSyncTenantWhere(
         // counter passes here and is then refused by selection and dispatch.
         syncStates: {
           some: {
-            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            // Hourly-only resources must not acquire retry candidacy. The
+            // later pure selection is stricter, but coarse false positives
+            // can still consume slots in the capped candidate query.
+            resourceType: { in: HOURLY_INVENTORY_RESOURCES.filter((resource) =>
+              (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource)) },
             status: SyncStateStatus.FAILED,
             lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
             lastAttemptAt: { lte: hourlyRetryBefore },

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
+import { Resolver } from 'node:dns/promises'
 import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
-import { HOURLY_INVENTORY_RESOURCES, TARGETED_TRANSIENT_RETRY_RESOURCES } from './scheduled-sync-selection.js'
+import { HOURLY_INVENTORY_RESOURCES } from './scheduled-sync-selection.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 
 /**
@@ -9,11 +10,11 @@ import { TenantSyncService } from './tenant-sync.service.js'
  * orchestration rather than a rebuilt module list. The real
  * `syncConnectedTenant` incremental branch runs against synthetic
  * dependencies, and every assertion is made on the URLs recorded at the
- * `globalThis.fetch` boundary — so a request is only observed if the real
+ * `globalThis.fetch` and DNS resolver boundaries — so work is only observed if the real
  * selection, module map and collector all actually ran.
  *
  * No local or live database and no provider call: `fetch` is replaced for the
- * duration of each case and restored in `finally`.
+ * duration of each case, DNS methods are mocked, and both are restored in `finally`.
  */
 
 const ENDPOINT = {
@@ -61,19 +62,21 @@ type SyntheticState = {
 
 /** Collector bookkeeping this test does not assert is answered permissively,
  *  so the case stands on the recorded requests rather than on the double. */
-function syntheticModel(name: string, writes: { model: string; method: string; data: unknown }[]) {
+type Write = { model: string; method: string; data: unknown; where?: unknown }
+
+function syntheticModel(name: string, writes: Write[]) {
   return new Proxy({} as Record<string, unknown>, {
-    get: (_target, method: string) => async (args: { data?: unknown } = {}) => {
+    get: (_target, method: string) => async (args: { data?: unknown; update?: unknown; create?: unknown; where?: unknown } = {}) => {
       if (method === 'findMany') return []
       if (method === 'count') return 0
       if (method === 'aggregate') return {}
       if (method === 'groupBy') return []
       if (method === 'updateMany' || method === 'deleteMany') {
-        writes.push({ model: name, method, data: args?.data })
+        writes.push({ model: name, method, data: args?.data ?? args?.update ?? args?.create, where: args?.where })
         return { count: 1 }
       }
       if (method === 'create' || method === 'update' || method === 'upsert') {
-        writes.push({ model: name, method, data: args?.data })
+        writes.push({ model: name, method, data: args?.data ?? args?.update ?? args?.create, where: args?.where })
         return { id: `${name}-1`, consecutiveFailures: 1 }
       }
       return null
@@ -82,7 +85,9 @@ function syntheticModel(name: string, writes: { model: string; method: string; d
 }
 
 function syntheticDatabase(states: SyntheticState[]) {
-  const writes: { model: string; method: string; data: unknown }[] = []
+  const writes: Write[] = []
+  const resourceReads: string[][] = []
+  const domainReads: unknown[] = []
   const models = new Map<string, unknown>()
   const syncState = {
     // Two different reads hit this model in one visit. The targeted/hourly
@@ -91,27 +96,31 @@ function syntheticDatabase(states: SyntheticState[]) {
     // re-trigger dispatch reasoning, so they are distinguished here.
     findMany: async (args: { where?: Record<string, unknown> }) => {
       const where = args?.where ?? {}
-      if ('resourceType' in where) return states
+      if ('resourceType' in where) {
+        const resources = (where.resourceType as { in: string[] }).in
+        resourceReads.push([...resources])
+        return states.filter(state => resources.includes(state.resourceType))
+      }
       return []
     },
     // No existing USERS lease row, so the lease is created and the delta link
     // is absent. The visit therefore runs a full user collection, which is
     // part of the work it performs unconditionally.
     findUnique: async () => null,
-    updateMany: async (args: { data?: unknown }) => {
-      writes.push({ model: 'syncState', method: 'updateMany', data: args?.data })
+    updateMany: async (args: { data?: unknown; where?: unknown }) => {
+      writes.push({ model: 'syncState', method: 'updateMany', data: args?.data, where: args?.where })
       return { count: 1 }
     },
-    update: async (args: { data?: unknown }) => {
-      writes.push({ model: 'syncState', method: 'update', data: args?.data })
+    update: async (args: { data?: unknown; where?: unknown }) => {
+      writes.push({ model: 'syncState', method: 'update', data: args?.data, where: args?.where })
       return { id: 'state-1', consecutiveFailures: 1 }
     },
-    upsert: async (args: { create?: unknown; update?: unknown }) => {
-      writes.push({ model: 'syncState', method: 'upsert', data: args?.update ?? args?.create })
+    upsert: async (args: { create?: unknown; update?: unknown; where?: unknown }) => {
+      writes.push({ model: 'syncState', method: 'upsert', data: args?.update ?? args?.create, where: args?.where })
       return { id: 'state-1', consecutiveFailures: 1 }
     },
-    create: async (args: { data?: unknown }) => {
-      writes.push({ model: 'syncState', method: 'create', data: args?.data })
+    create: async (args: { data?: unknown; where?: unknown }) => {
+      writes.push({ model: 'syncState', method: 'create', data: args?.data, where: args?.where })
       return { id: 'state-1' }
     },
   }
@@ -119,6 +128,10 @@ function syntheticDatabase(states: SyntheticState[]) {
     get: (target, key: string) => {
       if (key in target) return target[key]
       if (key === 'syncState') return syncState
+      if (key === 'tenantDomain') return { findMany: async (args: unknown) => {
+        domainReads.push(args)
+        return [{ name: 'tenant.example' }]
+      } }
       if (key === 'then') return undefined
       if (!models.has(key)) models.set(key, syntheticModel(key, writes))
       return models.get(key)
@@ -126,7 +139,18 @@ function syntheticDatabase(states: SyntheticState[]) {
     set: (target, key: string, value: unknown) => { target[key] = value; return true },
     has: () => true,
   })
-  return { database: managedSyncTestDatabase(base as never, tenant() as never), writes }
+  const database = managedSyncTestDatabase(base as { tenantConnection: { update: (args: unknown) => Promise<unknown> } }, tenant())
+  const executeUtc = database.$executeRawUnsafe
+  // Synthetic snapshot transaction only; assert the exact existing lock call.
+  database.$executeRawUnsafe = async (sql: string, ...values: unknown[]) => {
+    if (sql === 'SELECT pg_advisory_xact_lock(hashtext($1))') {
+      assert.equal(values.length, 1)
+      assert.ok(String(values[0]).startsWith('hawkview:snapshot:tenant-1:'))
+      return 0
+    }
+    return executeUtc(sql)
+  }
+  return { database, writes, resourceReads, domainReads }
 }
 
 function graphPage(body: unknown = { value: [] }) {
@@ -143,7 +167,19 @@ async function runIncrementalVisit(
 ) {
   const originalFetch = globalThis.fetch
   const urls: string[] = []
-  const { database, writes } = syntheticDatabase(states)
+  const { database, writes, resourceReads, domainReads } = syntheticDatabase(states)
+  const dnsCalls: string[] = []
+  // Fully synthetic DNS for every visit, including the all-allowlist case.
+  // These are the only lookup methods used by the existing DNS collector.
+  const txt = mock.method(Resolver.prototype, 'resolveTxt', async (name: string) => {
+    dnsCalls.push(`TXT ${name}`)
+    return [[name.startsWith('_dmarc.') ? 'v=DMARC1; p=reject' : 'v=spf1 -all']]
+  })
+  const cname = mock.method(Resolver.prototype, 'resolveCname', async (name: string) => {
+    dnsCalls.push(`CNAME ${name}`)
+    return ['dkim.example']
+  })
+  const cancel = mock.method(Resolver.prototype, 'cancel', () => undefined)
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input)
     urls.push(url)
@@ -157,8 +193,8 @@ async function runIncrementalVisit(
       database as never,
       { getCapturedManagedAccessToken: managedSyncTestToken(tenant()) } as never,
       {} as never,
-      {} as never,
-      {} as never,
+      { resolveIncident: async () => undefined, publishIncident: async () => undefined } as never,
+      { buildSnapshotDifferenceEvidence: () => [] } as never,
       { syncTenant: async () => [] } as never,
     )
     ;(service as unknown as { logger: unknown }).logger = { log() {}, warn() {}, error() {} }
@@ -166,9 +202,12 @@ async function runIncrementalVisit(
     const result = await (service as unknown as {
       syncConnectedTenant: (t: unknown, b: boolean, o: unknown) => Promise<{ status: string }>
     }).syncConnectedTenant(tenant(), true, { incrementalOnly: true, includeBundle: false })
-    return { urls, writes, result }
+    return { urls, writes, result, resourceReads, domainReads, dnsCalls }
   } finally {
     globalThis.fetch = originalFetch
+    txt.mock.restore()
+    cname.mock.restore()
+    cancel.mock.restore()
   }
 }
 
@@ -206,7 +245,7 @@ test('a fresh resource is not collected, so the request above came from the hour
 })
 
 test('every allowlisted resource is reachable through the real module map', async () => {
-  const { urls } = await runIncrementalVisit(
+  const { urls, dnsCalls } = await runIncrementalVisit(
     HOURLY_INVENTORY_RESOURCES.map((resource) => healthy(resource, 2 * 60 * MINUTE)),
   )
   for (const fragment of [
@@ -216,6 +255,7 @@ test('every allowlisted resource is reachable through the real module map', asyn
   ]) {
     assert.equal(requested(urls, fragment), 1, `${fragment} must be requested exactly once`)
   }
+  assert.equal(dnsCalls.length, 4, 'DNS must also run once through its existing collector')
 })
 
 test('stale excluded resources are never collected by an incremental visit', async () => {
@@ -329,13 +369,55 @@ test('a failed resource waits for its existing retry delay and is not refreshed 
   assert.equal(requested(pastItsDelay.urls, ENDPOINT.conditionalAccess), 1)
 })
 
-test('the allowlist stays inside the set the dispatch query selects', async () => {
-  // The visit reads TARGETED_TRANSIENT_RETRY_RESOURCES only, so an allowlist
-  // member outside that set would never be dispatched at all.
-  for (const resource of HOURLY_INVENTORY_RESOURCES) {
-    assert.ok(
-      (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource),
-      `${resource} must be inside the dispatch query's resource set`,
-    )
+const writtenResource = (write: Write) =>
+  (write.where as { customerTenantId_resourceType?: { resourceType?: string } } | undefined)
+    ?.customerTenantId_resourceType?.resourceType
+
+test('hourly DNS is selected through the real resource filter before dispatch', async () => {
+  const { resourceReads, domainReads } = await runIncrementalVisit([healthy('DOMAIN_DNS_HEALTH', 61 * MINUTE)])
+  assert.equal(resourceReads.length, 1)
+  assert.ok(resourceReads[0]!.includes('DOMAIN_DNS_HEALTH'), 'dispatch query must include hourly-only DNS, independently of retry membership')
+  assert.equal(new Set(resourceReads[0]).size, resourceReads[0]!.length, 'union must be deduplicated')
+  assert.equal(domainReads.length, 1, 'existing DNS collector must read stored domains exactly once')
+  assert.deepEqual(domainReads[0], {
+    where: { organizationId: 'org-1', customerTenantId: 'tenant-1' },
+    orderBy: [{ isDefault: 'desc' }, { name: 'asc' }], select: { name: true }, take: 1001,
+  })
+})
+
+test('hourly DNS persists its real collector result once without advancing anchors', async () => {
+  const states = [healthy('DOMAIN_DNS_HEALTH', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
+  const before = structuredClone(states)
+  const { dnsCalls, writes, urls } = await runIncrementalVisit(states)
+  assert.deepEqual(dnsCalls.sort(), [
+    'TXT tenant.example', 'TXT _dmarc.tenant.example',
+    'CNAME selector1._domainkey.tenant.example', 'CNAME selector2._domainkey.tenant.example',
+  ].sort())
+  const snapshots = writes.filter(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) === 'DOMAIN_DNS_HEALTH')
+  assert.equal(snapshots.length, 1, 'snapshot write proves collector completion rather than merely invocation')
+  const payload = (snapshots[0]!.data as { payload: { domain: string; spf: { status: string }; dmarc: { status: string }; dkim: { status: string } }[] }).payload
+  assert.equal(payload.length, 1)
+  assert.equal(payload[0]!.domain, 'tenant.example')
+  assert.equal(payload[0]!.spf.status, 'healthy')
+  assert.equal(payload[0]!.dkim.status, 'healthy')
+  assert.equal(payload[0]!.dmarc.status, 'healthy')
+  const dnsStates = writes.filter(w => w.model === 'syncState' && writtenResource(w) === 'DOMAIN_DNS_HEALTH')
+  assert.deepEqual(dnsStates.map(w => (w.data as { status: string }).status), ['RUNNING', 'SUCCEEDED'])
+  assert.ok((dnsStates[1]!.data as { lastSuccessfulAt: Date }).lastSuccessfulAt instanceof Date)
+  assert.equal(writes.some(w => ['LICENSES', 'DOMAINS'].includes(writtenResource(w) ?? '')), false)
+  assert.deepEqual(states, before, 'fixture input clocks are not mutated')
+  assert.equal(writes.some(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) !== 'DOMAIN_DNS_HEALTH'), false)
+  for (const fragment of Object.values(ENDPOINT)) assert.equal(requested(urls, fragment), 0, fragment)
+  assert.ok(urls.some(url => /\/users/.test(url)), 'coupled users work remains')
+})
+
+test('fresh, failed or running DNS never dispatches through hourly or targeted retries', async () => {
+  for (const dns of [healthy('DOMAIN_DNS_HEALTH', 5 * MINUTE),
+    { ...healthy('DOMAIN_DNS_HEALTH', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('DOMAIN_DNS_HEALTH', 6 * 60 * MINUTE), status: 'FAILED', lastAttemptAt: new Date(Date.now() - 31 * MINUTE), lastErrorCode: 'MICROSOFT_TRANSIENT' }]) {
+    const { dnsCalls, domainReads, writes } = await runIncrementalVisit([dns])
+    assert.deepEqual(dnsCalls, [])
+    assert.deepEqual(domainReads, [])
+    assert.equal(writes.some(w => writtenResource(w) === 'DOMAIN_DNS_HEALTH'), false)
   }
 })

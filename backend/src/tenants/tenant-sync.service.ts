@@ -126,6 +126,7 @@ import {
   shouldRunHourlyInventoryRefresh,
   shouldRunTargetedTransientRetry,
   TARGETED_TRANSIENT_RETRY_RESOURCES,
+  HOURLY_INVENTORY_RESOURCES,
   TENANT_SYNC_LEASE_MS,
 } from './scheduled-sync-selection.js'
 import {
@@ -1956,12 +1957,12 @@ export class TenantSyncService {
   }
 
   /**
-   * Keep between-inventory retries explicit and cheap. Every entry here is a
+   * Keep between-inventory dispatch explicit. Every entry here is a
    * tenant-level collection protected by the existing USERS lease and the
-   * scheduler's exponential backoff; adding a resource to the selection list
+   * resource-specific hourly/retry predicates. Adding a resource to selection
    * without an execution mapping must never silently run unrelated work.
    */
-  private targetedTransientRetryModule(
+  private incrementalInventoryModule(
     tenant: TenantSyncTarget,
     accessToken: string,
     resourceType: string,
@@ -1970,6 +1971,7 @@ export class TenantSyncService {
       LICENSES: () => this.syncLicenses(tenant, accessToken),
       ORGANIZATION_CONFIGURATION: () => this.syncOrganizationConfiguration(tenant, accessToken),
       DOMAINS: () => this.syncDomains(tenant, accessToken),
+      DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant),
       GROUPS: () => this.syncGroups(tenant, accessToken),
       AUTH_METHOD_POLICIES: () => this.syncAuthenticationMethodPolicy(tenant, accessToken),
       CONDITIONAL_ACCESS: () => this.syncEntraCollection(
@@ -2201,21 +2203,15 @@ export class TenantSyncService {
           synchronize: () => this.syncM365AuditActivity(tenant, accessToken),
         },
       ]
-      // Retry only explicitly safe, non-per-user inventory resources between
-      // daily full collections, and refresh the healthy hourly-eligible subset
-      // of the same set. The USERS row claim above serializes this with other
-      // tenant syncs. Permission failures never enter this path.
-      //
-      // HOURLY_INVENTORY_RESOURCES is a strict subset of
-      // TARGETED_TRANSIENT_RETRY_RESOURCES, so this selection already covers
-      // both rules and needs no widening; `hourly-inventory-dispatch.test.ts`
-      // pins that subset relationship so a future allowlist edit cannot
-      // silently fall outside this query.
-      const targetedRetryStates = await this.prisma.syncState.findMany({
+      // Read the union for dispatch reachability; each resource still needs
+      // its own hourly or targeted-retry predicate. Hourly-only DNS must not
+      // gain targeted failure retries. The existing USERS claim serializes
+      // this work with other tenant syncs.
+      const incrementalInventoryStates = await this.prisma.syncState.findMany({
         where: {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
-          resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },
+          resourceType: { in: [...new Set([...TARGETED_TRANSIENT_RETRY_RESOURCES, ...HOURLY_INVENTORY_RESOURCES])] },
         },
         select: {
           resourceType: true,
@@ -2227,14 +2223,14 @@ export class TenantSyncService {
           consecutiveFailures: true,
         },
       })
-      for (const state of targetedRetryStates) {
+      for (const state of incrementalInventoryStates) {
         // Mutually exclusive by construction: the targeted rule requires
         // FAILED and the hourly rule excludes it, so a single state can never
         // contribute two modules to one visit.
         const due = shouldRunTargetedTransientRetry(state, now)
           || shouldRunHourlyInventoryRefresh(state, now)
         if (!due) continue
-        const module = this.targetedTransientRetryModule(
+        const module = this.incrementalInventoryModule(
           tenant,
           accessToken,
           state.resourceType,

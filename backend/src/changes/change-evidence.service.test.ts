@@ -1971,7 +1971,7 @@ test('targeted retry maps Named Locations to its exact tenant-level Graph collec
     status: 'ACTIVE', connection: { status: 'CONNECTED' },
   }
 
-  const module = (service as any).targetedTransientRetryModule(
+  const module = (service as any).incrementalInventoryModule(
     tenant,
     'graph-token',
     'NAMED_LOCATIONS',
@@ -1984,7 +1984,7 @@ test('targeted retry maps Named Locations to its exact tenant-level Graph collec
     token: 'graph-token',
   }])
   assert.equal(
-    (service as any).targetedTransientRetryModule(tenant, 'graph-token', 'USERS'),
+    (service as any).incrementalInventoryModule(tenant, 'graph-token', 'USERS'),
     null,
   )
 })
