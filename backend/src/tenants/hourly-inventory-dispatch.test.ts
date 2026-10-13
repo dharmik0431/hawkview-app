@@ -26,6 +26,7 @@ const ENDPOINT = {
   sharePointSettings: 'admin/sharepoint/settings',
   organization: 'v1.0/organization',
   secureScore: 'security/secureScores?$top=1',
+  riskyUsers: 'identityProtection/riskyUsers',
   // Excluded resources, asserted absent.
   licenses: 'subscribedSkus',
   directoryRoles: 'roleManagement/directory/roleAssignments',
@@ -257,7 +258,7 @@ test('every allowlisted resource is reachable through the real module map', asyn
   for (const fragment of [
     ENDPOINT.organization, ENDPOINT.authMethodPolicies, ENDPOINT.securityDefaults,
     ENDPOINT.sharePointSettings, ENDPOINT.conditionalAccess, ENDPOINT.authStrengths,
-    ENDPOINT.namedLocations, ENDPOINT.secureScore,
+    ENDPOINT.namedLocations, ENDPOINT.secureScore, ENDPOINT.riskyUsers,
   ]) {
     assert.equal(requested(urls, fragment), 1, `${fragment} must be requested exactly once`)
   }
@@ -275,7 +276,6 @@ test('stale excluded resources are never collected by an incremental visit', asy
     healthy('SERVICE_PRINCIPALS', stale),
     healthy('APPLICATIONS', stale),
     healthy('SHAREPOINT_SITES', stale),
-    healthy('RISKY_USERS', stale),
     healthy('EXCHANGE_MAILBOX_RULES', stale),
     healthy('EXCHANGE_MAILBOXES', stale),
     healthy('AUTH_REGISTRATIONS', stale),
@@ -469,4 +469,59 @@ test('fresh, failed, running or undated secure-score never dispatches hourly or 
     assert.equal(requested(urls, '/security/secureScores'), 0)
     assert.equal(writes.some(w => writtenResource(w) === 'SECURE_SCORES'), false)
   }
+})
+
+
+const RISK_URL = 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
+
+test('hourly risky users persist the existing paged collector without advancing anchors', async () => {
+  const states = [healthy('RISKY_USERS', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
+  const before = structuredClone(states)
+  const continuation = 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$skiptoken=synthetic'
+  const riskRows = [
+    { id: 'risk-1', userPrincipalName: 'first@example.invalid', riskLevel: 'medium', riskState: 'atRisk' },
+    { id: 'risk-2', userPrincipalName: 'second@example.invalid', riskLevel: 'low', riskState: 'remediated' },
+  ]
+  const { urls, writes, resourceReads, dnsCalls } = await runIncrementalVisit(states, url => {
+    if (url === RISK_URL) return graphPage({ value: [riskRows[0]], '@odata.nextLink': continuation })
+    if (url === continuation) return graphPage({ value: [riskRows[1]] })
+    return undefined
+  })
+  assert.ok(resourceReads[0]!.includes('RISKY_USERS'), 'actual filtered state read includes risk')
+  assert.deepEqual(urls.filter(url => url.includes('/identityProtection/riskyUsers')), [RISK_URL, continuation])
+  const snapshots = writes.filter(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) === 'RISKY_USERS')
+  assert.equal(snapshots.length, 1)
+  assert.deepEqual((snapshots[0]!.data as { payload: unknown }).payload, riskRows)
+  const riskStates = writes.filter(w => w.model === 'syncState' && writtenResource(w) === 'RISKY_USERS')
+  assert.deepEqual(riskStates.map(w => (w.data as { status: string }).status), ['RUNNING', 'SUCCEEDED'])
+  assert.ok((riskStates[1]!.data as { lastSuccessfulAt: Date }).lastSuccessfulAt instanceof Date)
+  assert.equal(writes.some(w => ['LICENSES', 'DOMAINS', 'DIRECTORY_ROLES'].includes(writtenResource(w) ?? '')), false)
+  assert.equal(writes.some(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) !== 'RISKY_USERS'), false)
+  assert.deepEqual(states, before)
+  assert.deepEqual(dnsCalls, [])
+  assert.ok(urls.some(url => /\/users/.test(url)), 'coupled users work remains')
+})
+
+test('risky users preserve blocked and undated dispatch controls', async () => {
+  for (const risk of [healthy('RISKY_USERS', 5 * MINUTE),
+    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: null },
+    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(NaN) },
+    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(Date.now() + 60 * MINUTE) },
+    ...['MICROSOFT_PERMISSION_REQUIRED', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_TRANSIENT'].map(lastErrorCode => ({
+      ...healthy('RISKY_USERS', 6 * 60 * MINUTE), status: 'FAILED', lastAttemptAt: new Date(Date.now() - 90 * MINUTE),
+      consecutiveFailures: 4, lastErrorCode,
+    }))]) {
+    const { urls, writes } = await runIncrementalVisit([risk])
+    assert.equal(requested(urls, ENDPOINT.riskyUsers), 0)
+    assert.equal(writes.some(w => writtenResource(w) === 'RISKY_USERS'), false)
+  }
+})
+
+test('risky users still retry once on an independently admitted visit after existing backoff', async () => {
+  const { urls } = await runIncrementalVisit([{
+    ...healthy('RISKY_USERS', 6 * 60 * MINUTE), status: 'FAILED',
+    lastAttemptAt: new Date(Date.now() - 16 * MINUTE), consecutiveFailures: 1, lastErrorCode: 'MICROSOFT_TRANSIENT',
+  }])
+  assert.equal(requested(urls, ENDPOINT.riskyUsers), 1)
 })

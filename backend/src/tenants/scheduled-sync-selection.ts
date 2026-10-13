@@ -59,13 +59,30 @@ const HEAVIER_RETRY_RESOURCES = new Set<string>([
 ])
 
 /**
+ * Preserve the original seven resources' early FAILED candidacy. This set is
+ * intentionally independent of healthy hourly coverage: adding a healthy
+ * resource must not move its failures from the broad 30-minute query into the
+ * 15-minute query. Keep changes to this failure policy explicit.
+ */
+const ORIGINAL_SEVEN_EARLY_RETRY_RESOURCES = [
+  SyncResourceType.ORGANIZATION_CONFIGURATION,
+  SyncResourceType.AUTH_METHOD_POLICIES,
+  SyncResourceType.SECURITY_DEFAULTS,
+  SyncResourceType.SHAREPOINT_SETTINGS,
+  SyncResourceType.CONDITIONAL_ACCESS,
+  SyncResourceType.AUTHENTICATION_STRENGTHS,
+  SyncResourceType.NAMED_LOCATIONS,
+] as const
+
+/**
  * Healthy-state hourly catch-up for the selected bounded inventory collectors.
  * The original seven use the targeted retry map; DNS uses the existing stored
  * domain collector and can change without a recognized Microsoft audit event.
  * Current secure scores reuse their bounded single-query collector.
+ * Risky users reuse their existing bounded paged collector and dispatch map.
  * Hourly dispatch does not itself grant targeted failure retry eligibility.
- * Anchors, heavier Graph collectors and held DIRECTORY_ROLES remain excluded.
- * RISKY_USERS retains its daily policy and larger collection bounds.
+ * Anchors, other bulk collectors and held DIRECTORY_ROLES remain excluded.
+ * RISKY_USERS retains its larger bounds and existing failure candidacy.
  */
 export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.ORGANIZATION_CONFIGURATION,
@@ -77,6 +94,7 @@ export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.NAMED_LOCATIONS,
   SyncResourceType.DOMAIN_DNS_HEALTH,
   SyncResourceType.SECURE_SCORES,
+  SyncResourceType.RISKY_USERS,
 ] as const
 
 /** Existing daily-pass datasets whose own clock must survive unrelated
@@ -183,7 +201,7 @@ export function targetedTransientRetryDelayMs(state: DailyInventoryState) {
  * of it, so a failure between the two was due and invisible.
  */
 export const HOURLY_INVENTORY_FIRST_RETRY_MS = targetedTransientRetryDelayMs({
-  resourceType: HOURLY_INVENTORY_RESOURCES[0],
+  resourceType: ORIGINAL_SEVEN_EARLY_RETRY_RESOURCES[0],
   status: SyncStateStatus.FAILED,
   lastAttemptAt: null,
   lastSuccessfulAt: null,
@@ -485,11 +503,10 @@ export function scheduledSyncTenantWhere(
         // counter passes here and is then refused by selection and dispatch.
         syncStates: {
           some: {
-            // Hourly-only resources must not acquire retry candidacy. The
-            // later pure selection is stricter, but coarse false positives
-            // can still consume slots in the capped candidate query.
-            resourceType: { in: HOURLY_INVENTORY_RESOURCES.filter((resource) =>
-              (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource)) },
+            // Preserve the original early-failure policy independently of
+            // healthy additions. Coarse false positives can consume slots
+            // even when the later pure retry predicate refuses the work.
+            resourceType: { in: [...ORIGINAL_SEVEN_EARLY_RETRY_RESOURCES] },
             status: SyncStateStatus.FAILED,
             lastErrorCode: { notIn: [...TARGETED_RETRY_EXCLUDED_ERROR_CODES] },
             lastAttemptAt: { lte: hourlyRetryBefore },

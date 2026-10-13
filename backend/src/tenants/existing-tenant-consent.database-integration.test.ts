@@ -557,13 +557,41 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null }, 'SECURE_SCORES')
   })
 
+  await t.test('risky users gain healthy hourly candidacy without moving failed-only query timing', async () => {
+    for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+      await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(age), lastAttemptAt: before(age), lastErrorCode: null }, 'RISKY_USERS')
+      const found = await candidateFound(workspace)
+      assert.equal(found.length, age >= HOUR ? 1 : 0)
+      const work = selectScheduledTenantWork(found, CLOCK, 1)
+      assert.equal(work.length, age >= HOUR ? 1 : 0)
+      if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+    }
+    for (const age of [15 * 60_000, 30 * 60_000, 30 * 60_000 + 1]) {
+      await setInventory(workspace, { status: 'FAILED', lastSuccessfulAt: before(48 * HOUR), lastAttemptAt: before(age), lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 1 }, 'RISKY_USERS')
+      const found = await candidateFound(workspace)
+      assert.equal(found.length, age > 30 * 60_000 ? 1 : 0, `failed risk age ${age}`)
+      const work = selectScheduledTenantWork(found, CLOCK, 1)
+      assert.equal(work.length, found.length)
+      if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+    }
+    await setInventory(workspace, { status: 'FAILED', lastSuccessfulAt: before(48 * HOUR), lastAttemptAt: before(90 * 60_000), lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 4 }, 'RISKY_USERS')
+    const backedOff = await candidateFound(workspace)
+    assert.equal(backedOff.length, 1)
+    assert.deepEqual(selectScheduledTenantWork(backedOff, CLOCK, 1), [])
+    for (const code of ['MICROSOFT_PERMISSION_REQUIRED', 'HAWKVIEW_CAPACITY_GUARD']) {
+      await setInventory(workspace, { lastErrorCode: code, consecutiveFailures: 1 }, 'RISKY_USERS')
+      assert.deepEqual(await candidateFound(workspace), [])
+    }
+    await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null, consecutiveFailures: 0 }, 'RISKY_USERS')
+  })
+
   await t.test('daily guard candidate and pure rule agree for every existing daily resource', async () => {
     for (const resource of DAILY_INVENTORY_RESOURCES) {
       for (const delta of [-1, 0, 1]) {
         await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(24 * HOUR + delta), lastAttemptAt: before(24 * HOUR + delta) }, resource)
         const found = await candidateFound(workspace)
-        // DNS and secure scores may already be hourly due; only the daily flag changes at 24h.
-        assert.equal(found.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES'].includes(resource) || delta >= 0 ? 1 : 0, `${resource}: ${delta}`)
+        // DNS, secure scores and risky users may already be hourly due; only the daily flag changes at 24h.
+        assert.equal(found.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES', 'RISKY_USERS'].includes(resource) || delta >= 0 ? 1 : 0, `${resource}: ${delta}`)
         if (found.length) assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, delta >= 0)
       }
       await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000) }, resource)
