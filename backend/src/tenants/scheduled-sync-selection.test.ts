@@ -338,7 +338,7 @@ test('anchors, heavy collectors and held resources are never hourly due however 
 test('DNS hourly catch-up does not grant targeted failure retry membership', () => {
   assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), true)
   assert.equal((TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), false)
-  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 9)
+  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 10)
 })
 
 test('healthy DNS alone selects incremental work at one hour, not one millisecond before', () => {
@@ -510,8 +510,9 @@ test('the selected resources become candidates at their own first-retry delay', 
   // was invisible whenever USERS and both anchors were fresh.
   assert.equal(HOURLY_INVENTORY_FIRST_RETRY_MS, 15 * 60 * 1000)
   // Derived from the formula, so it cannot drift from the deciding predicate.
-  const retryResources = HOURLY_INVENTORY_RESOURCES.filter(resource =>
-    (TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes(resource))
+  const retryResources = ['ORGANIZATION_CONFIGURATION', 'AUTH_METHOD_POLICIES',
+    'SECURITY_DEFAULTS', 'SHAREPOINT_SETTINGS', 'CONDITIONAL_ACCESS',
+    'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS']
   for (const resource of retryResources) {
     assert.equal(
       targetedTransientRetryDelayMs({
@@ -628,7 +629,7 @@ test('each daily dataset owns its inclusive daily boundary despite fresh anchors
       const old = new Date(now.getTime() - 24 * HOUR - delta)
       const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS'), state(resource, 'SUCCEEDED', old)]
       const result = selectScheduledTenantWork([{ id: resource, syncStates: states }], now, 10)
-      assert.equal(result.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES'].includes(resource) || delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
+      assert.equal(result.length, ['DOMAIN_DNS_HEALTH', 'SECURE_SCORES', 'RISKY_USERS'].includes(resource) || delta >= 0 ? 1 : 0, `${resource} boundary ${delta}`)
       if (result.length) assert.equal(result[0]!.fullInventoryDue, delta >= 0)
     }
   }
@@ -704,5 +705,48 @@ test('secure-score running, missing, invalid and future success never enters hou
     state('SECURE_SCORES', 'SUCCEEDED', new Date(NaN)),
     state('SECURE_SCORES', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
     assert.equal(shouldRunHourlyInventoryRefresh(score, now), false)
+  }
+})
+
+
+test('healthy risky users alone select incremental work at the inclusive hourly boundary', () => {
+  for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+    const risk = state('RISKY_USERS', 'SUCCEEDED', ago(age))
+    const states = [...dailyCoverage().filter(s => s.resourceType !== 'RISKY_USERS'),
+      state('USERS', 'SUCCEEDED', now), state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now), risk]
+    assert.equal(shouldRunHourlyInventoryRefresh(risk, now), age >= HOUR)
+    const work = selectScheduledTenantWork([{ id: 'risk-only', syncStates: states }], now, 1)
+    assert.equal(work.length, age >= HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+  }
+})
+
+test('risky users keep broad strict30minute candidacy apart from pure15minute retry', () => {
+  const failed = failedCandidacyBranches(now)
+  const early = failed.find(b => b.lastAttemptAt.lte !== undefined)!
+  const broad = failed.find(b => b.lastAttemptAt.lt !== undefined)!
+  assert.equal(early.resourceType.in.includes('RISKY_USERS'), false)
+  assert.equal(broad.resourceType.in.includes('RISKY_USERS'), true)
+  assert.equal(broad.lastAttemptAt.lt!.getTime(), now.getTime() - 30 * 60_000)
+  for (const age of [15 * 60_000 - 1, 15 * 60_000, 30 * 60_000, 30 * 60_000 + 1]) {
+    const risk = { ...state('RISKY_USERS', 'FAILED', ago(48 * HOUR), ago(age)),
+      lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 1 }
+    assert.equal(shouldRunHourlyInventoryRefresh(risk, now), false)
+    assert.equal(shouldRunTargetedTransientRetry(risk, now), age >= 15 * 60_000)
+  }
+  const backedOff = { ...state('RISKY_USERS', 'FAILED', ago(48 * HOUR), ago(90 * 60_000)),
+    lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 4 }
+  assert.equal(targetedTransientRetryDelayMs(backedOff), 2 * HOUR)
+  assert.equal(shouldRunTargetedTransientRetry(backedOff, now), false)
+  for (const lastErrorCode of ['MICROSOFT_PERMISSION_REQUIRED', 'HAWKVIEW_CAPACITY_GUARD']) {
+    assert.equal(shouldRunTargetedTransientRetry({ ...backedOff, consecutiveFailures: 1, lastErrorCode }, now), false)
+  }
+})
+
+test('risky users with running, missing, invalid or future success are never hourly due', () => {
+  for (const risk of [state('RISKY_USERS', 'RUNNING', ago(6 * HOUR)),
+    state('RISKY_USERS', 'SUCCEEDED', null), state('RISKY_USERS', 'SUCCEEDED', new Date(NaN)),
+    state('RISKY_USERS', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
+    assert.equal(shouldRunHourlyInventoryRefresh(risk, now), false)
   }
 })
