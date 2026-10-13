@@ -62,6 +62,7 @@ const HEAVIER_RETRY_RESOURCES = new Set<string>([
  * Healthy-state hourly catch-up for the selected bounded inventory collectors.
  * The original seven use the targeted retry map; DNS uses the existing stored
  * domain collector and can change without a recognized Microsoft audit event.
+ * Current secure scores reuse their bounded single-query collector.
  * Hourly dispatch does not itself grant targeted failure retry eligibility.
  * Anchors, heavier Graph collectors and held DIRECTORY_ROLES remain excluded.
  * RISKY_USERS retains its daily policy and larger collection bounds.
@@ -75,6 +76,7 @@ export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.AUTHENTICATION_STRENGTHS,
   SyncResourceType.NAMED_LOCATIONS,
   SyncResourceType.DOMAIN_DNS_HEALTH,
+  SyncResourceType.SECURE_SCORES,
 ] as const
 
 /** Existing daily-pass datasets whose own clock must survive unrelated
