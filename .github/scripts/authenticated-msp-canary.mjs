@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url'
+import { setTimeout as delay } from 'node:timers/promises'
 
 export const CANARY_AUDIENCE =
   'https://api.hawkviewapp.com/api/internal/canary/sessions'
@@ -7,6 +8,9 @@ const FULL_GIT_REVISION = /^[0-9a-f]{40}$/i
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+// Match the existing deployed-health readiness window; never retry authenticated work.
+const READINESS_ATTEMPTS = 6
+const READINESS_DELAY_MS = 10_000
 const IDENTITY_RISK_CURRENT_MAX_AGE_MS = 36 * 60 * 60 * 1_000
 const IDENTITY_RISK_MAX_FUTURE_SKEW_MS = 5 * 60 * 1_000
 const IDENTITY_RISK_API_VERSION = 1
@@ -766,22 +770,61 @@ async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
   )
 }
 
+const READINESS_REQUEST_FAILURES = new Map([
+  ['API health failed', 'transport'],
+  ['API health response was not JSON', 'media-type'],
+  ['API health response was not usable', 'body'],
+  ['API health returned an unexpected status', 'http-status'],
+])
+
+function healthReadiness(body, expectedRevision) {
+  const health = record(body)
+  if (!health) return { reason: 'shape', status: 'unavailable', revision: 'unavailable' }
+  const status = health.status === 'ok' ? 'ok'
+    : health.status === undefined ? 'absent'
+      : typeof health.status === 'string' ? 'not-ok' : 'invalid'
+  // Only a full SHA can be printed. Never echo arbitrary provider/body content.
+  const revision = health.revision === undefined ? 'absent'
+    : typeof health.revision === 'string' && health.revision.length === 40 && FULL_GIT_REVISION.test(health.revision)
+      ? health.revision : 'invalid'
+  const reason = status !== 'ok' ? 'status'
+    : health.revision !== expectedRevision ? 'revision' : null
+  return { reason, status, revision }
+}
+
+async function waitForExpectedRevision(fetchImpl, expectedRevision, sleep) {
+  let failure
+  for (let attempt = 1; attempt <= READINESS_ATTEMPTS; attempt += 1) {
+    try {
+      const { body } = await requestJson(fetchImpl, `${API_ORIGIN}/health`, {}, [200], 'API health')
+      failure = healthReadiness(body, expectedRevision)
+    } catch (error) {
+      failure = {
+        reason: READINESS_REQUEST_FAILURES.get(error instanceof Error ? error.message : '') ?? 'request',
+        status: 'unavailable',
+        revision: 'unavailable',
+      }
+    }
+    if (failure.reason === null) return
+    if (attempt < READINESS_ATTEMPTS) await sleep(READINESS_DELAY_MS)
+  }
+  throw new Error(
+    `API readiness failed after ${READINESS_ATTEMPTS} attempts: reason=${failure.reason}; ` +
+    `status=${failure.status}; revision=${failure.revision}; expected=${expectedRevision}`,
+  )
+}
+
 export async function runAuthenticatedCanary({
   fetchImpl = fetch,
   environment = process.env,
   now = Date.now,
+  sleep = delay,
 } = {}) {
   assert(Number.isFinite(now()), 'Canary clock was invalid')
   const revision = environment.EXPECTED_REVISION?.trim().toLowerCase() ?? ''
   assert(FULL_GIT_REVISION.test(revision), 'Expected deployment revision is invalid')
 
-  const health = (
-    await requestJson(fetchImpl, `${API_ORIGIN}/health`, {}, [200], 'API health')
-  ).body
-  assert(
-    record(health)?.status === 'ok' && record(health)?.revision === revision,
-    'The expected API revision is not live',
-  )
+  await waitForExpectedRevision(fetchImpl, revision, sleep)
   const database = (
     await requestJson(fetchImpl, `${API_ORIGIN}/health/database`, {}, [200], 'database health')
   ).body
