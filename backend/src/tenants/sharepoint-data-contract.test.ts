@@ -435,8 +435,8 @@ test('the real usage collector refuses an unexpected period before baseline save
   const originalFetch = globalThis.fetch
   globalThis.fetch = async (input) => new Response(
     String(input).includes('getSharePointSiteUsageDetail')
-      ? 'Report Refresh Date,Report Period\r\n2026-08-18,ALL'
-      : 'Report Refresh Date,Report Period\r\n2026-08-18,30',
+      ? 'Report Refresh Date,Report Period,Site Id\r\n2026-08-18,ALL,site'
+      : 'Report Refresh Date,Report Period,Site URL\r\n2026-08-18,30,https://example.test/site',
     { status: 200, headers: { 'content-type': 'text/csv' } },
   )
   try {
@@ -451,6 +451,86 @@ test('the real usage collector refuses an unexpected period before baseline save
     globalThis.fetch = originalFetch
   }
   assert.equal(saved, false)
+})
+
+test('usage collector preserves stored report and last success for invalid first or second response', async (t) => {
+  for (const invalidSource of ['sharePoint', 'oneDrive']) {
+    for (const invalidBody of ['', '<html>private-response-token</html>']) {
+      await t.test(`${invalidSource} rejects ${invalidBody ? 'HTML' : 'empty'} body`, async () => {
+        const tenant = { id: 'tenant-1', organizationId: 'org-1' }
+        const priorSuccess = new Date('2026-08-18T01:00:00.000Z')
+        const originalSnapshot = [{ previous: 'retained-report' }]
+        let snapshot: unknown = structuredClone(originalSnapshot)
+        let saves = 0
+        const state: Record<string, any> = { status: 'SUCCEEDED', lastSuccessfulAt: priorSuccess, consecutiveFailures: 0 }
+        const stateWrites: Array<Record<string, any>> = []
+        const prisma = { syncState: {
+          upsert: async ({ where, update }: any) => {
+            assert.deepEqual(where.customerTenantId_resourceType, { customerTenantId: tenant.id, resourceType: 'SHAREPOINT_USAGE' })
+            Object.assign(state, update)
+            return { ...state }
+          },
+          update: async ({ data }: any) => {
+            stateWrites.push(data)
+            Object.assign(state, data, { consecutiveFailures: data.consecutiveFailures?.increment
+              ? state.consecutiveFailures + data.consecutiveFailures.increment : data.consecutiveFailures })
+            return { ...state }
+          },
+        } }
+        const service = new TenantSyncService(prisma as never, {} as never, {} as never,
+          { resolveIncident: async () => undefined, publishIncident: async () => undefined } as never,
+          {} as never, {} as never)
+        ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: string, result: any) => {
+          saves += 1; snapshot = result.rows
+        }
+        const requests: string[] = []
+        ;(service as any).fetchGraphPage = async (url: string) => {
+          const source = url.includes('getSharePointSiteUsageDetail') ? 'sharePoint' : 'oneDrive'
+          assert.ok(url.includes(source === 'sharePoint' ? "period='D180'" : "period='D30'"))
+          requests.push(source)
+          return new Response(source === invalidSource ? invalidBody : [
+            'Report Refresh Date,Site URL,Report Period',
+            `2026-08-18,https://example.test/site,${source === 'sharePoint' ? '180' : '30'}`,
+          ].join('\r\n'), { headers: { 'content-type': 'text/csv' } })
+        }
+        const originalFetch = globalThis.fetch
+        globalThis.fetch = async () => { throw new Error('Unexpected live network call') }
+        try {
+          await assert.rejects(() => (service as any).syncSharePointUsage(tenant, 'synthetic-token'))
+        } finally { globalThis.fetch = originalFetch }
+        assert.deepEqual(requests, invalidSource === 'sharePoint' ? ['sharePoint'] : ['sharePoint', 'oneDrive'])
+        assert.equal(saves, 0) // Also preserves the existing no-intermediate-save ordering.
+        assert.deepEqual(snapshot, originalSnapshot)
+        assert.equal(state.status, 'FAILED')
+        assert.equal(state.lastSuccessfulAt, priorSuccess)
+        assert.ok(stateWrites.every((write) => !Object.hasOwn(write, 'lastSuccessfulAt')))
+        assert.equal(JSON.stringify(stateWrites).includes('private-response-token'), false)
+      })
+    }
+  }
+})
+
+test('usage collector retains header-only empty reports as partial and saves one envelope', async () => {
+  const service = new TenantSyncService({} as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+  const saved: any[] = []
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: string, result: any) => { saved.push(result) }
+  ;(service as any).fetchGraphPage = async (url: string) => new Response(
+    url.includes('getSharePointSiteUsageDetail')
+      ? 'Report Refresh Date,Site Id,Report Period\r\n'
+      : 'Report Refresh Date,Owner Principal Name,Report Period\r\n',
+    { headers: { 'content-type': 'text/csv' } },
+  )
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error('Unexpected live network call') }
+  try { await (service as any).syncSharePointUsage({ id: 'tenant-1', organizationId: 'org-1' }, 'synthetic-token') }
+  finally { globalThis.fetch = originalFetch }
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].completeness, 'authoritative_complete')
+  assert.deepEqual(saved[0].rows, buildMicrosoftUsageReportSnapshot([], []))
+  assert.deepEqual(inspectMicrosoftUsageProjectionEvidence(saved[0].rows), {
+    ...PARTIAL_SOURCE_EVIDENCE, sharePoint: PARTIAL_SOURCE_EVIDENCE, oneDrive: PARTIAL_SOURCE_EVIDENCE,
+  })
 })
 
 test('labels usage-report deleted rows as signals and never claims recoverability', () => {

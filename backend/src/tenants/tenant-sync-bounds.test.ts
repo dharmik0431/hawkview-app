@@ -648,16 +648,65 @@ test('SharePoint and OneDrive CSV projection preserves quoted UTF-8 newlines and
   assert.deepEqual(Object.keys(rows[0]!), [...MICROSOFT_USAGE_REPORT_CSV_FIELDS])
 })
 
+test('usage CSV rejects absent, unrecognizable, and ambiguous headers without returning response text', () => {
+  for (const source of ['sharePoint', 'oneDrive'] as const) {
+    for (const csv of [
+      '', '  \r\n\t', '\uFEFF', '<html>private-response-token</html>', 'private-response-token',
+      'Site URL,Report Period', 'Report Refresh Date,Site URL',
+      'Report Refresh Date,Report Period,Unknown',
+      'Report Refresh Date,Report Period,Site URL, Site URL ',
+      'Report Refresh Date,Report Period,Site URL,File Count,File Count',
+    ]) {
+      assert.throws(() => parseMicrosoftUsageReportCsv(csv, source), (error: unknown) => {
+        assert.ok(error instanceof Error)
+        assert.match(error.message, /invalid CSV headers/)
+        assert.equal(error.message.includes('private-response-token'), false)
+        return true
+      })
+    }
+  }
+})
+
+test('usage CSV recognizes source-specific identity headers and preserves valid empty reports', () => {
+  for (const source of ['sharePoint', 'oneDrive'] as const) {
+    for (const identity of ['Site Id', 'Site URL']) {
+      const header = `\uFEFFReport Period,Extra,${identity},Report Refresh Date`
+      assert.deepEqual(parseMicrosoftUsageReportCsv(header + '\r\n', source), [])
+      assert.deepEqual(parseMicrosoftUsageReportCsv(header + '\r\n180,ignored,site,2026-08-18', source), [{
+        'Report Period': '180', [identity]: 'site', 'Report Refresh Date': '2026-08-18',
+      }])
+    }
+  }
+  const ownerHeader = 'Report Refresh Date,Report Period,Owner Principal Name'
+  assert.deepEqual(parseMicrosoftUsageReportCsv(ownerHeader, 'oneDrive'), [])
+  assert.throws(() => parseMicrosoftUsageReportCsv(ownerHeader, 'sharePoint'), /invalid CSV headers/)
+  assert.deepEqual(parseMicrosoftUsageReportCsv(`${ownerHeader}\n2026-08-18,30,owner@example.test`, 'oneDrive'), [{
+    'Report Refresh Date': '2026-08-18', 'Report Period': '30', 'Owner Principal Name': 'owner@example.test',
+  }])
+  // The shared parser's mailbox caller retains its previous lenient header behavior.
+  assert.deepEqual(parseMailboxUsageCsv(''), [])
+  assert.deepEqual(parseMailboxUsageCsv('unknown'), [])
+  assert.deepEqual(parseMailboxUsageCsv('Item Count,Item Count\n1,2'), [{ 'Item Count': '2' }])
+})
+
 test('usage CSV byte, row, and column limits accept their exact boundary and reject plus one', () => {
-  assert.doesNotThrow(() => parseMicrosoftUsageReportCsv('x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES)))
-  assert.throws(() => parseMicrosoftUsageReportCsv('x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES + 1)), /response-size/)
-  const header = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, index) => index === 0 ? 'Site Id' : `h${index}`).join(',')
+  const minimalHeader = 'Site Id,Report Refresh Date,Report Period'
+  const exactBytes = `${minimalHeader}\n${'x'.repeat(MAILBOX_USAGE_CSV_MAX_BYTES - Buffer.byteLength(minimalHeader) - 1)}`
+  assert.equal(Buffer.byteLength(exactBytes), MAILBOX_USAGE_CSV_MAX_BYTES)
+  assert.doesNotThrow(() => parseMicrosoftUsageReportCsv(exactBytes))
+  assert.throws(() => parseMicrosoftUsageReportCsv(exactBytes + 'x'), /response-size/)
+  const required = minimalHeader.split(',')
+  const header = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, index) => required[index] ?? `h${index}`).join(',')
   const row = Array.from({ length: MAILBOX_USAGE_CSV_MAX_COLUMNS }, (_, index) => index === 0 ? 'site' : 'v').join(',')
+  assert.equal(header.split(',').length, MAILBOX_USAGE_CSV_MAX_COLUMNS)
+  assert.equal(row.split(',').length, MAILBOX_USAGE_CSV_MAX_COLUMNS)
   assert.doesNotThrow(() => parseMicrosoftUsageReportCsv(`${header}\n${row}`))
-  assert.throws(() => parseMicrosoftUsageReportCsv(`${header},extra\n${row},extra`), /row or column/)
-  const exactRows = ['Site Id', ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'site')].join('\n')
+  assert.throws(() => parseMicrosoftUsageReportCsv(`${header},extra\n${row}`), /row or column/)
+  assert.throws(() => parseMicrosoftUsageReportCsv(`${header}\n${row},extra`), /row or column/)
+  const exactRows = [minimalHeader, ...Array.from({ length: MAILBOX_USAGE_CSV_MAX_ROWS - 1 }, () => 'site,2026-08-18,180')].join('\n')
+  assert.equal(exactRows.split('\n').length, MAILBOX_USAGE_CSV_MAX_ROWS)
   assert.equal(parseMicrosoftUsageReportCsv(exactRows).length, MAILBOX_USAGE_CSV_MAX_ROWS - 1)
-  assert.throws(() => parseMicrosoftUsageReportCsv(`${exactRows}\nsite`), /row or column/)
+  assert.throws(() => parseMicrosoftUsageReportCsv(`${exactRows}\nsite,2026-08-18,180`), /row or column/)
 })
 
 test('usage report transport accepts the exact byte cap and preserves a stable error when plus-one cancellation throws', async () => {

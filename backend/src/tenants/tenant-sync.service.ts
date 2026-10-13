@@ -1220,6 +1220,7 @@ export function parseProjectedUsageCsv(
   csv: string,
   fields: ReadonlyArray<string>,
   label: string,
+  validateHeaders?: (headers: readonly string[]) => void,
 ): Record<string, string>[] {
   if (Buffer.byteLength(csv, 'utf8') > MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES) {
     throw new Error(`Microsoft ${label} usage report exceeded the bounded response-size limit.`)
@@ -1241,6 +1242,7 @@ export function parseProjectedUsageCsv(
     if (!row.some((value) => value.length > 0)) { row = []; return }
     if (!headers) {
       headers = row.map((value, index) => (index === 0 ? value.replace(/^\uFEFF/, '') : value).trim())
+      validateHeaders?.(headers)
       row = []
       return
     }
@@ -1271,6 +1273,7 @@ export function parseProjectedUsageCsv(
   }
   if (quoted) throw new Error(`Microsoft ${label} usage report returned invalid quoted CSV.`)
   if (field.length > 0 || row.length > 0) completeRow()
+  if (!headers) validateHeaders?.([])
   return result
 }
 
@@ -1278,8 +1281,27 @@ export function parseMailboxUsageCsv(csv: string): Record<string, string>[] {
   return parseProjectedUsageCsv(csv, MAILBOX_USAGE_CSV_FIELDS, 'mailbox')
 }
 
-export function parseMicrosoftUsageReportCsv(csv: string): Record<string, string>[] {
-  return parseProjectedUsageCsv(csv, MICROSOFT_USAGE_REPORT_CSV_FIELDS, 'SharePoint or OneDrive')
+export function parseMicrosoftUsageReportCsv(
+  csv: string,
+  source: 'sharePoint' | 'oneDrive' = 'sharePoint',
+): Record<string, string>[] {
+  return parseProjectedUsageCsv(csv, MICROSOFT_USAGE_REPORT_CSV_FIELDS, 'SharePoint or OneDrive', (headers) => {
+    const invalidHeader = () => new Error('Microsoft SharePoint or OneDrive usage report returned invalid CSV headers.')
+    const names = new Set(headers)
+    const hasIdentity = names.has('Site Id') || names.has('Site URL') ||
+      (source === 'oneDrive' && names.has('Owner Principal Name'))
+    if (!names.has('Report Refresh Date') || !names.has('Report Period') || !hasIdentity) {
+      throw invalidHeader()
+    }
+    const selected = new Set<string>()
+    for (const header of headers) {
+      if (!MICROSOFT_USAGE_REPORT_CSV_FIELDS.includes(header)) continue
+      if (selected.has(header)) throw invalidHeader()
+      selected.add(header)
+    }
+    // Recognizable header-only reports retain the existing empty/PARTIAL contract.
+    // Unrecognizable bodies must fail before they can replace a stored snapshot.
+  })
 }
 
 export function assertGraphCollectionBounds(input: {
@@ -5573,11 +5595,11 @@ export class TenantSyncService {
       const sharePointUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getSharePointSiteUsageDetail(period='D180')",
           'SharePoint'
-        ))
+        ), 'sharePoint')
       const oneDriveUsage = parseMicrosoftUsageReportCsv(await downloadReport(
           "https://graph.microsoft.com/v1.0/reports/getOneDriveUsageAccountDetail(period='D30')",
           'OneDrive'
-        ))
+        ), 'oneDrive')
       const payload = buildMicrosoftUsageReportSnapshot(
         sharePointUsage,
         oneDriveUsage,
