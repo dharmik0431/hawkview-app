@@ -12,7 +12,7 @@ const ROLE = 'eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee'
 const DEFINITION = 'ffffffff-ffff-4fff-ffff-ffffffffffff'
 const UNKNOWN = '00000000-0000-4000-8000-000000000099'
 
-async function bundle(tenantId: string, name: string, conflicts = false) {
+async function bundle(tenantId: string, name: string, conflicts = false, omitAssignmentEvidence = false) {
   const org = `org-${tenantId}`
   const tenant = { id: tenantId, organizationId: org, microsoftTenantId: '11111111-1111-4111-8111-111111111111',
     displayName: 'Synthetic tenant', primaryDomain: 'example.invalid', status: 'CONNECTED',
@@ -33,7 +33,8 @@ async function bundle(tenantId: string, name: string, conflicts = false) {
     conditions: { users, applications: { includeApplications: ['All', APP, SP, UNKNOWN] } },
     grantControls: { builtInControls: ['mfa'] } })
   const payloads = {
-    SERVICE_PRINCIPALS: [{ id: SP, appId: APP, displayName: 'Service application', appRoleAssignedTo: assigned }],
+    SERVICE_PRINCIPALS: [{ id: SP, appId: APP, displayName: 'Service application',
+      ...(omitAssignmentEvidence ? {} : { appRoleAssignedTo: assigned }) }],
     APPLICATIONS: [{ id: 'registration', owners: [{ id: USER }, { id: SP }, { id: UNKNOWN },
       { id: USER, displayName: 'Observed owner name' }] }],
     DIRECTORY_ROLES: [{ principalId: USER, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } }],
@@ -89,6 +90,10 @@ test('real authorized bundle resolves labels while preserving CA IDs, kinds, and
   assert.deepEqual(app.assignedUsers, ['Alice', UNKNOWN, GROUP, 'Observed assignment name'])
   assert.deepEqual(app.assignedGroups, ['Operations'])
   assert.deepEqual(app.assignedServicePrincipals, ['Service application'])
+  assert.equal(app.publisher, 'Not reported')
+  assert.equal(app.verifiedPublisher, null)
+  assert.equal(app.delegatedGrants, null)
+  assert.equal(app.applicationPermissions, null)
   assert.deepEqual(result.entra.appRegistrations[0].owners, ['Alice', 'Service application', UNKNOWN, 'Observed owner name'])
 
   // Exercise the real frontend resolver using the actual service-produced bundle, not an invented bundle shape.
@@ -102,6 +107,18 @@ test('real authorized bundle resolves labels while preserving CA IDs, kinds, and
   assert.equal(exports.storedPrincipalName(names, SP), 'Service application')
   assert.equal(exports.storedPrincipalName(names, APP), null)
   assert.equal(exports.storedPrincipalNames(result, 'tenant-B').size, 0)
+})
+
+test('real bundle keeps omitted service-principal assignments and grants unreported', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const result = await bundle('tenant-A', 'Alice', false, true)
+  const app = result.entra.enterpriseApplications[0]
+  assert.equal(app.assignedUsers, null)
+  assert.equal(app.assignedGroups, null)
+  assert.equal(app.assignedServicePrincipals, null)
+  assert.equal(app.delegatedGrants, null)
+  assert.equal(app.applicationPermissions, null)
 })
 
 test('separate tenant invocations never share names; conflicting stored identities remain unresolved', async t => {

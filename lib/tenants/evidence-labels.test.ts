@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  enterpriseAppEnabled,
   licenseAuditOutcome,
   reportedText,
+  reportedYesNo,
   sharePointDomainRestriction,
   sharePointStorageLimitMode,
 } from './evidence-labels.ts'
@@ -37,4 +39,13 @@ test('SharePoint settings do not infer an open posture from missing values', () 
 test('blank provider labels remain unreported rather than inheriting a favorable default', () => {
   assert.equal(reportedText(' ', 'Status not reported'), 'Status not reported')
   assert.equal(reportedText('Granted by admin', 'Not reported'), 'Granted by admin')
+})
+
+test('enterprise application account state remains unknown without an explicit field', () => {
+  assert.equal(enterpriseAppEnabled(undefined, undefined), null)
+  assert.equal(enterpriseAppEnabled(undefined, 'Disabled'), false)
+  assert.equal(enterpriseAppEnabled(false, 'Enabled'), false)
+  assert.equal(enterpriseAppEnabled(undefined, 'Enabled'), true)
+  assert.equal(reportedYesNo(undefined), 'Not reported')
+  assert.equal(reportedYesNo(false), 'No')
 })

@@ -7344,10 +7344,10 @@ export class TenantSyncService {
             publisher:
               principal.verifiedPublisher?.displayName ??
               principal.publisherName ??
-              'Publisher not verified',
-            verifiedPublisher: Boolean(
-              principal.verifiedPublisher?.verifiedPublisherId
-            ),
+              'Not reported',
+            verifiedPublisher: principal.verifiedPublisher == null
+              ? null
+              : Boolean(principal.verifiedPublisher.verifiedPublisherId),
             servicePrincipalType: principal.servicePrincipalType,
             accountEnabled: principal.accountEnabled,
             appRoleAssignmentRequired: principal.appRoleAssignmentRequired,
@@ -7364,7 +7364,7 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('User', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
+              : null,
             assignedGroups: Array.isArray(principal.appRoleAssignedTo)
               ? principal.appRoleAssignedTo
                   .filter(
@@ -7374,7 +7374,7 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('Group', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
+              : null,
             assignedServicePrincipals: Array.isArray(
               principal.appRoleAssignedTo
             )
@@ -7387,9 +7387,11 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('ServicePrincipal', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
-            delegatedGrants: [],
-            applicationPermissions: [],
+              : null,
+            // These grants are not collected by the service-principal snapshot.
+            // An empty array would claim an observed absence of permissions.
+            delegatedGrants: null,
+            applicationPermissions: null,
           })),
           appRegistrations: applications.map((application) => {
             const now = Date.now()
