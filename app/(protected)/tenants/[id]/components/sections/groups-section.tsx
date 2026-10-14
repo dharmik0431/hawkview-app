@@ -83,11 +83,13 @@ function normalizeLabels(value: unknown): string[] | undefined {
 }
 
 export default function GroupsSection({ bundle }: GroupsSectionProps) {
-  // Extract real group data from API bundle
+  const hasCanonicalGroups = Array.isArray(bundle?.entra?.groups)
+  const hasSuccessfulCollection = Boolean(bundle?.sync?.groups?.lastSuccessfulAt)
+  const latestCollectionFailed = bundle?.sync?.groups?.outcomeProjection?.recordedOutcome?.kind === 'FAILED'
+  const hasVerifiedInventory = hasCanonicalGroups && hasSuccessfulCollection
+  // The Exchange list is a mail-enabled subset, not this directory inventory.
   const rawGroups = useMemo<GroupItem[]>(() => {
     if (Array.isArray(bundle?.entra?.groups)) return bundle.entra.groups
-    if (Array.isArray(bundle?.exchange?.groups)) return bundle.exchange.groups
-    if (Array.isArray(bundle?.groups)) return bundle.groups
     return []
   }, [bundle])
 
@@ -198,19 +200,26 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
     setTimeout(() => setCopiedId(null), 2000)
   }
 
-  const isSynchronized =
-    bundle?.sync?.groups?.status === 'succeeded' || rawGroups.length > 0
-
   return (
     <div className="mt-5 space-y-5">
-      <DatasetEmptyState evidence={groupsAge(bundle)} isEmpty={rawGroups.length === 0} />
+      <DatasetEmptyState evidence={groupsAge(bundle)} isEmpty={hasCanonicalGroups && rawGroups.length === 0} />
+      {hasVerifiedInventory && latestCollectionFailed ? (
+        <p role="status" className="text-xs text-amber-700 dark:text-amber-400">
+          Last reported stored group inventory · latest refresh failed.
+        </p>
+      ) : null}
+      {hasCanonicalGroups && !hasSuccessfulCollection && rawGroups.length > 0 ? (
+        <p role="status" className="text-xs text-amber-700 dark:text-amber-400">
+          Stored group rows are available, but no successful collection is recorded. Inventory totals are withheld{latestCollectionFailed ? '; the latest refresh failed' : ''}.
+        </p>
+      ) : null}
       {/* Summary Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
         <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs">
           <CardContent className="p-3.5">
-            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Total Groups</div>
+            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Stored groups</div>
             <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.total : '—'}
+              {hasVerifiedInventory ? summary.total : '—'}
             </div>
           </CardContent>
         </Card>
@@ -219,7 +228,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Security</div>
             <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.security : '—'}
+              {hasVerifiedInventory ? summary.security : '—'}
             </div>
           </CardContent>
         </Card>
@@ -228,7 +237,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Microsoft 365</div>
             <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.m365 : '—'}
+              {hasVerifiedInventory ? summary.m365 : '—'}
             </div>
           </CardContent>
         </Card>
@@ -237,7 +246,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Distribution</div>
             <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.distribution : '—'}
+              {hasVerifiedInventory ? summary.distribution : '—'}
             </div>
           </CardContent>
         </Card>
@@ -246,7 +255,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Dynamic</div>
             <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.dynamic : '—'}
+              {hasVerifiedInventory ? summary.dynamic : '—'}
             </div>
           </CardContent>
         </Card>
@@ -302,22 +311,34 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
             </div>
 
             <div className="text-xs text-slate-500 dark:text-slate-400">
-              Showing <span className="font-semibold text-slate-900 dark:text-white">{filteredGroups.length}</span> of {normalizedGroups.length} groups
+              Showing <span className="font-semibold text-slate-900 dark:text-white">{filteredGroups.length}</span> of {normalizedGroups.length} stored group rows
             </div>
           </div>
 
           {/* Table */}
-          {!isSynchronized ? (
+          {!hasCanonicalGroups ? (
             <div className="p-8 text-center space-y-2">
               <Info className="mx-auto h-8 w-8 text-slate-400" />
-              <div className="text-sm font-semibold text-slate-900 dark:text-white">Group inventory is awaiting collection</div>
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">Directory group inventory unavailable in this response</div>
               <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
-                No synchronized group records were found in the current tenant API response. Backend Microsoft Graph group synchronization is required to populate this inventory.
+                The mail-enabled Exchange subset cannot establish the full stored Entra group inventory.
               </p>
+            </div>
+          ) : rawGroups.length === 0 && !hasSuccessfulCollection ? (
+            <div className="p-8 text-center space-y-2">
+              <Info className="mx-auto h-8 w-8 text-slate-400" />
+              <div className="text-sm font-semibold text-slate-900 dark:text-white">No successful group inventory is recorded</div>
+              <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                The stored response contains no group rows, but that does not verify an empty tenant inventory{latestCollectionFailed ? '; the latest refresh failed' : ''}.
+              </p>
+            </div>
+          ) : rawGroups.length === 0 ? (
+            <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">
+              No group rows were stored in the last successful inventory{latestCollectionFailed ? '; the latest refresh failed' : ''}.
             </div>
           ) : filteredGroups.length === 0 ? (
             <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">
-              No groups match the current search or filter criteria.
+              No stored groups match the current search or filter criteria.
             </div>
           ) : (
             <div className="overflow-x-auto">
