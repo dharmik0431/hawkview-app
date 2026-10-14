@@ -84,7 +84,6 @@ interface LicensesSectionProps {
   syncCompleted?: boolean
   tenant?: any
   bundle?: any
-  domains?: string[] | any[]
   securityDefaultsEvidence?: PilotEvidenceView['securityDefaults'] | null
 }
 
@@ -95,7 +94,6 @@ export default function LicensesSection({
   syncCompleted: syncCompletedProp,
   tenant,
   bundle,
-  domains = [],
   securityDefaultsEvidence,
 }: LicensesSectionProps) {
   const syncCompleted =
@@ -163,73 +161,28 @@ export default function LicensesSection({
     return 'Awaiting collection'
   }, [bundle, isMicrosoft, securityDefaultsEvidence, tenant, syncCompleted])
 
-  // (c) Tenant Domains (verified count & total count)
+  // (c) Microsoft-verified domains are a separate collection from licences and DNS.
   const domainMetrics = useMemo(() => {
-    const domainList: any[] =
-      Array.isArray(domains) && domains.length > 0
-        ? domains
-        : Array.isArray(bundle?.domains) && bundle.domains.length > 0
-          ? bundle.domains
-          : Array.isArray(tenant?.domains) && tenant.domains.length > 0
-            ? tenant.domains
-            : tenant?.domain
-              ? [tenant.domain]
-              : []
-
-    if (!syncCompleted && domainList.length === 0) {
+    if (!bundle?.sync?.domains?.lastSuccessfulAt) {
       return {
-        text: 'Awaiting collection',
-        verified: 0,
-        total: 0,
-        isSynced: false,
+        text: 'Awaiting domain collection',
+        detail: 'No successful Microsoft domain collection recorded',
       }
     }
-
-    const total = domainList.length
-    let verified = 0
-
-    domainList.forEach((d: any) => {
-      if (typeof d === 'object' && d !== null) {
-        if (
-          d.isVerified === true ||
-          d.verified === true ||
-          d.status === 'verified' ||
-          d.isInitial === true
-        ) {
-          verified++
-        } else if (d.isVerified === false || d.verified === false) {
-          // unverified
-        } else {
-          verified++
-        }
-      } else if (typeof d === 'string') {
-        const dLower = d.toLowerCase()
-        const dnsEntry =
-          bundle?.dns?.byDomain?.[dLower] || bundle?.dns?.byDomain?.[d]
-        if (dnsEntry) {
-          if (dnsEntry.status === 'healthy' || dnsEntry.isVerified === true) {
-            verified++
-          } else if (
-            dnsEntry.status === 'failed' ||
-            dnsEntry.isVerified === false
-          ) {
-            // not verified
-          } else {
-            verified++
-          }
-        } else {
-          verified++
-        }
-      }
-    })
-
+    // The DOMAINS collector stores organization.verifiedDomains. It does not
+    // collect the full /domains inventory, so an unverified denominator cannot
+    // be inferred from this list (or from a separate DNS health check).
+    if (!Array.isArray(bundle?.tenant?.domains)) {
+      return { text: 'Not reported', detail: 'Verified-domain list unavailable from the last collection' }
+    }
+    const total = bundle.tenant.domains.filter(
+      (domain: unknown) => typeof domain === 'string' && domain.trim().length > 0
+    ).length
     return {
-      text: `${verified} verified of ${total}`,
-      verified,
-      total,
-      isSynced: true,
+      text: total === 0 ? 'No verified domains reported' : `${total} verified domain${total === 1 ? '' : 's'} reported`,
+      detail: 'From the last successful Microsoft domain collection',
     }
-  }, [domains, bundle, tenant, syncCompleted])
+  }, [bundle?.sync?.domains?.lastSuccessfulAt, bundle?.tenant?.domains])
 
   // Filtered rows
   const filteredRows = useMemo(() => {
@@ -582,14 +535,10 @@ export default function LicensesSection({
             <Globe className="h-4 w-4 text-slate-400" />
           </div>
           <div className="mt-2 text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
-            {domainMetrics.isSynced ? domainMetrics.text : 'Awaiting collection'}
+            {domainMetrics.text}
           </div>
           <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            {domainMetrics.isSynced
-              ? `${domainMetrics.total} total synchronized domain${
-                  domainMetrics.total === 1 ? '' : 's'
-                }`
-              : 'Awaiting domain synchronization'}
+            {domainMetrics.detail}
           </div>
         </div>
       </div>
