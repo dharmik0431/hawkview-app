@@ -23,6 +23,9 @@ function dateLabel(value: unknown): string | null {
 }
 
 export function tenantConnectionBadge(tenant: Pick<Tenant, 'status' | 'connectionStatus'>): CollectionBadge {
+  if (tenant.status === 'suspended') {
+    return { label: 'Suspended', detail: 'This tenant is suspended; a past connection does not establish current collection.', tone: 'attention' }
+  }
   if (tenant.status === 'disconnected' || tenant.connectionStatus === 'revoked') {
     return { label: 'Disconnected', detail: 'Tenant-wide Microsoft access is reported disconnected or revoked. Earlier collected data may still be visible.', tone: 'attention' }
   }
@@ -31,9 +34,6 @@ export function tenantConnectionBadge(tenant: Pick<Tenant, 'status' | 'connectio
   }
   if (tenant.status === 'pending' || tenant.connectionStatus === 'pending-consent') {
     return { label: 'Setup pending', detail: 'Tenant-wide Microsoft connection setup or consent has not completed.', tone: 'neutral' }
-  }
-  if (tenant.status === 'suspended') {
-    return { label: 'Suspended', detail: 'This tenant is suspended; a past connection does not establish current collection.', tone: 'attention' }
   }
   if (tenant.status === 'active' && tenant.connectionStatus === 'connected') {
     return { label: 'Connected', detail: 'The tenant-wide Microsoft connection is reported connected. Each service collection is shown separately below.', tone: 'ok' }

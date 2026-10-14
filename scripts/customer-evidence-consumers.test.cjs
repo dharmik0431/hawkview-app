@@ -71,7 +71,7 @@ for(const compact of [true,false])for(const [name,value,selected,label]of servic
   assert.match(pill.getAttribute('aria-label'),new RegExp(key===selected?label:'Status unavailable'))
  }
  assert.match(doc.body.textContent,/Connection: (Disconnected|Connected)/)
- assert.doesNotMatch(doc.body.textContent,/No issue|\bhealthy\b|all clear|PRIVATE_DIAGNOSTIC/)
+ assert.doesNotMatch(doc.body.textContent+' '+[...doc.querySelectorAll('[title]')].map(e=>e.title).join(' '),/No issue|\bis healthy\b|\bhealthy tenant\b|all clear|PRIVATE_DIAGNOSTIC/)
 }))
 for(const [name,value,expected]of [
  ['connected',{status:'active',connectionStatus:'connected'},'Connected'],
@@ -79,6 +79,8 @@ for(const [name,value,expected]of [
  ['error',{status:'active',connectionStatus:'error'},'Needs attention'],
  ['pending',{status:'pending',connectionStatus:'pending-consent'},'Setup pending'],
  ['suspended',{status:'suspended',connectionStatus:'connected'},'Suspended'],
+ ['suspended-pending',{status:'suspended',connectionStatus:'pending-consent'},'Suspended'],
+ ['suspended-error',{status:'suspended',connectionStatus:'error'},'Suspended'],
  ['unknown',{status:'active',connectionStatus:null},'Not verified'],
 ])test('tenant connection '+name,()=>assert.equal(tenantConnectionBadge(value).label,expected))
 for(const [name,attention,expected]of [
