@@ -419,7 +419,7 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
   const setInventory = async (
     workspace: { organizationId: string; tenantId: string },
     data: Record<string, unknown>,
-    resourceType: typeof DAILY_INVENTORY_RESOURCES[number] | 'EXCHANGE_MAILBOX_CONFIGURATION' | 'CONDITIONAL_ACCESS' | 'LICENSES' = 'CONDITIONAL_ACCESS',
+    resourceType: typeof DAILY_INVENTORY_RESOURCES[number] | 'EXCHANGE_MAILBOX_CONFIGURATION' | 'CONDITIONAL_ACCESS' | 'LICENSES' | 'DOMAINS' = 'CONDITIONAL_ACCESS',
   ) => {
     await prisma.syncState.upsert({
       where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType } },
@@ -508,17 +508,46 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     assert.equal(pastItsDelay.selected[0]!.fullInventoryDue, false)
   })
 
-  await t.test('an excluded resource at the same staleness is not a candidate', async () => {
-    // Put CONDITIONAL_ACCESS back inside the boundary so only the anchor is old.
+  await t.test('each healthy anchor is hourly eligible at its own inclusive boundary', async () => {
+    // Restore both anchors before the later DNS, score and risk controls: an old
+    // LICENSES row would otherwise make their negative arms pass for the wrong reason.
     await setInventory(workspace, {
       status: 'SUCCEEDED', lastSuccessfulAt: before(HOUR - 1), lastAttemptAt: before(HOUR - 1),
     })
-    // LICENSES is an anchor: two hours of age must not make it due, because the
-    // daily interval governs it.
-    await setInventory(workspace, {
-      status: 'SUCCEEDED', lastSuccessfulAt: before(2 * HOUR), lastAttemptAt: before(2 * HOUR),
-    }, 'LICENSES')
-    assert.deepEqual(await candidateFound(workspace), [])
+    for (const resourceType of ['LICENSES', 'DOMAINS'] as const) {
+      for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+        await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(age), lastAttemptAt: before(age), lastErrorCode: null }, resourceType)
+        const found = await candidateFound(workspace)
+        assert.equal(found.length, age >= HOUR ? 1 : 0, `${resourceType}: ${age}`)
+        const work = selectScheduledTenantWork(found, CLOCK, 1)
+        assert.equal(work.length, age >= HOUR ? 1 : 0)
+        if (work.length) {
+          assert.equal(work[0]!.fullInventoryDue, false)
+          assert.equal(work[0]!.dueAt.getTime(), before(age).getTime())
+        }
+      }
+      await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null }, resourceType)
+    }
+  })
+
+  await t.test('an overdue independent daily dataset survives fresh hourly anchors', async () => {
+    await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(24 * HOUR + 1), lastAttemptAt: before(24 * HOUR + 1) }, 'GROUPS')
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]!.fullInventoryDue, true)
+    await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000) }, 'GROUPS')
+  })
+
+  await t.test('failed anchors retain the one-hour full-pass branch', async () => {
+    for (const resourceType of ['LICENSES', 'DOMAINS'] as const) {
+      for (const age of [HOUR - 1, HOUR]) {
+        await setInventory(workspace, { status: 'FAILED', lastSuccessfulAt: before(3 * HOUR), lastAttemptAt: before(age), lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 1 }, resourceType)
+        const found = await candidateFound(workspace)
+        assert.equal(found.length, 1, `${resourceType} retains existing broad failed candidacy`)
+        assert.equal(selectScheduledTenantWork(found, CLOCK, 1)[0]?.fullInventoryDue, age >= HOUR)
+      }
+      await setInventory(workspace, { status: 'SUCCEEDED', lastSuccessfulAt: before(60_000), lastAttemptAt: before(60_000), lastErrorCode: null, consecutiveFailures: 0 }, resourceType)
+    }
   })
 
   await t.test('DNS alone is hourly eligible at the exact boundary and retains its daily failure policy', async () => {

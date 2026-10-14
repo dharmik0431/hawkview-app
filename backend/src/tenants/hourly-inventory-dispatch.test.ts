@@ -24,11 +24,12 @@ const ENDPOINT = {
   authStrengths: 'policies/authenticationStrengthPolicies',
   securityDefaults: 'identitySecurityDefaultsEnforcementPolicy',
   sharePointSettings: 'admin/sharepoint/settings',
-  organization: 'v1.0/organization',
+  organization: 'organization?$select=id,displayName',
   secureScore: 'security/secureScores?$top=1',
   riskyUsers: 'identityProtection/riskyUsers',
-  // Excluded resources, asserted absent.
   licenses: 'subscribedSkus',
+  domains: 'organization?$select=displayName,verifiedDomains',
+  // Excluded resources, asserted absent.
   directoryRoles: 'roleManagement/directory/roleAssignments',
 } as const
 
@@ -132,10 +133,14 @@ function syntheticDatabase(states: SyntheticState[]) {
     get: (target, key: string) => {
       if (key in target) return target[key]
       if (key === 'syncState') return syncState
-      if (key === 'tenantDomain') return { findMany: async (args: unknown) => {
-        domainReads.push(args)
-        return [{ name: 'tenant.example' }]
-      } }
+      if (key === 'tenantDomain') return new Proxy(syntheticModel('tenantDomain', writes), {
+        get: (model, method: string) => method === 'findMany'
+          ? async (args: unknown) => {
+            domainReads.push(args)
+            return [{ name: 'tenant.example' }]
+          }
+          : Reflect.get(model, method),
+      })
       if (key === 'then') return undefined
       if (!models.has(key)) models.set(key, syntheticModel(key, writes))
       return models.get(key)
@@ -259,17 +264,60 @@ test('every allowlisted resource is reachable through the real module map', asyn
     ENDPOINT.organization, ENDPOINT.authMethodPolicies, ENDPOINT.securityDefaults,
     ENDPOINT.sharePointSettings, ENDPOINT.conditionalAccess, ENDPOINT.authStrengths,
     ENDPOINT.namedLocations, ENDPOINT.secureScore, ENDPOINT.riskyUsers,
+    ENDPOINT.licenses, ENDPOINT.domains,
   ]) {
     assert.equal(requested(urls, fragment), 1, `${fragment} must be requested exactly once`)
   }
   assert.equal(dnsCalls.length, 4, 'DNS must also run once through its existing collector')
 })
 
+test('healthy hourly anchors run their existing bounded collectors and persist recognized rows', async () => {
+  const states = [healthy('LICENSES', 61 * MINUTE), healthy('DOMAINS', 61 * MINUTE)]
+  const before = structuredClone(states)
+  const license = { skuId: 'sku-a', skuPartNumber: 'SYNTHETIC', consumedUnits: 2,
+    prepaidUnits: { enabled: 10 }, servicePlans: [] }
+  const domains = [{ name: 'new.example', isDefault: true, isInitial: false }]
+  const { urls, writes, resourceReads, dnsCalls } = await runIncrementalVisit(states, url => {
+    if (url.endsWith('/subscribedSkus')) return graphPage({ value: [license] })
+    if (url.endsWith('/organization?$select=displayName,verifiedDomains')) {
+      return graphPage({ value: [{ displayName: 'Synthetic Tenant', verifiedDomains: domains }] })
+    }
+    return undefined
+  })
+  assert.ok(resourceReads[0]!.includes('LICENSES') && resourceReads[0]!.includes('DOMAINS'))
+  assert.equal(requested(urls, ENDPOINT.licenses), 1)
+  assert.equal(requested(urls, ENDPOINT.domains), 1)
+  assert.ok(writes.some(w => w.model === 'tenantLicense' && w.method === 'upsert'))
+  assert.ok(writes.some(w => w.model === 'tenantDomain' && w.method === 'upsert'))
+  assert.ok(writes.some(w => w.model === 'customerTenant' && w.method === 'update'))
+  for (const resource of ['LICENSES', 'DOMAINS']) {
+    assert.deepEqual(writes.filter(w => w.model === 'syncState' && writtenResource(w) === resource)
+      .map(w => (w.data as { status: string }).status), ['RUNNING', 'SUCCEEDED'])
+    assert.equal(writes.filter(w => w.model === 'tenantEntraSnapshot' && writtenResource(w) === resource).length, 1)
+  }
+  assert.equal(writes.some(w => writtenResource(w) === 'DIRECTORY_ROLES'), false)
+  assert.deepEqual(dnsCalls, [], 'DNS has its own clock and is not bundled into anchor dispatch')
+  assert.ok(urls.some(url => /\/users/.test(url)), 'normal coupled user work remains')
+  assert.deepEqual(states, before)
+})
+
+test('fresh, running, undated and authorization-failed anchors do not use healthy hourly dispatch', async () => {
+  for (const resource of ['LICENSES', 'DOMAINS']) {
+    for (const row of [healthy(resource, 5 * MINUTE),
+      { ...healthy(resource, 2 * 60 * MINUTE), status: 'RUNNING' },
+      { ...healthy(resource, 2 * 60 * MINUTE), lastSuccessfulAt: null },
+      { ...healthy(resource, 2 * 60 * MINUTE), lastSuccessfulAt: new Date(Date.now() + 60 * MINUTE) },
+      { ...healthy(resource, 2 * 60 * MINUTE), status: 'FAILED', lastErrorCode: 'MICROSOFT_PERMISSION_REQUIRED' }]) {
+      const { urls, writes } = await runIncrementalVisit([row])
+      assert.equal(requested(urls, resource === 'LICENSES' ? ENDPOINT.licenses : ENDPOINT.domains), 0)
+      assert.equal(writes.some(w => writtenResource(w) === resource), false)
+    }
+  }
+})
+
 test('stale excluded resources are never collected by an incremental visit', async () => {
   const stale = 30 * 24 * 60 * MINUTE
   const { urls } = await runIncrementalVisit([
-    healthy('LICENSES', stale),
-    healthy('DOMAINS', stale),
     healthy('DIRECTORY_ROLES', stale),
     healthy('GROUPS', stale),
     healthy('DEVICES', stale),
@@ -280,7 +328,6 @@ test('stale excluded resources are never collected by an incremental visit', asy
     healthy('EXCHANGE_MAILBOXES', stale),
     healthy('AUTH_REGISTRATIONS', stale),
   ])
-  assert.equal(requested(urls, ENDPOINT.licenses), 0)
   assert.equal(requested(urls, ENDPOINT.directoryRoles), 0)
   assert.equal(requested(urls, 'riskyUsers'), 0)
   assert.equal(requested(urls, 'mailboxSettings'), 0)
@@ -288,7 +335,6 @@ test('stale excluded resources are never collected by an incremental visit', asy
   assert.equal(requested(urls, '/devices'), 0)
   assert.equal(requested(urls, '/servicePrincipals'), 0)
   assert.equal(requested(urls, '/applications'), 0)
-  // The anchors are refreshed by the daily pass, which this visit is not.
   assert.equal(requested(urls, ENDPOINT.conditionalAccess), 0)
 })
 
@@ -391,6 +437,7 @@ test('hourly DNS is selected through the real resource filter before dispatch', 
 })
 
 test('hourly DNS persists its real collector result once without advancing anchors', async () => {
+  // Five-minute anchors are fresh, so this case isolates DOMAIN_DNS_HEALTH hourly dispatch.
   const states = [healthy('DOMAIN_DNS_HEALTH', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
   const before = structuredClone(states)
   const { dnsCalls, writes, urls } = await runIncrementalVisit(states)
@@ -436,6 +483,7 @@ test('hourly secure-score reaches the real resource-state query independently of
 })
 
 test('hourly secure-score persists the existing current-score collector once without advancing anchors', async () => {
+  // Five-minute anchors are fresh, so this case isolates SECURE_SCORES hourly dispatch.
   const states = [healthy('SECURE_SCORES', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
   const before = structuredClone(states)
   const { urls, writes, dnsCalls, domainReads } = await runIncrementalVisit(states, url =>
@@ -475,6 +523,7 @@ test('fresh, failed, running or undated secure-score never dispatches hourly or 
 const RISK_URL = 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
 
 test('hourly risky users persist the existing paged collector without advancing anchors', async () => {
+  // Five-minute anchors are fresh, so this case isolates RISKY_USERS hourly dispatch.
   const states = [healthy('RISKY_USERS', 61 * MINUTE), healthy('LICENSES', 5 * MINUTE), healthy('DOMAINS', 5 * MINUTE)]
   const before = structuredClone(states)
   const continuation = 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$skiptoken=synthetic'
