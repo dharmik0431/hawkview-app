@@ -243,12 +243,15 @@ test('production Prisma connections and email runner preserve exact instants ove
     await Promise.all([prisma.$connect(), peer.$connect()])
     const positive = '2026-01-15T12:34:56.789+05:30'
     const negative = '2026-07-15T12:34:56.789-07:00'
-    const projection = `SELECT current_setting('TimeZone') AS zone,
+    // Sample the volatile clock once. Two separate clock_timestamp() calls can
+    // straddle a millisecond boundary and fail an otherwise correct equality.
+    const projection = `WITH sampled_clock AS MATERIALIZED (SELECT clock_timestamp() AS instant)
+      SELECT current_setting('TimeZone') AS zone,
       floor(extract(epoch FROM $1::timestamptz) * 1000)::bigint::text AS positive_ms,
       floor(extract(epoch FROM $2::timestamptz) * 1000)::bigint::text AS negative_ms,
       $1::timestamptz AS positive_instant, $2::timestamptz AS negative_instant,
-      floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint::text AS clock_ms,
-      clock_timestamp() AS clock_instant`
+      floor(extract(epoch FROM sampled_clock.instant) * 1000)::bigint::text AS clock_ms,
+      sampled_clock.instant AS clock_instant FROM sampled_clock`
     type Projection = {
       zone: string; positive_ms: string; negative_ms: string
       positive_instant: Date; negative_instant: Date; clock_ms: string; clock_instant: Date
