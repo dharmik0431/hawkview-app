@@ -59,10 +59,15 @@ export function serviceCollectionBadge(syncFreshness: unknown, key: CollectionSe
   const failed = typeof service.failedCollectors === 'number' && service.failedCollectors > 0
 
   if (status === 'UNKNOWN' && service.expectedCollectors === 0) {
-    if (typeof service.notLicensedCollectors === 'number' && service.notLicensedCollectors > 0) {
+    const notLicensed = typeof service.notLicensedCollectors === 'number' && service.notLicensedCollectors > 0
+    const unsupported = typeof service.unsupportedCollectors === 'number' && service.unsupportedCollectors > 0
+    if (notLicensed && unsupported) {
+      return { label: 'Not eligible', detail: 'Reported licensing and support limits exclude all collectors in this service. This is not a tenant-wide connection failure.', tone: 'neutral' }
+    }
+    if (notLicensed) {
       return { label: 'Not licensed', detail: 'No collector in this service is currently eligible under the reported Microsoft licensing. This is not a tenant-wide connection failure.', tone: 'neutral' }
     }
-    if (typeof service.unsupportedCollectors === 'number' && service.unsupportedCollectors > 0) {
+    if (unsupported) {
       return { label: 'Unsupported', detail: 'No collector in this service is supported for this tenant. This is not a tenant-wide connection failure.', tone: 'neutral' }
     }
   }
@@ -70,9 +75,9 @@ export function serviceCollectionBadge(syncFreshness: unknown, key: CollectionSe
   if (status === 'RUNNING') return { label: 'Syncing', detail: `A collection is running; displayed data may be from before it started.${lastDetail}`, tone: 'neutral' }
   if (status === 'FAILED' && permissionRequired && !failed) return { label: 'Access needed', detail: `At least one service collector needs Microsoft permission.${lastDetail} This does not establish a tenant-wide connection failure.`, tone: 'attention' }
   if (status === 'FAILED') return { label: 'Collection failed', detail: `A service collection attempt failed.${lastDetail} This does not by itself establish a tenant-wide connection failure.`, tone: 'attention' }
-  if (status === 'STALE' || freshness === 'STALE') return { label: 'Stale', detail: `Some service data is older than its collection window.${lastDetail}${counts}`, tone: 'attention' }
   if (status === 'PARTIAL' && permissionRequired) return { label: 'Partial · access needed', detail: `Collection is partial and at least one service collector needs Microsoft permission.${lastDetail}${counts} This does not establish a tenant-wide connection failure.`, tone: 'attention' }
   if (status === 'PARTIAL') return { label: 'Partial', detail: `Some service collectors have not completed successfully.${lastDetail}${counts} Inspect collection details for the cause.`, tone: 'attention' }
+  if (status === 'STALE' || freshness === 'STALE') return { label: 'Stale', detail: `Some service data is older than its collection window.${lastDetail}${counts}`, tone: 'attention' }
   if (status === 'NOT_COLLECTED') return { label: 'Not collected', detail: 'No collector state was recorded for this service. This is not an empty or healthy result.', tone: 'neutral' }
   if (status === 'PENDING') return { label: 'Pending', detail: 'Service collection has not completed. This is not an empty or healthy result.', tone: 'neutral' }
   if (status === 'SUCCESS' && last) {

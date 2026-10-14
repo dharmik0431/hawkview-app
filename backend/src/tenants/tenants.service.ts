@@ -397,7 +397,11 @@ export class TenantsService {
       .filter((key) => !['LICENSE_APPLICABILITY', 'PERMISSION_GRANT'].includes(key))
     const notApplicableResourceTypes = readinessResourceTypes('NOT_LICENSED')
     const unsupportedResourceTypes = readinessResourceTypes('UNSUPPORTED')
-    const syncFreshness = deriveTenantSyncFreshness(tenant.syncStates, new Date(), [...notApplicableResourceTypes, ...unsupportedResourceTypes])
+    const syncFreshness = deriveTenantSyncFreshness(
+      tenant.syncStates, new Date(),
+      [...notApplicableResourceTypes, ...unsupportedResourceTypes],
+      { notLicensed: notApplicableResourceTypes, unsupported: unsupportedResourceTypes },
+    )
     const health = deriveTenantHealth({
       tenantId: tenant.id,
       effectiveStatus,

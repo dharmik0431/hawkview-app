@@ -214,8 +214,14 @@ function oldestIso(dates: Array<Date | null | undefined>) {
   return iso(oldest)
 }
 
-function buildService(definition: ServiceDefinition, states: Map<string, PersistedSyncState>, now: Date): ServiceSyncFreshness {
-  const rows = definition.collectors.map((collector) => ({ collector, state: states.get(collector) }))
+function buildService(
+  definition: ServiceDefinition,
+  states: Map<string, PersistedSyncState>,
+  now: Date,
+  excluded: { notLicensed: ReadonlySet<string>; unsupported: ReadonlySet<string>; all: ReadonlySet<string> },
+): ServiceSyncFreshness {
+  const rows = definition.collectors.filter((collector) => !excluded.all.has(collector))
+    .map((collector) => ({ collector, state: states.get(collector) }))
   const classifications = rows.map(({ collector, state }) => collectorStatus(collector, state, now))
   const successfulCollectors = classifications.filter((status) => status === 'SUCCESS' || status === 'EMPTY').length
   // A failed collector can still have usable data from an earlier successful
@@ -225,9 +231,11 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
   const permissionRequiredCollectors = classifications.filter((status) => status === 'PERMISSION_REQUIRED').length
   const pendingCollectors = classifications.filter((status) => status === 'PENDING' || status === 'RUNNING' || status === 'NOT_CONFIGURED').length
   const staleCollectors = classifications.filter((status) => status === 'STALE').length
-  const unsupportedCollectors = classifications.filter((status) => status === 'UNSUPPORTED').length
-  const notLicensedCollectors = classifications.filter((status) => status === 'NOT_LICENSED').length
-  const expectedCollectors = definition.collectors.length - unsupportedCollectors - notLicensedCollectors
+  // Excluded collectors never enter classifications. Count their reported
+  // readiness reasons against the original registry before removing them.
+  const unsupportedCollectors = definition.collectors.filter((collector) => excluded.all.has(collector) && excluded.unsupported.has(collector) && !excluded.notLicensed.has(collector)).length
+  const notLicensedCollectors = definition.collectors.filter((collector) => excluded.all.has(collector) && excluded.notLicensed.has(collector)).length
+  const expectedCollectors = definition.collectors.filter((collector) => !excluded.all.has(collector)).length
   const successfulDates = rows.map(({ state }) => state?.lastSuccessfulAt)
   const lastSuccessfulCollectionAt = latestIso(successfulDates)
   const oldestSuccessful = oldestIso(successfulDates)
@@ -297,10 +305,20 @@ function buildService(definition: ServiceDefinition, states: Map<string, Persist
   }
 }
 
-export function deriveTenantSyncFreshness(syncStates: PersistedSyncState[], now = new Date(), excludedCollectors: readonly string[] = []): TenantSyncFreshness {
+export function deriveTenantSyncFreshness(
+  syncStates: PersistedSyncState[],
+  now = new Date(),
+  excludedCollectors: readonly string[] = [],
+  excludedReasons: { notLicensed?: readonly string[]; unsupported?: readonly string[] } = {},
+): TenantSyncFreshness {
   const states = new Map(syncStates.map((state) => [state.resourceType, state]))
   const excluded = new Set(excludedCollectors)
-  const serviceEntries = SERVICE_COLLECTOR_REGISTRY.map((definition) => [definition.key, buildService({ ...definition, collectors: definition.collectors.filter((collector) => !excluded.has(collector)) }, states, now)] as const)
+  const reasons = {
+    notLicensed: new Set(excludedReasons.notLicensed ?? []),
+    unsupported: new Set(excludedReasons.unsupported ?? []),
+    all: excluded,
+  }
+  const serviceEntries = SERVICE_COLLECTOR_REGISTRY.map((definition) => [definition.key, buildService(definition, states, now, reasons)] as const)
   const services = Object.fromEntries(serviceEntries) as TenantSyncFreshness['services']
   return {
     modelVersion: SERVICE_SYNC_FRESHNESS_VERSION,

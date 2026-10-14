@@ -17,6 +17,7 @@ function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.
  const p=name.startsWith('@/')?path.join(root,name.slice(2)):path.resolve(path.dirname(file),name);return load([p,p+'.tsx',p+'.ts'].find(fs.existsSync))},ex);return ex}
 const prov=load(root+'/backend/src/tenants/attention-provenance.ts')
 const {TenantServiceCollection}=load(root+'/components/tenants/tenant-service-collection.tsx')
+const {tenantConnectionBadge}=load(root+'/lib/tenants/service-collection-status.ts')
 const {TenantRiskMatrixDrawer}=load(root+'/components/dashboard/tenant-risk-matrix-drawer.tsx')
 const {TenantOverview}=load(root+'/app/(protected)/tenants/[id]/components/tenant-overview.tsx')
 const {deriveTenantWorkspaceDisplay}=load(root+'/lib/tenant-workspace-state.ts')
@@ -40,7 +41,7 @@ async function mount(name,element,check){
  }
 }
 const snapshot=(key,status,freshness='CURRENT',last=at)=>({services:{[key]:{
- status,freshnessStatus:freshness,lastSuccessfulCollectionAt:last,successfulCollectors:1,expectedCollectors:2,
+ status,freshnessStatus:freshness,lastSuccessfulCollectionAt:last,successfulCollectors:status==='SUCCESS'?2:1,expectedCollectors:2,
 }}})
 const serviceCases=[
  ['missing',tenant,null,'Status unavailable'],
@@ -51,8 +52,12 @@ const serviceCases=[
  ['failed',{...tenant,syncFreshness:snapshot('sharePointOneDrive','FAILED')},'sharePointOneDrive','Collection failed'],
  ['permission',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','FAILED').services.exchange,permissionRequiredCollectors:1,failedCollectors:0}}}},'exchange','Access needed'],
  ['partial-permission',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','PARTIAL').services.exchange,permissionRequiredCollectors:1,failedCollectors:0}}}},'exchange','Partial · access needed'],
- ['not-licensed',{...tenant,syncFreshness:{services:{office365:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:2}}}},'office365','Not licensed'],
- ['unsupported',{...tenant,syncFreshness:{services:{auditLogs:{status:'UNKNOWN',expectedCollectors:0,unsupportedCollectors:1}}}},'auditLogs','Unsupported'],
+ ['partial-permission-stale',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','PARTIAL','STALE').services.exchange,permissionRequiredCollectors:1,pendingCollectors:1}}}},'exchange','Partial · access needed'],
+ ['partial-pending-stale',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','PARTIAL','STALE').services.exchange,pendingCollectors:1}}}},'exchange','Partial'],
+ ['not-licensed',{...tenant,syncFreshness:{services:{sharePointOneDrive:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:3,unsupportedCollectors:0}}}},'sharePointOneDrive','Not licensed'],
+ ['unsupported',{...tenant,syncFreshness:{services:{auditLogs:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:0,unsupportedCollectors:2}}}},'auditLogs','Unsupported'],
+ ['mixed-eligibility',{...tenant,syncFreshness:{services:{auditLogs:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:1,unsupportedCollectors:1}}}},'auditLogs','Not eligible'],
+ ['excluded-reason-missing',{...tenant,syncFreshness:{services:{auditLogs:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:0,unsupportedCollectors:0}}}},'auditLogs','Status unavailable'],
  ['stale',{...tenant,syncFreshness:snapshot('office365','STALE','STALE')},'office365','Stale'],
  ['not-collected',{...tenant,syncFreshness:snapshot('signInLogs','NOT_COLLECTED','NEVER_SYNCED',null)},'signInLogs','Not collected'],
  ['pending',{...tenant,syncFreshness:snapshot('auditLogs','PENDING','NEVER_SYNCED',null)},'auditLogs','Pending'],
@@ -66,8 +71,16 @@ for(const compact of [true,false])for(const [name,value,selected,label]of servic
   assert.match(pill.getAttribute('aria-label'),new RegExp(key===selected?label:'Status unavailable'))
  }
  assert.match(doc.body.textContent,/Connection: (Disconnected|Connected)/)
- assert.doesNotMatch(doc.body.textContent+' '+[...doc.querySelectorAll('[title]')].map(e=>e.title).join(' '),/No issue|all clear|PRIVATE_DIAGNOSTIC/)
+ assert.doesNotMatch(doc.body.textContent,/No issue|\bhealthy\b|all clear|PRIVATE_DIAGNOSTIC/)
 }))
+for(const [name,value,expected]of [
+ ['connected',{status:'active',connectionStatus:'connected'},'Connected'],
+ ['revoked',{status:'active',connectionStatus:'revoked'},'Disconnected'],
+ ['error',{status:'active',connectionStatus:'error'},'Needs attention'],
+ ['pending',{status:'pending',connectionStatus:'pending-consent'},'Setup pending'],
+ ['suspended',{status:'suspended',connectionStatus:'connected'},'Suspended'],
+ ['unknown',{status:'active',connectionStatus:null},'Not verified'],
+])test('tenant connection '+name,()=>assert.equal(tenantConnectionBadge(value).label,expected))
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],
  ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Finding total unavailable/],
