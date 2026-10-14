@@ -42,13 +42,20 @@ test('application list and detail do not classify missing audience, owner, crede
   const root = createRoot(document.getElementById('root'))
   try {
     await React.act(async () => root.render(h(exports.default, {
-      bundle: { entra: { appRegistrations: [{ id: 'registration-1', displayName: 'Example registration' }] } },
+      bundle: { entra: { appRegistrations: [
+        { id: 'registration-1', displayName: 'Example registration' },
+        { id: 'registration-2', displayName: 'Personal-only registration', signInAudience: 'PersonalMicrosoftAccount' },
+      ] } },
     })))
     const row = document.querySelector('tbody tr')
     assert.ok(row)
     assert.match(row.textContent ?? '', /Example registration/)
     assert.match(row.textContent ?? '', /Not reported/)
     assert.doesNotMatch(row.textContent ?? '', /Single tenant|None/)
+    const personalRow = Array.from(document.querySelectorAll('tbody tr')).find((item) => item.textContent?.includes('Personal-only registration'))
+    assert.ok(personalRow)
+    assert.match(personalRow.textContent ?? '', /Personal accounts/)
+    assert.match(document.body.textContent ?? '', /1 personal-only/)
     await React.act(async () => row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))
     const detail = document.querySelector('.fixed.inset-0')
     assert.ok(detail)

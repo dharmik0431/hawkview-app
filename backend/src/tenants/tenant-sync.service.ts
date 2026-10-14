@@ -7434,8 +7434,7 @@ export class TenantSyncService {
               application.requiredResourceAccess
             ) && application.requiredResourceAccess.every((resource: any) => Array.isArray(resource.resourceAccess))
               ? application.requiredResourceAccess.flatMap((resource: any) =>
-                  Array.isArray(resource.resourceAccess)
-                    ? resource.resourceAccess.map((permission: any) => {
+                  resource.resourceAccess.map((permission: any) => {
                         const resourceApi = resourceApiByAppId.get(
                           String(resource.resourceAppId ?? '').toLowerCase()
                         )
@@ -7454,7 +7453,6 @@ export class TenantSyncService {
                           scopeOrRole: permissionName,
                         }
                       })
-                    : []
                 )
               : null
             return {

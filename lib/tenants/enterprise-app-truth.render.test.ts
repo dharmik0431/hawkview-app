@@ -43,7 +43,8 @@ test('enterprise app list does not invent publisher, enabled state, or assignmen
   }))
   const doc = new JSDOM(html).window.document
   assert.match(doc.body.textContent ?? '', /1 app status not reported/)
-  assert.match(doc.body.textContent ?? '', /1 publisher classification not reported/)
+  assert.match(doc.body.textContent ?? '', /1 publisher names not reported/)
+  assert.doesNotMatch(doc.body.textContent ?? '', /Microsoft Apps|Third-party|All Publishers/)
   const row = doc.querySelector('tbody tr')
   assert.ok(row)
   assert.match(row.textContent ?? '', /Example app/)

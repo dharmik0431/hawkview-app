@@ -45,12 +45,13 @@ test('group list and detail leave unreported source state unclassified', async (
   const root = createRoot(document.getElementById('root'))
   try {
     await React.act(async () => root.render(h(exports.default, {
-      bundle: { entra: { groups: [{ id: 'group-1', displayName: 'Example group', type: 'Security', owners: null, onPremisesSyncEnabled: null }] } },
+      bundle: { entra: { groups: [{ id: 'group-1', displayName: 'Example group', type: 'Dynamic security', owners: null, onPremisesSyncEnabled: null }] } },
     })))
     const row = document.querySelector('tbody tr')
     assert.ok(row)
     assert.match(row.textContent ?? '', /Example group/)
     assert.match(row.textContent ?? '', /Not reported/)
+    assert.equal(row.querySelector('td:nth-child(3)')?.textContent?.trim(), 'Not reported')
     assert.match(row.textContent ?? '', /Stored record/)
     assert.doesNotMatch(row.textContent ?? '', /Synced/)
     await React.act(async () => row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))

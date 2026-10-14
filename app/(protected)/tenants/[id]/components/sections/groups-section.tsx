@@ -124,7 +124,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
         typeLabel = rawType || 'Unknown'
       }
 
-      const membership = g.membershipType || (lower.includes('dynamic') ? 'Dynamic' : 'Not reported')
+      const membership = g.membershipType || 'Not reported'
       const members = normalizeLabels(g.members)
       const owners = normalizeLabels(g.owners)
       const membersCount = typeof g.membersCount === 'number'
