@@ -155,7 +155,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
   // Summary counts
   const summary = useMemo(() => {
     const total = normalizedGroups.length
-    const security = normalizedGroups.filter(g => g.typeLabel.includes('Security') || g.typeLabel === 'Mail-enabled security').length
+    const security = normalizedGroups.filter(g => g.typeLabel.toLowerCase().includes('security')).length
     const m365 = normalizedGroups.filter(g => g.typeLabel.includes('Microsoft 365')).length
     const distribution = normalizedGroups.filter(g => g.typeLabel === 'Distribution list').length
     const dynamic = normalizedGroups.filter(g => g.typeLabel.toLowerCase().includes('dynamic') || g.membership.toLowerCase() === 'dynamic').length

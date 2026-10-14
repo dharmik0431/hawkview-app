@@ -110,7 +110,7 @@ function tile(section: HTMLElement, label: string) {
 test('canonical stored groups with successful collection populate total and non-total tiles', async () => {
   await mounted(bundle([security, dynamic]), (section) => {
     assert.match(tile(section, 'Stored groups'), /2$/)
-    assert.match(tile(section, 'Security'), /1$/)
+    assert.match(tile(section, 'Security'), /2$/)
     assert.match(tile(section, 'Dynamic'), /1$/)
     assert.match(section.textContent ?? '', /Stored security group/)
     assert.match(section.textContent ?? '', /Stored dynamic group/)
