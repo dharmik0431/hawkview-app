@@ -127,6 +127,16 @@ function formatSignInTime(dateStr: string) {
   }
 }
 
+function collectionEvidence(sync: any) {
+  const observed = Boolean(sync?.lastSuccessfulAt)
+  const latestFailed = sync?.outcomeProjection?.recordedOutcome?.kind === 'FAILED'
+  return {
+    observed,
+    supported: observed && !latestFailed,
+    reason: latestFailed ? 'latest attempt failed' : !observed ? 'not reported' : null,
+  }
+}
+
 export default function EntraOverviewSection({
   tenant,
   bundle,
@@ -140,7 +150,12 @@ export default function EntraOverviewSection({
   onNavigateTab,
 }: EntraOverviewSectionProps) {
   // DIRECTORY DATA CALCULATIONS
-  const usersSynchronized = Array.isArray(bundle?.users) || users.length > 0
+  const usersCollection = collectionEvidence(bundle?.sync?.users)
+  const authMethodsCollection = collectionEvidence(bundle?.sync?.authMethodPolicies)
+  const authRegistrationsCollection = collectionEvidence(bundle?.sync?.authRegistrations)
+  const namedLocationsCollection = collectionEvidence(bundle?.sync?.namedLocations)
+  const signInsCollection = collectionEvidence(bundle?.sync?.signIns)
+  const usersSynchronized = usersCollection.observed
   const totalUsers = usersSynchronized ? users.length : null
   const enabledUsers = usersSynchronized
     ? users.filter((u) => u.status === 'Enabled').length
@@ -187,25 +202,29 @@ export default function EntraOverviewSection({
     [conditionalAccessEvidence, caPolicies]
   )
 
-  const authMethodsSynchronized =
-    Array.isArray(bundle?.entra?.authMethods) &&
-    bundle?.entra?.authMethods.length > 0
-
-  const namedLocationsSynchronized =
-    Array.isArray(bundle?.entra?.namedLocations) || namedLocations.length > 0
+  const authMethodsSynchronized = authMethodsCollection.observed
+  const namedLocationsSynchronized = namedLocationsCollection.observed
 
   const activeUsersCount = enabledUsers ?? 0
-  const mfaRegisteredUsersCount = usersSynchronized
-    ? users.filter(
-        (u) =>
-          u.status === 'Enabled' &&
-          tenantUserMfaRegistration(u) === 'Registered'
-      ).length
-    : 0
+  const enabledUserRegistrations = usersSynchronized
+    ? users.filter((u) => u.status === 'Enabled').map(tenantUserMfaRegistration)
+    : []
+  const mfaRegisteredUsersCount = enabledUserRegistrations.filter(
+    (state) => state === 'Registered'
+  ).length
+  const mfaUnreportedUsersCount = enabledUserRegistrations.filter(
+    (state) => state === 'Unknown'
+  ).length
+  // The same predicate controls both the default coverage warning and the
+  // overall verdict. It covers the full stored enabled-user array, not a page.
+  const mfaRegistrationEvidenceSupported =
+    usersCollection.supported &&
+    authRegistrationsCollection.supported &&
+    mfaUnreportedUsersCount === 0
   const mfaRegistrationCoveragePct =
-    activeUsersCount > 0
+    mfaRegistrationEvidenceSupported && activeUsersCount > 0
       ? Math.round((mfaRegisteredUsersCount / activeUsersCount) * 100)
-      : 0
+      : null
 
 
   // SIGN-INS CALCULATIONS FOR COMPACT SUMMARY ROW
@@ -229,37 +248,36 @@ export default function EntraOverviewSection({
     return signIns[0]?.createdAt || null
   }, [signIns])
 
-  // Overall posture status logic
+  // This closed list is shared by the verdict gate and its evidence disclosure.
+  const verdictEvidence = [
+    { label: 'Users collection', supported: usersCollection.supported, reason: usersCollection.reason },
+    { label: 'Authentication-method policies', supported: authMethodsCollection.supported, reason: authMethodsCollection.reason },
+    {
+      label: 'MFA registration',
+      supported: mfaRegistrationEvidenceSupported,
+      reason: authRegistrationsCollection.reason ??
+        (mfaUnreportedUsersCount > 0 ? `${mfaUnreportedUsersCount} enabled user state${mfaUnreportedUsersCount === 1 ? '' : 's'} not reported` :
+          !usersCollection.supported ? `users collection ${usersCollection.reason ?? 'not reported'}` : null),
+    },
+    { label: 'Conditional Access', supported: caOverview.authoritative, reason: caOverview.authoritative ? null : caOverview.value },
+    {
+      label: 'Sign-ins',
+      supported: signInsCollection.supported && !signInEvidenceIncomplete,
+      reason: signInsCollection.reason ?? (signInEvidenceIncomplete ? 'outcomes not fully reported' : null),
+    },
+  ] as const
+  const unsupportedEvidence = verdictEvidence.filter((item) => !item.supported)
+  const hasObservedWarning =
+    failedSignInsCount > 0 ||
+    caOverview.contributesWarning ||
+    (mfaRegistrationCoveragePct !== null && mfaRegistrationCoveragePct < 80) ||
+    (bundle?.entra?.riskyUsers?.length || 0) > 0
   const overallStatus: 'Healthy' | 'Needs attention' | 'Incomplete data' =
-    useMemo(() => {
-      if (
-        !caOverview.authoritative &&
-        !usersSynchronized &&
-        !authMethodsSynchronized
-      ) {
-        return 'Incomplete data'
-      }
-      if (
-        failedSignInsCount > 0 ||
-        caOverview.contributesWarning ||
-        (usersSynchronized && mfaRegistrationCoveragePct < 80) ||
-        (bundle?.entra?.riskyUsers?.length || 0) > 0
-      ) {
-        return 'Needs attention'
-      }
-      if (caOverview.status === 'neutral' || signInEvidenceIncomplete) {
-        return 'Incomplete data'
-      }
-      return 'Healthy'
-    }, [
-      caOverview,
-      usersSynchronized,
-      authMethodsSynchronized,
-      failedSignInsCount,
-      signInEvidenceIncomplete,
-      mfaRegistrationCoveragePct,
-      bundle?.entra?.riskyUsers,
-    ])
+    hasObservedWarning
+      ? 'Needs attention'
+      : unsupportedEvidence.length > 0
+        ? 'Incomplete data'
+        : 'Healthy'
 
   // Security posture checklist items
   const securityRows = useMemo(() => {
@@ -275,11 +293,19 @@ export default function EntraOverviewSection({
       {
         id: 'mfa',
         name: 'MFA registration coverage',
-        value: usersSynchronized
-          ? `${mfaRegisteredUsersCount} of ${activeUsersCount} registered (${mfaRegistrationCoveragePct}%)`
-          : 'Awaiting collection',
-        detail: 'Registered methods; not enforcement state',
-        status: !usersSynchronized
+        value: !usersSynchronized
+          ? 'Awaiting collection'
+          : activeUsersCount === 0
+            ? 'No enabled users reported'
+            : mfaRegistrationCoveragePct !== null
+              ? `${mfaRegisteredUsersCount} of ${activeUsersCount} registered (${mfaRegistrationCoveragePct}%)`
+              : authRegistrationsCollection.supported && usersCollection.supported
+                ? `${mfaRegisteredUsersCount} registered of ${activeUsersCount} enabled; ${mfaUnreportedUsersCount} not reported`
+                : 'Coverage not fully reported',
+        detail: mfaUnreportedUsersCount > 0 && authRegistrationsCollection.supported
+          ? `${mfaUnreportedUsersCount} enabled user registration state${mfaUnreportedUsersCount === 1 ? ' was' : 's were'} not reported; no all-user percentage`
+          : 'Registered methods; not enforcement state',
+        status: mfaRegistrationCoveragePct === null
           ? 'neutral'
           : mfaRegistrationCoveragePct >= 80
             ? 'healthy'
@@ -289,11 +315,13 @@ export default function EntraOverviewSection({
       {
         id: 'auth',
         name: 'Authentication methods',
-        value: authMethodsSynchronized
-          ? `${authMethods.length} methods configured`
-          : 'Awaiting collection',
+        value: !authMethodsSynchronized
+          ? 'Awaiting collection'
+          : authMethodsCollection.supported
+            ? `${authMethods.length} ${authMethods.length === 1 ? 'method' : 'methods'} configured`
+            : `${authMethods.length} ${authMethods.length === 1 ? 'method' : 'methods'} last reported; latest collection failed`,
         detail: 'FIDO2, Authenticator & SMS settings',
-        status: !authMethodsSynchronized ? 'neutral' : 'healthy',
+        status: !authMethodsCollection.supported || authMethods.length === 0 ? 'neutral' : 'healthy',
         action: authMethodsSynchronized
           ? () => onNavigateTab('security', 'auth')
           : undefined,
@@ -301,11 +329,13 @@ export default function EntraOverviewSection({
       {
         id: 'locations',
         name: 'Named locations',
-        value: namedLocationsSynchronized
-          ? `${namedLocations.length} locations configured`
-          : 'Awaiting collection',
+        value: !namedLocationsSynchronized
+          ? 'Awaiting collection'
+          : namedLocationsCollection.supported
+            ? `${namedLocations.length} ${namedLocations.length === 1 ? 'location' : 'locations'} configured`
+            : `${namedLocations.length} ${namedLocations.length === 1 ? 'location' : 'locations'} last reported; latest collection failed`,
         detail: 'Trusted corporate network boundaries',
-        status: !namedLocationsSynchronized ? 'neutral' : 'healthy',
+        status: !namedLocationsCollection.supported || namedLocations.length === 0 ? 'neutral' : 'healthy',
         action: namedLocationsSynchronized
           ? () => onNavigateTab('security', 'locations')
           : undefined,
@@ -329,10 +359,15 @@ export default function EntraOverviewSection({
     usersSynchronized,
     mfaRegisteredUsersCount,
     activeUsersCount,
+    mfaUnreportedUsersCount,
     mfaRegistrationCoveragePct,
+    authRegistrationsCollection.supported,
+    usersCollection.supported,
     authMethodsSynchronized,
+    authMethodsCollection.supported,
     authMethods.length,
     namedLocationsSynchronized,
+    namedLocationsCollection.supported,
     namedLocations.length,
     failedSignInsCount,
     totalSignInsCount,
@@ -381,7 +416,7 @@ export default function EntraOverviewSection({
                       {totalUsers}
                     </span>
                     <span className="text-xs font-medium text-muted-foreground">
-                      Total users
+                      {usersCollection.supported ? 'Total users' : 'Last reported users'}
                     </span>
                   </div>
                 ) : (
@@ -634,6 +669,13 @@ export default function EntraOverviewSection({
                   )}
                 </div>
               </div>
+
+              {unsupportedEvidence.length > 0 ? (
+                <div aria-label="Entra evidence not fully reported" className="py-3 text-[11px] text-slate-600 dark:text-slate-400">
+                  <span className="font-semibold">Evidence not fully reported:</span>{' '}
+                  {unsupportedEvidence.map((item) => `${item.label}: ${item.reason ?? 'not reported'}`).join(' · ')}
+                </div>
+              ) : null}
 
               {/* Checklist Rows */}
               <div className="divide-y divide-slate-100 dark:divide-slate-800/60">

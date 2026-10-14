@@ -7596,6 +7596,9 @@ export class TenantSyncService {
               userSyncState?.lastSuccessfulAt?.toISOString() ?? null,
             lastError: userSyncState?.lastErrorMessage ?? null,
           },
+          authMethodPolicies: exchangeSync('AUTH_METHOD_POLICIES'),
+          authRegistrations: exchangeSync('AUTH_REGISTRATIONS'),
+          namedLocations: exchangeSync('NAMED_LOCATIONS'),
           licenses: {
             outcomeProjection: projectSyncOutcome('LICENSES', licenseSyncState, mfaEvaluationNow),
             status: licenseSyncState?.status.toLowerCase() ?? 'never-synced',

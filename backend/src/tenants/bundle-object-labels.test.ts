@@ -12,7 +12,8 @@ const ROLE = 'eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee'
 const DEFINITION = 'ffffffff-ffff-4fff-ffff-ffffffffffff'
 const UNKNOWN = '00000000-0000-4000-8000-000000000099'
 
-async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false) {
+type SyncOverride = Record<string, { status?: string; lastSuccessfulAt?: Date | null } | null>
+async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false, syncOverride: SyncOverride = {}) {
   const org = `org-${tenantId}`
   const tenant = { id: tenantId, organizationId: org, microsoftTenantId: '11111111-1111-4111-8111-111111111111',
     displayName: 'Synthetic tenant', primaryDomain: 'example.invalid', status: 'CONNECTED',
@@ -41,6 +42,7 @@ async function bundle(tenantId: string, name: string, conflicts = false, omitOpt
     CONDITIONAL_ACCESS: [policy('selected', { includeUsers: [USER.toUpperCase(), UNKNOWN], includeGroups: [GROUP],
       includeRoles: [ROLE, DEFINITION], excludeUsers: ['GuestsOrExternalUsers'], excludeGroups: [GROUP], excludeRoles: [ROLE] }),
       policy('all', { includeUsers: ['All'] }), policy('none', { includeUsers: ['None'] })],
+    AUTH_METHOD_POLICIES: [], AUTH_REGISTRATIONS: [], NAMED_LOCATIONS: [],
   }
   let identityReads = 0, tenantReads = 0, scopedReads = 0
   const scoped = (args: any) => {
@@ -58,8 +60,11 @@ async function bundle(tenantId: string, name: string, conflicts = false, omitOpt
     directoryGroup: many([group]), tenantLicense: many([]), tenantDomain: many([]), tenantCollectionFieldState: many([]),
     signInLog: many([]), directoryAuditLog: many([]), m365ActivitySubscription: many([]),
     tenantEntraSnapshot: many(Object.entries(payloads).map(([resourceType, payload]) => ({ resourceType, payload, observedAt: NOW }))),
-    syncState: many(Object.keys(payloads).map(resourceType => ({ resourceType, status: 'SUCCEEDED', lastAttemptAt: NOW,
-      lastSuccessfulAt: NOW, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 }))),
+    syncState: many(Object.keys(payloads).filter(resourceType => syncOverride[resourceType] !== null).map(resourceType => ({
+      resourceType, status: syncOverride[resourceType]?.status ?? 'SUCCEEDED', lastAttemptAt: NOW,
+      lastSuccessfulAt: syncOverride[resourceType]?.lastSuccessfulAt === undefined ? NOW : syncOverride[resourceType]?.lastSuccessfulAt,
+      lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+    }))),
     m365ActivityContent: { groupBy: async (args: any) => { scoped(args); return [] }, findFirst: async (args: any) => { scoped(args); return null } },
     m365AuditDailyUsage: { findFirst: async (args: any) => { scoped(args); return null }, aggregate: async (args: any) => {
       scoped(args); return { _sum: { downloadedBytes: null, recordsStored: null, blobsProcessed: null } }
@@ -126,6 +131,38 @@ test('real bundle keeps omitted principal and application evidence unreported', 
   assert.equal(result.entra.appRegistrations[0].owners, null)
   assert.equal(result.entra.appRegistrations[0].credentials, null)
   assert.equal(result.entra.appRegistrations[0].apiPermissions, null)
+})
+
+test('bundle projects empty, absent, and latest-failed Entra collection evidence independently of array size', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const reported = await bundle('tenant-A', 'Alice')
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(reported.sync[key].lastSuccessfulAt, NOW.toISOString())
+    assert.equal(reported.sync[key].outcomeProjection.recordedOutcome.kind, 'SUCCEEDED')
+  }
+  assert.deepEqual(reported.entra.authMethods, [])
+  assert.deepEqual(reported.entra.namedLocations, [])
+
+  const absent = await bundle('tenant-A', 'Alice', false, false, {
+    AUTH_METHOD_POLICIES: null, AUTH_REGISTRATIONS: null, NAMED_LOCATIONS: null,
+  })
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(absent.sync[key].lastSuccessfulAt, null)
+    assert.equal(absent.sync[key].outcomeProjection.recordedOutcome.kind, 'UNKNOWN')
+  }
+  assert.deepEqual(absent.entra.authMethods, [])
+  assert.deepEqual(absent.entra.namedLocations, [])
+
+  const failed = await bundle('tenant-A', 'Alice', false, false, {
+    AUTH_METHOD_POLICIES: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+    AUTH_REGISTRATIONS: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+    NAMED_LOCATIONS: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+  })
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(failed.sync[key].lastSuccessfulAt, '2026-10-11T12:00:00.000Z')
+    assert.equal(failed.sync[key].outcomeProjection.recordedOutcome.kind, 'FAILED')
+  }
 })
 
 test('separate tenant invocations never share names; conflicting stored identities remain unresolved', async t => {
