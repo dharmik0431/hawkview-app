@@ -57,10 +57,12 @@ test('domain card uses only the observed Microsoft verified-domain collection', 
   try {
     await render({ tenant: { domains: [] }, sync: { domains: { status: 'never-synced', lastSuccessfulAt: null } } })
     assert.match(card(), /Awaiting domain collection/)
+    assert.match(card(), /No successful Microsoft domain collection recorded/)
     assert.doesNotMatch(card(), /verified of|1 verified domain/)
 
     await render({ tenant: { domains: [] }, sync: { domains: { status: 'succeeded', lastSuccessfulAt: '2026-10-14T00:00:00Z' } } })
     assert.match(card(), /No verified domains reported/)
+    assert.match(card(), /From the last successful Microsoft domain collection/)
     assert.doesNotMatch(card(), /verified of/)
 
     await render({
@@ -69,7 +71,15 @@ test('domain card uses only the observed Microsoft verified-domain collection', 
       dns: { byDomain: { 'two.example': { status: 'failed' } } },
     })
     assert.match(card(), /3 verified domains reported/)
+    assert.match(card(), /From the last successful Microsoft domain collection/)
     assert.doesNotMatch(card(), /verified of|2 verified domains/)
+
+    await render({
+      tenant: { domains: ['one.example', 'two.example'] },
+      sync: { domains: { status: 'failed', lastSuccessfulAt: '2026-10-01T00:00:00Z' } },
+    })
+    assert.match(card(), /2 verified domains reported/)
+    assert.match(card(), /From the last successful Microsoft domain collection/)
 
     await render({ tenant: {}, sync: { domains: { status: 'succeeded', lastSuccessfulAt: '2026-10-14T00:00:00Z' } } })
     assert.match(card(), /Not reported/)
