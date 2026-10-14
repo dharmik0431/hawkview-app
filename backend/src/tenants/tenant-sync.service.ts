@@ -7395,7 +7395,8 @@ export class TenantSyncService {
           })),
           appRegistrations: applications.map((application) => {
             const now = Date.now()
-            const credentials = [
+            const credentialSourcesReported = Array.isArray(application.passwordCredentials) && Array.isArray(application.keyCredentials)
+            const credentials = credentialSourcesReported ? [
               ...(Array.isArray(application.passwordCredentials)
                 ? application.passwordCredentials.map((credential: any) => ({
                     type: 'Secret',
@@ -7428,10 +7429,10 @@ export class TenantSyncService {
                         ? 'Expiring'
                         : 'Active',
               }
-            })
+            }) : null
             const apiPermissions = Array.isArray(
               application.requiredResourceAccess
-            )
+            ) && application.requiredResourceAccess.every((resource: any) => Array.isArray(resource.resourceAccess))
               ? application.requiredResourceAccess.flatMap((resource: any) =>
                   Array.isArray(resource.resourceAccess)
                     ? resource.resourceAccess.map((permission: any) => {
@@ -7455,7 +7456,7 @@ export class TenantSyncService {
                       })
                     : []
                 )
-              : []
+              : null
             return {
               id: application.id,
               objectId: application.id,
@@ -7472,7 +7473,7 @@ export class TenantSyncService {
                     (owner: any) =>
                       objectLabels.ownerName(owner)
                   )
-                : [],
+                : null,
               credentials,
               apiPermissions,
             }

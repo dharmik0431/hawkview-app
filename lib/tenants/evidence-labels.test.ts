@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  applicationAudience,
   enterpriseAppEnabled,
   licenseAuditOutcome,
   reportedText,
@@ -25,6 +26,14 @@ test('license audit results distinguish success, failure, and absent or ambiguou
   assert.deepEqual(licenseAuditOutcome(' ', null), {
     label: 'Result not reported', outcome: 'unreported',
   })
+})
+
+test('application audience recognizes the four Microsoft Graph states without guessing missing values', () => {
+  assert.deepEqual(applicationAudience('AzureADMyOrg'), { label: 'Single tenant', reach: 'single' })
+  assert.deepEqual(applicationAudience('AzureADMultipleOrgs'), { label: 'Multitenant', reach: 'multi' })
+  assert.deepEqual(applicationAudience('AzureADandPersonalMicrosoftAccount'), { label: 'Multitenant + personal', reach: 'multi' })
+  assert.deepEqual(applicationAudience('PersonalMicrosoftAccount'), { label: 'Personal accounts', reach: 'personal' })
+  assert.deepEqual(applicationAudience(undefined), { label: 'Not reported', reach: null })
 })
 
 test('SharePoint settings do not infer an open posture from missing values', () => {

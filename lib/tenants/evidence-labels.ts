@@ -36,6 +36,18 @@ export function enterpriseAppEnabled(accountEnabled: unknown, accountStatus: unk
   return null
 }
 
+/** Microsoft Graph application.signInAudience values, kept separate from a
+ * missing or future value so a personal-only app is not called single-tenant. */
+export function applicationAudience(value: unknown): { label: string; reach: 'single' | 'multi' | 'personal' | null } {
+  switch (value) {
+    case 'AzureADMyOrg': return { label: 'Single tenant', reach: 'single' }
+    case 'AzureADMultipleOrgs': return { label: 'Multitenant', reach: 'multi' }
+    case 'AzureADandPersonalMicrosoftAccount': return { label: 'Multitenant + personal', reach: 'multi' }
+    case 'PersonalMicrosoftAccount': return { label: 'Personal accounts', reach: 'personal' }
+    default: return { label: reportedText(value, 'Not reported'), reach: null }
+  }
+}
+
 export function sharePointDomainRestriction(mode: unknown): string {
   const value = reportedText(mode, '')
   if (!value) return 'Not available'
