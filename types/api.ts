@@ -35,6 +35,10 @@ export const TenantSchema = z.object({
   microsoftRiskSummary: MicrosoftRiskSummarySchema.optional(),
   data: z.unknown().optional(),
   tenantHealth: z.unknown().optional(),
+  // The list endpoint includes per-service collection evidence. Keep it in the
+  // parsed tenant without making an older or malformed response fail the list.
+  syncFreshness: z.unknown().optional(),
+  collectionReadiness: z.unknown().optional(),
   attention: z.array(z.object({
     provenance: z.unknown().optional(),
     key: z.string(),

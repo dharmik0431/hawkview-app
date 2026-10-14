@@ -24,6 +24,7 @@ import type { Tenant } from '@/types/api'
 import type { AttentionItem, AttentionSeverity } from '@/types/attention'
 import { cn } from '@/lib/utils'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
+import { tenantConnectionBadge } from '@/lib/tenants/service-collection-status'
 
 interface TenantIssueDrawerProps {
   tenant: Tenant | null
@@ -105,6 +106,8 @@ export function TenantIssueDrawer({
 
   if (!isOpen || !tenant) return null
 
+  const connection = tenantConnectionBadge(tenant)
+
   const customer = customerAttention(tenant)
   const attentionItems: AttentionItem[] = computeTenantAttention(tenant)
 
@@ -179,22 +182,23 @@ export function TenantIssueDrawer({
                 </span>
                 <Badge
                   variant="outline"
+                  title={connection.detail}
                   className={cn(
-                    'text-xs font-semibold capitalize',
-                    tenant.connectionStatus === 'connected'
+                    'text-xs font-semibold',
+                    connection.tone === 'ok'
                       ? 'border-emerald-200 text-emerald-700 bg-emerald-50 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-400'
-                      : tenant.connectionStatus === 'pending-consent'
-                        ? 'border-amber-200 text-amber-700 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-400'
-                        : 'border-red-200 text-red-700 bg-red-50 dark:border-red-900 dark:bg-red-950/30 dark:text-red-400'
+                      : connection.tone === 'attention'
+                        ? 'border-amber-200 text-amber-800 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'
+                        : 'border-slate-200 text-slate-700 bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300'
                   )}
                 >
-                  {tenant.connectionStatus || 'Unknown'}
+                  {connection.label}
                 </Badge>
               </div>
 
               <div>
                 <span className="text-[10px] font-semibold uppercase text-slate-400 block mb-1">
-                  Last Sync
+                  Latest Resource Collection
                 </span>
                 <div className="flex items-center gap-1 text-xs font-medium text-slate-700 dark:text-slate-300">
                   <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" />

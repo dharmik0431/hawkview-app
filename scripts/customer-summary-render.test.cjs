@@ -9,7 +9,7 @@ const query=()=>({data:{tenants:[currentTenant]},isLoading:false,isError:false,i
 function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.set(file,ex);const js=ts.transpileModule(fs.readFileSync(file,'utf8'),{fileName:file,compilerOptions:{jsx:ts.JsxEmit.ReactJSX,module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022,esModuleInterop:true}}).outputText;new Function('require','exports',js)(name=>{
  if(name==='next/navigation')return {useRouter:()=>({push(){}}),usePathname:()=>'/dashboard',useSearchParams:()=>new URLSearchParams()}
  if(name==='next/link')return {__esModule:true,default:({children,...p})=>h('a',p,children)}
- if(name==='@/components/providers/auth-provider')return {useAuth:()=>({session:null})}
+ if(name==='@/components/providers/auth-provider')return {useAuth:()=>({session:null,cacheScope:'fixture',isLoading:false,currentIdentityToken:()=> 'fixture-identity'})}
  if(name==='@tanstack/react-query')return {useQueryClient:()=>({invalidateQueries(){}})}
  if(name==='@/lib/api/hooks')return {useTenants:query}
  if(name==='@/lib/api/native-risk-summary-hooks')return {useNativeRiskSummary:()=>({isLoading:false,isError:false,isFetching:false,refetch:async()=>{}})}
@@ -18,7 +18,6 @@ function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.
  if(!name.startsWith('.')&&!name.startsWith('@/'))return req(name)
  const p=name.startsWith('@/')?path.join(root,name.slice(2)):path.resolve(path.dirname(file),name);return load([p,p+'.tsx',p+'.ts'].find(fs.existsSync))},ex);return ex}
 const prov=load(root+'/backend/src/tenants/attention-provenance.ts')
-const {AffectedServices}=load(root+'/components/tenants/affected-services.tsx')
 const {TenantRiskMatrixDrawer}=load(root+'/components/dashboard/tenant-risk-matrix-drawer.tsx')
 const {TenantOverview}=load(root+'/app/(protected)/tenants/[id]/components/tenant-overview.tsx')
 const {deriveTenantWorkspaceDisplay}=load(root+'/lib/tenant-workspace-state.ts')
@@ -127,4 +126,19 @@ test('named overview dates remain independent of unrelated collection failure',a
  assert.equal(display.customer.incomplete,true);assert.match(h.text(),/1 reported finding/)
  assert.deepEqual([...h.doc.querySelectorAll('[aria-label="Dataset update times"] time')].map(e=>e.dateTime),[])
  assert.doesNotMatch(h.text(),/PRIVATE_DIAGNOSTIC|Evidence incomplete/)
+}))
+test('Secure Score date comes from its own collection, not another resource sync',()=>{
+ const newest='2026-09-29T17:59:00.000Z',older='2026-09-28T12:00:00.000Z'
+ const withSource=helpers.getTenantSecureScoreInfo({...baseline,secureScore:80,lastSync:newest,
+  secureScoreDetails:{version:1,percentage:80,scoreCreatedAt:older,snapshotObservedAt:older,lastSuccessfulCollectionAt:older}})
+ assert.match(withSource.dateText,/Score collected: 1d ago/)
+ const withoutSource=helpers.getTenantSecureScoreInfo({...baseline,secureScore:80,lastSync:newest})
+ assert.equal(withoutSource.dateText,'Score collection time unavailable')
+})
+test('missing connection evidence is neutral in the tenant drawer',async()=>mounted(async h=>{
+ await h.render('tenant-drawer',{...baseline,connectionStatus:null,attention:[]})
+ const badge=[...h.doc.querySelectorAll('[title]')].find(node=>node.textContent?.trim()==='Not verified')
+ assert.ok(badge)
+ assert.match(badge.title,/does not establish/)
+ assert.doesNotMatch(badge.className,/border-red/)
 }))

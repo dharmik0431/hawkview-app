@@ -216,13 +216,15 @@ export function getTenantSecureScoreInfo(tenant: Tenant) {
     tenantStatus === 'pending'
 
   if (tenant.secureScore !== null && tenant.secureScore !== undefined) {
-    const syncInfo = getTenantSyncTimeInfo(tenant.lastSync)
+    // A recent unrelated collector cannot date the Microsoft Secure Score.
+    const scoreCollectionAt = tenant.secureScoreDetails?.lastSuccessfulCollectionAt ?? null
+    const scoreSyncInfo = scoreCollectionAt ? getTenantSyncTimeInfo(scoreCollectionAt) : null
     return {
       score: tenant.secureScore,
       isAvailable: true,
       stateLabel: `${tenant.secureScore}%`,
       pointsText: 'Points breakdown not supplied',
-      dateText: tenant.lastSync ? `Sync: ${syncInfo.display}` : 'Sync pending',
+      dateText: scoreSyncInfo ? `Score collected: ${scoreSyncInfo.display}` : 'Score collection time unavailable',
       statusType: 'available' as const,
     }
   }

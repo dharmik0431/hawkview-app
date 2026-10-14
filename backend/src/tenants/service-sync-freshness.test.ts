@@ -45,6 +45,25 @@ test('reports initial collection as not collected instead of a fabricated failur
   assert.equal(data.services.entraId.lastSuccessfulCollectionAt, null)
 })
 
+test('reports fully excluded licensing and support reasons from the original service registry', () => {
+  const sharePoint = ['SHAREPOINT_SITES', 'SHAREPOINT_SETTINGS', 'SHAREPOINT_USAGE']
+  const excluded = deriveTenantSyncFreshness([], now, sharePoint, { notLicensed: sharePoint })
+  assert.equal(excluded.services.sharePointOneDrive.status, 'UNKNOWN')
+  assert.equal(excluded.services.sharePointOneDrive.expectedCollectors, 0)
+  assert.equal(excluded.services.sharePointOneDrive.notLicensedCollectors, 3)
+  assert.equal(excluded.services.sharePointOneDrive.unsupportedCollectors, 0)
+
+  const audit = ['AUDIT_LOGS', 'M365_AUDIT']
+  const unsupported = deriveTenantSyncFreshness([], now, audit, { unsupported: audit })
+  assert.equal(unsupported.services.auditLogs.expectedCollectors, 0)
+  assert.equal(unsupported.services.auditLogs.unsupportedCollectors, 2)
+
+  // A legacy unclassified exclusion cannot claim a licensing cause.
+  const unclassified = deriveTenantSyncFreshness([], now, sharePoint)
+  assert.equal(unclassified.services.sharePointOneDrive.expectedCollectors, 0)
+  assert.equal(unclassified.services.sharePointOneDrive.notLicensedCollectors, 0)
+})
+
 test('reports an active collector as running', () => {
   const data = deriveTenantSyncFreshness([{ ...success('SIGN_INS'), status: 'RUNNING', lastSuccessfulAt: null }], now)
   assert.equal(data.services.signInLogs.status, 'RUNNING')

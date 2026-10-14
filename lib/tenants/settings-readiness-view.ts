@@ -188,7 +188,7 @@ export type SettingsConnectionHealth = {
 }
 
 export function settingsConnectionHealth(value: unknown): SettingsConnectionHealth {
-  if (typeof value !== 'string') return { state: 'UNKNOWN', label: 'Unknown' }
+  if (typeof value !== 'string') return { state: 'UNKNOWN', label: 'Not verified' }
   const status = value.trim().toLowerCase()
   if (['connected', 'healthy', 'active'].includes(status)) {
     return { state: 'CONNECTED', label: 'Connected' }
@@ -199,7 +199,7 @@ export function settingsConnectionHealth(value: unknown): SettingsConnectionHeal
   if (['error', 'critical', 'disconnected', 'revoked'].includes(status)) {
     return { state: 'DISCONNECTED', label: 'Disconnected' }
   }
-  return { state: 'UNKNOWN', label: 'Unknown' }
+  return { state: 'UNKNOWN', label: 'Not verified' }
 }
 
 /** Connection status and collection readiness are deliberately separate. */

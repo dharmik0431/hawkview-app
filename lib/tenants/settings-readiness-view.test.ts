@@ -11,7 +11,7 @@ import {
 } from './settings-readiness-view.ts'
 
 test('does not infer a healthy connection when connection status is absent', () => {
-  assert.deepEqual(settingsConnectionHealth(undefined), { state: 'UNKNOWN', label: 'Unknown' })
+  assert.deepEqual(settingsConnectionHealth(undefined), { state: 'UNKNOWN', label: 'Not verified' })
   assert.deepEqual(settingsConnectionHealth('connected'), { state: 'CONNECTED', label: 'Connected' })
   assert.deepEqual(settingsConnectionHealth('revoked'), { state: 'DISCONNECTED', label: 'Disconnected' })
 })
