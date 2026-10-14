@@ -3953,7 +3953,6 @@ function TenantDetailsWorkspace() {
               syncCompleted={Boolean(bundle?.licenses)}
               tenant={tenant}
               bundle={bundle}
-              domains={domains}
               securityDefaultsEvidence={collectionReadiness?.evidence.securityDefaults ?? null}
             />
           ) : (
