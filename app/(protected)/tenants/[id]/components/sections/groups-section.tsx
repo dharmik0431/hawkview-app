@@ -44,7 +44,7 @@ export type GroupItem = {
   membershipType?: 'Assigned' | 'Dynamic' | 'Direct' | string
   createdDateTime?: string
   createdDate?: string
-  owners?: string[]
+  owners?: string[] | null
   members?: string[]
   membersCount?: number
   assignedLicenses?: string[]
@@ -124,7 +124,7 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
         typeLabel = rawType || 'Unknown'
       }
 
-      const membership = g.membershipType || (lower.includes('dynamic') ? 'Dynamic' : 'Direct')
+      const membership = g.membershipType || 'Not reported'
       const members = normalizeLabels(g.members)
       const owners = normalizeLabels(g.owners)
       const membersCount = typeof g.membersCount === 'number'
@@ -402,8 +402,8 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
                         {g.visibility || '—'}
                       </td>
                       <td className="py-3 px-3">
-                        <Badge className="bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 text-[10px]">
-                          Synced
+                        <Badge variant="outline" className="border-slate-200 text-slate-600 dark:border-slate-700 dark:text-slate-300 text-[10px]">
+                          Stored record
                         </Badge>
                       </td>
                       <td className="py-3 px-3 text-right">
@@ -471,12 +471,12 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">Membership Type</div>
-                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedGroup.membership || 'Direct'}</div>
+                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedGroup.membership || 'Not reported'}</div>
                   </div>
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[11px] text-slate-500 dark:text-slate-400">Visibility</div>
-                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedGroup.visibility || 'Public'}</div>
+                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedGroup.visibility || 'Not reported'}</div>
                   </div>
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
@@ -591,14 +591,14 @@ export default function GroupsSection({ bundle }: GroupsSectionProps) {
                 <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 flex items-center justify-between">
                   <span className="text-slate-600 dark:text-slate-400">On-premises sync state</span>
                   <span className="font-semibold text-slate-900 dark:text-white">
-                    {selectedGroup.onPremisesSyncEnabled ? 'Synced from AD' : 'Cloud-only'}
+                    {selectedGroup.onPremisesSyncEnabled === true ? 'Synced from AD' : selectedGroup.onPremisesSyncEnabled === false ? 'Cloud-only' : 'Not reported'}
                   </span>
                 </div>
 
                 <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 flex items-center justify-between">
                   <span className="text-slate-600 dark:text-slate-400">Assigned Licenses</span>
                   <span className="font-semibold text-slate-900 dark:text-white">
-                    {selectedGroup.assignedLicenses?.length ? selectedGroup.assignedLicenses.join(', ') : 'None assigned'}
+                    {Array.isArray(selectedGroup.assignedLicenses) ? selectedGroup.assignedLicenses.length ? selectedGroup.assignedLicenses.join(', ') : 'None assigned' : 'Not reported'}
                   </span>
                 </div>
               </div>

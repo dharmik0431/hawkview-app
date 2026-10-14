@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react'
 import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { servicePrincipalsAge } from '@/lib/tenants/dataset-age'
+import { enterpriseAppEnabled, reportedText, reportedYesNo } from '@/lib/tenants/evidence-labels'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -29,30 +30,29 @@ export type EnterpriseAppItem = {
   name?: string
   description?: string
   publisher?: string
-  verifiedPublisher?: boolean
-  isMicrosoft?: boolean
+  verifiedPublisher?: boolean | null
   servicePrincipalType?: string
   type?: string
   accountEnabled?: boolean
-  enabled?: boolean
+  enabled?: boolean | null
   accountStatus?: 'Enabled' | 'Disabled' | string
   appRoleAssignmentRequired?: boolean
-  assignmentRequired?: boolean
+  assignmentRequired?: boolean | null
   createdDateTime?: string
   createdDate?: string
   created?: string
-  assignedUsers?: string[]
-  assignedGroups?: string[]
-  assignedServicePrincipals?: string[]
+  assignedUsers?: string[] | null
+  assignedGroups?: string[] | null
+  assignedServicePrincipals?: string[] | null
   users?: string[]
   groups?: string[]
   sps?: string[]
-  totalAssigned?: number
-  permsCount?: number
+  totalAssigned?: number | null
+  permsCount?: number | null
   risk?: string | null
   appRoles?: string[]
-  delegatedGrants?: string[]
-  applicationPermissions?: string[]
+  delegatedGrants?: string[] | null
+  applicationPermissions?: string[] | null
   resourceApi?: string
   consentType?: string
   grantedBy?: string
@@ -83,7 +83,6 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
   }, [bundle])
 
   const [query, setQuery] = useState('')
-  const [publisherFilter, setPublisherFilter] = useState<string>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
   const [statusFilter, setStatusFilter] = useState<string>('all')
   const [riskFilter, setRiskFilter] = useState<string>('all')
@@ -95,29 +94,29 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
   const normalizedApps = useMemo(() => {
     return rawApps.map((a, idx) => {
       const name = a.displayName || a.name || `Enterprise App ${idx + 1}`
-      const appId = a.appId || `app-id-${idx}`
-      const objectId = a.objectId || a.id || `sp-id-${idx}`
-      const publisher = a.publisher || 'Microsoft Services'
-      const isMicrosoft = publisher.toLowerCase().includes('microsoft')
-      const type = a.servicePrincipalType || 'Application'
-      const enabled = typeof a.accountEnabled === 'boolean' ? a.accountEnabled : a.accountStatus !== 'Disabled'
-      const assignmentRequired = Boolean(a.appRoleAssignmentRequired)
+      const appId = reportedText(a.appId, '')
+      const objectId = reportedText(a.objectId || a.id, '')
+      const publisher = reportedText(a.publisher, 'Not reported')
+      const type = reportedText(a.servicePrincipalType || a.type, 'Not reported')
+      const enabled = enterpriseAppEnabled(a.accountEnabled, a.accountStatus)
+      const assignmentRequired = typeof a.appRoleAssignmentRequired === 'boolean' ? a.appRoleAssignmentRequired : null
       const users = Array.isArray(a.assignedUsers) ? a.assignedUsers : []
       const groups = Array.isArray(a.assignedGroups) ? a.assignedGroups : []
       const sps = Array.isArray(a.assignedServicePrincipals) ? a.assignedServicePrincipals : []
-      const totalAssigned = users.length + groups.length + sps.length
-      const permsCount = (a.delegatedGrants?.length || 0) + (a.applicationPermissions?.length || 0)
+      const assignmentListsReported = [a.assignedUsers, a.assignedGroups, a.assignedServicePrincipals].every(Array.isArray)
+      const permissionListsReported = [a.delegatedGrants, a.applicationPermissions].every(Array.isArray)
+      const totalAssigned = assignmentListsReported ? users.length + groups.length + sps.length : null
+      const permsCount = permissionListsReported ? a.delegatedGrants!.length + a.applicationPermissions!.length : null
       const created = a.createdDate || a.createdDateTime || 'Unknown'
       const risk = a.riskLevel || null
 
       return {
         ...a,
-        id: objectId,
+        id: objectId || appId || `row-${idx}`,
         objectId,
         appId,
         name,
         publisher,
-        isMicrosoft,
         type,
         enabled,
         assignmentRequired,
@@ -134,25 +133,27 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
 
   const summary = useMemo(() => {
     const total = normalizedApps.length
-    const enabled = normalizedApps.filter(a => a.enabled).length
-    const disabled = normalizedApps.filter(a => !a.enabled).length
-    const microsoft = normalizedApps.filter(a => a.isMicrosoft).length
-    const thirdParty = normalizedApps.filter(a => !a.isMicrosoft).length
-    const requiringAttention = normalizedApps.filter(a => a.risk === 'high' || (!a.enabled && a.lastSignIn)).length
+    const enabled = normalizedApps.filter(a => a.enabled === true).length
+    const disabled = normalizedApps.filter(a => a.enabled === false).length
+    const statusNotReported = normalizedApps.filter(a => a.enabled === null).length
+    const publisherNotReported = normalizedApps.filter(a => a.publisher === 'Not reported').length
+    const requiringAttention = normalizedApps.filter(a => a.risk === 'high' || (a.enabled === false && a.lastSignIn)).length
 
-    return { total, enabled, disabled, microsoft, thirdParty, requiringAttention }
+    return { total, enabled, disabled, statusNotReported, publisherNotReported, requiringAttention }
   }, [normalizedApps])
 
   const filteredApps = useMemo(() => {
     const q = query.trim().toLowerCase()
     return normalizedApps.filter((a) => {
       const matchesText = !q || a.name.toLowerCase().includes(q) || a.publisher.toLowerCase().includes(q) || a.appId.toLowerCase().includes(q)
-      const matchesPublisher = publisherFilter === 'all' || (publisherFilter === 'microsoft' ? a.isMicrosoft : !a.isMicrosoft)
       const matchesType = typeFilter === 'all' || a.type.toLowerCase() === typeFilter.toLowerCase()
-      const matchesStatus = statusFilter === 'all' || (statusFilter === 'enabled' ? a.enabled : !a.enabled)
+      const matchesStatus = statusFilter === 'all' ||
+        (statusFilter === 'enabled' && a.enabled === true) ||
+        (statusFilter === 'disabled' && a.enabled === false) ||
+        (statusFilter === 'notReported' && a.enabled === null)
       const matchesRisk = riskFilter === 'all' || (a.risk && a.risk.toLowerCase() === riskFilter.toLowerCase())
 
-      return matchesText && matchesPublisher && matchesType && matchesStatus && matchesRisk
+      return matchesText && matchesType && matchesStatus && matchesRisk
     }).sort((a, b) => {
       let valA: any = a[sortField === 'name' ? 'name' : sortField === 'publisher' ? 'publisher' : sortField === 'type' ? 'type' : sortField === 'status' ? 'enabled' : sortField === 'created' ? 'created' : 'risk']
       let valB: any = b[sortField === 'name' ? 'name' : sortField === 'publisher' ? 'publisher' : sortField === 'type' ? 'type' : sortField === 'status' ? 'enabled' : sortField === 'created' ? 'created' : 'risk']
@@ -164,7 +165,7 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
       if (valA > valB) return sortOrder === 'asc' ? 1 : -1
       return 0
     })
-  }, [normalizedApps, query, publisherFilter, typeFilter, statusFilter, riskFilter, sortField, sortOrder])
+  }, [normalizedApps, query, typeFilter, statusFilter, riskFilter, sortField, sortOrder])
 
   const handleSort = (field: EnterpriseAppSortField) => {
     if (sortField === field) {
@@ -188,7 +189,7 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
     <div className="mt-5 space-y-5">
       <DatasetEmptyState evidence={servicePrincipalsAge(bundle)} isEmpty={rawApps.length === 0} />
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs">
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Total Apps</div>
@@ -216,24 +217,6 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
           </CardContent>
         </Card>
 
-        <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs">
-          <CardContent className="p-3.5">
-            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Microsoft Apps</div>
-            <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.microsoft : '—'}
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs">
-          <CardContent className="p-3.5">
-            <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Third-party</div>
-            <div className="text-xl font-semibold text-slate-900 dark:text-white mt-1">
-              {isSynchronized ? summary.thirdParty : '—'}
-            </div>
-          </CardContent>
-        </Card>
-
         <Card className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-2xs col-span-2 sm:col-span-1">
           <CardContent className="p-3.5">
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">Requires Attention</div>
@@ -243,6 +226,12 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
           </CardContent>
         </Card>
       </div>
+
+      {isSynchronized && (summary.statusNotReported > 0 || summary.publisherNotReported > 0) && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          {summary.statusNotReported} app status not reported · {summary.publisherNotReported} publisher names not reported.
+        </p>
+      )}
 
       {/* Main Table Card */}
       <Card className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
@@ -262,19 +251,6 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
 
               <div className="flex flex-wrap items-center gap-2">
                 <div className="flex items-center gap-1.5 text-xs">
-                  <span className="text-slate-500 dark:text-slate-400">Publisher:</span>
-                  <select
-                    value={publisherFilter}
-                    onChange={(e) => setPublisherFilter(e.target.value)}
-                    className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-2xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
-                  >
-                    <option value="all">All Publishers</option>
-                    <option value="microsoft">Microsoft</option>
-                    <option value="thirdParty">Third-party</option>
-                  </select>
-                </div>
-
-                <div className="flex items-center gap-1.5 text-xs">
                   <span className="text-slate-500 dark:text-slate-400">Sign-in:</span>
                   <select
                     value={statusFilter}
@@ -284,6 +260,7 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                     <option value="all">All Statuses</option>
                     <option value="enabled">Enabled</option>
                     <option value="disabled">Disabled</option>
+                    <option value="notReported">Not reported</option>
                   </select>
                 </div>
 
@@ -375,24 +352,26 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                         </Badge>
                       </td>
                       <td className="py-3 px-3">
-                        {a.enabled ? (
+                        {a.enabled === true ? (
                           <Badge className="bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border border-emerald-200 text-[10px]">
                             Yes
                           </Badge>
-                        ) : (
+                        ) : a.enabled === false ? (
                           <Badge className="bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400 border border-slate-200 text-[10px]">
                             No
                           </Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-[10px]">Not reported</Badge>
                         )}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.assignmentRequired ? 'Yes' : 'No'}
+                        {reportedYesNo(a.assignmentRequired)}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.totalAssigned > 0 ? `${a.totalAssigned} identities` : 'None'}
+                        {a.totalAssigned === null ? 'Not reported' : a.totalAssigned > 0 ? `${a.totalAssigned} identities` : 'None reported'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.permsCount > 0 ? `${a.permsCount} granted` : 'None'}
+                        {a.permsCount === null ? 'Not reported' : a.permsCount > 0 ? `${a.permsCount} granted` : 'None reported'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400 whitespace-nowrap">
                         {a.created}
@@ -471,17 +450,17 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[10px] text-slate-500 dark:text-slate-400">Verified Publisher</div>
-                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedApp.verifiedPublisher ? 'Yes' : 'No'}</div>
+                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{reportedYesNo(selectedApp.verifiedPublisher)}</div>
                   </div>
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[10px] text-slate-500 dark:text-slate-400">Account Enabled</div>
-                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedApp.enabled ? 'Yes' : 'No'}</div>
+                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{reportedYesNo(selectedApp.enabled)}</div>
                   </div>
 
                   <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div className="text-[10px] text-slate-500 dark:text-slate-400">Assignment Required</div>
-                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{selectedApp.assignmentRequired ? 'Yes' : 'No'}</div>
+                    <div className="font-semibold text-slate-900 dark:text-white mt-0.5">{reportedYesNo(selectedApp.assignmentRequired)}</div>
                   </div>
                 </div>
 
@@ -489,12 +468,13 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                   <div className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Application ID</div>
-                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.appId}</div>
+                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.appId || 'Not reported'}</div>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => handleCopy(selectedApp.appId!)}
+                      disabled={!selectedApp.appId}
                       className="h-7 text-[11px] gap-1"
                     >
                       {copiedId === selectedApp.appId ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
@@ -505,12 +485,13 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                   <div className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Service Principal Object ID</div>
-                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.objectId}</div>
+                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.objectId || 'Not reported'}</div>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => handleCopy(selectedApp.objectId!)}
+                      disabled={!selectedApp.objectId}
                       className="h-7 text-[11px] gap-1"
                     >
                       {copiedId === selectedApp.objectId ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
@@ -532,35 +513,35 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                     </div>
                     <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                       <div>
-                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Users ({users.length})</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Users ({Array.isArray(selectedApp.assignedUsers) ? users.length : 'not reported'})</div>
                         {users.length > 0 ? (
                           <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400 mt-1">
                             {users.map((u, i) => <li key={i}>• {u}</li>)}
                           </ul>
                         ) : (
-                          <p className="text-slate-500 italic mt-0.5">No direct user assignments listed.</p>
+                          <p className="text-slate-500 italic mt-0.5">{Array.isArray(selectedApp.assignedUsers) ? 'None reported in current response.' : 'Not reported in current response.'}</p>
                         )}
                       </div>
 
                       <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
-                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Groups ({groups.length})</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Groups ({Array.isArray(selectedApp.assignedGroups) ? groups.length : 'not reported'})</div>
                         {groups.length > 0 ? (
                           <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400 mt-1">
                             {groups.map((g, i) => <li key={i}>• {g}</li>)}
                           </ul>
                         ) : (
-                          <p className="text-slate-500 italic mt-0.5">No group assignments listed.</p>
+                          <p className="text-slate-500 italic mt-0.5">{Array.isArray(selectedApp.assignedGroups) ? 'None reported in current response.' : 'Not reported in current response.'}</p>
                         )}
                       </div>
 
                       <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
-                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Service Principals ({sps.length})</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">Assigned Service Principals ({Array.isArray(selectedApp.assignedServicePrincipals) ? sps.length : 'not reported'})</div>
                         {sps.length > 0 ? (
                           <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400 mt-1">
                             {sps.map((sp, i) => <li key={i}>• {sp}</li>)}
                           </ul>
                         ) : (
-                          <p className="text-slate-500 italic mt-0.5">No service principal assignments listed.</p>
+                          <p className="text-slate-500 italic mt-0.5">{Array.isArray(selectedApp.assignedServicePrincipals) ? 'None reported in current response.' : 'Not reported in current response.'}</p>
                         )}
                       </div>
                     </div>
@@ -575,8 +556,8 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                 </div>
                 <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                   <div>
-                    <div className="text-[10px] text-slate-500">Resource API: {selectedApp.resourceApi || 'Microsoft Graph'}</div>
-                    <div className="text-[10px] text-slate-500">Consent Type: {selectedApp.consentType || 'AllPrincipals (Tenant-wide)'}</div>
+                    <div className="text-[10px] text-slate-500">Resource API: {reportedText(selectedApp.resourceApi, 'Not reported')}</div>
+                    <div className="text-[10px] text-slate-500">Consent Type: {reportedText(selectedApp.consentType, 'Not reported')}</div>
                     {selectedApp.grantedBy && (
                       <div className="text-[10px] text-slate-500">Granted By: {selectedApp.grantedBy}</div>
                     )}

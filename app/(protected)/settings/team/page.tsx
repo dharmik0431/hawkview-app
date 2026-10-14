@@ -698,7 +698,7 @@ export function AdminPanelPage({ initialTab = 'overview', }: { initialTab?: Admi
     activeMembership?.organization.name ||
     'HawkView Workspace'
   const orgId = workspace?.organization.id || activeMembership?.organization.id || 'N/A'
-  const orgStatus = activeMembership?.organization.status || 'ACTIVE'
+  const orgStatus = activeMembership?.organization.status || 'Status not verified'
   const businessDomain =
     organizationProfile?.businessDomain ||
     activeMembership?.organization.businessDomain ||

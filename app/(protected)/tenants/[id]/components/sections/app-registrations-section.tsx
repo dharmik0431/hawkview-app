@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react'
 import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { applicationsAge } from '@/lib/tenants/dataset-age'
+import { applicationAudience, reportedText } from '@/lib/tenants/evidence-labels'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -37,10 +38,10 @@ export type AppRegistrationItem = {
   signInAudience?: string
   supportedAccounts?: string
   accounts?: string
-  isMultitenant?: boolean
+  isMultitenant?: boolean | null
   homepageUrl?: string
   identifierUris?: string[]
-  owners?: string[]
+  owners?: string[] | null
   risk?: string | null
   apiPermissions?: Array<{
     name?: string
@@ -49,8 +50,8 @@ export type AppRegistrationItem = {
     consentStatus?: string
     adminConsentRequired?: boolean
     scopeOrRole?: string
-  }>
-  perms?: any[]
+  }> | null
+  perms?: any[] | null
   credentials?: Array<{
     type?: 'Secret' | 'Certificate' | string
     name?: string
@@ -58,8 +59,8 @@ export type AppRegistrationItem = {
     endDate?: string
     expirationDate?: string
     status?: 'Active' | 'Expiring' | 'Expired' | string
-  }>
-  creds?: any[]
+  }> | null
+  creds?: any[] | null
   assignedIdentities?: string[]
   consentGrants?: string[]
   riskLevel?: 'high' | 'medium' | 'low' | string
@@ -94,23 +95,25 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
   const normalizedApps = useMemo(() => {
     return rawApps.map((a, idx) => {
       const name = a.displayName || a.name || `Application ${idx + 1}`
-      const appId = a.appId || a.clientId || `app-id-${idx}`
-      const objectId = a.objectId || a.id || `obj-id-${idx}`
-      const accounts = a.supportedAccounts || a.signInAudience || 'Single tenant'
-      const isMultitenant = accounts.toLowerCase().includes('multi')
-      const owners = Array.isArray(a.owners) ? a.owners : []
-      const creds = Array.isArray(a.credentials) ? a.credentials : []
-      const perms = Array.isArray(a.apiPermissions) ? a.apiPermissions : []
+      const appId = reportedText(a.appId || a.clientId, '')
+      const objectId = reportedText(a.objectId || a.id, '')
+      const audience = applicationAudience(a.signInAudience || a.supportedAccounts)
+      const accounts = audience.label
+      const isMultitenant = audience.reach === 'multi' ? true : audience.reach === 'single' ? false : null
+      const owners = Array.isArray(a.owners) ? a.owners : null
+      const creds = Array.isArray(a.credentials) ? a.credentials : null
+      const perms = Array.isArray(a.apiPermissions) ? a.apiPermissions : null
       const created = a.createdDate || a.createdDateTime || 'Unknown'
       const risk = a.riskLevel || null // Only if real calculation exists
 
       return {
         ...a,
-        id: objectId,
+        id: objectId || appId || `row-${idx}`,
         objectId,
         appId,
         name,
         accounts,
+        audienceReach: audience.reach,
         isMultitenant,
         owners,
         creds,
@@ -123,19 +126,22 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
 
   const summary = useMemo(() => {
     const total = normalizedApps.length
-    const singleTenant = normalizedApps.filter(a => !a.isMultitenant).length
-    const multiTenant = normalizedApps.filter(a => a.isMultitenant).length
-    const withCreds = normalizedApps.filter(a => a.creds.length > 0).length
-    const requiringAttention = normalizedApps.filter(a => a.risk === 'high' || a.creds.some(c => c.status === 'Expiring' || c.status === 'Expired')).length
+    const singleTenant = normalizedApps.filter(a => a.audienceReach === 'single').length
+    const multiTenant = normalizedApps.filter(a => a.audienceReach === 'multi').length
+    const audienceUnclassified = normalizedApps.filter(a => a.audienceReach === null).length
+    const personalOnly = normalizedApps.filter(a => a.audienceReach === 'personal').length
+    const credentialUnreported = normalizedApps.filter(a => a.creds === null).length
+    const withCreds = normalizedApps.filter(a => (a.creds?.length ?? 0) > 0).length
+    const requiringAttention = normalizedApps.filter(a => a.risk === 'high' || a.creds?.some(c => c.status === 'Expiring' || c.status === 'Expired')).length
 
-    return { total, singleTenant, multiTenant, withCreds, requiringAttention }
+    return { total, singleTenant, multiTenant, audienceUnclassified, personalOnly, credentialUnreported, withCreds, requiringAttention }
   }, [normalizedApps])
 
   const filteredApps = useMemo(() => {
     const q = query.trim().toLowerCase()
     return normalizedApps.filter((a) => {
       const matchesText = !q || a.name.toLowerCase().includes(q) || a.appId.toLowerCase().includes(q) || a.objectId.toLowerCase().includes(q)
-      const matchesAccount = accountFilter === 'all' || (accountFilter === 'single' ? !a.isMultitenant : a.isMultitenant)
+      const matchesAccount = accountFilter === 'all' || a.audienceReach === accountFilter || (accountFilter === 'notReported' && a.audienceReach === null)
       const matchesRisk = riskFilter === 'all' || (a.risk && a.risk.toLowerCase() === riskFilter.toLowerCase())
 
       return matchesText && matchesAccount && matchesRisk
@@ -221,6 +227,12 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
         </Card>
       </div>
 
+      {isSynchronized && (summary.audienceUnclassified > 0 || summary.personalOnly > 0 || summary.credentialUnreported > 0) && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          {summary.audienceUnclassified} account audience not classified · {summary.personalOnly} personal-only · {summary.credentialUnreported} credential inventories not reported.
+        </p>
+      )}
+
       {/* Main Table Card */}
       <Card className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
         <CardContent className="p-0">
@@ -248,6 +260,8 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                     <option value="all">All Accounts</option>
                     <option value="single">Single-tenant</option>
                     <option value="multi">Multitenant</option>
+                    <option value="personal">Personal accounts</option>
+                    <option value="notReported">Not reported</option>
                   </select>
                 </div>
 
@@ -330,19 +344,19 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                         {a.name}
                       </td>
                       <td className="py-3 px-3 font-mono text-[11px] text-slate-600 dark:text-slate-400 max-w-[150px] truncate">
-                        {a.appId}
+                        {a.appId || 'Not reported'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
                         {a.accounts}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.owners.length} owner{a.owners.length === 1 ? '' : 's'}
+                        {a.owners === null ? 'Not reported' : `${a.owners.length} owner${a.owners.length === 1 ? '' : 's'}`}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.creds.length > 0 ? `${a.creds.length} defined` : 'None'}
+                        {a.creds === null ? 'Not reported' : a.creds.length > 0 ? `${a.creds.length} defined` : 'None reported'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400">
-                        {a.perms.length > 0 ? `${a.perms.length} requested` : 'None'}
+                        {a.perms === null ? 'Not reported' : a.perms.length > 0 ? `${a.perms.length} requested` : 'None reported'}
                       </td>
                       <td className="py-3 px-3 text-slate-600 dark:text-slate-400 whitespace-nowrap">
                         {a.created}
@@ -430,12 +444,13 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                   <div className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Application / Client ID</div>
-                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.appId}</div>
+                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.appId || 'Not reported'}</div>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => handleCopy(selectedApp.appId || '')}
+                      disabled={!selectedApp.appId}
                       className="h-7 text-[11px] gap-1"
                     >
                       {copiedId === selectedApp.appId ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
@@ -446,12 +461,13 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                   <div className="flex items-center justify-between p-2.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
                     <div>
                       <div className="text-[10px] text-slate-500 dark:text-slate-400">Object ID</div>
-                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.objectId}</div>
+                      <div className="font-mono text-xs font-semibold text-slate-900 dark:text-white">{selectedApp.objectId || 'Not reported'}</div>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => handleCopy(selectedApp.objectId || '')}
+                      disabled={!selectedApp.objectId}
                       className="h-7 text-[11px] gap-1"
                     >
                       {copiedId === selectedApp.objectId ? <Check className="h-3 w-3 text-emerald-600" /> : <Copy className="h-3 w-3" />}
@@ -480,7 +496,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                   <>
                     <div className="space-y-2">
                       <div className="font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider text-[10px]">
-                        3. API Permissions ({perms.length})
+                        3. API Permissions ({selectedApp.perms === null ? 'not reported' : perms.length})
                       </div>
                       {perms.length > 0 ? (
                         <div className="space-y-2">
@@ -489,17 +505,17 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                               <div className="flex items-center justify-between">
                                 <span className="font-semibold text-slate-900 dark:text-white">{p.name || 'Permission'}</span>
                                 <Badge variant="outline" className="text-[10px]">
-                                  {p.type || 'Delegated'}
+                                  {reportedText(p.type, 'Type not reported')}
                                 </Badge>
                               </div>
-                              <div className="text-[11px] text-slate-500">Resource API: {p.resourceApi || 'Microsoft Graph'}</div>
-                              <div className="text-[11px] text-slate-500">Scope/Role: <code className="font-mono">{p.scopeOrRole || 'Default'}</code></div>
+                              <div className="text-[11px] text-slate-500">Resource API: {reportedText(p.resourceApi, 'Not reported')}</div>
+                              <div className="text-[11px] text-slate-500">Scope/Role: <code className="font-mono">{reportedText(p.scopeOrRole, 'Not reported')}</code></div>
                             </div>
                           ))}
                         </div>
                       ) : (
                         <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 text-slate-500 italic">
-                          No API permissions enumerated in current response.
+                          {selectedApp.perms === null ? 'API permission requests not reported in current response.' : 'No API permissions enumerated in current response.'}
                         </div>
                       )}
                     </div>
@@ -507,7 +523,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                     {/* 4. Credentials (NEVER DISPLAY SECRET VALUES) */}
                     <div className="space-y-2">
                       <div className="font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider text-[10px]">
-                        4. Credentials ({creds.length})
+                        4. Credentials ({selectedApp.creds === null ? 'not reported' : creds.length})
                       </div>
                       <div className="p-2.5 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-[11px] text-amber-800 dark:text-amber-300 flex items-center gap-2">
                         <Lock className="h-4 w-4 shrink-0" />
@@ -521,15 +537,15 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                                 <div className="font-semibold text-slate-900 dark:text-white">{c.name || `${c.type || 'Credential'} #${idx+1}`}</div>
                                 <div className="text-[11px] text-slate-500">Expires: {c.expirationDate || c.endDate || 'Not set'}</div>
                               </div>
-                              <Badge className="text-[10px]">
-                                {c.status || 'Active'}
+                              <Badge variant="outline" className="text-[10px]">
+                                {reportedText(c.status, 'Status not reported')}
                               </Badge>
                             </div>
                           ))}
                         </div>
                       ) : (
                         <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 text-slate-500 italic">
-                          No credentials defined for this application.
+                          {selectedApp.creds === null ? 'Credential metadata not reported in current response.' : 'No credentials defined for this application.'}
                         </div>
                       )}
                     </div>
@@ -540,7 +556,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                         5. Access & Governance
                       </div>
                       <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-1.5">
-                        <div className="font-semibold text-slate-900 dark:text-white">Owners ({owners.length})</div>
+                        <div className="font-semibold text-slate-900 dark:text-white">Owners ({selectedApp.owners === null ? 'not reported' : owners.length})</div>
                         {owners.length > 0 ? (
                           <ul className="space-y-1 font-mono text-[11px] text-slate-600 dark:text-slate-400">
                             {owners.map((owner, i) => (
@@ -548,7 +564,7 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                             ))}
                           </ul>
                         ) : (
-                          <p className="text-slate-500 italic">No owners assigned.</p>
+                          <p className="text-slate-500 italic">{selectedApp.owners === null ? 'Owner roster not reported.' : 'No owners assigned.'}</p>
                         )}
                       </div>
                     </div>

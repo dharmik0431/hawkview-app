@@ -23,6 +23,7 @@ import {
   Layers,
 } from 'lucide-react'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
+import { reportedText } from '@/lib/tenants/evidence-labels'
 
 export type LicenseStatus =
   | 'Available'
@@ -399,7 +400,12 @@ export default function LicensesSection({
           id: u.id || userEmail || userName,
           name: userName,
           email: userEmail,
-          status: 'Active',
+          status:
+            u.status === 'Enabled' || u.status === 'Disabled'
+              ? u.status
+              : typeof u.accountEnabled === 'boolean'
+                ? u.accountEnabled ? 'Enabled' : 'Disabled'
+                : 'Not reported',
         })
       }
     })
@@ -946,7 +952,9 @@ export default function LicensesSection({
                           plan.displayName ||
                           `Service Plan ${idx + 1}`
                         const planStatus =
-                          plan.status || plan.provisioningStatus || 'Success'
+                          reportedText(plan.status, '') ||
+                          reportedText(plan.provisioningStatus, '') ||
+                          'Status not reported'
                         const isSuccess =
                           planStatus.toLowerCase() === 'success' ||
                           planStatus.toLowerCase() === 'active' ||
@@ -1033,7 +1041,7 @@ export default function LicensesSection({
                       <thead>
                         <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-800/40 text-slate-500 dark:text-slate-400 font-semibold">
                           <th className="py-2 px-3">User</th>
-                          <th className="py-2 px-3 text-right">Status</th>
+                          <th className="py-2 px-3 text-right">Account status</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">

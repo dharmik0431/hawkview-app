@@ -1,0 +1,71 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { resolve } from 'node:path'
+import test from 'node:test'
+
+const require = createRequire(import.meta.url)
+const React = require('react')
+const { createRoot } = require('react-dom/client')
+const { JSDOM } = require('jsdom')
+const ts = require('typescript')
+const h = React.createElement
+const source = resolve('app/(protected)/tenants/[id]/components/sections/groups-section.tsx')
+
+function component(tag: string) {
+  return ({ children, ...props }: any) => h(tag, props, children)
+}
+
+test('group list and detail leave unreported source state unclassified', async () => {
+  const output = ts.transpileModule(readFileSync(source, 'utf8'), {
+    fileName: source,
+    compilerOptions: {
+      jsx: ts.JsxEmit.ReactJSX,
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+    },
+  }).outputText
+  const exports: any = {}
+  new Function('require', 'exports', output)((name: string) => {
+    if (name === '@/components/tenant/section-freshness') return { DatasetEmptyState: () => null }
+    if (name === '@/lib/tenants/dataset-age') return { groupsAge: () => ({}) }
+    if (name === '@/components/ui/card') return { Card: component('section'), CardContent: component('div') }
+    if (name === '@/components/ui/badge') return { Badge: component('span') }
+    if (name === '@/components/ui/input') return { Input: component('input') }
+    if (name === '@/components/ui/button') return { Button: component('button') }
+    return require(name)
+  }, exports)
+  const dom = new JSDOM('<div id="root"></div>', { url: 'https://fixture.invalid' })
+  const previous: Record<string, PropertyDescriptor | undefined> = {}
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator, IS_REACT_ACT_ENVIRONMENT: true })) {
+    previous[key] = Object.getOwnPropertyDescriptor(globalThis, key)
+    Object.defineProperty(globalThis, key, { configurable: true, value })
+  }
+  const root = createRoot(document.getElementById('root'))
+  try {
+    await React.act(async () => root.render(h(exports.default, {
+      bundle: { entra: { groups: [{ id: 'group-1', displayName: 'Example group', type: 'Dynamic security', owners: null, onPremisesSyncEnabled: null }] } },
+    })))
+    const row = document.querySelector('tbody tr')
+    assert.ok(row)
+    assert.match(row.textContent ?? '', /Example group/)
+    assert.match(row.textContent ?? '', /Not reported/)
+    assert.equal(row.querySelector('td:nth-child(3)')?.textContent?.trim(), 'Not reported')
+    assert.match(row.textContent ?? '', /Stored record/)
+    assert.doesNotMatch(row.textContent ?? '', /Synced/)
+    await React.act(async () => row.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true })))
+    const detail = document.querySelector('.fixed.inset-0')
+    assert.ok(detail)
+    assert.match(detail.textContent ?? '', /Not reported/)
+    assert.match(detail.textContent ?? '', /Owner roster unavailable/)
+    assert.doesNotMatch(detail.textContent ?? '', /Cloud-only|Public|None assigned/)
+  } finally {
+    await React.act(async () => root.unmount())
+    dom.window.close()
+    for (const [key, descriptor] of Object.entries(previous)) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor)
+      else Reflect.deleteProperty(globalThis, key)
+    }
+  }
+})

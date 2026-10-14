@@ -7328,11 +7328,11 @@ export class TenantSyncService {
               ),
               owners: Array.isArray(graphGroup?.owners)
                 ? uniquePrincipalLabels(graphGroup.owners)
-                : [],
+                : null,
               onPremisesSyncEnabled:
                 typeof graphGroup?.onPremisesSyncEnabled === 'boolean'
                   ? graphGroup.onPremisesSyncEnabled
-                  : false,
+                  : null,
             }
           }),
           enterpriseApplications: servicePrincipals.map((principal) => ({
@@ -7344,10 +7344,10 @@ export class TenantSyncService {
             publisher:
               principal.verifiedPublisher?.displayName ??
               principal.publisherName ??
-              'Publisher not verified',
-            verifiedPublisher: Boolean(
-              principal.verifiedPublisher?.verifiedPublisherId
-            ),
+              'Not reported',
+            verifiedPublisher: principal.verifiedPublisher == null
+              ? null
+              : Boolean(principal.verifiedPublisher.verifiedPublisherId),
             servicePrincipalType: principal.servicePrincipalType,
             accountEnabled: principal.accountEnabled,
             appRoleAssignmentRequired: principal.appRoleAssignmentRequired,
@@ -7364,7 +7364,7 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('User', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
+              : null,
             assignedGroups: Array.isArray(principal.appRoleAssignedTo)
               ? principal.appRoleAssignedTo
                   .filter(
@@ -7374,7 +7374,7 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('Group', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
+              : null,
             assignedServicePrincipals: Array.isArray(
               principal.appRoleAssignedTo
             )
@@ -7387,13 +7387,16 @@ export class TenantSyncService {
                     (assignment: any) =>
                       objectLabels.assignmentName('ServicePrincipal', assignment.principalId, assignment.principalDisplayName)
                   )
-              : [],
-            delegatedGrants: [],
-            applicationPermissions: [],
+              : null,
+            // These grants are not collected by the service-principal snapshot.
+            // An empty array would claim an observed absence of permissions.
+            delegatedGrants: null,
+            applicationPermissions: null,
           })),
           appRegistrations: applications.map((application) => {
             const now = Date.now()
-            const credentials = [
+            const credentialSourcesReported = Array.isArray(application.passwordCredentials) && Array.isArray(application.keyCredentials)
+            const credentials = credentialSourcesReported ? [
               ...(Array.isArray(application.passwordCredentials)
                 ? application.passwordCredentials.map((credential: any) => ({
                     type: 'Secret',
@@ -7426,13 +7429,12 @@ export class TenantSyncService {
                         ? 'Expiring'
                         : 'Active',
               }
-            })
+            }) : null
             const apiPermissions = Array.isArray(
               application.requiredResourceAccess
-            )
+            ) && application.requiredResourceAccess.every((resource: any) => Array.isArray(resource.resourceAccess))
               ? application.requiredResourceAccess.flatMap((resource: any) =>
-                  Array.isArray(resource.resourceAccess)
-                    ? resource.resourceAccess.map((permission: any) => {
+                  resource.resourceAccess.map((permission: any) => {
                         const resourceApi = resourceApiByAppId.get(
                           String(resource.resourceAppId ?? '').toLowerCase()
                         )
@@ -7451,9 +7453,8 @@ export class TenantSyncService {
                           scopeOrRole: permissionName,
                         }
                       })
-                    : []
                 )
-              : []
+              : null
             return {
               id: application.id,
               objectId: application.id,
@@ -7470,7 +7471,7 @@ export class TenantSyncService {
                     (owner: any) =>
                       objectLabels.ownerName(owner)
                   )
-                : [],
+                : null,
               credentials,
               apiPermissions,
             }
