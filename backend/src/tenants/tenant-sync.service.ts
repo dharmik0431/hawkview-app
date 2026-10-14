@@ -1455,17 +1455,9 @@ export function organizationConfigurationSnapshotForTenant(
  * the only way to check its behaviour was to restate the expression in a test — and a test that
  * restates the thing it checks agrees with itself by construction.
  *
- * WHAT IT DOES WITH AN ABSENT PROPERTY, stated plainly because it is not obvious:
- * `accountEnabled` absent becomes TRUE, and `proxyAddresses` absent becomes `[]`. Absent and
- * explicitly null are therefore indistinguishable here — both take the default.
- *
- * THIS IS A ROBUSTNESS GAP, NOT AN OBSERVED DATA LOSS, and the distinction matters. Graph's
- * default delta responses RETAIN previously-set selected properties; omission is the opt-in
- * `Prefer: return=minimal` mode, and nothing in this codebase sends that header. So there is no
- * evidence of an active erasure and it should not be described as customer data loss. What is
- * true is that a partial payload arriving for any other reason would be written as fact.
- *
- * Whether to harden this is the owner's decision and is not taken here. */
+ * The mailbox collector reads a bounded Graph /users list. Omitted selected fields remain
+ * omitted in this projection; explicit null remains distinct and clears a stored value.
+ * This guards the stored snapshot against an incomplete row, not an observed customer fault. */
 export function exchangeMailboxRow(user: any) {
   // PRESENT-ONLY. A property the directory did not mention is OMITTED rather than defaulted,
   // because "I am not telling you about this" and "this is empty" are different facts and this
@@ -1483,8 +1475,10 @@ export function exchangeMailboxRow(user: any) {
   carry('userPrincipalName', user.userPrincipalName)
   carry('mail', user.mail)
   carry('proxyAddresses', user.proxyAddresses)
-  // Normalised only when PRESENT. Absent stays absent.
-  carry('accountEnabled', user.accountEnabled === undefined ? undefined : user.accountEnabled !== false)
+  // Only a reported boolean establishes account state. Explicit null clears;
+  // absent or malformed values cannot manufacture an enabled account.
+  carry('accountEnabled', typeof user.accountEnabled === 'boolean' || user.accountEnabled === null
+    ? user.accountEnabled : undefined)
   return row
 }
 
@@ -1496,10 +1490,9 @@ export function exchangeMailboxRow(user: any) {
  * only accepts a collection that attests to complete pagination -- a legitimate empty inventory
  * is allowed to remove objects, and a partial read cannot reach here at all.
  *
- * NOT A RESPONSE TO OBSERVED DATA LOSS. Graph's default delta responses retain previously-set
- * selected properties, and nothing here sends `Prefer: return=minimal`. This is robustness
- * against a partial payload arriving for any other reason -- a truncated response, an API
- * change, a replayed fixture -- and it must not be described as confirmed customer data loss.
+ * NOT A RESPONSE TO OBSERVED DATA LOSS. The mailbox collector uses a bounded Graph /users
+ * list. This is robustness against a row with an omitted selected property, whether caused by
+ * an API change or a replayed fixture, not a claim of confirmed customer data loss.
  */
 export function mergeExchangeMailboxRows(
   previous: readonly unknown[], incoming: readonly unknown[],
