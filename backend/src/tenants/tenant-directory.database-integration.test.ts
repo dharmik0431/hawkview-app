@@ -853,6 +853,64 @@ test(
 )
 
 test(
+  'a migrated PostgreSQL users delta preserves a stored disabled account when accountEnabled is omitted',
+  { skip: !databaseIntegrationEnabled, concurrency: false },
+  async (context) => {
+    assertDisposableTestDatabase()
+    context.mock.method(globalThis, 'fetch', async () => {
+      throw new Error('Unexpected external request in physical users delta proof')
+    })
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'user-delta-status', randomUUID(), track)
+    const microsoftUserId = randomUUID()
+    await prisma.directoryUser.create({ data: {
+      organizationId: workspace.organizationId,
+      customerTenantId: workspace.tenantId,
+      microsoftUserId,
+      displayName: 'Observed Disabled',
+      userPrincipalName: 'disabled@example.test',
+      accountEnabled: false,
+    } })
+    const service = new TenantSyncService(
+      prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
+    )
+    const checkpoint = 'https://graph.microsoft.com/v1.0/users/delta?$deltatoken=synthetic'
+    let page: Record<string, unknown> = { id: microsoftUserId, userPrincipalName: 'disabled@example.test' }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({
+      value: [page], '@odata.deltaLink': checkpoint,
+    }), { headers: { 'content-type': 'application/json' } })
+    const collect = () => (service as any).synchronizeUsers(
+      { id: workspace.tenantId, organizationId: workspace.organizationId }, 'synthetic-token', checkpoint,
+    )
+    const stored = () => prisma.directoryUser.findUniqueOrThrow({
+      where: { customerTenantId_microsoftUserId: { customerTenantId: workspace.tenantId, microsoftUserId } },
+    })
+
+    await collect()
+    assert.equal((await stored()).accountEnabled, false,
+      'a real Prisma upsert replaced the previously observed disabled state')
+    page = { ...page, accountEnabled: true }
+    await collect()
+    assert.equal((await stored()).accountEnabled, true, 'an explicit true must still update the row')
+    page = { ...page, accountEnabled: false }
+    await collect()
+    assert.equal((await stored()).accountEnabled, false, 'an explicit false must still update the row')
+
+    const newMicrosoftUserId = randomUUID()
+    page = { id: newMicrosoftUserId, userPrincipalName: 'new@example.test' }
+    await collect()
+    const newRow = await prisma.directoryUser.findUniqueOrThrow({
+      where: { customerTenantId_microsoftUserId: {
+        customerTenantId: workspace.tenantId, microsoftUserId: newMicrosoftUserId,
+      } },
+    })
+    assert.equal(newRow.accountEnabled, true,
+      'a new user without the field still takes the existing schema default; unknown is not yet representable')
+  },
+)
+
+test(
   'a migrated PostgreSQL database refuses a directory audit export one past the candidate cap',
   { skip: !databaseIntegrationEnabled },
   async (context) => {

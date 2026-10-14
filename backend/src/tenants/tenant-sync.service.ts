@@ -5707,6 +5707,13 @@ export class TenantSyncService {
                 .filter((skuId): skuId is string => Boolean(skuId))
             ),
           ].sort()
+          // A partial delta row must not replace an observed Disabled state
+          // with the column's favourable default. Only a reported boolean can
+          // change the stored account status. New rows without the field still
+          // use the existing schema default until unknown is representable.
+          const observedAccountEnabled = typeof user.accountEnabled === 'boolean'
+            ? { accountEnabled: user.accountEnabled }
+            : {}
           return this.prisma.directoryUser.upsert({
             where: {
               customerTenantId_microsoftUserId: {
@@ -5721,7 +5728,7 @@ export class TenantSyncService {
               displayName: user.displayName?.trim() || userPrincipalName,
               userPrincipalName,
               mail: user.mail?.trim() || null,
-              accountEnabled: user.accountEnabled !== false,
+              ...observedAccountEnabled,
               userType: user.userType?.trim() || null,
               assignedLicenseSkuIds,
               lastSeenAt: observedAt,
@@ -5730,7 +5737,7 @@ export class TenantSyncService {
               displayName: user.displayName?.trim() || userPrincipalName,
               userPrincipalName,
               mail: user.mail?.trim() || null,
-              accountEnabled: user.accountEnabled !== false,
+              ...observedAccountEnabled,
               userType: user.userType?.trim() || null,
               assignedLicenseSkuIds,
               lastSeenAt: observedAt,
