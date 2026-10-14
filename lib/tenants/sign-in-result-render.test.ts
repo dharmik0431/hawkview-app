@@ -78,9 +78,14 @@ test('unknown transport values are neutral in tenant rendering and maps',async()
 }))
 
 const Overview = load(resolve(base, 'app/(protected)/tenants/[id]/components/sections/entra-overview-section.tsx')).default
+const SYNTHETIC_SUCCESS = '2026-10-14T00:00:00.000Z'
+const syncEvidence = (kind: 'SUCCEEDED' | 'FAILED' = 'SUCCEEDED', lastSuccessfulAt: string | null = SYNTHETIC_SUCCESS) => ({
+  lastSuccessfulAt,
+  outcomeProjection: { recordedOutcome: { kind } },
+})
 test('composed overview cannot turn unreported outcomes or no data into healthy posture',async()=>mounted(async(h:any)=>{
   const user={id:'u',name:'Synthetic',email:'u@example.test',type:'Member',role:'User',status:'Enabled',mfa:'Enabled',mfaRegistration:'Registered',authMethods:['microsoftAuthenticatorPush']}
-  const props={tenant:{},bundle:{users:[user],entra:{riskyUsers:[]}},users:[user],caPolicies:[{state:'ON'}],conditionalAccessEvidence:{availability:'READY',count:1},authMethods:[],namedLocations:[],onNavigateTab:()=>{}}
+  const props={tenant:{},bundle:{users:[user],entra:{riskyUsers:[]},sync:{users:syncEvidence(),authMethodPolicies:syncEvidence(),authRegistrations:syncEvidence(),signIns:syncEvidence(),namedLocations:syncEvidence()}},users:[user],caPolicies:[{state:'ON'}],conditionalAccessEvidence:{availability:'READY',count:1},authMethods:[],namedLocations:[],onNavigateTab:()=>{}}
   for (const [outcomes, posture, icon] of [
     [['Not reported'],'Incomplete data','neutral'],
     [['Success','Not reported'],'Incomplete data','neutral'],
@@ -100,13 +105,157 @@ test('composed overview cannot turn unreported outcomes or no data into healthy 
     if(outcomes.length===0) {assert.match(checklistRow.textContent,/No sign-in data/);assert.doesNotMatch(checklistRow.textContent,/0 reported authentication failures/)}
     if(outcomes.includes('Failure' as never)) assert.match(checklistRow.textContent,/1 reported authentication failure/)
   }
-  // Reported successes cannot override neutral Conditional Access evidence.
-  for (const evidence of [{availability:'UNVERIFIED',count:null},{availability:'READY',count:0}]) {
-    await h.render(Overview,{...props,signIns:[{...rows[0],result:'Success'}],caPolicies:[],conditionalAccessEvidence:evidence})
-    assert.match(h.document.body.textContent,/Incomplete data/)
-    assert.doesNotMatch(h.document.body.textContent,/Healthy/)
-  }
+  // Reported successes cannot override unavailable Conditional Access evidence.
+  await h.render(Overview,{...props,signIns:[{...rows[0],result:'Success'}],caPolicies:[],conditionalAccessEvidence:{availability:'UNVERIFIED',count:null}})
+  assert.match(h.document.body.textContent,/Incomplete data/)
+  assert.doesNotMatch(h.document.body.textContent,/Healthy/)
+  // An authoritative empty CA list is observed, neutral configuration evidence.
+  await h.render(Overview,{...props,signIns:[{...rows[0],result:'Success'}],caPolicies:[],conditionalAccessEvidence:{availability:'READY',count:0}})
+  assert.match(h.document.body.textContent,/Healthy/)
   // Unknown sign-ins must not suppress warnings from other security evidence.
   await h.render(Overview,{...props,signIns:[{...rows[0],result:'Not reported'}],bundle:{...props.bundle,entra:{riskyUsers:[{id:'synthetic-risk'}]}}})
   assert.match(h.document.body.textContent,/Needs attention/)
+}))
+
+test('Entra overview gates posture on its actual collection and per-user registration evidence', async () => mounted(async (h: any) => {
+  const registered = { id: 'registered', name: 'Registered', email: 'registered@example.test', type: 'Member', role: 'User', status: 'Enabled', mfaRegistration: 'Registered' }
+  const unreported = { ...registered, id: 'unreported', name: 'Unreported', mfaRegistration: 'Unknown' }
+  const notRegistered = { ...registered, id: 'not-registered', name: 'Not registered', mfaRegistration: 'Not registered' }
+  const baseSync = {
+    users: syncEvidence(), authMethodPolicies: syncEvidence(), authRegistrations: syncEvidence(),
+    namedLocations: syncEvidence(), signIns: syncEvidence(),
+  }
+  const render = async ({
+    users = [registered], sync = {}, outcomes = ['Success'], authMethods = [{ method: 'Authenticator', enabled: true, users: 1 }],
+    namedLocations = [{ id: 'location', name: 'Office', type: 'TRUSTED' }],
+  }: any = {}) => h.render(Overview, {
+    tenant: {}, users, bundle: { users, entra: { riskyUsers: [], authMethods, namedLocations }, sync: { ...baseSync, ...sync } },
+    signIns: outcomes.map((result: string, index: number) => ({ ...rows[index], result })),
+    caPolicies: [{ state: 'ON' }], conditionalAccessEvidence: { availability: 'READY', count: 1 },
+    authMethods, namedLocations, onNavigateTab: () => {},
+  })
+  const row = (name: string) => {
+    const label = Array.from(h.document.querySelectorAll('div')).find((element: any) => element.textContent === name) as any
+    assert.ok(label, `${name} row exists`)
+    return label.parentElement.parentElement.parentElement as HTMLElement
+  }
+  const evidence = () => h.document.querySelector('[aria-label="Entra evidence not fully reported"]')?.textContent ?? ''
+
+  await render()
+  assert.match(h.document.body.textContent, /Healthy/)
+  assert.equal(evidence(), '', 'complete default evidence has no missing-input disclosure')
+
+  await render({ users: [], sync: { users: syncEvidence('SUCCEEDED', null) } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(row('MFA registration coverage').textContent, /Awaiting collection/)
+  assert.doesNotMatch(row('MFA registration coverage').textContent, /0%/)
+  assert.match(evidence(), /Users collection: not reported/)
+
+  await render({ sync: { authMethodPolicies: syncEvidence('SUCCEEDED', null) } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(evidence(), /Authentication-method policies: not reported/)
+  assert.equal(Boolean(row('Authentication methods').querySelector('svg.text-emerald-500')), false)
+
+  await render({ users: [unreported], sync: { authRegistrations: syncEvidence('SUCCEEDED', null) } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(row('MFA registration coverage').textContent, /Coverage not fully reported/)
+  assert.doesNotMatch(row('MFA registration coverage').textContent, /0%/)
+  assert.match(evidence(), /MFA registration: not reported/)
+
+  await render({ users: [registered, unreported] })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(row('MFA registration coverage').textContent, /1 registered of 2 enabled; 1 not reported/)
+  assert.doesNotMatch(row('MFA registration coverage').textContent, /%/)
+  assert.equal(Boolean(row('MFA registration coverage').querySelector('svg.text-emerald-500, svg.text-amber-500')), false)
+  assert.match(evidence(), /MFA registration: 1 enabled user state not reported/)
+
+  await render({ sync: { users: syncEvidence('FAILED') } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(evidence(), /Users collection: latest attempt failed/)
+  assert.doesNotMatch(h.document.body.textContent, /Healthy/)
+
+  await render({ sync: { signIns: syncEvidence('FAILED') } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(evidence(), /Sign-ins: latest attempt failed/)
+
+  await render({ sync: { authMethodPolicies: syncEvidence('FAILED'), namedLocations: syncEvidence('FAILED') } })
+  assert.match(h.document.body.textContent, /Incomplete data/)
+  assert.match(evidence(), /Authentication-method policies: latest attempt failed/)
+  assert.match(row('Authentication methods').textContent, /1 method last reported; latest collection failed/)
+  assert.equal(Boolean(row('Authentication methods').querySelector('svg.text-emerald-500')), false)
+  assert.match(row('Named locations').textContent, /1 location last reported; latest collection failed/)
+  assert.equal(Boolean(row('Named locations').querySelector('svg.text-emerald-500')), false)
+
+  await render({ users: [registered, notRegistered] })
+  assert.match(h.document.body.textContent, /Needs attention/)
+  assert.match(row('MFA registration coverage').textContent, /1 of 2 registered \(50%\)/)
+  assert.ok(row('MFA registration coverage').querySelector('svg.text-amber-500'))
+
+  await render({ outcomes: ['Failure'], sync: { authMethodPolicies: syncEvidence('SUCCEEDED', null) } })
+  assert.match(h.document.body.textContent, /Needs attention/)
+  assert.match(evidence(), /Authentication-method policies: not reported/)
+
+  await render({ users: [], authMethods: [], namedLocations: [] })
+  assert.match(row('MFA registration coverage').textContent, /No enabled users reported/)
+  assert.equal(Boolean(row('MFA registration coverage').querySelector('svg.text-emerald-500, svg.text-amber-500')), false)
+  assert.match(row('Authentication methods').textContent, /0 methods configured/)
+  assert.equal(Boolean(row('Authentication methods').querySelector('svg.text-emerald-500')), false)
+  assert.match(row('Named locations').textContent, /0 locations configured/)
+  assert.equal(Boolean(row('Named locations').querySelector('svg.text-emerald-500')), false)
+
+  await render({ sync: { namedLocations: syncEvidence('SUCCEEDED', null) } })
+  assert.match(row('Named locations').textContent, /Awaiting collection/)
+  assert.equal(Boolean(row('Named locations').querySelector('svg.text-emerald-500')), false)
+}))
+
+test('Entra overview reports stored group/device counts only with their own collection evidence and never asserts an admin total', async () => mounted(async (h: any) => {
+  const user = {
+    id: 'user-one', name: 'Synthetic', email: 'user@example.test', type: 'Member',
+    role: 'Global Administrator', status: 'Enabled', mfaRegistration: 'Registered',
+    groups: ['Operations'], devices: [{ name: 'Shared' }],
+  }
+  const groups = [
+    { id: 'group-one', displayName: 'Operations' },
+    { id: 'group-two', displayName: 'Operations' },
+    { id: 'group-three', displayName: 'Security only' },
+  ]
+  const completeSync = {
+    users: syncEvidence(), authMethodPolicies: syncEvidence(), authRegistrations: syncEvidence(),
+    namedLocations: syncEvidence(), signIns: syncEvidence(), groups: syncEvidence(), devices: syncEvidence(),
+  }
+  const render = async ({ storedGroups = groups, deviceCount = 3, sync = {} }: any = {}) => h.render(Overview, {
+    tenant: {}, users: [user], signIns: [{ ...rows[0], result: 'Success' }],
+    bundle: {
+      users: [user], exchange: { groups: [{ id: 'group-one', name: 'Operations', email: 'ops@example.test' }] },
+      entra: { groups: storedGroups, deviceCount, riskyUsers: [] }, sync: { ...completeSync, ...sync },
+    },
+    caPolicies: [{ state: 'ON' }], conditionalAccessEvidence: { availability: 'READY', count: 1 },
+    authMethods: [], namedLocations: [], onNavigateTab: () => {},
+  })
+  const metric = (name: string) => {
+    const label = Array.from(h.document.querySelectorAll('div')).find((element: any) => element.textContent === name) as any
+    assert.ok(label, `${name} metric exists`)
+    return label.parentElement.textContent as string
+  }
+
+  await render()
+  assert.match(metric('Stored groups'), /Stored groups\s*3/)
+  assert.match(metric('Stored devices'), /Stored devices\s*3/)
+  assert.match(metric('Admins'), /Admins\s*Not assessed by HawkView/)
+  assert.doesNotMatch(metric('Admins'), /\b1\b/)
+
+  await render({ storedGroups: [], deviceCount: 0 })
+  assert.match(metric('Stored groups'), /Stored groups\s*0/)
+  assert.match(metric('Stored devices'), /Stored devices\s*0/)
+
+  await render({ sync: { groups: syncEvidence('SUCCEEDED', null), devices: syncEvidence('SUCCEEDED', null) } })
+  assert.match(metric('Stored groups'), /Count not reported/)
+  assert.match(metric('Stored devices'), /Count not reported/)
+  assert.doesNotMatch(metric('Stored groups'), /\b3\b/)
+  assert.doesNotMatch(metric('Stored devices'), /\b3\b/)
+
+  await render({ sync: { groups: syncEvidence('FAILED'), devices: syncEvidence('FAILED') } })
+  assert.match(metric('Stored groups'), /Stored groups\s*3\s*Latest refresh failed/)
+  assert.match(metric('Stored devices'), /Stored devices\s*3\s*Latest refresh failed/)
+  assert.match(metric('Admins'), /Not assessed by HawkView/)
 }))

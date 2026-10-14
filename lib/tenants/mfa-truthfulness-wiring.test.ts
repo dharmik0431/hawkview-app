@@ -47,7 +47,7 @@ test('user security facts precede role and type in the table', () => {
     'label="MFA registration"',
     'MFA enforcement',
     'Legacy per-user MFA',
-    'label="Role"',
+    'label="Direct role"',
     'label="Type"',
   ].map((label) => table.indexOf(label))
   assert.equal(order.every((position) => position >= 0), true)

@@ -161,7 +161,7 @@ type EntraTab =
 
 type UserSortField = 'name' | 'type' | 'role' | 'status' | 'mfa'
 type UserSortOrder = 'asc' | 'desc'
-type UserRoleFilter = 'all' | 'admin' | 'user' | 'unknown'
+type UserRoleFilter = 'all' | 'reported' | 'none' | 'unknown'
 type UserStatusFilter = 'all' | 'enabled' | 'disabled' | 'unknown'
 type UserMfaFilter = 'all' | 'registered' | 'not-registered' | 'not-reported'
 
@@ -397,6 +397,23 @@ function getUserRoles(u: { role?: string; roles?: string[] }): string[] {
     return [r]
   }
   return []
+}
+
+type DirectRoleState = {
+  kind: 'reported' | 'none' | 'unknown'
+  names: string[]
+  latestFailed: boolean
+}
+
+function directRoleState(
+  user: { role?: string; roles?: string[] },
+  sync: any
+): DirectRoleState {
+  const observed = Boolean(sync?.lastSuccessfulAt)
+  const latestFailed = sync?.outcomeProjection?.recordedOutcome?.kind === 'FAILED'
+  if (!observed) return { kind: 'unknown', names: [], latestFailed }
+  const names = getUserRoles(user)
+  return { kind: names.length > 0 ? 'reported' : 'none', names, latestFailed }
 }
 
 function UserRolesPopover({
@@ -1611,6 +1628,7 @@ function TenantDetailsWorkspace() {
     () => (bundle?.users ?? []) as TenantUser[],
     [bundle?.users]
   )
+  const directoryRoleSync = bundle?.sync?.directoryRoles
   const SIGNINS = useMemo(
     () => ((bundle?.signIns ?? []) as SignInEvent[]).map(event => ({ ...event, result: reportedSignInResult(event.result) })),
     [bundle?.signIns]
@@ -1802,28 +1820,8 @@ function TenantDetailsWorkspace() {
         if (!matchName && !matchEmail) return false
       }
 
-      if (userRoleFilter === 'admin') {
-        const roles = getUserRoles(u)
-        const isOldAdmin = Boolean(
-          u.role && u.role.toLowerCase().includes('admin')
-        )
-        if (roles.length === 0 && !isOldAdmin) return false
-      } else if (userRoleFilter === 'user') {
-        const roles = getUserRoles(u)
-        if (
-          roles.length > 0 ||
-          (u.role && u.role.toLowerCase().includes('admin'))
-        )
-          return false
-      } else if (userRoleFilter === 'unknown') {
-        const roles = getUserRoles(u)
-        if (
-          roles.length > 0 ||
-          u.role === 'User' ||
-          (u.role && u.role.toLowerCase().includes('admin'))
-        )
-          return false
-      }
+      if (userRoleFilter !== 'all' &&
+          directRoleState(u, directoryRoleSync).kind !== userRoleFilter) return false
 
       if (userStatusFilter === 'enabled') {
         if (u.status !== 'Enabled') return false
@@ -1844,7 +1842,7 @@ function TenantDetailsWorkspace() {
 
       return true
     })
-  }, [USERS, userSearch, userRoleFilter, userStatusFilter, userMfaFilter])
+  }, [USERS, directoryRoleSync, userSearch, userRoleFilter, userStatusFilter, userMfaFilter])
 
   const sortedUsers = useMemo(() => {
     const isUnknownOrMissing = (val: string | null | undefined) => {
@@ -1892,29 +1890,18 @@ function TenantDetailsWorkspace() {
         }
 
         case 'role': {
-          const rolesA = getUserRoles(a)
-          const rolesB = getUserRoles(b)
-          const roleNameA = rolesA.length > 0 ? rolesA[0] : a.role || 'User'
-          const roleNameB = rolesB.length > 0 ? rolesB[0] : b.role || 'User'
-          const missingA = isUnknownOrMissing(a.role) && rolesA.length === 0
-          const missingB = isUnknownOrMissing(b.role) && rolesB.length === 0
-          if (missingA && missingB) cmp = 0
-          else if (missingA) return 1
-          else if (missingB) return -1
-          else {
-            const isAdminA =
-              rolesA.length > 0 ||
-              (a.role && a.role.toLowerCase().includes('admin'))
-            const isAdminB =
-              rolesB.length > 0 ||
-              (b.role && b.role.toLowerCase().includes('admin'))
-            if (isAdminA && !isAdminB) cmp = -1
-            else if (!isAdminA && isAdminB) cmp = 1
-            else {
-              cmp = roleNameA.localeCompare(roleNameB, undefined, {
-                sensitivity: 'base',
-              })
-            }
+          const roleA = directRoleState(a, directoryRoleSync)
+          const roleB = directRoleState(b, directoryRoleSync)
+          if (roleA.kind === 'unknown' && roleB.kind !== 'unknown') return 1
+          if (roleB.kind === 'unknown' && roleA.kind !== 'unknown') return -1
+          const rank: Record<DirectRoleState['kind'], number> = {
+            reported: 0, none: 1, unknown: 2,
+          }
+          cmp = rank[roleA.kind] - rank[roleB.kind]
+          if (cmp === 0 && roleA.kind === 'reported' && roleB.kind === 'reported') {
+            cmp = roleA.names[0].localeCompare(roleB.names[0], undefined, {
+              sensitivity: 'base',
+            })
           }
           break
         }
@@ -1970,7 +1957,10 @@ function TenantDetailsWorkspace() {
       const tieB = (b.name || '').toLowerCase()
       return tieA.localeCompare(tieB)
     })
-  }, [filteredUsers, userSortField, userSortOrder])
+  }, [filteredUsers, directoryRoleSync, userSortField, userSortOrder])
+  const selectedUserRoleState = selectedUser
+    ? directRoleState(selectedUser, directoryRoleSync)
+    : null
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const filteredTenants = useMemo(() => {
@@ -4218,7 +4208,7 @@ function TenantDetailsWorkspace() {
                         <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
                           <div className="flex items-center gap-1.5">
                             <span className="text-slate-500 dark:text-slate-400 font-medium">
-                              Role:
+                              Direct role:
                             </span>
                             <select
                               value={userRoleFilter}
@@ -4230,9 +4220,9 @@ function TenantDetailsWorkspace() {
                               className="h-8 px-2.5 py-1 text-xs rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 cursor-pointer"
                             >
                               <option value="all">All roles</option>
-                              <option value="admin">Administrators</option>
-                              <option value="user">Users</option>
-                              <option value="unknown">Unknown</option>
+                              <option value="reported">Stored direct role</option>
+                              <option value="none">No direct role in stored result</option>
+                              <option value="unknown">Role data not collected</option>
                             </select>
                           </div>
 
@@ -4339,7 +4329,7 @@ function TenantDetailsWorkspace() {
                               </th>
                               <UserSortHeader
                                 field="role"
-                                label="Role"
+                                label="Direct role"
                                 activeField={userSortField}
                                 sortOrder={userSortOrder}
                                 onSort={handleUserSort}
@@ -4363,13 +4353,12 @@ function TenantDetailsWorkspace() {
                             {sortedUsers.map((u) => {
                               const isTypeUnknown =
                                 !u.type || u.type.toLowerCase() === 'unknown'
-                              const isRoleUnknown =
-                                !u.role || u.role.toLowerCase() === 'unknown'
+                              const userRoleState = directRoleState(u, directoryRoleSync)
                               const mfaRegistrationBadge =
                                 mfaRegistrationPresentation(u)
                               const perUserMfaBadge =
                                 perUserMfaPresentation(u)
-                              const userRoles = getUserRoles(u)
+                              const userRoles = userRoleState.names
                               const firstRole =
                                 userRoles.length > 0 ? userRoles[0] : null
                               const extraRoleCount = userRoles.length - 1
@@ -4428,13 +4417,13 @@ function TenantDetailsWorkspace() {
                                     <MfaFactBadge {...perUserMfaBadge} />
                                   </td>
                                   <td className="px-4 py-3.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 relative min-w-[150px]">
-                                    {isRoleUnknown ? (
+                                    {userRoleState.kind === 'unknown' ? (
                                       <span className="text-slate-400 dark:text-slate-500 italic text-xs">
-                                        Awaiting collection
+                                        Role data not collected
                                       </span>
-                                    ) : userRoles.length === 0 ? (
+                                    ) : userRoleState.kind === 'none' ? (
                                       <span className="text-slate-600 dark:text-slate-300 font-normal">
-                                        User
+                                        No direct role reported
                                       </span>
                                     ) : userRoles.length === 1 ? (
                                       <span
@@ -4488,6 +4477,11 @@ function TenantDetailsWorkspace() {
                                         )}
                                       </div>
                                     )}
+                                    {userRoleState.kind !== 'unknown' && userRoleState.latestFailed ? (
+                                      <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                                        Last reported · latest refresh failed
+                                      </div>
+                                    ) : null}
                                   </td>
                                   <td className="px-4 py-3.5 text-slate-600 dark:text-slate-300 whitespace-nowrap hidden md:table-cell text-xs sm:text-sm min-w-[90px]">
                                     {isTypeUnknown ? (
@@ -4840,9 +4834,18 @@ function TenantDetailsWorkspace() {
                       <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
                         {selectedUser.type}
                       </Badge>
-                      <Badge className="bg-slate-50 text-slate-700 border border-slate-200">
-                        {selectedUser.role}
+                      <Badge className="bg-slate-50 text-slate-700 border border-slate-200 break-words">
+                        Direct role: {selectedUserRoleState?.kind === 'unknown'
+                          ? 'Not collected'
+                          : selectedUserRoleState?.kind === 'none'
+                            ? 'None reported'
+                            : selectedUserRoleState?.names.join(', ')}
                       </Badge>
+                      {selectedUserRoleState?.kind !== 'unknown' && selectedUserRoleState?.latestFailed ? (
+                        <Badge className="bg-amber-50 text-amber-800 border border-amber-200">
+                          Last reported · latest refresh failed
+                        </Badge>
+                      ) : null}
                       <Badge
                         className={
                           selectedUser.status === 'Enabled'

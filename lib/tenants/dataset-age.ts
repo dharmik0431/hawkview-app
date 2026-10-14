@@ -62,8 +62,14 @@ export function servicePrincipalsAge(bundle: Bundle): DatasetAgeEvidence {
   return snapshot(bundle, 'servicePrincipals', 'Enterprise applications', bundle?.entra?.enterpriseApplications || bundle?.entra?.servicePrincipals || bundle?.enterpriseApplications || bundle?.servicePrincipals)
 }
 export function groupsAge(bundle: Bundle): DatasetAgeEvidence {
-  // Exchange groups are a projection of the same directoryGroups dataset.
-  return snapshot(bundle, 'groups', 'Groups', bundle?.entra?.groups || bundle?.exchange?.groups || bundle?.groups)
+  // The GROUPS clock remains useful even when an older response omits the
+  // canonical Entra inventory. An Exchange mail-enabled subset cannot verify
+  // that the displayed Entra group result is empty.
+  const canonicalRows = bundle?.entra?.groups
+  return {
+    ...snapshot(bundle, 'groups', 'Groups', canonicalRows),
+    emptyVerified: Array.isArray(canonicalRows) && Boolean(bundle?.sync?.groups?.lastSuccessfulAt),
+  }
 }
 export function licensesAge(bundle: Bundle, rows: unknown): DatasetAgeEvidence {
   return Array.isArray(rows) && rows === bundle?.licenses?.rows

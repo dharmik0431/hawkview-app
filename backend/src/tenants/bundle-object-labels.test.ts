@@ -12,7 +12,8 @@ const ROLE = 'eeeeeeee-eeee-4eee-eeee-eeeeeeeeeeee'
 const DEFINITION = 'ffffffff-ffff-4fff-ffff-ffffffffffff'
 const UNKNOWN = '00000000-0000-4000-8000-000000000099'
 
-async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false) {
+type SyncOverride = Record<string, { status?: string; lastSuccessfulAt?: Date | null } | null>
+async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false, syncOverride: SyncOverride = {}, roleAssignments?: any[]) {
   const org = `org-${tenantId}`
   const tenant = { id: tenantId, organizationId: org, microsoftTenantId: '11111111-1111-4111-8111-111111111111',
     displayName: 'Synthetic tenant', primaryDomain: 'example.invalid', status: 'CONNECTED',
@@ -37,10 +38,16 @@ async function bundle(tenantId: string, name: string, conflicts = false, omitOpt
       ...(omitOptionalEvidence ? {} : { appRoleAssignedTo: assigned }) }],
     APPLICATIONS: [{ id: 'registration', ...(omitOptionalEvidence ? {} : { owners: [{ id: USER }, { id: SP }, { id: UNKNOWN },
       { id: USER, displayName: 'Observed owner name' }] }) }],
-    DIRECTORY_ROLES: [{ principalId: USER, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } }],
+    DIRECTORY_ROLES: roleAssignments ?? [{ principalId: USER, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } }],
     CONDITIONAL_ACCESS: [policy('selected', { includeUsers: [USER.toUpperCase(), UNKNOWN], includeGroups: [GROUP],
       includeRoles: [ROLE, DEFINITION], excludeUsers: ['GuestsOrExternalUsers'], excludeGroups: [GROUP], excludeRoles: [ROLE] }),
       policy('all', { includeUsers: ['All'] }), policy('none', { includeUsers: ['None'] })],
+    AUTH_METHOD_POLICIES: [], AUTH_REGISTRATIONS: [], NAMED_LOCATIONS: [], GROUPS: [],
+    DEVICES: [
+      { id: 'device-one', displayName: 'Shared', registeredOwners: [{ id: USER }] },
+      { id: 'device-two', displayName: 'Shared', registeredOwners: [{ id: USER }, { id: UNKNOWN }] },
+      { id: 'device-three', displayName: 'Ownerless', registeredOwners: [] },
+    ],
   }
   let identityReads = 0, tenantReads = 0, scopedReads = 0
   const scoped = (args: any) => {
@@ -58,8 +65,11 @@ async function bundle(tenantId: string, name: string, conflicts = false, omitOpt
     directoryGroup: many([group]), tenantLicense: many([]), tenantDomain: many([]), tenantCollectionFieldState: many([]),
     signInLog: many([]), directoryAuditLog: many([]), m365ActivitySubscription: many([]),
     tenantEntraSnapshot: many(Object.entries(payloads).map(([resourceType, payload]) => ({ resourceType, payload, observedAt: NOW }))),
-    syncState: many(Object.keys(payloads).map(resourceType => ({ resourceType, status: 'SUCCEEDED', lastAttemptAt: NOW,
-      lastSuccessfulAt: NOW, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 }))),
+    syncState: many(Object.keys(payloads).filter(resourceType => syncOverride[resourceType] !== null).map(resourceType => ({
+      resourceType, status: syncOverride[resourceType]?.status ?? 'SUCCEEDED', lastAttemptAt: NOW,
+      lastSuccessfulAt: syncOverride[resourceType]?.lastSuccessfulAt === undefined ? NOW : syncOverride[resourceType]?.lastSuccessfulAt,
+      lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+    }))),
     m365ActivityContent: { groupBy: async (args: any) => { scoped(args); return [] }, findFirst: async (args: any) => { scoped(args); return null } },
     m365AuditDailyUsage: { findFirst: async (args: any) => { scoped(args); return null }, aggregate: async (args: any) => {
       scoped(args); return { _sum: { downloadedBytes: null, recordsStored: null, blobsProcessed: null } }
@@ -126,6 +136,92 @@ test('real bundle keeps omitted principal and application evidence unreported', 
   assert.equal(result.entra.appRegistrations[0].owners, null)
   assert.equal(result.entra.appRegistrations[0].credentials, null)
   assert.equal(result.entra.appRegistrations[0].apiPermissions, null)
+})
+
+test('bundle projects empty, absent, and latest-failed Entra collection evidence independently of array size', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const reported = await bundle('tenant-A', 'Alice')
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(reported.sync[key].lastSuccessfulAt, NOW.toISOString())
+    assert.equal(reported.sync[key].outcomeProjection.recordedOutcome.kind, 'SUCCEEDED')
+  }
+  assert.deepEqual(reported.entra.authMethods, [])
+  assert.deepEqual(reported.entra.namedLocations, [])
+
+  const absent = await bundle('tenant-A', 'Alice', false, false, {
+    AUTH_METHOD_POLICIES: null, AUTH_REGISTRATIONS: null, NAMED_LOCATIONS: null,
+  })
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(absent.sync[key].lastSuccessfulAt, null)
+    assert.equal(absent.sync[key].outcomeProjection.recordedOutcome.kind, 'UNKNOWN')
+  }
+  assert.deepEqual(absent.entra.authMethods, [])
+  assert.deepEqual(absent.entra.namedLocations, [])
+
+  const failed = await bundle('tenant-A', 'Alice', false, false, {
+    AUTH_METHOD_POLICIES: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+    AUTH_REGISTRATIONS: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+    NAMED_LOCATIONS: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+  })
+  for (const key of ['authMethodPolicies', 'authRegistrations', 'namedLocations'] as const) {
+    assert.equal(failed.sync[key].lastSuccessfulAt, '2026-10-11T12:00:00.000Z')
+    assert.equal(failed.sync[key].outcomeProjection.recordedOutcome.kind, 'FAILED')
+  }
+})
+
+test('bundle exposes stored group and device populations independently of owner-linked user rows', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const reported = await bundle('tenant-A', 'Alice')
+  assert.equal(reported.exchange.groups.length, 0, 'mail-disabled group is absent from Exchange')
+  assert.equal(reported.entra.groups.length, 1, 'all stored groups remain in Entra inventory')
+  assert.equal(reported.entra.groups[0].id, GROUP)
+  assert.equal(reported.entra.deviceCount, 3, 'ownerless and same-named devices count as stored rows')
+  assert.equal(reported.users[0].devices.length, 1, 'owner-linked display list is not device inventory')
+  assert.equal(reported.sync.groups.lastSuccessfulAt, NOW.toISOString())
+  assert.equal(reported.sync.devices.lastSuccessfulAt, NOW.toISOString())
+
+  const absent = await bundle('tenant-A', 'Alice', false, false, { GROUPS: null, DEVICES: null })
+  assert.equal(absent.sync.groups.lastSuccessfulAt, null)
+  assert.equal(absent.sync.devices.lastSuccessfulAt, null)
+  assert.equal(absent.entra.deviceCount, 3, 'rows alone must not imply observed collection')
+
+  const failed = await bundle('tenant-A', 'Alice', false, false, {
+    GROUPS: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+    DEVICES: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+  })
+  assert.equal(failed.sync.groups.outcomeProjection.recordedOutcome.kind, 'FAILED')
+  assert.equal(failed.sync.devices.outcomeProjection.recordedOutcome.kind, 'FAILED')
+  assert.equal(failed.entra.deviceCount, 3, 'historical stored rows remain available after failure')
+})
+
+test('bundle does not invent an ordinary-user role and projects the direct-role collection state', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const assigned = await bundle('tenant-A', 'Alice')
+  assert.equal(assigned.users[0].role, 'Global Reader')
+  assert.equal(assigned.sync.directoryRoles.lastSuccessfulAt, NOW.toISOString())
+  assert.equal(assigned.sync.directoryRoles.outcomeProjection.recordedOutcome.kind, 'SUCCEEDED')
+
+  const empty = await bundle('tenant-A', 'Alice', false, false, {}, [])
+  assert.equal(empty.users[0].role, '', 'a successful empty direct-role snapshot is not a User role')
+  assert.equal(empty.sync.directoryRoles.lastSuccessfulAt, NOW.toISOString())
+
+  const groupPrincipal = await bundle('tenant-A', 'Alice', false, false, {}, [
+    { principalId: GROUP, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } },
+  ])
+  assert.equal(groupPrincipal.users[0].role, '', 'a group-principal assignment is not a direct user role')
+
+  const never = await bundle('tenant-A', 'Alice', false, false, { DIRECTORY_ROLES: null })
+  assert.equal(never.users[0].role, 'Global Reader', 'historical rows remain separate from collection proof')
+  assert.equal(never.sync.directoryRoles.lastSuccessfulAt, null)
+
+  const failed = await bundle('tenant-A', 'Alice', false, false, {
+    DIRECTORY_ROLES: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+  })
+  assert.equal(failed.users[0].role, 'Global Reader')
+  assert.equal(failed.sync.directoryRoles.outcomeProjection.recordedOutcome.kind, 'FAILED')
 })
 
 test('separate tenant invocations never share names; conflicting stored identities remain unresolved', async t => {

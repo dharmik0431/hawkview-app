@@ -5,12 +5,9 @@ import { exchangeMailboxRow, mergeExchangeMailboxRows } from './tenant-sync.serv
 /**
  * A PARTIAL PAYLOAD MUST NOT OVERWRITE STORED VALUES — AND AN EXPLICIT NULL MUST STILL CLEAR.
  *
- * NOT A RESPONSE TO OBSERVED DATA LOSS, and the framing is binding. Microsoft documents that
- * default user delta responses RETAIN previously-set selected properties; omission is the opt-in
- * `Prefer: return=minimal` mode, and nothing in this codebase sends that header — searched for,
- * not assumed. So this is robustness against a partial payload arriving for some other reason —
- * a truncated response, an API change, a replayed fixture — and it must not be described as
- * confirmed customer data loss.
+ * NOT A RESPONSE TO OBSERVED DATA LOSS. This mailbox collector reads a bounded Graph /users
+ * list; these cases protect the snapshot merge if a selected property is missing from a row.
+ * They must not be described as confirmed customer data loss.
  *
  * The characterisation these replace (at `0f02ccf`) found that ABSENT and EXPLICITLY NULL
  * reached the same stored value, so "I am not telling you about this" and "this is empty" were
@@ -67,6 +64,14 @@ test('an EXPLICIT value still wins over the stored one', async () => {
   assert.equal(round({ ...STORED, displayName: 'Ada L' }).displayName, 'Ada L')
   assert.deepEqual(round({ ...STORED, proxyAddresses: [] }).proxyAddresses, [],
     'an explicitly EMPTY list must clear, and is not the same as an absent one')
+})
+
+test('an explicit unknown account state clears the stored boolean instead of becoming enabled', () => {
+  const merged = round({ ...STORED, accountEnabled: null })
+  assert.equal(merged.accountEnabled, null)
+  assert.equal(exchangeMailboxRow({ id: STORED.id, accountEnabled: null }).accountEnabled, null)
+  assert.equal(round({ ...STORED, accountEnabled: 'unreported' }).accountEnabled, false,
+    'a malformed account state cannot overwrite a known disabled account')
 })
 
 test('a user the baseline has never seen is carried through whole', async () => {
