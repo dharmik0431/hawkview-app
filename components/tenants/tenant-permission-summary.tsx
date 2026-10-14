@@ -16,7 +16,7 @@ const TONE = {
 export function TenantPermissionSummary({ tenant }: { tenant: Tenant }) {
   const result = tenantPermissionStatus(tenant)
   const Icon = result.tone === 'ok' ? CheckCircle2 : result.tone === 'attention' ? AlertTriangle : ShieldQuestion
-  const shownNames = result.missing.length ? result.missing : result.optional
+  const shownNames = result.missing
 
   return (
     <Link

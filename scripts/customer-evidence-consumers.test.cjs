@@ -91,6 +91,30 @@ test('tenant directory permission badge names a verified missing grant and opens
  assert.match(link.textContent,/User\.Read\.All/)
  assert.doesNotMatch(link.textContent,/Collection|Stale|Not licensed/)
 }))
+test('tenant directory does not advertise an intentionally ungranted optional Exchange capability',()=>{
+ const dataset=(key,tier,state,grantStatus,permissionName,resource,consentMode,licenseKind)=>({
+  key,label:key,tier,state,permissionStatus:grantStatus,
+  permissions:[{resource,name:permissionName,type:'APPLICATION',consentMode,grantStatus}],
+  permissionMatch:'ALL',evidenceMode:'RESOURCE_STATE',licensePrerequisite:{kind:licenseKind,state:'SATISFIED'},
+  fallbackDatasetKey:null,failureScope:'DATASET_ONLY',resourceTypes:[key],endpointPatterns:['/fixture'],
+  documentationUrl:'https://learn.microsoft.com/graph/',freshness:'CURRENT',remediation:'Review access.'
+ })
+ const datasets=[
+  dataset('Users','CORE','READY','CONFIRMED','User.Read.All','MICROSOFT_GRAPH','DEFAULT','NONE'),
+  dataset('Exchange Admin','CAPABILITY_OPTIONAL','BLOCKED_PERMISSION','MISSING','Exchange.ManageAsAppV2','EXCHANGE_ONLINE','SEPARATE_OPT_IN','EXCHANGE_SERVICE_PLAN'),
+ ]
+ const value={...tenant,status:'active',connectionStatus:'connected',missingRequiredPermissions:[],collectionReadiness:{
+  accessContractVersion:1,permissionVerifiedAt:at,workloads:[{key:'directory',workload:'Directory',state:'READY',
+   configuredCapability:'CONFIGURED',permissionStatus:'CONFIRMED',requiredPermissions:[],freshness:'CURRENT',
+   remediation:'Review access.',datasets}],
+ }}
+ return mount('optional-permission-hidden',h(TenantPermissionSummary,{tenant:value}),doc=>{
+  const link=doc.querySelector('a[href="/tenants/tenant-a/settings?tab=permissions"]')
+  assert.ok(link)
+  assert.match(link.textContent,/No required permission gap/)
+  assert.doesNotMatch(link.outerHTML,/Exchange\.ManageAsAppV2|optional permission not granted/)
+ })
+})
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],
  ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Finding total unavailable/],

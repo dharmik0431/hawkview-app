@@ -6,7 +6,6 @@ export type TenantPermissionStatus = {
   detail: string
   tone: 'ok' | 'attention' | 'neutral'
   missing: string[]
-  optional: string[]
 }
 
 const unavailable = (detail: string): TenantPermissionStatus => ({
@@ -14,7 +13,6 @@ const unavailable = (detail: string): TenantPermissionStatus => ({
   detail,
   tone: 'neutral',
   missing: [],
-  optional: [],
 })
 
 /** Only verified, required grants become directory-level permission alerts.
@@ -37,13 +35,12 @@ export function tenantPermissionStatus(tenant: Pick<Tenant,
   }
 
   const missing = new Map<string, string>()
-  const optional = new Map<string, string>()
-  const addName = (target: Map<string, string>, name: unknown) => {
+  const addName = (name: unknown) => {
     if (typeof name !== 'string') return
     const trimmed = name.trim()
-    if (trimmed) target.set(trimmed.toLowerCase(), trimmed)
+    if (trimmed) missing.set(trimmed.toLowerCase(), trimmed)
   }
-  tenant.missingRequiredPermissions.forEach((name) => addName(missing, name))
+  tenant.missingRequiredPermissions.forEach(addName)
 
   let coreUnverified = false
   let applicableCoreCount = 0
@@ -53,10 +50,6 @@ export function tenantPermissionStatus(tenant: Pick<Tenant,
     const byKey = new Map(workload.datasets.map((dataset) => [dataset.key, dataset]))
     for (const dataset of workload.datasets) {
       if (dataset.licensePrerequisite.state === 'NOT_LICENSED') continue
-      if (dataset.tier === 'CAPABILITY_OPTIONAL' && dataset.permissionStatus === 'MISSING') {
-        dataset.permissions.filter((permission) => permission.grantStatus === 'MISSING')
-          .forEach((permission) => addName(optional, permission.name))
-      }
       if (dataset.tier !== 'CORE') continue
       applicableCoreCount += 1
       const fallback = dataset.fallbackDatasetKey ? byKey.get(dataset.fallbackDatasetKey) : null
@@ -71,20 +64,18 @@ export function tenantPermissionStatus(tenant: Pick<Tenant,
       if (effective.permissionStatus !== 'MISSING') continue
       const names = effective.permissions.filter((permission) => permission.grantStatus === 'MISSING')
       if (names.length === 0) unnamedCoreGap = true
-      names.forEach((permission) => addName(missing, permission.name))
+      names.forEach((permission) => addName(permission.name))
     }
   }
 
   const names = Array.from(missing.values()).sort((a, b) => a.localeCompare(b))
-  const optionalNames = Array.from(optional.values()).sort((a, b) => a.localeCompare(b))
   if (names.length || unnamedCoreGap) {
     const count = names.length
     return {
       label: count ? `${count} required permission${count === 1 ? '' : 's'} missing` : 'Required permission gap',
-      detail: `${count ? `Missing: ${names.join(', ')}.` : 'A required dataset reports a permission gap without a named grant.'}${optionalNames.length ? ` Optional grants not given: ${optionalNames.join(', ')}.` : ''} Last permission verification: ${readiness.permissionVerifiedAt}. Collection failures and licensing are assessed separately.`,
+      detail: `${count ? `Missing: ${names.join(', ')}.` : 'A required dataset reports a permission gap without a named grant.'} Last permission verification: ${readiness.permissionVerifiedAt}. Optional grants, collection failures and licensing are assessed separately.`,
       tone: 'attention',
       missing: names,
-      optional: optionalNames,
     }
   }
   if (blockedRequired.size) {
@@ -94,7 +85,6 @@ export function tenantPermissionStatus(tenant: Pick<Tenant,
       detail: `Microsoft access was denied for: ${labels.join(', ')}. The last grant check did not identify a specific missing permission; review the dataset cause before changing consent. Collection freshness and licensing are separate.`,
       tone: 'attention',
       missing: [],
-      optional: optionalNames,
     }
   }
   if (coreUnverified) {
@@ -103,21 +93,10 @@ export function tenantPermissionStatus(tenant: Pick<Tenant,
   if (!applicableCoreCount) {
     return unavailable('No applicable required dataset supplied a permission result. Optional capability grants alone do not establish required access.')
   }
-  if (optionalNames.length) {
-    const count = optionalNames.length
-    return {
-      label: `${count} optional permission${count === 1 ? '' : 's'} not granted`,
-      detail: `Optional Microsoft access not granted: ${optionalNames.join(', ')}. Required grants had no reported gap at the last verification (${readiness.permissionVerifiedAt}). Optional access is a capability choice, not a tenant-wide connection failure.`,
-      tone: 'neutral',
-      missing: [],
-      optional: optionalNames,
-    }
-  }
   return {
     label: 'No required permission gap',
     detail: `No required Microsoft permission gap was reported at the last verification (${readiness.permissionVerifiedAt}). Optional grants and current collector outcomes are separate; this is not a complete-data or tenant-health claim.`,
     tone: 'ok',
     missing: [],
-    optional: [],
   }
 }
