@@ -23,6 +23,7 @@ import {
   Layers,
 } from 'lucide-react'
 import type { PilotEvidenceView } from '@/lib/tenants/collection-readiness'
+import { reportedText } from '@/lib/tenants/evidence-labels'
 
 export type LicenseStatus =
   | 'Available'
@@ -946,7 +947,9 @@ export default function LicensesSection({
                           plan.displayName ||
                           `Service Plan ${idx + 1}`
                         const planStatus =
-                          plan.status || plan.provisioningStatus || 'Success'
+                          reportedText(plan.status, '') ||
+                          reportedText(plan.provisioningStatus, '') ||
+                          'Status not reported'
                         const isSuccess =
                           planStatus.toLowerCase() === 'success' ||
                           planStatus.toLowerCase() === 'active' ||

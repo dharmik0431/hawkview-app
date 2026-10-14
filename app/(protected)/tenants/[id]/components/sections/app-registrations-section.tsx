@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react'
 import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { applicationsAge } from '@/lib/tenants/dataset-age'
+import { reportedText } from '@/lib/tenants/evidence-labels'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -489,11 +490,11 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                               <div className="flex items-center justify-between">
                                 <span className="font-semibold text-slate-900 dark:text-white">{p.name || 'Permission'}</span>
                                 <Badge variant="outline" className="text-[10px]">
-                                  {p.type || 'Delegated'}
+                                  {reportedText(p.type, 'Type not reported')}
                                 </Badge>
                               </div>
-                              <div className="text-[11px] text-slate-500">Resource API: {p.resourceApi || 'Microsoft Graph'}</div>
-                              <div className="text-[11px] text-slate-500">Scope/Role: <code className="font-mono">{p.scopeOrRole || 'Default'}</code></div>
+                              <div className="text-[11px] text-slate-500">Resource API: {reportedText(p.resourceApi, 'Not reported')}</div>
+                              <div className="text-[11px] text-slate-500">Scope/Role: <code className="font-mono">{reportedText(p.scopeOrRole, 'Not reported')}</code></div>
                             </div>
                           ))}
                         </div>
@@ -521,8 +522,8 @@ export default function AppRegistrationsSection({ bundle }: AppRegistrationsSect
                                 <div className="font-semibold text-slate-900 dark:text-white">{c.name || `${c.type || 'Credential'} #${idx+1}`}</div>
                                 <div className="text-[11px] text-slate-500">Expires: {c.expirationDate || c.endDate || 'Not set'}</div>
                               </div>
-                              <Badge className="text-[10px]">
-                                {c.status || 'Active'}
+                              <Badge variant="outline" className="text-[10px]">
+                                {reportedText(c.status, 'Status not reported')}
                               </Badge>
                             </div>
                           ))}

@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react'
 import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { licenseActivityAge } from '@/lib/tenants/dataset-age'
+import { licenseAuditOutcome } from '@/lib/tenants/evidence-labels'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -78,7 +79,7 @@ export default function LicenseActivitySection({
 
     return rawEvents.map((evt: any, idx: number) => {
       const rawDate = evt.timestamp || evt.date || evt.createdAt || evt.time
-      const parsedDate = rawDate ? new Date(rawDate) : new Date(0)
+      const parsedDate = rawDate ? new Date(rawDate) : new Date(NaN)
       const dateStr = !isNaN(parsedDate.getTime())
         ? parsedDate.toLocaleString('en-US', {
             month: 'short',
@@ -88,9 +89,9 @@ export default function LicenseActivitySection({
             minute: '2-digit',
             hour12: true,
           })
-        : 'Awaiting collection'
+        : 'Date not reported'
 
-      const rawAct = evt.activity || evt.action || evt.type || 'Assigned'
+      const rawAct = evt.activity || evt.action || evt.type || 'Activity not reported'
       let normalizedActivity = rawAct
       const actLower = String(rawAct).toLowerCase()
       if (actLower.includes('assign') && !actLower.includes('un')) {
@@ -161,10 +162,7 @@ export default function LicenseActivitySection({
       }
 
       // Status / Result
-      const rawStatus = evt.status || evt.result || 'Successful'
-      const isSuccess =
-        String(rawStatus).toLowerCase().includes('success') ||
-        String(rawStatus).toLowerCase() === 'ok'
+      const reportedOutcome = licenseAuditOutcome(evt.status, evt.result)
 
       return {
         id: evt.id || evt.rawId || `evt-${idx}`,
@@ -176,8 +174,8 @@ export default function LicenseActivitySection({
         userUpn,
         license: licenseName,
         performedBy: actorName,
-        status: isSuccess ? 'Successful' : String(rawStatus),
-        isSuccess,
+        status: reportedOutcome.label,
+        outcome: reportedOutcome.outcome,
         isTenantEvent,
       }
     })
@@ -198,6 +196,7 @@ export default function LicenseActivitySection({
       // Date Filter
       if (dateFilter !== 'all') {
         const itemTime = item.dateObj.getTime()
+        if (!Number.isFinite(itemTime)) return false
         if (dateFilter === '24h' && now - itemTime > 24 * 60 * 60 * 1000)
           return false
         if (dateFilter === '7d' && now - itemTime > 7 * 24 * 60 * 60 * 1000)
@@ -207,10 +206,10 @@ export default function LicenseActivitySection({
       }
 
       // Result / Status Filter
-      if (statusFilter === 'success' && !item.isSuccess) {
+      if (statusFilter === 'success' && item.outcome !== 'success') {
         return false
       }
-      if (statusFilter === 'failure' && item.isSuccess) {
+      if (statusFilter === 'failure' && item.outcome !== 'failure') {
         return false
       }
 
@@ -244,7 +243,9 @@ export default function LicenseActivitySection({
     return list.sort((a, b) => {
       let cmp = 0
       if (sortField === 'date') {
-        cmp = a.dateObj.getTime() - b.dateObj.getTime()
+        const aTime = a.dateObj.getTime()
+        const bTime = b.dateObj.getTime()
+        cmp = (Number.isFinite(aTime) ? aTime : 0) - (Number.isFinite(bTime) ? bTime : 0)
       } else if (sortField === 'activity') {
         cmp = a.activity.localeCompare(b.activity)
       } else if (sortField === 'user') {
@@ -489,9 +490,11 @@ export default function LicenseActivitySection({
                     <td className="py-3 px-3 text-right whitespace-nowrap">
                       <Badge
                         className={`text-[10px] font-semibold px-2 py-0.5 border shadow-none ${
-                          evt.isSuccess
+                          evt.outcome === 'success'
                             ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/80'
-                            : 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300 border-red-200 dark:border-red-800/80'
+                            : evt.outcome === 'failure'
+                              ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300 border-red-200 dark:border-red-800/80'
+                              : 'bg-slate-50 text-slate-600 dark:bg-slate-800/40 dark:text-slate-300 border-slate-200 dark:border-slate-700'
                         }`}
                       >
                         {evt.status}

@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from 'react'
 import { DatasetEmptyState } from '@/components/tenant/section-freshness'
 import { servicePrincipalsAge } from '@/lib/tenants/dataset-age'
+import { reportedText } from '@/lib/tenants/evidence-labels'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -575,8 +576,8 @@ export default function EnterpriseAppsSection({ bundle }: EnterpriseAppsSectionP
                 </div>
                 <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 space-y-2">
                   <div>
-                    <div className="text-[10px] text-slate-500">Resource API: {selectedApp.resourceApi || 'Microsoft Graph'}</div>
-                    <div className="text-[10px] text-slate-500">Consent Type: {selectedApp.consentType || 'AllPrincipals (Tenant-wide)'}</div>
+                    <div className="text-[10px] text-slate-500">Resource API: {reportedText(selectedApp.resourceApi, 'Not reported')}</div>
+                    <div className="text-[10px] text-slate-500">Consent Type: {reportedText(selectedApp.consentType, 'Not reported')}</div>
                     {selectedApp.grantedBy && (
                       <div className="text-[10px] text-slate-500">Granted By: {selectedApp.grantedBy}</div>
                     )}

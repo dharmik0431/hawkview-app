@@ -46,6 +46,7 @@ import {
   Cloud,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { sharePointDomainRestriction, sharePointStorageLimitMode } from '@/lib/tenants/evidence-labels'
 import {
   buildSharePointViewModel,
   sharePointReportedDeletedState,
@@ -989,9 +990,7 @@ export default function SharePointPage({
                   <div className="flex items-center justify-between py-1.5">
                     <span className="text-slate-600 dark:text-slate-400">Domain restrictions</span>
                     <span className="font-semibold text-slate-800 dark:text-slate-200">
-                      {!rawTenantSettings?.sharingDomainRestrictionMode || String(rawTenantSettings.sharingDomainRestrictionMode).toLowerCase() === 'none'
-                        ? 'No domain restriction'
-                        : String(rawTenantSettings.sharingDomainRestrictionMode)}
+                      {sharePointDomainRestriction(rawTenantSettings?.sharingDomainRestrictionMode)}
                     </span>
                   </div>
 
@@ -1529,7 +1528,7 @@ export default function SharePointPage({
                 </div>
 
                 {/* 2. Legacy Authentication */}
-                {rawTenantSettings?.isLegacyAuthProtocolsEnabled !== undefined && (
+                {typeof rawTenantSettings?.isLegacyAuthProtocolsEnabled === 'boolean' && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-slate-500">Legacy Auth:</span>
                     <Badge
@@ -1545,7 +1544,7 @@ export default function SharePointPage({
                 )}
 
                 {/* 3. Storage-Limit Mode */}
-                {rawTenantSettings?.isSitesStorageLimitAutomatic !== undefined && (
+                {typeof rawTenantSettings?.isSitesStorageLimitAutomatic === 'boolean' && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-slate-500">Storage Limit:</span>
                     <Badge variant="secondary" className="text-[11px] font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200/60 dark:border-indigo-800/60">
@@ -1555,7 +1554,7 @@ export default function SharePointPage({
                 )}
 
                 {/* 4. Unmanaged Sync Restriction */}
-                {rawTenantSettings?.isUnmanagedSyncAppForTenantRestricted !== undefined && (
+                {typeof rawTenantSettings?.isUnmanagedSyncAppForTenantRestricted === 'boolean' && (
                   <div className="flex items-center gap-1.5">
                     <span className="text-slate-500">Unmanaged Sync:</span>
                     <Badge variant="outline" className="text-[11px] font-semibold text-teal-700 dark:text-teal-300 bg-teal-50/50 dark:bg-teal-950/30 border-teal-200/60 dark:border-teal-800/60">
@@ -1601,9 +1600,7 @@ export default function SharePointPage({
                     <div className="flex items-center justify-between py-2">
                       <span className="text-slate-600 dark:text-slate-400">Domain restrictions</span>
                       <span className="font-semibold text-slate-800 dark:text-slate-200">
-                        {!rawTenantSettings?.sharingDomainRestrictionMode || String(rawTenantSettings.sharingDomainRestrictionMode).toLowerCase() === 'none'
-                          ? 'No domain restriction'
-                          : String(rawTenantSettings.sharingDomainRestrictionMode)}
+                        {sharePointDomainRestriction(rawTenantSettings?.sharingDomainRestrictionMode)}
                       </span>
                     </div>
 
@@ -1698,11 +1695,7 @@ export default function SharePointPage({
                     <div className="flex items-center justify-between py-2">
                       <span className="text-slate-600 dark:text-slate-400">Site storage limit mode</span>
                       <Badge variant="secondary" className="font-semibold text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-200/60 dark:border-indigo-800/60">
-                        {rawTenantSettings?.isSitesStorageLimitAutomatic !== undefined
-                          ? rawTenantSettings.isSitesStorageLimitAutomatic
-                            ? 'Automatic'
-                            : 'Manual'
-                          : 'Not available'}
+                        {sharePointStorageLimitMode(rawTenantSettings?.isSitesStorageLimitAutomatic)}
                       </Badge>
                     </div>
 
