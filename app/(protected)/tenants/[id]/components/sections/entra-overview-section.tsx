@@ -170,30 +170,20 @@ export default function EntraOverviewSection({
     ? users.filter((u) => Array.isArray(u.licenses) && u.licenses.length > 0)
         .length
     : null
-  const adminUsers = usersSynchronized
-    ? users.filter((u) => u.role && u.role.toLowerCase().includes('admin'))
-        .length
-    : null
-
-  const groupsSynchronized =
-    Array.isArray(bundle?.exchange?.groups) ||
-    users.some((u) => u.groups?.length)
-  const totalGroups = groupsSynchronized
-    ? Array.from(
-        new Set([
-          ...(bundle?.exchange?.groups?.map(
-            (g: any) => g.displayName || g.email || g.id
-          ) || []),
-          ...users.flatMap((u) => u.groups || []),
-        ])
-      ).length
-    : null
-
-  const devicesSynchronized = users.some(
-    (u) => Array.isArray(u.devices) && u.devices.length > 0
+  const groupsCollection = collectionEvidence(bundle?.sync?.groups)
+  const devicesCollection = collectionEvidence(bundle?.sync?.devices)
+  const storedGroups = Array.isArray(bundle?.entra?.groups) ? bundle.entra.groups : null
+  const storedGroupIds = storedGroups?.map((group: any) => group?.id).filter(
+    (id: unknown): id is string => typeof id === 'string' && id.length > 0
   )
-  const totalDevices = devicesSynchronized
-    ? users.flatMap((u) => u.devices || []).length
+  const totalGroups = groupsCollection.observed && storedGroups &&
+    storedGroupIds?.length === storedGroups.length
+    ? new Set(storedGroupIds).size
+    : null
+  const storedDeviceCount = bundle?.entra?.deviceCount
+  const totalDevices = devicesCollection.observed &&
+    Number.isSafeInteger(storedDeviceCount) && storedDeviceCount >= 0
+    ? storedDeviceCount
     : null
 
   // SECURITY DATA CALCULATIONS
@@ -596,44 +586,44 @@ export default function EntraOverviewSection({
             <div className="pt-4 border-t border-slate-100 dark:border-slate-800 grid grid-cols-3 divide-x divide-slate-200 dark:divide-slate-800 text-center">
               <div className="px-2">
                 <div className="text-[10px] uppercase font-semibold text-muted-foreground tracking-wider">
-                  Groups
+                  Stored groups
                 </div>
                 <div className="text-sm font-bold text-slate-800 dark:text-slate-200 mt-0.5">
                   {totalGroups !== null ? (
                     totalGroups
                   ) : (
                     <span className="text-xs font-normal text-muted-foreground">
-                      Awaiting collection
+                      Count not reported
                     </span>
                   )}
                 </div>
+                {totalGroups !== null && !groupsCollection.supported ? (
+                  <div className="text-[10px] text-slate-500 dark:text-slate-400">Latest refresh failed</div>
+                ) : null}
               </div>
               <div className="px-2">
                 <div className="text-[10px] uppercase font-semibold text-muted-foreground tracking-wider">
-                  Devices
+                  Stored devices
                 </div>
                 <div className="text-sm font-bold text-slate-800 dark:text-slate-200 mt-0.5">
                   {totalDevices !== null ? (
                     totalDevices
                   ) : (
                     <span className="text-xs font-normal text-muted-foreground">
-                      Awaiting collection
+                      Count not reported
                     </span>
                   )}
                 </div>
+                {totalDevices !== null && !devicesCollection.supported ? (
+                  <div className="text-[10px] text-slate-500 dark:text-slate-400">Latest refresh failed</div>
+                ) : null}
               </div>
               <div className="px-2">
                 <div className="text-[10px] uppercase font-semibold text-muted-foreground tracking-wider">
                   Admins
                 </div>
-                <div className="text-sm font-bold text-purple-600 dark:text-purple-400 mt-0.5">
-                  {adminUsers !== null ? (
-                    adminUsers
-                  ) : (
-                    <span className="text-xs font-normal text-muted-foreground">
-                      Awaiting collection
-                    </span>
-                  )}
+                <div className="text-xs font-normal text-muted-foreground mt-0.5" title="HawkView has not established a complete administrator inventory">
+                  Not assessed by HawkView
                 </div>
               </div>
             </div>

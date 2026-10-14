@@ -7297,6 +7297,7 @@ export class TenantSyncService {
               value: (snapshotByResource.get('CONDITIONAL_ACCESS') ?? []).length,
             },
           },
+          deviceCount: devices.length,
           securityDefaults:
             typeof securityDefaults?.isEnabled === 'boolean'
               ? {
@@ -7599,6 +7600,7 @@ export class TenantSyncService {
           authMethodPolicies: exchangeSync('AUTH_METHOD_POLICIES'),
           authRegistrations: exchangeSync('AUTH_REGISTRATIONS'),
           namedLocations: exchangeSync('NAMED_LOCATIONS'),
+          devices: exchangeSync('DEVICES'),
           licenses: {
             outcomeProjection: projectSyncOutcome('LICENSES', licenseSyncState, mfaEvaluationNow),
             status: licenseSyncState?.status.toLowerCase() ?? 'never-synced',

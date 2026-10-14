@@ -207,3 +207,55 @@ test('Entra overview gates posture on its actual collection and per-user registr
   assert.match(row('Named locations').textContent, /Awaiting collection/)
   assert.equal(Boolean(row('Named locations').querySelector('svg.text-emerald-500')), false)
 }))
+
+test('Entra overview reports stored group/device counts only with their own collection evidence and never asserts an admin total', async () => mounted(async (h: any) => {
+  const user = {
+    id: 'user-one', name: 'Synthetic', email: 'user@example.test', type: 'Member',
+    role: 'Global Administrator', status: 'Enabled', mfaRegistration: 'Registered',
+    groups: ['Operations'], devices: [{ name: 'Shared' }],
+  }
+  const groups = [
+    { id: 'group-one', displayName: 'Operations' },
+    { id: 'group-two', displayName: 'Operations' },
+    { id: 'group-three', displayName: 'Security only' },
+  ]
+  const completeSync = {
+    users: syncEvidence(), authMethodPolicies: syncEvidence(), authRegistrations: syncEvidence(),
+    namedLocations: syncEvidence(), signIns: syncEvidence(), groups: syncEvidence(), devices: syncEvidence(),
+  }
+  const render = async ({ storedGroups = groups, deviceCount = 3, sync = {} }: any = {}) => h.render(Overview, {
+    tenant: {}, users: [user], signIns: [{ ...rows[0], result: 'Success' }],
+    bundle: {
+      users: [user], exchange: { groups: [{ id: 'group-one', name: 'Operations', email: 'ops@example.test' }] },
+      entra: { groups: storedGroups, deviceCount, riskyUsers: [] }, sync: { ...completeSync, ...sync },
+    },
+    caPolicies: [{ state: 'ON' }], conditionalAccessEvidence: { availability: 'READY', count: 1 },
+    authMethods: [], namedLocations: [], onNavigateTab: () => {},
+  })
+  const metric = (name: string) => {
+    const label = Array.from(h.document.querySelectorAll('div')).find((element: any) => element.textContent === name) as any
+    assert.ok(label, `${name} metric exists`)
+    return label.parentElement.textContent as string
+  }
+
+  await render()
+  assert.match(metric('Stored groups'), /Stored groups\s*3/)
+  assert.match(metric('Stored devices'), /Stored devices\s*3/)
+  assert.match(metric('Admins'), /Admins\s*Not assessed by HawkView/)
+  assert.doesNotMatch(metric('Admins'), /\b1\b/)
+
+  await render({ storedGroups: [], deviceCount: 0 })
+  assert.match(metric('Stored groups'), /Stored groups\s*0/)
+  assert.match(metric('Stored devices'), /Stored devices\s*0/)
+
+  await render({ sync: { groups: syncEvidence('SUCCEEDED', null), devices: syncEvidence('SUCCEEDED', null) } })
+  assert.match(metric('Stored groups'), /Count not reported/)
+  assert.match(metric('Stored devices'), /Count not reported/)
+  assert.doesNotMatch(metric('Stored groups'), /\b3\b/)
+  assert.doesNotMatch(metric('Stored devices'), /\b3\b/)
+
+  await render({ sync: { groups: syncEvidence('FAILED'), devices: syncEvidence('FAILED') } })
+  assert.match(metric('Stored groups'), /Stored groups\s*3\s*Latest refresh failed/)
+  assert.match(metric('Stored devices'), /Stored devices\s*3\s*Latest refresh failed/)
+  assert.match(metric('Admins'), /Not assessed by HawkView/)
+}))
