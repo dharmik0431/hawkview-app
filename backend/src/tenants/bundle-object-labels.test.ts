@@ -13,7 +13,7 @@ const DEFINITION = 'ffffffff-ffff-4fff-ffff-ffffffffffff'
 const UNKNOWN = '00000000-0000-4000-8000-000000000099'
 
 type SyncOverride = Record<string, { status?: string; lastSuccessfulAt?: Date | null } | null>
-async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false, syncOverride: SyncOverride = {}) {
+async function bundle(tenantId: string, name: string, conflicts = false, omitOptionalEvidence = false, syncOverride: SyncOverride = {}, roleAssignments?: any[]) {
   const org = `org-${tenantId}`
   const tenant = { id: tenantId, organizationId: org, microsoftTenantId: '11111111-1111-4111-8111-111111111111',
     displayName: 'Synthetic tenant', primaryDomain: 'example.invalid', status: 'CONNECTED',
@@ -38,7 +38,7 @@ async function bundle(tenantId: string, name: string, conflicts = false, omitOpt
       ...(omitOptionalEvidence ? {} : { appRoleAssignedTo: assigned }) }],
     APPLICATIONS: [{ id: 'registration', ...(omitOptionalEvidence ? {} : { owners: [{ id: USER }, { id: SP }, { id: UNKNOWN },
       { id: USER, displayName: 'Observed owner name' }] }) }],
-    DIRECTORY_ROLES: [{ principalId: USER, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } }],
+    DIRECTORY_ROLES: roleAssignments ?? [{ principalId: USER, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } }],
     CONDITIONAL_ACCESS: [policy('selected', { includeUsers: [USER.toUpperCase(), UNKNOWN], includeGroups: [GROUP],
       includeRoles: [ROLE, DEFINITION], excludeUsers: ['GuestsOrExternalUsers'], excludeGroups: [GROUP], excludeRoles: [ROLE] }),
       policy('all', { includeUsers: ['All'] }), policy('none', { includeUsers: ['None'] })],
@@ -194,6 +194,34 @@ test('bundle exposes stored group and device populations independently of owner-
   assert.equal(failed.sync.groups.outcomeProjection.recordedOutcome.kind, 'FAILED')
   assert.equal(failed.sync.devices.outcomeProjection.recordedOutcome.kind, 'FAILED')
   assert.equal(failed.entra.deviceCount, 3, 'historical stored rows remain available after failure')
+})
+
+test('bundle does not invent an ordinary-user role and projects the direct-role collection state', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', () => { throw Error('Network forbidden') })
+  const assigned = await bundle('tenant-A', 'Alice')
+  assert.equal(assigned.users[0].role, 'Global Reader')
+  assert.equal(assigned.sync.directoryRoles.lastSuccessfulAt, NOW.toISOString())
+  assert.equal(assigned.sync.directoryRoles.outcomeProjection.recordedOutcome.kind, 'SUCCEEDED')
+
+  const empty = await bundle('tenant-A', 'Alice', false, false, {}, [])
+  assert.equal(empty.users[0].role, '', 'a successful empty direct-role snapshot is not a User role')
+  assert.equal(empty.sync.directoryRoles.lastSuccessfulAt, NOW.toISOString())
+
+  const groupPrincipal = await bundle('tenant-A', 'Alice', false, false, {}, [
+    { principalId: GROUP, roleDefinition: { id: DEFINITION, templateId: ROLE, displayName: 'Global Reader' } },
+  ])
+  assert.equal(groupPrincipal.users[0].role, '', 'a group-principal assignment is not a direct user role')
+
+  const never = await bundle('tenant-A', 'Alice', false, false, { DIRECTORY_ROLES: null })
+  assert.equal(never.users[0].role, 'Global Reader', 'historical rows remain separate from collection proof')
+  assert.equal(never.sync.directoryRoles.lastSuccessfulAt, null)
+
+  const failed = await bundle('tenant-A', 'Alice', false, false, {
+    DIRECTORY_ROLES: { status: 'FAILED', lastSuccessfulAt: new Date('2026-10-11T12:00:00Z') },
+  })
+  assert.equal(failed.users[0].role, 'Global Reader')
+  assert.equal(failed.sync.directoryRoles.outcomeProjection.recordedOutcome.kind, 'FAILED')
 })
 
 test('separate tenant invocations never share names; conflicting stored identities remain unresolved', async t => {

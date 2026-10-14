@@ -6666,7 +6666,9 @@ export class TenantSyncService {
             name: user.displayName,
             email: user.userPrincipalName || user.mail || '',
             type: user.userType === 'Guest' ? 'Guest' : 'Member',
-            role: roleNames.length > 0 ? roleNames.join(', ') : 'User',
+            // Direct assignments only. Empty is not a verified ordinary-user role;
+            // consumers must consult sync.directoryRoles before interpreting it.
+            role: roleNames.length > 0 ? roleNames.join(', ') : '',
             status: user.accountEnabled ? 'Enabled' : 'Disabled',
             ...mfaTruth,
             effectiveMfaEnforcement,
@@ -7601,6 +7603,7 @@ export class TenantSyncService {
           authRegistrations: exchangeSync('AUTH_REGISTRATIONS'),
           namedLocations: exchangeSync('NAMED_LOCATIONS'),
           devices: exchangeSync('DEVICES'),
+          directoryRoles: exchangeSync('DIRECTORY_ROLES'),
           licenses: {
             outcomeProjection: projectSyncOutcome('LICENSES', licenseSyncState, mfaEvaluationNow),
             status: licenseSyncState?.status.toLowerCase() ?? 'never-synced',
