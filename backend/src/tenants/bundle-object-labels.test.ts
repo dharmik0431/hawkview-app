@@ -94,6 +94,8 @@ test('real authorized bundle resolves labels while preserving CA IDs, kinds, and
   assert.equal(app.verifiedPublisher, null)
   assert.equal(app.delegatedGrants, null)
   assert.equal(app.applicationPermissions, null)
+  assert.equal(result.entra.groups[0].owners, null)
+  assert.equal(result.entra.groups[0].onPremisesSyncEnabled, null)
   assert.deepEqual(result.entra.appRegistrations[0].owners, ['Alice', 'Service application', UNKNOWN, 'Observed owner name'])
 
   // Exercise the real frontend resolver using the actual service-produced bundle, not an invented bundle shape.

@@ -7328,11 +7328,11 @@ export class TenantSyncService {
               ),
               owners: Array.isArray(graphGroup?.owners)
                 ? uniquePrincipalLabels(graphGroup.owners)
-                : [],
+                : null,
               onPremisesSyncEnabled:
                 typeof graphGroup?.onPremisesSyncEnabled === 'boolean'
                   ? graphGroup.onPremisesSyncEnabled
-                  : false,
+                  : null,
             }
           }),
           enterpriseApplications: servicePrincipals.map((principal) => ({
