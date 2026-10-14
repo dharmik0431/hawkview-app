@@ -60,7 +60,7 @@ import {
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
-import { AffectedServices } from '@/components/tenants/affected-services'
+import { TenantServiceCollection } from '@/components/tenants/tenant-service-collection'
 import {
   TenantStatusBadge,
   getTenantDisplayStatus,
@@ -1656,7 +1656,7 @@ export default function TenantsPage() {
                     />
                     <SortHeader
                       field="status"
-                      label="Overall Status"
+                      label="Review Summary"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
@@ -1672,11 +1672,11 @@ export default function TenantsPage() {
                       scope="col"
                       className="py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800"
                     >
-                      Affected Services
+                      Connection & Collection
                     </th>
                     <SortHeader
                       field="lastSync"
-                      label="Last Successful Sync"
+                      label="Latest Resource Sync"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
@@ -1729,7 +1729,7 @@ export default function TenantsPage() {
                           </div>
                         </td>
 
-                        {/* Overall Status */}
+                        {/* Reported findings and access actions; not collection health */}
                         <td className="py-3.5 px-4 whitespace-nowrap">
                           <TenantStatusBadge tenant={tenant} />
                         </td>
@@ -1759,16 +1759,18 @@ export default function TenantsPage() {
                           )}
                         </td>
 
-                        {/* Affected Services */}
+                        {/* Tenant-wide connection and per-service collection */}
                         <td className="py-3.5 px-4 whitespace-nowrap">
-                          <AffectedServices tenant={tenant} compact />
+                          <TenantServiceCollection tenant={tenant} compact />
                         </td>
 
-                        {/* Last Sync */}
+                        {/* Latest successful resource; not a whole-tenant pass */}
                         <td className="py-3.5 px-4 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-medium">
                           <div
                             className="flex items-center gap-1.5"
-                            title={tenant.lastSync || 'Awaiting initial sync'}
+                            title={tenant.lastSync
+                              ? `Latest successful resource collection: ${tenant.lastSync}. Other services may be older or incomplete.`
+                              : 'No successful resource collection reported.'}
                           >
                             <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" />
                             <span>{formatSyncTime(tenant.lastSync)}</span>
@@ -1878,7 +1880,7 @@ export default function TenantsPage() {
 
                     <div>
                       <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
-                        Last Sync
+                        Latest Resource Sync
                       </span>
                       <span className="text-slate-600 dark:text-slate-300 font-medium truncate block">
                         {formatSyncTime(tenant.lastSync)}
@@ -1888,9 +1890,9 @@ export default function TenantsPage() {
 
                   <div>
                     <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
-                      Affected Services
+                      Connection & Collection
                     </span>
-                    <AffectedServices tenant={tenant} compact />
+                    <TenantServiceCollection tenant={tenant} compact />
                   </div>
 
                   <div className="flex justify-end">{directoryHealthAction(tenant)}</div>

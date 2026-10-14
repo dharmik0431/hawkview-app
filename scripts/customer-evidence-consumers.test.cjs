@@ -16,7 +16,7 @@ function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.
  if(!name.startsWith('.')&&!name.startsWith('@/'))return req(name)
  const p=name.startsWith('@/')?path.join(root,name.slice(2)):path.resolve(path.dirname(file),name);return load([p,p+'.tsx',p+'.ts'].find(fs.existsSync))},ex);return ex}
 const prov=load(root+'/backend/src/tenants/attention-provenance.ts')
-const {AffectedServices}=load(root+'/components/tenants/affected-services.tsx')
+const {TenantServiceCollection}=load(root+'/components/tenants/tenant-service-collection.tsx')
 const {TenantRiskMatrixDrawer}=load(root+'/components/dashboard/tenant-risk-matrix-drawer.tsx')
 const {TenantOverview}=load(root+'/app/(protected)/tenants/[id]/components/tenant-overview.tsx')
 const {deriveTenantWorkspaceDisplay}=load(root+'/lib/tenant-workspace-state.ts')
@@ -39,27 +39,34 @@ async function mount(name,element,check){
   for(const [key,desc]of Object.entries(previous))if(desc)Object.defineProperty(globalThis,key,desc);else delete globalThis[key]
  }
 }
+const snapshot=(key,status,freshness='CURRENT',last=at)=>({services:{[key]:{
+ status,freshnessStatus:freshness,lastSuccessfulCollectionAt:last,successfulCollectors:1,expectedCollectors:2,
+}}})
 const serviceCases=[
- ['missing',{id:'tenant-a'},null,'Unknown'],
- ['complete-empty',tenant,null,'Unknown'],
- ['access',{...tenant,attention:[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))]},null,'Unknown',1],
- ['legacy-exchange',{...tenant,attention:[row(undefined)]},null,'Unknown',1],
- ['future',{...tenant,attention:[row({...prov.tenantFindingProvenance('MICROSOFT_ACTIVE_RISK'),version:2})]},null,'Unknown',1],
- ['generic-application',{...tenant,attention:[row(prov.tenantFindingProvenance('APPLICATION_ACCESS_CHANGE'))]},null,'Unknown',1],
- ['generic-role',{...tenant,attention:[row(prov.tenantFindingProvenance('ADMINISTRATIVE_ROLE_CHANGE'))]},null,'Unknown',1],
- ...['MICROSOFT_ACTIVE_RISK','MFA_REGISTRATION_COVERAGE','CONDITIONAL_ACCESS_CHANGE','AUTHENTICATION_CHANGE'].map(kind=>[kind,{...tenant,attention:[row(prov.tenantFindingProvenance(kind))]},'entra','Finding reported']),
- ...[['M365_AUDIT','o365'],['USERS','entra'],['EXCHANGE_MAILBOXES','exchange'],['SHAREPOINT_SITES','sharepoint']].map(([resource,service])=>[resource,{...tenant,attention:[row(prov.collectorAttentionProvenance(resource,'HAWKVIEW_INTERNAL_FAILURE'))]},service,'Evidence gap']),
- ['mixed',{...tenant,attention:[row(prov.tenantFindingProvenance('MFA_REGISTRATION_COVERAGE')),row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))]},'entra','Finding · evidence gap'],
+ ['missing',tenant,null,'Status unavailable'],
+ ['finding-does-not-establish-collection',{...tenant,attention:[row(prov.tenantFindingProvenance('MICROSOFT_ACTIVE_RISK'))]},null,'Status unavailable'],
+ ['collection-operation-does-not-establish-service-result',{...tenant,attention:[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))]},null,'Status unavailable'],
+ ['success',{...tenant,status:'active',connectionStatus:'connected',syncFreshness:snapshot('entraId','SUCCESS')},'entraId','Collected'],
+ ['partial',{...tenant,syncFreshness:snapshot('exchange','PARTIAL')},'exchange','Partial'],
+ ['failed',{...tenant,syncFreshness:snapshot('sharePointOneDrive','FAILED')},'sharePointOneDrive','Collection failed'],
+ ['permission',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','FAILED').services.exchange,permissionRequiredCollectors:1,failedCollectors:0}}}},'exchange','Access needed'],
+ ['partial-permission',{...tenant,syncFreshness:{services:{exchange:{...snapshot('exchange','PARTIAL').services.exchange,permissionRequiredCollectors:1,failedCollectors:0}}}},'exchange','Partial · access needed'],
+ ['not-licensed',{...tenant,syncFreshness:{services:{office365:{status:'UNKNOWN',expectedCollectors:0,notLicensedCollectors:2}}}},'office365','Not licensed'],
+ ['unsupported',{...tenant,syncFreshness:{services:{auditLogs:{status:'UNKNOWN',expectedCollectors:0,unsupportedCollectors:1}}}},'auditLogs','Unsupported'],
+ ['stale',{...tenant,syncFreshness:snapshot('office365','STALE','STALE')},'office365','Stale'],
+ ['not-collected',{...tenant,syncFreshness:snapshot('signInLogs','NOT_COLLECTED','NEVER_SYNCED',null)},'signInLogs','Not collected'],
+ ['pending',{...tenant,syncFreshness:snapshot('auditLogs','PENDING','NEVER_SYNCED',null)},'auditLogs','Pending'],
+ ['malformed',{...tenant,syncFreshness:{services:{entraId:{status:'SUCCESS',freshnessStatus:'CURRENT',lastSuccessfulCollectionAt:'bad-date'}}}},'entraId','Status unavailable'],
 ]
-for(const compact of [true,false])for(const [name,value,affected,label,unattributed]of serviceCases)test(`mounted services ${compact?'compact':'full'} ${name}`,()=>mount('services-'+name+'-'+compact,h(AffectedServices,{tenant:value,compact}),doc=>{
- assert.equal(doc.querySelectorAll('[data-service]').length,4)
- for(const key of ['o365','entra','exchange','sharepoint']){
+for(const compact of [true,false])for(const [name,value,selected,label]of serviceCases)test(`mounted collection ${compact?'compact':'full'} ${name}`,()=>mount('services-'+name+'-'+compact,h(TenantServiceCollection,{tenant:value,compact}),doc=>{
+ assert.equal(doc.querySelectorAll('[data-service]').length,6)
+ for(const key of ['office365','entraId','exchange','sharePointOneDrive','signInLogs','auditLogs']){
   const pill=doc.querySelector(`[data-service="${key}"]`)
-  assert.ok(pill.textContent.endsWith(key===affected?label:'Unknown'),pill.textContent)
-  assert.match(pill.getAttribute('aria-label'),new RegExp(key===affected?label:'Unknown'))
+  assert.ok(pill.textContent.endsWith(key===selected?label:'Status unavailable'),pill.textContent)
+  assert.match(pill.getAttribute('aria-label'),new RegExp(key===selected?label:'Status unavailable'))
  }
- assert.doesNotMatch(doc.body.textContent+' '+[...doc.querySelectorAll('[title]')].map(e=>e.title).join(' '),/No issue|healthy|Needs attention|PRIVATE_DIAGNOSTIC/)
- if(unattributed)assert.match(doc.body.textContent,/Service not established for 1 reported item/)
+ assert.match(doc.body.textContent,/Connection: (Disconnected|Connected)/)
+ assert.doesNotMatch(doc.body.textContent+' '+[...doc.querySelectorAll('[title]')].map(e=>e.title).join(' '),/No issue|all clear|PRIVATE_DIAGNOSTIC/)
 }))
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],

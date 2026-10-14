@@ -881,9 +881,9 @@ function TenantSettingsContent() {
             </div>
 
             <div className="rounded-xl border border-slate-200/90 dark:border-slate-800 bg-white dark:bg-slate-900 p-3.5 space-y-1 shadow-2xs">
-              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Last Successful Sync</span>
+              <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400">Priority Workload Last Success</span>
               <div className="font-semibold text-xs text-slate-900 dark:text-white pt-0.5 truncate">
-                {formatDate(synchronizationSummary?.primaryLastSuccessfulAt || tenant.lastSync)}
+                {formatDate(synchronizationSummary?.primaryLastSuccessfulAt)}
               </div>
             </div>
 
@@ -1808,8 +1808,8 @@ function TenantSettingsContent() {
               )}
 
               <div>
-                <dt className="text-slate-500 dark:text-slate-400">Last Verification</dt>
-                <dd className="font-semibold text-slate-900 dark:text-white mt-0.5">{formatDate(tenant.lastSync)}</dd>
+                <dt className="text-slate-500 dark:text-slate-400">Last Microsoft permission verification</dt>
+                <dd className="font-semibold text-slate-900 dark:text-white mt-0.5">{formatDate(permissionVerificationAt)}</dd>
               </div>
 
               {tenant.connectedAt && (

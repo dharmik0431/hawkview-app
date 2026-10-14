@@ -280,7 +280,7 @@ export function TenantRiskMatrixDrawer({
 
                   <div className="col-span-2 pt-2 border-t border-slate-200/60 dark:border-slate-700/60 flex items-center justify-between">
                     <span className="text-slate-500 dark:text-slate-400">
-                      Last Successful Sync:
+                      Latest Successful Resource Collection:
                     </span>
                     <Tooltip>
                       <TooltipTrigger asChild>
