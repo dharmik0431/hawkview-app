@@ -80,8 +80,10 @@ const ORIGINAL_SEVEN_EARLY_RETRY_RESOURCES = [
  * domain collector and can change without a recognized Microsoft audit event.
  * Current secure scores reuse their bounded single-query collector.
  * Risky users reuse their existing bounded paged collector and dispatch map.
+ * Healthy licences and domains use their existing bounded singleton collectors;
+ * the independent daily guard and failed-anchor paths remain in force.
  * Hourly dispatch does not itself grant targeted failure retry eligibility.
- * Anchors, other bulk collectors and held DIRECTORY_ROLES remain excluded.
+ * Other bulk collectors and held DIRECTORY_ROLES remain excluded.
  * RISKY_USERS retains its larger bounds and existing failure candidacy.
  */
 export const HOURLY_INVENTORY_RESOURCES = [
@@ -95,6 +97,8 @@ export const HOURLY_INVENTORY_RESOURCES = [
   SyncResourceType.DOMAIN_DNS_HEALTH,
   SyncResourceType.SECURE_SCORES,
   SyncResourceType.RISKY_USERS,
+  SyncResourceType.LICENSES,
+  SyncResourceType.DOMAINS,
 ] as const
 
 /** Existing daily-pass datasets whose own clock must survive unrelated
@@ -326,7 +330,9 @@ export function selectScheduledTenantWork(
 
     if (!fullInventoryDue && !userDue && !targetedDue && !hourlyDue) return []
     const dueStates = candidate.syncStates.filter((state) => {
-      if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) return fullInventoryDue
+      if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) {
+        return fullInventoryDue || shouldRunHourlyInventoryRefresh(state, now)
+      }
       if (state.resourceType === SyncResourceType.USERS) return userDue
       return shouldRunTargetedTransientRetry(state, now) || shouldRunHourlyInventoryRefresh(state, now)
     })

@@ -21,7 +21,7 @@ const dailyCoverage = () => DAILY_INVENTORY_RESOURCES.map(resource => state(reso
 function state(
   resourceType: string,
   status = 'SUCCEEDED',
-  lastSuccessfulAt: Date | null = new Date('2026-08-17T15:00:00.000Z'),
+  lastSuccessfulAt: Date | null = new Date('2026-08-17T15:59:00.000Z'),
   lastAttemptAt = lastSuccessfulAt,
 ) {
   return { resourceType, status, lastSuccessfulAt, lastAttemptAt }
@@ -308,10 +308,9 @@ test('an unhealthy, missing or impossible timestamp is never hourly due', () => 
   assert.equal(shouldRunHourlyInventoryRefresh(undefined, now), false)
 })
 
-test('anchors, heavy collectors and held resources are never hourly due however stale', () => {
+test('bulk, log and held resources remain excluded from healthy hourly work', () => {
   const ancient = ago(30 * 24 * HOUR)
   for (const resource of [
-    'LICENSES', 'DOMAINS',
     'GROUPS', 'DEVICES', 'SERVICE_PRINCIPALS', 'APPLICATIONS', 'SHAREPOINT_SITES',
     'DIRECTORY_ROLES',
     'USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT',
@@ -338,7 +337,7 @@ test('anchors, heavy collectors and held resources are never hourly due however 
 test('DNS hourly catch-up does not grant targeted failure retry membership', () => {
   assert.equal((HOURLY_INVENTORY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), true)
   assert.equal((TARGETED_TRANSIENT_RETRY_RESOURCES as readonly string[]).includes('DOMAIN_DNS_HEALTH'), false)
-  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 10)
+  assert.equal(HOURLY_INVENTORY_RESOURCES.length, 12)
 })
 
 test('healthy DNS alone selects incremental work at one hour, not one millisecond before', () => {
@@ -407,19 +406,79 @@ test('a fresh allowlisted resource with everything else fresh selects no work', 
 })
 
 test('an hourly refresh does not postpone an overdue daily inventory', () => {
-  // The trap this plan exists to avoid: hourly work must never advance the
-  // timestamps the daily pass reads.
-  const states = [
+  // The independent daily-resource clock still selects a full pass even
+  // after both anchors have been refreshed by healthy hourly work.
+  const states = [...dailyCoverage().filter(s => s.resourceType !== 'GROUPS'),
+    state('GROUPS', 'SUCCEEDED', ago(24 * HOUR + 1)),
     state('USERS', 'SUCCEEDED', ago(60_000)),
-    state('LICENSES', 'SUCCEEDED', ago(26 * HOUR)),
-    state('DOMAINS', 'SUCCEEDED', ago(26 * HOUR)),
-    // Just refreshed by an hourly pass.
-    state('CONDITIONAL_ACCESS', 'SUCCEEDED', ago(1_000)),
+    state('LICENSES', 'SUCCEEDED', ago(1_000)),
+    state('DOMAINS', 'SUCCEEDED', ago(1_000)),
   ]
   assert.equal(requiresDailyInventoryRefresh(states, now), true)
   const work = selectScheduledTenantWork([{ id: 'tenant-daily', syncStates: states }], now, 10)
   assert.equal(work.length, 1)
   assert.equal(work[0]!.fullInventoryDue, true)
+})
+
+test('each healthy anchor uses its own inclusive hourly clock and real dueAt', () => {
+  for (const resourceType of ['LICENSES', 'DOMAINS']) {
+    for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+      const states = [...dailyCoverage(),
+        state('USERS', 'SUCCEEDED', now, now),
+        state('LICENSES', 'SUCCEEDED', now, now),
+        state('DOMAINS', 'SUCCEEDED', now, now),
+      ].map(s => s.resourceType === resourceType ? state(resourceType, 'SUCCEEDED', ago(age)) : s)
+      const work = selectScheduledTenantWork([{ id: resourceType, syncStates: states }], now, 1)
+      assert.equal(shouldRunHourlyInventoryRefresh(states.find(s => s.resourceType === resourceType), now), age >= HOUR)
+      assert.equal(work.length, age >= HOUR ? 1 : 0, `${resourceType}: ${age}`)
+      if (work.length) {
+        assert.equal(work[0]!.fullInventoryDue, false)
+        assert.equal(work[0]!.dueAt.getTime(), ago(age).getTime(), 'anchor dueAt must not be epoch')
+      }
+    }
+  }
+})
+
+test('older anchor work wins fairly over a newer anchor with an earlier tenant ID', () => {
+  const base = [...dailyCoverage(),
+    state('USERS', 'SUCCEEDED', now, now),
+    state('LICENSES', 'SUCCEEDED', now, now),
+    state('DOMAINS', 'SUCCEEDED', now, now),
+  ]
+  const newer = { id: 'a-newer', syncStates: base.map(s =>
+    s.resourceType === 'LICENSES' ? state('LICENSES', 'SUCCEEDED', ago(61 * 60_000)) : s) }
+  const older = { id: 'z-older', syncStates: base.map(s =>
+    s.resourceType === 'DOMAINS' ? state('DOMAINS', 'SUCCEEDED', ago(120 * 60_000)) : s) }
+  const ranked = selectScheduledTenantWork([newer, older], now, 2)
+  assert.deepEqual(ranked.map(w => w.tenantId), ['z-older', 'a-newer'])
+  assert.deepEqual(ranked.map(w => w.dueAt.getTime()), [ago(120 * 60_000).getTime(), ago(61 * 60_000).getTime()])
+  assert.ok(ranked.every(w => !w.fullInventoryDue))
+})
+
+test('missing daily data remains full-pass due after healthy hourly anchors advance', () => {
+  const states = [...dailyCoverage().filter(s => s.resourceType !== 'GROUPS'),
+    state('USERS', 'SUCCEEDED', now, now),
+    state('LICENSES', 'SUCCEEDED', now, now),
+    state('DOMAINS', 'SUCCEEDED', now, now),
+  ]
+  const work = selectScheduledTenantWork([{ id: 'missing-groups', syncStates: states }], now, 1)
+  assert.equal(work[0]?.fullInventoryDue, true)
+  assert.equal(work[0]?.dueAt.getTime(), 0)
+})
+
+test('failed anchors retain their full-pass retry and never use healthy hourly work', () => {
+  for (const resourceType of ['LICENSES', 'DOMAINS']) {
+    for (const age of [HOUR - 1, HOUR]) {
+      const failed = { ...state(resourceType, 'FAILED', ago(3 * HOUR), ago(age)),
+        lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 1 }
+      const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now, now),
+        state('LICENSES', 'SUCCEEDED', now, now), state('DOMAINS', 'SUCCEEDED', now, now), failed]
+      assert.equal(shouldRunHourlyInventoryRefresh(failed, now), false)
+      assert.equal(requiresDailyInventoryRefresh(states, now), age >= HOUR)
+      const work = selectScheduledTenantWork([{ id: resourceType, syncStates: states }], now, 1)
+      assert.equal(work[0]?.fullInventoryDue, age >= HOUR)
+    }
+  }
 })
 
 // ------------------------------------- hourly rule beside the failure path
