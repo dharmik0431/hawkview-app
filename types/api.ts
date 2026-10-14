@@ -58,6 +58,8 @@ export const TenantSchema = z.object({
   ),
   consentedPermissions: z.array(z.string()),
   missingPermissions: z.array(z.string()),
+  // The API separates connection-required grants from optional consent scopes.
+  missingRequiredPermissions: z.array(z.string()).optional(),
   connectionErrorCode: z.string().nullable(),
   organization: z.object({
     id: z.string(),

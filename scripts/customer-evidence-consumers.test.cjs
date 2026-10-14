@@ -17,6 +17,7 @@ function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.
  const p=name.startsWith('@/')?path.join(root,name.slice(2)):path.resolve(path.dirname(file),name);return load([p,p+'.tsx',p+'.ts'].find(fs.existsSync))},ex);return ex}
 const prov=load(root+'/backend/src/tenants/attention-provenance.ts')
 const {TenantServiceCollection}=load(root+'/components/tenants/tenant-service-collection.tsx')
+const {TenantPermissionSummary}=load(root+'/components/tenants/tenant-permission-summary.tsx')
 const {tenantConnectionBadge}=load(root+'/lib/tenants/service-collection-status.ts')
 const {TenantRiskMatrixDrawer}=load(root+'/components/dashboard/tenant-risk-matrix-drawer.tsx')
 const {TenantOverview}=load(root+'/app/(protected)/tenants/[id]/components/tenant-overview.tsx')
@@ -83,6 +84,13 @@ for(const [name,value,expected]of [
  ['suspended-error',{status:'suspended',connectionStatus:'error'},'Suspended'],
  ['unknown',{status:'active',connectionStatus:null},'Not verified'],
 ])test('tenant connection '+name,()=>assert.equal(tenantConnectionBadge(value).label,expected))
+test('tenant directory permission badge names a verified missing grant and opens permission details',()=>mount('tenant-permissions',h(TenantPermissionSummary,{tenant:{...tenant,status:'active',connectionStatus:'connected',missingRequiredPermissions:['User.Read.All'],collectionReadiness:{accessContractVersion:1,permissionVerifiedAt:at,workloads:[{key:'directory',workload:'Directory',state:'BLOCKED_PERMISSION',configuredCapability:'NOT_CONFIGURED',permissionStatus:'MISSING',requiredPermissions:['User.Read.All'],freshness:'CURRENT',remediation:'Review access.',datasets:[{key:'users',label:'Users',tier:'CORE',state:'BLOCKED_PERMISSION',permissionStatus:'MISSING',permissions:[{resource:'MICROSOFT_GRAPH',name:'User.Read.All',type:'APPLICATION',consentMode:'DEFAULT',grantStatus:'MISSING'}],permissionMatch:'ALL',evidenceMode:'RESOURCE_STATE',licensePrerequisite:{kind:'NONE',state:'NOT_REQUIRED'},fallbackDatasetKey:null,failureScope:'DATASET_ONLY',resourceTypes:['USERS'],endpointPatterns:['/users'],documentationUrl:'https://learn.microsoft.com/graph/',freshness:'CURRENT',remediation:'Review access.'}]}]}}}),doc=>{
+ const link=doc.querySelector('a[href="/tenants/tenant-a/settings?tab=permissions"]')
+ assert.ok(link)
+ assert.match(link.textContent,/1 required permission missing/)
+ assert.match(link.textContent,/User\.Read\.All/)
+ assert.doesNotMatch(link.textContent,/Collection|Stale|Not licensed/)
+}))
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],
  ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Finding total unavailable/],

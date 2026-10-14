@@ -60,7 +60,7 @@ import {
 import { topAttention } from '@/lib/attention/topAttention'
 import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
-import { TenantServiceCollection } from '@/components/tenants/tenant-service-collection'
+import { TenantPermissionSummary } from '@/components/tenants/tenant-permission-summary'
 import {
   TenantStatusBadge,
   getTenantDisplayStatus,
@@ -1672,7 +1672,7 @@ export default function TenantsPage() {
                       scope="col"
                       className="py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800"
                     >
-                      Connection & Collection
+                      Microsoft Permissions
                     </th>
                     <SortHeader
                       field="lastSync"
@@ -1759,9 +1759,9 @@ export default function TenantsPage() {
                           )}
                         </td>
 
-                        {/* Tenant-wide connection and per-service collection */}
+                        {/* Only verified permission gaps belong in this column. */}
                         <td className="py-3.5 px-4 whitespace-nowrap">
-                          <TenantServiceCollection tenant={tenant} compact />
+                          <TenantPermissionSummary tenant={tenant} />
                         </td>
 
                         {/* Latest successful resource; not a whole-tenant pass */}
@@ -1890,9 +1890,9 @@ export default function TenantsPage() {
 
                   <div>
                     <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
-                      Connection & Collection
+                      Microsoft Permissions
                     </span>
-                    <TenantServiceCollection tenant={tenant} compact />
+                    <TenantPermissionSummary tenant={tenant} />
                   </div>
 
                   <div className="flex justify-end">{directoryHealthAction(tenant)}</div>
