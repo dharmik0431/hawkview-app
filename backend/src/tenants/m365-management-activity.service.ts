@@ -1100,7 +1100,7 @@ export class M365ManagementActivityService {
         }
       }
       const retainedById = new Map<string, { record: JsonObject; role: ManagementActivityRole }>()
-      const supportingGroups = new Map<string, JsonObject[]>()
+      const supportingGroups = new Map<string, Map<string, JsonObject>>()
       for (const record of allRecords) {
         const role = classifyManagementActivity(record)
         if (role === 'routine_activity') continue
@@ -1115,20 +1115,22 @@ export class M365ManagementActivityService {
         // Supporting mailbox activity can be very high volume. Preserve a
         // deterministic 15-minute actor/mailbox/operation summary per source
         // blob instead of duplicating every message event in PostgreSQL.
+        // Correlation IDs can differ for every message and must not split
+        // that summary back into individual retained records.
         const bucket = Math.floor(eventTime.getTime() / (15 * 60 * 1000))
         const groupingKey = [
           text(record.Workload) ?? '',
           text(record.Operation) ?? '',
           text(record.UserId) ?? text(record.UserKey) ?? '',
           text(record.MailboxOwnerUPN) ?? text(record.TargetUserOrGroupName) ?? '',
-          text(record.CorrelationId) ?? text(record.ClientRequestId) ?? '',
           String(bucket),
         ].join('\u0000').toLowerCase()
-        const group = supportingGroups.get(groupingKey) ?? []
-        if (!group.some((candidate) => text(candidate.Id) === id)) group.push(record)
+        const group = supportingGroups.get(groupingKey) ?? new Map<string, JsonObject>()
+        if (!group.has(id)) group.set(id, record)
         supportingGroups.set(groupingKey, group)
       }
-      for (const [groupingKey, records] of supportingGroups) {
+      for (const [groupingKey, uniqueRecords] of supportingGroups) {
+        const records = [...uniqueRecords.values()]
         records.sort((left, right) => validDate(left.CreationTime)!.getTime() - validDate(right.CreationTime)!.getTime())
         const first = records[0]!
         const last = records.at(-1)!
@@ -1142,6 +1144,10 @@ export class M365ManagementActivityService {
           record: {
             ...first,
             Id: summaryId,
+            // A multi-event summary is not evidence for the first event's
+            // request correlation. Keep that link only for a singleton.
+            CorrelationId: records.length === 1 ? first.CorrelationId : null,
+            ClientRequestId: records.length === 1 ? first.ClientRequestId : null,
             ObjectId: text(first.MailboxOwnerUPN) ?? text(first.TargetUserOrGroupName) ?? text(first.ObjectId),
             hawkviewSupportingActivityCount: records.length,
             hawkviewSupportingFirstSeenAt: text(first.CreationTime),
