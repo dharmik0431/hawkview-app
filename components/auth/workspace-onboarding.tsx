@@ -141,7 +141,7 @@ export function WorkspaceOnboardingGate({
         className="relative w-full max-w-3xl overflow-hidden rounded-2xl border border-white/10 bg-white shadow-2xl dark:bg-slate-950"
       >
         <div className="grid md:grid-cols-[0.82fr_1.18fr]">
-          <div className="hidden bg-gradient-to-br from-blue-700 via-blue-600 to-cyan-600 p-8 text-white md:flex md:flex-col md:justify-between">
+          <div className="hidden bg-gradient-to-br from-blue-700 via-blue-600 to-slate-800 p-8 text-white md:flex md:flex-col md:justify-between">
             <div>
               <div className="mb-8 flex h-11 w-11 items-center justify-center rounded-xl bg-white/15 ring-1 ring-white/25">
                 <ShieldCheck className="h-6 w-6" aria-hidden="true" />

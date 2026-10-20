@@ -267,7 +267,7 @@ export default function ProfilePage() {
       {/* Identity Header Card */}
       <div className="rounded-xl border border-border bg-card p-5 text-card-foreground shadow-sm">
         <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-          <div className="w-16 h-16 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 text-white flex items-center justify-center font-bold text-xl shadow-inner shrink-0">
+          <div className="w-16 h-16 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-xl shadow-inner shrink-0">
             {initials}
           </div>
           <div className="flex-1 min-w-0">

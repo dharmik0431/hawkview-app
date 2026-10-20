@@ -117,7 +117,7 @@ export default function BaselineAssessmentPage() {
         ← Baseline library
       </Link>
       <header>
-        <p className="text-xs font-semibold uppercase text-blue-700">
+        <p className="text-xs font-semibold uppercase text-blue-700 dark:text-blue-300">
           Policies / Baseline / Assessment
         </p>
         <h1 className="mt-1 text-2xl font-bold">
@@ -145,7 +145,7 @@ export default function BaselineAssessmentPage() {
       {error && (
         <p
           role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-800"
+          className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
         >
           {error}
         </p>

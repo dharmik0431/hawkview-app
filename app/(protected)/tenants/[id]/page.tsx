@@ -5161,12 +5161,12 @@ function TenantDetailsWorkspace() {
             <div className="space-y-8 divide-y divide-slate-200/60">
               {/* HERO / IDENTITY */}
               <div className="pt-2">
-                <div className="rounded-2xl border bg-gradient-to-r from-blue-50 to-white p-4">
-                  <div className="text-xs uppercase tracking-wide text-blue-600 font-semibold">
+                <div className="rounded-2xl border border-blue-200 bg-gradient-to-r from-blue-50 to-white p-4 dark:border-blue-900 dark:from-blue-950/40 dark:to-slate-900">
+                  <div className="text-xs uppercase tracking-wide text-blue-700 font-semibold dark:text-blue-300">
                     Mailbox
                   </div>
 
-                  <div className="mt-1 text-lg font-bold text-slate-900">
+                  <div className="mt-1 text-lg font-bold text-slate-900 dark:text-white">
                     {selectedMailbox.displayName}
                   </div>
 
@@ -5175,17 +5175,17 @@ function TenantDetailsWorkspace() {
                   </div>
 
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <Badge className="bg-blue-50 text-blue-700 border border-blue-200">
+                    <Badge className="bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950 dark:text-blue-200 dark:border-blue-900">
                       {selectedMailbox.mailboxType ?? 'Type not reported'}
                     </Badge>
 
                     <Badge
                       className={
                         selectedMailbox.archiveEnabled === true
-                          ? 'bg-green-50 text-green-700 border border-green-200'
+                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950 dark:text-emerald-200 dark:border-emerald-900'
                           : selectedMailbox.archiveEnabled === false
-                            ? 'bg-orange-50 text-orange-700 border border-orange-200'
-                            : 'bg-slate-50 text-slate-600 border border-slate-200'
+                            ? 'bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-950 dark:text-amber-200 dark:border-amber-900'
+                            : 'bg-slate-50 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700'
                       }
                     >
                       {selectedMailbox.archiveEnabled === true
@@ -5198,8 +5198,8 @@ function TenantDetailsWorkspace() {
                     <Badge
                       className={
                         selectedMailbox.retentionLabel
-                          ? 'bg-blue-50 text-blue-700 border border-blue-200'
-                          : 'bg-slate-50 text-slate-600 border border-slate-200'
+                          ? 'bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950 dark:text-blue-200 dark:border-blue-900'
+                          : 'bg-slate-50 text-slate-600 border border-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-700'
                       }
                     >
                       {selectedMailbox.retentionLabel

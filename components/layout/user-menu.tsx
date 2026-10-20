@@ -117,7 +117,7 @@ export function UserMenu() {
               aria-expanded={isOpen}
               aria-haspopup="true"
               aria-label={`User menu for ${fullName}`}
-              className="flex items-center justify-center w-9 h-9 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 text-white font-semibold text-xs transition-transform hover:scale-105 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background cursor-pointer"
+              className="flex items-center justify-center w-9 h-9 rounded-full bg-blue-600 text-white font-semibold text-xs transition-transform hover:scale-105 active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background cursor-pointer"
             >
               {initials}
             </button>
@@ -137,7 +137,7 @@ export function UserMenu() {
             {/* User Identity Header */}
             <div className="px-4 py-3 bg-muted/30 border-b border-border">
               <div className="flex items-start gap-3">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
+                <div className="w-10 h-10 rounded-full bg-blue-600 text-white flex items-center justify-center font-bold text-sm shrink-0">
                   {initials}
                 </div>
                 <div className="flex-1 min-w-0">
