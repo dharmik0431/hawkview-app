@@ -620,7 +620,7 @@ export default function BaselinesPage() {
     coverage?.baselineId === baselineId &&
     coverage.revision === detail?.baseline.revision &&
     coverage.page === coveragePage &&
-    coverage.search === assignedFilter.trim().toLowerCase() &&
+    coverage.search === assignedFilter.trim().slice(0, 100).toLowerCase() &&
     coverage.statusFilter === coverageStatus
       ? coverage
       : null
@@ -1070,7 +1070,7 @@ export default function BaselinesPage() {
                     ['Meets selected checks', currentCoverage.counts.met, 'text-emerald-700 dark:text-emerald-300'],
                     ['Needs review', currentCoverage.counts.needsAction, 'text-amber-700 dark:text-amber-300'],
                     ['Unable to assess', currentCoverage.counts.unableToAssess, 'text-slate-600 dark:text-slate-300'],
-                    ['Not applied', currentCoverage.counts.notApplied, 'text-slate-600 dark:text-slate-300'],
+                    ['Not on this baseline', currentCoverage.counts.notApplied, 'text-slate-600 dark:text-slate-300'],
                   ].map(([label, value, color]) => (
                     <div key={label} className="rounded-lg border border-slate-200 p-3 dark:border-slate-700">
                       <p className="text-xs font-semibold uppercase text-slate-500">{label}</p>
@@ -1079,6 +1079,7 @@ export default function BaselinesPage() {
                   ))}
                 </div>
                 <p className="mt-3 text-xs text-slate-500">
+                  Tenants not on this baseline may be assigned to another baseline; this count does not mean they have no baseline.{' '}
                   Assessed {new Date(currentCoverage.assessedAt).toLocaleString()} from stored Microsoft configuration. A result is not proof of a complete sync or of unselected controls.
                 </p>
                 <div className="mt-5 border-t border-slate-200 pt-4 dark:border-slate-800">
@@ -1227,6 +1228,7 @@ export default function BaselinesPage() {
                 id="assigned-search"
                 className={field + ' min-w-0 flex-1 sm:max-w-sm'}
                 placeholder="Search name or domain"
+                maxLength={100}
                 value={assignedSearch}
                 onChange={(event) => setAssignedSearch(event.target.value)}
               />
