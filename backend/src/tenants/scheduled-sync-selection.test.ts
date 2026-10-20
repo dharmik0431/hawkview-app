@@ -291,12 +291,60 @@ test('the hourly rule and the candidate query agree on the boundary millisecond'
   assert.equal(some.lastSuccessfulAt.lte.getTime(), now.getTime() - HOUR)
 })
 
+test('an abandoned clean RUNNING hourly collector recovers at one hour without changing the daily guard', () => {
+  const priorSuccess = ago(2 * HOUR)
+  for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
+    const running = { ...state('ORGANIZATION_CONFIGURATION', 'RUNNING', priorSuccess, ago(age)),
+      lastErrorCode: null, lastErrorMessage: null }
+    assert.equal(shouldRunHourlyInventoryRefresh(running, now), age >= HOUR)
+    const states = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now),
+      state('LICENSES', 'SUCCEEDED', now), state('DOMAINS', 'SUCCEEDED', now), running]
+    const work = selectScheduledTenantWork([{ id: 'abandoned-organization', syncStates: states }], now, 1)
+    assert.equal(work.length, age >= HOUR ? 1 : 0)
+    if (work.length) assert.equal(work[0]!.fullInventoryDue, false)
+  }
+  assert.equal(shouldRunHourlyInventoryRefresh({
+    ...state('ORGANIZATION_CONFIGURATION', 'RUNNING', null, ago(HOUR)),
+    lastErrorCode: null, lastErrorMessage: null,
+  }, now), true, 'a never-completed abandoned attempt also needs recovery')
+})
+
+test('the stale clean RUNNING candidate matches the pure hourly recovery boundary', () => {
+  const where = scheduledSyncTenantWhere(now) as unknown as {
+    AND: { OR?: Array<Record<string, unknown>> }[]
+  }
+  const branch = where.AND[1]!.OR!.find((candidate) => {
+    const some = (candidate as { syncStates?: { some?: Record<string, unknown> } }).syncStates?.some
+    return some?.status === 'RUNNING' && some?.lastErrorCode === null
+  }) as { syncStates: { some: {
+    resourceType: { in: string[] }
+    lastErrorCode: null
+    lastErrorMessage: null
+    lastAttemptAt: { lte: Date }
+    OR: Array<{ lastSuccessfulAt: null | { lte: Date } }>
+  } } } | undefined
+  assert.ok(branch)
+  const some = branch!.syncStates.some
+  assert.deepEqual([...some.resourceType.in].sort(), [...HOURLY_INVENTORY_RESOURCES].sort())
+  assert.equal(some.lastErrorCode, null)
+  assert.equal(some.lastErrorMessage, null)
+  assert.equal(some.lastAttemptAt.lte.getTime(), now.getTime() - HOUR)
+  assert.deepEqual(some.OR, [{ lastSuccessfulAt: null }, { lastSuccessfulAt: { lte: now } }])
+})
+
 test('an unhealthy, missing or impossible timestamp is never hourly due', () => {
   const stale = ago(6 * HOUR)
   // FAILED keeps its own targeted retry schedule and must not take this path.
   assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'FAILED', stale), now), false)
-  // RUNNING must not be duplicated.
-  assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'RUNNING', stale), now), false)
+  // A current RUNNING attempt must not be duplicated.
+  assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'RUNNING', stale, ago(1)), now), false)
+  for (const invalid of [
+    { ...state('CONDITIONAL_ACCESS', 'RUNNING', stale, ago(2 * HOUR)), lastErrorCode: 'COLLECTION_PARTIAL' },
+    { ...state('CONDITIONAL_ACCESS', 'RUNNING', stale, ago(2 * HOUR)), lastErrorMessage: 'Collection partial' },
+    state('CONDITIONAL_ACCESS', 'RUNNING', stale, null),
+    state('CONDITIONAL_ACCESS', 'RUNNING', stale, new Date(now.getTime() + HOUR)),
+    state('CONDITIONAL_ACCESS', 'RUNNING', new Date(now.getTime() + HOUR), ago(2 * HOUR)),
+  ]) assert.equal(shouldRunHourlyInventoryRefresh(invalid, now), false)
   // Never collected belongs to the initial/daily path, or it would re-attempt
   // on every tick.
   assert.equal(shouldRunHourlyInventoryRefresh(state('CONDITIONAL_ACCESS', 'SUCCEEDED', null), now), false)
@@ -366,8 +414,8 @@ test('DNS failures retain daily handling without hourly or targeted retry eligib
   for (const branch of failedCandidacyBranches(now)) assert.equal(branch.resourceType.in.includes('DOMAIN_DNS_HEALTH'), false)
 })
 
-test('DNS running, missing, invalid and future success never enters hourly refresh', () => {
-  for (const dns of [state('DOMAIN_DNS_HEALTH', 'RUNNING', ago(6 * HOUR)),
+test('DNS in-flight, missing, invalid and future success never enters hourly refresh', () => {
+  for (const dns of [state('DOMAIN_DNS_HEALTH', 'RUNNING', ago(6 * HOUR), ago(1)),
     state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', null),
     state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', new Date(NaN)),
     state('DOMAIN_DNS_HEALTH', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
@@ -758,8 +806,8 @@ test('secure-score failure policy excludes retry candidacy and retains its daily
   }
 })
 
-test('secure-score running, missing, invalid and future success never enters hourly refresh', () => {
-  for (const score of [state('SECURE_SCORES', 'RUNNING', ago(6 * HOUR)),
+test('secure-score in-flight, missing, invalid and future success never enters hourly refresh', () => {
+  for (const score of [state('SECURE_SCORES', 'RUNNING', ago(6 * HOUR), ago(1)),
     state('SECURE_SCORES', 'SUCCEEDED', null),
     state('SECURE_SCORES', 'SUCCEEDED', new Date(NaN)),
     state('SECURE_SCORES', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
@@ -802,8 +850,8 @@ test('risky users keep broad strict30minute candidacy apart from pure15minute re
   }
 })
 
-test('risky users with running, missing, invalid or future success are never hourly due', () => {
-  for (const risk of [state('RISKY_USERS', 'RUNNING', ago(6 * HOUR)),
+test('risky users in-flight, missing, invalid or future success are never hourly due', () => {
+  for (const risk of [state('RISKY_USERS', 'RUNNING', ago(6 * HOUR), ago(1)),
     state('RISKY_USERS', 'SUCCEEDED', null), state('RISKY_USERS', 'SUCCEEDED', new Date(NaN)),
     state('RISKY_USERS', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
     assert.equal(shouldRunHourlyInventoryRefresh(risk, now), false)
