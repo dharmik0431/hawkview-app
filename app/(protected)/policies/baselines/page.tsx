@@ -101,6 +101,47 @@ type Choices = {
   pageSize: number
 }
 
+type CoverageOutcome = 'MET' | 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS'
+type Coverage = {
+  baselineId: string
+  revision: number
+  counts: {
+    assigned: number
+    met: number
+    needsAction: number
+    unableToAssess: number
+    notApplied: number
+  }
+  checkImpact: Array<{
+    id: string
+    title: string
+    met: number
+    needsAction: number
+    unableToAssess: number
+  }>
+  items: Array<{
+    tenantId: string
+    name: string
+    domain: string | null
+    assignedAt: string
+    outcome: CoverageOutcome
+    met: number
+    needsAction: number
+    unableToAssess: number
+    attention: Array<{
+      id: string
+      title: string
+      outcome: 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS'
+    }>
+  }>
+  matchingTenants: number
+  page: number
+  pageSize: number
+  search: string
+  statusFilter: 'ALL' | CoverageOutcome
+  assessedAt: string
+}
+
 const services = [
   'Entra',
   'SharePoint',
@@ -288,6 +329,10 @@ export default function BaselinesPage() {
   const [library, setLibrary] = useState<Library | null>(null)
   const [detail, setDetail] = useState<Detail | null>(null)
   const [choices, setChoices] = useState<Choices | null>(null)
+  const [coverage, setCoverage] = useState<Coverage | null>(null)
+  const [coverageError, setCoverageError] = useState<string | null>(null)
+  const [coveragePage, setCoveragePage] = useState(1)
+  const [coverageStatus, setCoverageStatus] = useState<'ALL' | CoverageOutcome>('ALL')
   const [listPage, setListPage] = useState(1)
   const [assignedPage, setAssignedPage] = useState(1)
   const [choicePage, setChoicePage] = useState(1)
@@ -347,6 +392,24 @@ export default function BaselinesPage() {
     },
     [url, baselineId, assignedPage, assignedFilter]
   )
+  const loadCoverage = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!url || !baselineId) return
+      const result = await apiClient.get<Coverage>(
+        `${url}/${encodeURIComponent(baselineId)}/coverage`,
+        {
+          params: {
+            page: String(coveragePage),
+            search: assignedFilter,
+            status: coverageStatus,
+          },
+          signal,
+        }
+      )
+      if (!signal?.aborted) setCoverage(result)
+    },
+    [url, baselineId, coveragePage, assignedFilter, coverageStatus]
+  )
   useEffect(() => {
     if (!url) return
     const controller = new AbortController()
@@ -367,7 +430,19 @@ export default function BaselinesPage() {
   }, [url, baselineId, loadDetail, loadLibrary])
   useEffect(() => {
     setDetail(null)
+    setCoverage(null)
+    setCoveragePage(1)
+    setCoverageStatus('ALL')
   }, [baselineId, url])
+  useEffect(() => {
+    if (!url || !baselineId) return
+    const controller = new AbortController()
+    setCoverageError(null)
+    void loadCoverage(controller.signal).catch((caught) => {
+      if (!controller.signal.aborted) setCoverageError(errorText(caught))
+    })
+    return () => controller.abort()
+  }, [url, baselineId, loadCoverage])
   useEffect(() => {
     if (!assignOpen || !url) return
     const controller = new AbortController()
@@ -449,6 +524,7 @@ export default function BaselinesPage() {
           expectedRevision: detail?.baseline.revision,
         })
         await loadDetail()
+        await loadCoverage()
       } else {
         const created = await apiClient.post<{ id: string }>(url, {
           name,
@@ -482,6 +558,7 @@ export default function BaselinesPage() {
         })
       )
       await loadDetail()
+      await loadCoverage()
     } catch (caught) {
       setError(errorText(caught))
     } finally {
@@ -539,6 +616,14 @@ export default function BaselinesPage() {
     }
     return false
   })
+  const currentCoverage =
+    coverage?.baselineId === baselineId &&
+    coverage.revision === detail?.baseline.revision &&
+    coverage.page === coveragePage &&
+    coverage.search === assignedFilter.trim().toLowerCase() &&
+    coverage.statusFilter === coverageStatus
+      ? coverage
+      : null
   return (
     <div className="space-y-5 pb-8">
       <header className="relative overflow-hidden rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-cyan-50 p-5 dark:border-indigo-900 dark:from-indigo-950/60 dark:via-slate-900 dark:to-cyan-950/40 sm:p-6">
@@ -959,6 +1044,74 @@ export default function BaselinesPage() {
               })}
             </div>
           </section>
+          <section className={panel + ' p-5'} aria-label="Baseline impact">
+            <h2 className="text-lg font-semibold">Baseline impact</h2>
+            <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
+              Results cover only tenants assigned to this baseline and only its
+              selected checks. An unavailable result is not a failed setting.
+            </p>
+            {coverageError && (
+              <p role="alert" className="mt-3 text-sm text-red-700 dark:text-red-300">
+                Impact could not be loaded: {coverageError}{' '}
+                <button type="button" className="underline" onClick={() => {
+                  setCoverageError(null)
+                  void loadCoverage().catch((caught) => setCoverageError(errorText(caught)))
+                }}>Retry</button>
+              </p>
+            )}
+            {!currentCoverage && !coverageError && (
+              <p role="status" className="mt-3 text-sm text-slate-500">Assessing assigned tenants from stored evidence…</p>
+            )}
+            {currentCoverage && (
+              <>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+                  {[
+                    ['Applied', currentCoverage.counts.assigned, 'text-slate-900 dark:text-white'],
+                    ['Meets selected checks', currentCoverage.counts.met, 'text-emerald-700 dark:text-emerald-300'],
+                    ['Needs review', currentCoverage.counts.needsAction, 'text-amber-700 dark:text-amber-300'],
+                    ['Unable to assess', currentCoverage.counts.unableToAssess, 'text-slate-600 dark:text-slate-300'],
+                    ['Not applied', currentCoverage.counts.notApplied, 'text-slate-600 dark:text-slate-300'],
+                  ].map(([label, value, color]) => (
+                    <div key={label} className="rounded-lg border border-slate-200 p-3 dark:border-slate-700">
+                      <p className="text-xs font-semibold uppercase text-slate-500">{label}</p>
+                      <p className={`mt-1 text-2xl font-bold ${color}`}>{value}</p>
+                    </div>
+                  ))}
+                </div>
+                <p className="mt-3 text-xs text-slate-500">
+                  Assessed {new Date(currentCoverage.assessedAt).toLocaleString()} from stored Microsoft configuration. A result is not proof of a complete sync or of unselected controls.
+                </p>
+                <div className="mt-5 border-t border-slate-200 pt-4 dark:border-slate-800">
+                  <h3 className="font-semibold">Which requirements need attention?</h3>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Counts are per selected check across applied tenants; one tenant can appear under several checks.
+                  </p>
+                  <div className="mt-3 overflow-x-auto">
+                    <table className="w-full min-w-[520px] text-left text-sm">
+                      <thead className="text-xs uppercase text-slate-500">
+                        <tr>
+                          <th className="py-2 pr-4">Selected check</th>
+                          <th className="py-2 pr-4">Needs review</th>
+                          <th className="py-2 pr-4">Unable to assess</th>
+                          <th className="py-2">Met</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+                        {currentCoverage.checkImpact.map((check) => (
+                          <tr key={check.id}>
+                            <td className="py-2 pr-4 font-medium">{check.title}</td>
+                            <td className="py-2 pr-4 text-amber-700 dark:text-amber-300">{check.needsAction}</td>
+                            <td className="py-2 pr-4 text-slate-600 dark:text-slate-300">{check.unableToAssess}</td>
+                            <td className="py-2 text-emerald-700 dark:text-emerald-300">{check.met}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+          </section>
           <section className={panel + ' p-5'}>
             <h2 className="text-lg font-semibold">Required settings</h2>
             <p className="mt-1 text-sm text-slate-500">
@@ -1040,8 +1193,9 @@ export default function BaselinesPage() {
                   Applied tenants ({detail.baseline.assignedTenantCount})
                 </h2>
                 <p className="text-sm text-slate-500">
-                  Search assignments; assess one tenant’s stored evidence on
-                  demand.
+                  Find tenants that meet the chosen minimum, need review, or
+                  lack enough current evidence. Open a tenant to see every
+                  selected check and its observed setting.
                 </p>
               </div>
               <button
@@ -1058,10 +1212,11 @@ export default function BaselinesPage() {
               </button>
             </div>
             <form
-              className="flex gap-2 border-t border-slate-200 p-4 dark:border-slate-800"
+              className="flex flex-wrap gap-2 border-t border-slate-200 p-4 dark:border-slate-800"
               onSubmit={(event) => {
                 event.preventDefault()
                 setAssignedPage(1)
+                setCoveragePage(1)
                 setAssignedFilter(assignedSearch)
               }}
             >
@@ -1076,19 +1231,36 @@ export default function BaselinesPage() {
                 onChange={(event) => setAssignedSearch(event.target.value)}
               />
               <button className={secondary}>Search</button>
+              <label htmlFor="baseline-result-filter" className="sr-only">Filter by baseline result</label>
+              <select
+                id="baseline-result-filter"
+                className={field}
+                value={coverageStatus}
+                onChange={(event) => {
+                  setCoveragePage(1)
+                  setCoverageStatus(event.target.value as 'ALL' | CoverageOutcome)
+                }}
+              >
+                <option value="ALL">All results</option>
+                <option value="NEEDS_ACTION">Needs review</option>
+                <option value="UNABLE_TO_ASSESS">Unable to assess</option>
+                <option value="MET">Meets selected checks</option>
+              </select>
             </form>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[540px] text-left text-sm">
+              <table className="w-full min-w-[760px] text-left text-sm">
                 <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-slate-950">
                   <tr>
                     <th className="px-4 py-3">Tenant</th>
                     <th className="px-4 py-3">Domain</th>
                     <th className="px-4 py-3">Applied</th>
+                    <th className="px-4 py-3">Baseline result</th>
+                    <th className="px-4 py-3">What needs attention</th>
                     <th className="px-4 py-3">Assessment</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                  {detail.assignments.map((item) => (
+                  {currentCoverage?.items.map((item) => (
                     <tr key={item.tenantId}>
                       <td className="px-4 py-3 font-medium">{item.name}</td>
                       <td className="px-4 py-3">
@@ -1096,6 +1268,34 @@ export default function BaselinesPage() {
                       </td>
                       <td className="px-4 py-3">
                         {formatDate(item.assignedAt)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${
+                          item.outcome === 'MET'
+                            ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200'
+                            : item.outcome === 'NEEDS_ACTION'
+                              ? 'bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-200'
+                              : 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200'
+                        }`}>
+                          {item.outcome === 'MET' ? 'Meets selected checks' : item.outcome === 'NEEDS_ACTION' ? 'Needs review' : 'Unable to assess'}
+                        </span>
+                        <p className="mt-1 text-xs text-slate-500">
+                          {item.met} met · {item.needsAction} need review · {item.unableToAssess} unavailable
+                        </p>
+                      </td>
+                      <td className="px-4 py-3">
+                        {item.attention.length ? (
+                          <>
+                            <ul className="space-y-1">
+                              {item.attention.slice(0, 2).map((check) => (
+                                <li key={check.id} className="text-xs">
+                                  {check.title} <span className="text-slate-500">({check.outcome === 'NEEDS_ACTION' ? 'gap' : 'evidence needed'})</span>
+                                </li>
+                              ))}
+                            </ul>
+                            {item.attention.length > 2 && <p className="mt-1 text-xs text-slate-500">+{item.attention.length - 2} more</p>}
+                          </>
+                        ) : <span className="text-xs text-slate-500">No selected check needs review</span>}
                       </td>
                       <td className="px-4 py-3">
                         <a
@@ -1107,27 +1307,27 @@ export default function BaselinesPage() {
                       </td>
                     </tr>
                   ))}
-                  {!detail.assignments.length && (
+                  {currentCoverage && !currentCoverage.items.length && (
                     <tr>
                       <td
-                        colSpan={4}
+                        colSpan={6}
                         className="px-4 py-8 text-center text-slate-500"
                       >
-                        {assignedFilter
-                          ? 'No assigned tenants match.'
-                          : 'No tenants assigned yet.'}
+                        {currentCoverage.counts.assigned === 0
+                          ? 'No tenants assigned yet.'
+                          : 'No assigned tenants match these filters.'}
                       </td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </div>
-            <Pager
-              page={detail.page}
-              total={detail.matchingTenants}
-              size={detail.pageSize}
-              change={setAssignedPage}
-            />
+            {currentCoverage && <Pager
+              page={currentCoverage.page}
+              total={currentCoverage.matchingTenants}
+              size={currentCoverage.pageSize}
+              change={setCoveragePage}
+            />}
           </section>
         </>
       )}

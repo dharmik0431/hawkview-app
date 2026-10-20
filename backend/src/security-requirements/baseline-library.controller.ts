@@ -45,6 +45,20 @@ export class BaselineLibraryController {
     )
   }
 
+  @Get(':baselineId/coverage')
+  coverage(
+    @Req() request: AuthenticatedRequest,
+    @Param('organizationId') organizationId: string,
+    @Param('baselineId') baselineId: string,
+    @Query('page') page: string | undefined,
+    @Query('search') search: string | undefined,
+    @Query('status') status: string | undefined
+  ) {
+    return this.service.baselineCoverage(
+      request.auth, organizationId, baselineId, page, search, status
+    )
+  }
+
   @Get(':baselineId')
   detail(
     @Req() request: AuthenticatedRequest,
