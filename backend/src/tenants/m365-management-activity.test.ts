@@ -432,25 +432,29 @@ test('writes raw and normalized evidence and completes a content ledger in one t
       record(),
       record(),
       record({ Id: 'record-already-accepted-concurrently' }),
-      record({ Id: 'supporting-record', Operation: 'MoveToDeletedItems', ObjectId: 'message-1', MailboxOwnerUPN: 'victim@example.test' }),
-      record({ Id: 'supporting-record-2', Operation: 'MoveToDeletedItems', ObjectId: 'message-2', MailboxOwnerUPN: 'victim@example.test', CreationTime: '2026-08-17T12:31:00.000Z' }),
+      record({ Id: 'supporting-record', Operation: 'MoveToDeletedItems', ObjectId: 'message-1', MailboxOwnerUPN: 'victim@example.test', CorrelationId: 'request-1' }),
+      record({ Id: 'supporting-record-2', Operation: 'MoveToDeletedItems', ObjectId: 'message-2', MailboxOwnerUPN: 'victim@example.test', CorrelationId: 'request-2', CreationTime: '2026-08-17T12:31:00.000Z' }),
+      record({ Id: 'other-mailbox', Operation: 'MoveToDeletedItems', ObjectId: 'message-3', MailboxOwnerUPN: 'other@example.test', CreationTime: '2026-08-17T12:32:00.000Z' }),
+      record({ Id: 'next-window', Operation: 'MoveToDeletedItems', ObjectId: 'message-4', MailboxOwnerUPN: 'victim@example.test', CreationTime: '2026-08-17T12:46:00.000Z' }),
       record({ Id: 'routine-record', Operation: 'FileAccessed' }),
     ]))
   }
   try {
     const changes = await (service as any).processContent(tenant, 'token', publisherIdentifier, { remainingBytes: 1024 * 1024 }, content, Date.now() + 60_000)
     assert.equal(changes.length, 2)
-    assert.equal(rawWrites.length, 3)
+    assert.equal(rawWrites.length, 5)
     assert.equal(evidenceWrites.length, 2)
     assert.equal(evidenceWrites[0].source, 'M365_UNIFIED_AUDIT')
     assert.equal(evidenceWrites[0].raw.evidenceOrigin, 'microsoft_audit_event')
-    const supportingSummary = rawWrites.find((entry) => entry.raw.hawkviewEvidenceRole === 'security_supporting_activity')
+    const summaries = rawWrites.filter((entry) => entry.raw.hawkviewEvidenceRole === 'security_supporting_activity')
+    assert.equal(summaries.length, 3)
+    const supportingSummary = summaries.find((entry) => entry.raw.hawkviewSupportingActivityCount === 2)
     assert.equal(supportingSummary?.raw.hawkviewSupportingActivityCount, 2)
     assert.deepEqual(supportingSummary?.raw.hawkviewSupportingSampleRecordIds, ['supporting-record', 'supporting-record-2'])
     assert.match(supportingSummary?.microsoftRecordId, /^support:blob-1:/)
     assert.equal(rawWrites.some((entry) => entry.microsoftRecordId === 'routine-record'), false)
     assert.equal(ledgerWrites[0].status, 'COMPLETED')
-    assert.equal(usageWrites.some((entry) => entry.create.recordsStored === 3), true)
+    assert.equal(usageWrites.some((entry) => entry.create.recordsStored === 5), true)
   } finally {
     globalThis.fetch = originalFetch
   }

@@ -1115,13 +1115,14 @@ export class M365ManagementActivityService {
         // Supporting mailbox activity can be very high volume. Preserve a
         // deterministic 15-minute actor/mailbox/operation summary per source
         // blob instead of duplicating every message event in PostgreSQL.
+        // Correlation IDs can differ for every message and must not split
+        // that summary back into individual retained records.
         const bucket = Math.floor(eventTime.getTime() / (15 * 60 * 1000))
         const groupingKey = [
           text(record.Workload) ?? '',
           text(record.Operation) ?? '',
           text(record.UserId) ?? text(record.UserKey) ?? '',
           text(record.MailboxOwnerUPN) ?? text(record.TargetUserOrGroupName) ?? '',
-          text(record.CorrelationId) ?? text(record.ClientRequestId) ?? '',
           String(bucket),
         ].join('\u0000').toLowerCase()
         const group = supportingGroups.get(groupingKey) ?? []
