@@ -44,7 +44,7 @@ test('only a verified required grant gap is called missing', () => {
   assert.match(result.detail, /Last permission verification/)
 })
 
-test('optional missing scope, licensing and stale collection do not become a directory permission warning', () => {
+test('optional missing scope stays out of the directory status without hiding it from the optional detail', () => {
   const result = tenantPermissionStatus(tenant({
     collectionReadiness: readiness(
       dataset({ name: 'User.Read.All', grantStatus: 'CONFIRMED' }),
@@ -56,7 +56,7 @@ test('optional missing scope, licensing and stale collection do not become a dir
   assert.equal(result.label, 'No required permission gap')
   assert.equal(result.tone, 'ok')
   assert.deepEqual(result.missing, [])
-  assert.doesNotMatch(result.detail, /RiskyUser\.Read\.All|Premium\.Read\.All/)
+  assert.deepEqual(result.optional, ['RiskyUser.Read.All'])
 })
 
 test('missing or unverified access evidence never produces a green result', () => {

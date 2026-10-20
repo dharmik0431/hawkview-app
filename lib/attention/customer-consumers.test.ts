@@ -6,12 +6,13 @@ import * as customer from './customer-attention.ts'
 import * as attention from './computeTenantAttention.ts'
 import * as risk from '../identity-risk/microsoft-risk-summary.ts'
 import * as navigation from '../tenants/navigation.ts'
+import * as permissionStatus from '../tenants/tenant-permission-status.ts'
 import { tenantFindingProvenance, collectorAttentionProvenance, accessProvenance } from '../../backend/src/tenants/attention-provenance.ts'
 const require = createRequire(import.meta.url), ts = require('typescript')
 function compile(path: string): any {
  const ex = {}; const source=readFileSync(new URL(path,import.meta.url),'utf8')
  const js=ts.transpileModule(source,{fileName:path,compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.ReactJSX}}).outputText
- const mocks:Record<string,unknown>={'lucide-react':new Proxy({},{get:()=>()=>null}),'@/components/ui/badge':{},'@/lib/utils':{},'@/lib/attention/customer-attention':customer,'@/lib/attention/computeTenantAttention':attention,'@/lib/identity-risk/microsoft-risk-summary':risk,'@/lib/tenants/navigation':navigation}
+ const mocks:Record<string,unknown>={'lucide-react':new Proxy({},{get:()=>()=>null}),'@/components/ui/badge':{},'@/lib/utils':{},'@/lib/attention/customer-attention':customer,'@/lib/attention/computeTenantAttention':attention,'@/lib/identity-risk/microsoft-risk-summary':risk,'@/lib/tenants/navigation':navigation,'@/lib/tenants/tenant-permission-status':permissionStatus}
  new Function('require','exports',js)((name:string)=>mocks[name]??require(name),ex);return ex
 }
 const matrix=compile('../../components/dashboard/tenant-risk-matrix-helpers.ts'),directory=compile('../../components/tenants/tenant-status-badge.tsx')
