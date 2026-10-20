@@ -452,6 +452,8 @@ test('writes raw and normalized evidence and completes a content ledger in one t
     const supportingSummary = summaries.find((entry) => entry.raw.hawkviewSupportingActivityCount === 2)
     assert.equal(supportingSummary?.raw.hawkviewSupportingActivityCount, 2)
     assert.deepEqual(supportingSummary?.raw.hawkviewSupportingSampleRecordIds, ['supporting-record', 'supporting-record-2'])
+    assert.equal(supportingSummary?.correlationId, null)
+    assert.equal(supportingSummary?.raw.CorrelationId, null)
     assert.match(supportingSummary?.microsoftRecordId, /^support:blob-1:/)
     assert.equal(rawWrites.some((entry) => entry.microsoftRecordId === 'routine-record'), false)
     assert.equal(ledgerWrites[0].status, 'COMPLETED')

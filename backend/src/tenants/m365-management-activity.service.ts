@@ -1144,6 +1144,10 @@ export class M365ManagementActivityService {
           record: {
             ...first,
             Id: summaryId,
+            // A multi-event summary is not evidence for the first event's
+            // request correlation. Keep that link only for a singleton.
+            CorrelationId: records.length === 1 ? first.CorrelationId : null,
+            ClientRequestId: records.length === 1 ? first.ClientRequestId : null,
             ObjectId: text(first.MailboxOwnerUPN) ?? text(first.TargetUserOrGroupName) ?? text(first.ObjectId),
             hawkviewSupportingActivityCount: records.length,
             hawkviewSupportingFirstSeenAt: text(first.CreationTime),
