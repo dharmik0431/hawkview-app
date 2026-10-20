@@ -413,13 +413,12 @@ export function WhatChangedView() {
       {!isLoading && !error && data && (!data.validPayload || data.partialPayload || data.discardedCount > 0) && (
         <div role="status" aria-live="polite" className="rounded-xl border border-amber-300 bg-amber-50 p-4 text-xs text-amber-950 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-100">
           {!data.validPayload
-            ? 'Change evidence is unavailable because the service response could not be verified.'
+            ? 'Change activity could not be loaded right now. Please try again.'
             : data.discardedCount > 0
-            ? `Some evidence could not be displayed (${data.discardedCount} malformed ${data.discardedCount === 1 ? 'record' : 'records'}).`
+            ? 'Some change activity could not be displayed right now.'
             : missingSources
-            ? 'Some change evidence could not be read completely or its availability is unverified.'
-            : 'Change evidence is partially available because response metadata could not be verified.'}
-          {missingSources && ` Source reads are incomplete or unverified: ${missingSources}. The unread remainder is unknown.`}
+            ? 'Some change activity could not be loaded right now.'
+            : 'Change activity could not be loaded completely right now.'}
         </div>
       )}
 
@@ -491,9 +490,9 @@ export function WhatChangedView() {
             </div>
             <p className="text-xs text-muted-foreground max-w-md mx-auto">
               {rawChanges.length === 0 && !incomplete
-                ? 'Both source reads completed with no matching retained evidence. This does not verify upstream collection completeness.'
+                ? 'No matching events are in HawkView records for this range.'
                 : rawChanges.length === 0
-                  ? 'Some response evidence was unavailable or malformed, so this is not a verified zero.'
+                  ? 'Some change activity could not be loaded. Try again shortly.'
                   : 'Try another category or clear the active filters.'}
             </p>
             <div className="pt-2 flex flex-wrap justify-center gap-2">

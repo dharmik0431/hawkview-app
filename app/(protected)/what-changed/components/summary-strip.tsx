@@ -69,10 +69,6 @@ export function SummaryStrip({
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card shadow-2xs">
-      <p className="px-3 pt-3 text-xs text-muted-foreground">
-        {incomplete ? 'Counts reflect available evidence only; missing evidence may change these totals.' : 'Counts reflect retained evidence read for this range.'}
-        {' Upstream collection completeness has not been verified.'}
-      </p>
       <div className="grid grid-cols-2 divide-y divide-border sm:grid-cols-4 sm:divide-x sm:divide-y-0" role="region" aria-label="Investigation Categories">
         {items.map((item) => {
           const isSelected = selectedCategory === item.key

@@ -104,9 +104,9 @@ async function frontend(response) {
 }
 function assertIncomplete(ui) {
   assert.ok(!ui.html.includes('authoritative empty'))
-  assert.ok(!ui.html.includes('Both source reads completed'))
+  assert.ok(!ui.html.includes('Upstream collection completeness has not been verified'))
+  assert.ok(!ui.html.includes('Counts reflect retained evidence'))
   assert.equal(ui.summary?.incomplete, true)
-  assert.ok(ui.html.includes('Upstream collection completeness has not been verified'))
   for (const count of Object.values(ui.summary.summary)) {
     assert.ok(ui.html.includes(count > 0 ? `${count.toLocaleString()} observed` : 'Unknown'))
   }
@@ -120,8 +120,8 @@ for (const [name, a, e] of [['directory rejects', fail, empty], ['projection rej
     const ui = await frontend(result)
     assertIncomplete(ui)
     assert.equal((ui.html.match(/>Unknown</g) ?? []).length, 4)
-    assert.ok(ui.html.includes('unread remainder is unknown'))
-    assert.ok(ui.html.includes('not a verified zero'))
+    assert.ok(ui.html.includes('Some change activity could not be loaded right now.'))
+    assert.ok(ui.html.includes('Some change activity could not be loaded. Try again shortly.'))
   })
 }
 test('successful empty reads are limited to retained evidence and upstream completeness remains unknown', async () => {
@@ -129,7 +129,8 @@ test('successful empty reads are limited to retained evidence and upstream compl
   assert.equal(result.collectionCompleteness, 'unknown')
   const ui = await frontend(result)
   assert.equal(ui.summary.incomplete, false)
-  assert.ok(ui.html.includes('Both source reads completed with no matching retained evidence'))
+  assert.ok(ui.html.includes('No matching events are in HawkView records for this range.'))
+  assert.ok(!ui.html.includes('Upstream collection completeness has not been verified'))
   assert.ok(!ui.html.includes('authoritative empty'))
 })
 for (const [name, a, e, count] of [
