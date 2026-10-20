@@ -18,6 +18,7 @@ function load(file){if(cache.has(file))return cache.get(file);const ex={};cache.
 const prov=load(root+'/backend/src/tenants/attention-provenance.ts')
 const {TenantServiceCollection}=load(root+'/components/tenants/tenant-service-collection.tsx')
 const {TenantPermissionSummary}=load(root+'/components/tenants/tenant-permission-summary.tsx')
+const {TenantIssueDrawer}=load(root+'/components/tenants/tenant-issue-drawer.tsx')
 const {tenantConnectionBadge}=load(root+'/lib/tenants/service-collection-status.ts')
 const {TenantRiskMatrixDrawer}=load(root+'/components/dashboard/tenant-risk-matrix-drawer.tsx')
 const {TenantOverview}=load(root+'/app/(protected)/tenants/[id]/components/tenant-overview.tsx')
@@ -115,6 +116,14 @@ test('tenant directory does not advertise an intentionally ungranted optional Ex
   assert.doesNotMatch(link.outerHTML,/Exchange\.ManageAsAppV2|optional permission not granted/)
  })
 })
+test('tenant issue drawer does not turn incomplete evidence into zero findings or collector success',()=>mount(
+ 'incomplete-issue-drawer',
+ h(TenantIssueDrawer,{tenant:{...tenant,status:'active',connectionStatus:'connected',data:{status:'PARTIAL'},attention:[]},isOpen:true,onClose(){},initialTab:'findings'}),
+ doc=>{
+  assert.match(doc.body.textContent,/Finding total unavailable/)
+  assert.doesNotMatch(doc.body.textContent,/All expected collectors succeeded|Complete observation dataset/)
+ }
+))
 for(const [name,attention,expected]of [
  ['access',[row(prov.accessProvenance('AUTHORIZATION_REQUIRED',true))],/explicit customer access setup action/],
  ['operations',[row(prov.collectorAttentionProvenance('USERS','HAWKVIEW_INTERNAL_FAILURE'))],/Finding total unavailable/],

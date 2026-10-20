@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, Fragment } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
@@ -8,6 +8,9 @@ import {
   Plus,
   Clock,
   ChevronRight,
+  ChevronDown,
+  Activity,
+  Sparkles,
   AlertCircle,
   RefreshCw,
   LayoutGrid,
@@ -57,13 +60,19 @@ import {
   computeTenantAttention,
   tenantActionableHealthProjection,
 } from '@/lib/attention/computeTenantAttention'
+import { customerAttention } from '@/lib/attention/customer-attention'
+import { tenantPermissionStatus } from '@/lib/tenants/tenant-permission-status'
 import { topAttention } from '@/lib/attention/topAttention'
-import { TenantIssueDrawer } from '@/components/tenants/tenant-issue-drawer'
+import { TenantIssueDrawer, type DrawerTabKey } from '@/components/tenants/tenant-issue-drawer'
 import { tenantOverviewPath } from '@/lib/tenants/navigation'
-import { TenantPermissionSummary } from '@/components/tenants/tenant-permission-summary'
+import {
+  TenantPermissionSummary,
+  TenantOptionalPermissionsDisclosure,
+} from '@/components/tenants/tenant-permission-summary'
 import {
   TenantStatusBadge,
   getTenantDisplayStatus,
+  getTenantReviewSummary,
   type DisplayStatusKey,
 } from '@/components/tenants/tenant-status-badge'
 import { TenantOnboardingDialog } from '@/components/tenants/tenant-onboarding-dialog'
@@ -74,13 +83,35 @@ type Provider = 'microsoft' | 'google'
 type ProviderFilter = 'all' | 'microsoft' | 'google'
 type StatusFilter =
   | 'all'
-  | 'healthy'
-  | 'needs_attention'
-  | 'disconnected_pending'
-  | 'stale'
+  | 'action_required'
+  | 'no_findings'
+  | 'setup_incomplete'
 type ViewMode = 'list' | 'tile'
-type SortField = 'name' | 'status' | 'needsAttention' | 'lastSync'
+type SortField = 'name' | 'actionRequired' | 'permissions' | 'findings' | 'lastSync'
 type SortOrder = 'asc' | 'desc'
+
+function getTenantActionSummary(tenant: Tenant) {
+  const summary = getTenantReviewSummary(tenant)
+  const type =
+    summary.type === 'error'
+      ? ('error' as const)
+      : summary.type === 'pending_setup'
+        ? ('pending' as const)
+        : summary.type === 'unverified'
+          ? ('unverified' as const)
+        : summary.type === 'finding' || summary.type === 'finding_and_action'
+          ? ('finding' as const)
+          : summary.type === 'action'
+            ? ('warning' as const)
+            : ('none' as const)
+
+  return {
+    type,
+    label: summary.headline,
+    detail: summary.detail,
+    drawerTab: summary.drawerTab,
+  }
+}
 
 function SortHeader({
   field,
@@ -298,13 +329,21 @@ export default function TenantsPage() {
   function directoryHealthAction(tenant: Tenant) {
     if (tenant.provider !== 'microsoft') return null
     return (
-      <Button type="button" variant="outline" size="sm"
-        className="h-8 px-3 text-xs font-semibold"
-        aria-label={`Directory health for ${tenant.name}`} aria-haspopup="dialog"
+      <button
+        type="button"
+        aria-label={`Directory health for ${tenant.name}`}
+        aria-haspopup="dialog"
         disabled={authLoading || !isSuccess || Boolean(error)}
-        onClick={(event) => openDirectoryHealth(tenant.id, event.currentTarget)}>
-        Directory health
-      </Button>
+        onClick={(event) => {
+          event.stopPropagation()
+          openDirectoryHealth(tenant.id, event.currentTarget)
+        }}
+        title={`View directory health receipts and role observations for ${tenant.name}`}
+        className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded px-1.5 py-0.5 border border-slate-200/80 dark:border-slate-800 bg-slate-100/70 dark:bg-slate-800/60 hover:bg-white dark:hover:bg-slate-800 shrink-0 select-none"
+      >
+        <Activity className="h-3 w-3 text-slate-400 shrink-0" aria-hidden="true" />
+        <span>Directory health</span>
+      </button>
     )
   }
 
@@ -337,8 +376,27 @@ export default function TenantsPage() {
   const [viewMode, setViewMode] = useState<ViewMode>('list')
   const [sortField, setSortField] = useState<SortField>('name')
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
+  const [expandedTenants, setExpandedTenants] = useState<Set<string>>(new Set())
+
+  const toggleExpand = (tenantId: string) => {
+    setExpandedTenants((prev) => {
+      const next = new Set(prev)
+      if (next.has(tenantId)) {
+        next.delete(tenantId)
+      } else {
+        next.add(tenantId)
+      }
+      return next
+    })
+  }
 
   const [selectedDrawerTenant, setSelectedDrawerTenant] = useState<Tenant | null>(null)
+  const [drawerInitialTab, setDrawerInitialTab] = useState<DrawerTabKey>('action')
+
+  const openTenantDrawer = (tenant: Tenant, tab: DrawerTabKey = 'action') => {
+    setDrawerInitialTab(tab)
+    setSelectedDrawerTenant(tenant)
+  }
 
   // Onboarding state
   const [showOnboarding, setShowOnboarding] = useState(false)
@@ -813,29 +871,26 @@ export default function TenantsPage() {
 
   // Calculate Truthful Counts strictly from API response
   const counts = useMemo(() => {
-    let healthy = 0
-    let needsAttention = 0
-    let disconnectedPending = 0
-    let unverified = 0
+    let actionRequired = 0
+    let noFindings = 0
+    let setupOrIncomplete = 0
 
     tenants.forEach((t) => {
-      const displayStatus = getTenantDisplayStatus(t)
-      if (displayStatus.key === 'healthy') {
-        healthy++
-      } else if (displayStatus.key === 'needs_attention') {
-        needsAttention++
-      } else if (displayStatus.key === 'unverified') {
-        unverified++
+      const action = getTenantActionSummary(t)
+      if (action.type === 'error' || action.type === 'warning' || action.type === 'finding') {
+        actionRequired++
+      } else if (action.type === 'pending' || action.type === 'unverified' || customerAttention(t).incomplete) {
+        setupOrIncomplete++
       } else {
-        disconnectedPending++
+        noFindings++
       }
     })
 
     return {
       total: tenants.length,
-      healthy,
-      needsAttention,
-      disconnectedPending: disconnectedPending + unverified,
+      actionRequired,
+      noFindings,
+      setupOrIncomplete,
     }
   }, [tenants])
 
@@ -853,19 +908,14 @@ export default function TenantsPage() {
       const matchesProvider =
         providerFilter === 'all' || tenant.provider === providerFilter
 
-      const displayStatus = getTenantDisplayStatus(tenant)
+      const action = getTenantActionSummary(tenant)
       let matchesStatus = true
-      if (statusFilter === 'healthy') {
-        matchesStatus = displayStatus.key === 'healthy'
-      } else if (statusFilter === 'needs_attention') {
-        matchesStatus = displayStatus.key === 'needs_attention'
-      } else if (statusFilter === 'disconnected_pending') {
-        matchesStatus =
-          displayStatus.key === 'disconnected' ||
-          displayStatus.key === 'pending_setup' ||
-          displayStatus.key === 'unverified'
-      } else if (statusFilter === 'stale') {
-        matchesStatus = displayStatus.key === 'stale'
+      if (statusFilter === 'action_required') {
+        matchesStatus = action.type === 'error' || action.type === 'warning' || action.type === 'finding'
+      } else if (statusFilter === 'no_findings') {
+        matchesStatus = action.type === 'none' && !customerAttention(tenant).incomplete
+      } else if (statusFilter === 'setup_incomplete') {
+        matchesStatus = action.type === 'pending' || action.type === 'unverified' || customerAttention(tenant).incomplete
       }
 
       return matchesSearch && matchesProvider && matchesStatus
@@ -884,26 +934,40 @@ export default function TenantsPage() {
           cmp = nameA.localeCompare(nameB)
           break
         }
-        case 'status': {
-          const statusRank: Record<DisplayStatusKey, number> = {
-            needs_attention: 1,
-            disconnected: 2,
-            pending_setup: 3,
-            stale: 4,
-            syncing: 5,
-            partially_synchronized: 6,
-            unverified: 7,
-            healthy: 8,
+        case 'actionRequired': {
+          const rankMap: Record<string, number> = {
+            error: 1,
+            warning: 2,
+            finding: 3,
+            pending: 4,
+            unverified: 5,
+            none: 6,
           }
-          const rankA = statusRank[getTenantDisplayStatus(a).key] || 99
-          const rankB = statusRank[getTenantDisplayStatus(b).key] || 99
-          cmp = rankA - rankB
+          const actionA = getTenantActionSummary(a)
+          const actionB = getTenantActionSummary(b)
+          cmp = (rankMap[actionA.type] || 99) - (rankMap[actionB.type] || 99)
           break
         }
-        case 'needsAttention': {
-          const itemsA = computeTenantAttention(a)
-          const itemsB = computeTenantAttention(b)
-          cmp = itemsB.length - itemsA.length
+        case 'permissions': {
+          const permA = tenantPermissionStatus(a)
+          const permB = tenantPermissionStatus(b)
+          const score = (p: typeof permA) =>
+            p.missing.length > 0 ? 1 : p.label === 'Required access blocked' ? 2 : p.tone === 'ok' ? 4 : 3
+          cmp = score(permA) - score(permB)
+          break
+        }
+        case 'findings': {
+          const rankScore = (t: Tenant) => {
+            const summary = getTenantReviewSummary(t)
+            if (summary.tone === 'error') return 1
+            if (summary.type === 'finding_and_action') return 2
+            if (summary.type === 'finding') return 3
+            if (summary.type === 'action') return 4
+            if (summary.type === 'pending_setup') return 5
+            if (summary.type === 'unverified') return 6
+            return 7
+          }
+          cmp = rankScore(a) - rankScore(b)
           break
         }
         case 'lastSync': {
@@ -969,61 +1033,105 @@ export default function TenantsPage() {
 
       {/* 1b. Compact Summary Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
-              Total Tenants
-            </p>
-            <p className="text-2xl font-extrabold text-slate-900 dark:text-white mt-0.5">
-              {counts.total}
-            </p>
+        <button
+          type="button"
+          onClick={() => setStatusFilter('all')}
+          className={cn(
+            'p-3.5 rounded-2xl border text-left transition-all',
+            statusFilter === 'all'
+              ? 'bg-blue-50/60 dark:bg-blue-950/30 border-blue-300 dark:border-blue-800 ring-2 ring-blue-500/20'
+              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:border-slate-300'
+          )}
+        >
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                Total Environments
+              </p>
+              <p className="text-2xl font-extrabold text-slate-900 dark:text-white mt-0.5 font-mono tabular-nums">
+                {counts.total}
+              </p>
+            </div>
+            <div className="h-10 w-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-600 dark:text-slate-300">
+              <Building2 className="h-5 w-5" />
+            </div>
           </div>
-          <div className="h-10 w-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-600 dark:text-slate-300">
-            <Building2 className="h-5 w-5" />
-          </div>
-        </div>
+        </button>
 
-        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">
-              No findings reported
-            </p>
-            <p className="text-2xl font-extrabold text-emerald-700 dark:text-emerald-400 mt-0.5">
-              {counts.healthy}
-            </p>
+        <button
+          type="button"
+          onClick={() => setStatusFilter('action_required')}
+          className={cn(
+            'p-3.5 rounded-2xl border text-left transition-all',
+            statusFilter === 'action_required'
+              ? 'bg-amber-50/80 dark:bg-amber-950/40 border-amber-300 dark:border-amber-800 ring-2 ring-amber-500/20'
+              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:border-amber-300'
+          )}
+        >
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-amber-700 dark:text-amber-400 uppercase tracking-wider">
+                Action Required
+              </p>
+              <p className="text-2xl font-extrabold text-amber-700 dark:text-amber-400 mt-0.5 font-mono tabular-nums">
+                {counts.actionRequired}
+              </p>
+            </div>
+            <div className="h-10 w-10 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-100 dark:border-amber-900 flex items-center justify-center text-amber-600">
+              <AlertTriangle className="h-5 w-5" />
+            </div>
           </div>
-          <div className="h-10 w-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-900 flex items-center justify-center text-emerald-600">
-            <CheckCircle2 className="h-5 w-5" />
-          </div>
-        </div>
+        </button>
 
-        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold text-amber-600 dark:text-amber-400 uppercase tracking-wider">
-              Needs Attention
-            </p>
-            <p className="text-2xl font-extrabold text-amber-700 dark:text-amber-400 mt-0.5">
-              {counts.needsAttention}
-            </p>
+        <button
+          type="button"
+          onClick={() => setStatusFilter('no_findings')}
+          className={cn(
+            'p-3.5 rounded-2xl border text-left transition-all',
+            statusFilter === 'no_findings'
+              ? 'bg-emerald-50/80 dark:bg-emerald-950/40 border-emerald-300 dark:border-emerald-800 ring-2 ring-emerald-500/20'
+              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:border-emerald-300'
+          )}
+        >
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 uppercase tracking-wider">
+                No Findings Reported
+              </p>
+              <p className="text-2xl font-extrabold text-emerald-700 dark:text-emerald-400 mt-0.5 font-mono tabular-nums">
+                {counts.noFindings}
+              </p>
+            </div>
+            <div className="h-10 w-10 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-100 dark:border-emerald-900 flex items-center justify-center text-emerald-600">
+              <CheckCircle2 className="h-5 w-5" />
+            </div>
           </div>
-          <div className="h-10 w-10 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-100 dark:border-amber-900 flex items-center justify-center text-amber-600">
-            <AlertTriangle className="h-5 w-5" />
-          </div>
-        </div>
+        </button>
 
-        <div className="p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm flex items-center justify-between">
-          <div>
-            <p className="text-xs font-semibold text-red-600 dark:text-red-400 uppercase tracking-wider">
-              Access setup / Incomplete evidence
-            </p>
-            <p className="text-2xl font-extrabold text-red-700 dark:text-red-400 mt-0.5">
-              {counts.disconnectedPending}
-            </p>
+        <button
+          type="button"
+          onClick={() => setStatusFilter('setup_incomplete')}
+          className={cn(
+            'p-3.5 rounded-2xl border text-left transition-all',
+            statusFilter === 'setup_incomplete'
+              ? 'bg-slate-100 dark:bg-slate-800/80 border-slate-300 dark:border-slate-700 ring-2 ring-slate-500/20'
+              : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:border-slate-300'
+          )}
+        >
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-slate-600 dark:text-slate-400 uppercase tracking-wider">
+                Setup / Incomplete
+              </p>
+              <p className="text-2xl font-extrabold text-slate-700 dark:text-slate-300 mt-0.5 font-mono tabular-nums">
+                {counts.setupOrIncomplete}
+              </p>
+            </div>
+            <div className="h-10 w-10 rounded-xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 flex items-center justify-center text-slate-500">
+              <XCircle className="h-5 w-5" />
+            </div>
           </div>
-          <div className="h-10 w-10 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-100 dark:border-red-900 flex items-center justify-center text-red-600">
-            <XCircle className="h-5 w-5" />
-          </div>
-        </div>
+        </button>
       </div>
 
       {/* Onboarding Modal */}
@@ -1482,10 +1590,22 @@ export default function TenantsPage() {
             </button>
             <button
               type="button"
-              onClick={() => setStatusFilter('healthy')}
+              onClick={() => setStatusFilter('action_required')}
               className={cn(
                 'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
-                statusFilter === 'healthy'
+                statusFilter === 'action_required'
+                  ? 'bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-300 shadow-sm font-bold'
+                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
+              )}
+            >
+              Action required
+            </button>
+            <button
+              type="button"
+              onClick={() => setStatusFilter('no_findings')}
+              className={cn(
+                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
+                statusFilter === 'no_findings'
                   ? 'bg-emerald-50 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 shadow-sm font-bold'
                   : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
               )}
@@ -1494,23 +1614,11 @@ export default function TenantsPage() {
             </button>
             <button
               type="button"
-              onClick={() => setStatusFilter('needs_attention')}
+              onClick={() => setStatusFilter('setup_incomplete')}
               className={cn(
                 'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
-                statusFilter === 'needs_attention'
-                  ? 'bg-amber-50 text-amber-800 dark:bg-amber-950 dark:text-amber-300 shadow-sm font-bold'
-                  : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
-              )}
-            >
-              Attention
-            </button>
-            <button
-              type="button"
-              onClick={() => setStatusFilter('disconnected_pending')}
-              className={cn(
-                'px-2.5 py-1 rounded-lg text-xs font-semibold transition-all',
-                statusFilter === 'disconnected_pending'
-                  ? 'bg-red-50 text-red-800 dark:bg-red-950 dark:text-red-300 shadow-sm font-bold'
+                statusFilter === 'setup_incomplete'
+                  ? 'bg-slate-200 text-slate-800 dark:bg-slate-700 dark:text-slate-200 shadow-sm font-bold'
                   : 'text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-white'
               )}
             >
@@ -1641,10 +1749,10 @@ export default function TenantsPage() {
       {/* 4. Primary Tenant Directory Display */}
       {!loading && sortedTenants.length > 0 && (
         viewMode === 'list' ? (
-          /* List View (Default for 100+ scalability) */
+          /* List View (Optimized for 6 to 100+ scalability) */
           <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm border-collapse">
+              <table className="w-full text-left text-sm border-collapse" aria-label="Customer Tenants">
                 <thead>
                   <tr>
                     <SortHeader
@@ -1655,25 +1763,19 @@ export default function TenantsPage() {
                       onSort={handleSort}
                     />
                     <SortHeader
-                      field="status"
+                      field="findings"
                       label="Review Summary"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
                     />
                     <SortHeader
-                      field="needsAttention"
-                      label="Needs Attention"
+                      field="permissions"
+                      label="Microsoft Permissions"
                       activeField={sortField}
                       sortOrder={sortOrder}
                       onSort={handleSort}
                     />
-                    <th
-                      scope="col"
-                      className="py-3.5 px-4 text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider sticky top-0 bg-slate-50 dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800"
-                    >
-                      Microsoft Permissions
-                    </th>
                     <SortHeader
                       field="lastSync"
                       label="Latest Resource Sync"
@@ -1691,129 +1793,221 @@ export default function TenantsPage() {
                 </thead>
                 <tbody className="divide-y divide-slate-100 dark:divide-slate-800/80">
                   {sortedTenants.map((tenant) => {
-                    const statusInfo = getTenantDisplayStatus(tenant)
-                    const actionableHealth = tenantActionableHealthProjection(tenant)
-                    const attentionItems = actionableHealth.items
+                    const review = getTenantReviewSummary(tenant)
+                    const isExpanded = expandedTenants.has(tenant.id)
 
                     return (
-                      <tr
-                        key={tenant.id}
-                        className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group"
-                      >
-                        {/* Tenant Column */}
-                        <td className="py-3.5 px-4">
-                          <div className="flex items-center gap-3">
-                            <ProviderIcon
-                              provider={tenant.provider}
-                              size="small"
-                            />
-                            <div className="min-w-0">
-                              <Link
-                                href={tenantOverviewPath(String(tenant.id))}
-                                className="font-bold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors block truncate"
+                      <Fragment key={tenant.id}>
+                        <tr
+                          className={cn(
+                            'hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors group',
+                            isExpanded && 'bg-slate-50/40 dark:bg-slate-800/20'
+                          )}
+                        >
+                          {/* Tenant Identity Column */}
+                          <td className="py-3.5 px-4">
+                            <div className="flex items-start gap-2.5">
+                              <button
+                                type="button"
+                                onClick={() => toggleExpand(tenant.id)}
+                                aria-expanded={isExpanded}
+                                aria-controls={`tenant-disclosure-${tenant.id}`}
+                                aria-label={`${isExpanded ? 'Collapse' : 'Expand'} details for ${tenant.name}`}
+                                className="mt-1 p-1 -m-1 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                               >
-                                {tenant.name}
-                              </Link>
-                              <div className="flex items-center gap-2 mt-0.5">
-                                <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                                  {tenant.domain || 'Domain collection pending'}
-                                </span>
-                                <span className="text-slate-300 dark:text-slate-700">
-                                  •
-                                </span>
-                                <TenantIdPill
-                                  tenantId={tenant.microsoftTenantId || tenant.id}
-                                />
+                                {isExpanded ? (
+                                  <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                                ) : (
+                                  <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                                )}
+                              </button>
+                              <ProviderIcon
+                                provider={tenant.provider}
+                                size="small"
+                              />
+                              <div className="min-w-0">
+                                <Link
+                                  href={tenantOverviewPath(String(tenant.id))}
+                                  className="font-bold text-slate-900 dark:text-white group-hover:text-blue-600 transition-colors block truncate"
+                                >
+                                  {tenant.name}
+                                </Link>
+                                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                  <span className="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                    {tenant.domain || 'Domain collection pending'}
+                                  </span>
+                                  <span className="text-slate-300 dark:text-slate-700" aria-hidden="true">
+                                    •
+                                  </span>
+                                  <TenantIdPill
+                                    tenantId={tenant.microsoftTenantId || tenant.id}
+                                  />
+                                  {directoryHealthAction(tenant)}
+                                </div>
                               </div>
                             </div>
-                          </div>
-                        </td>
+                          </td>
 
-                        {/* Reported findings and access actions; not collection health */}
-                        <td className="py-3.5 px-4 whitespace-nowrap">
-                          <TenantStatusBadge tenant={tenant} />
-                        </td>
+                          {/* Concise Review Summary Column */}
+                          <td className="py-3.5 px-4">
+                            <TenantStatusBadge
+                              tenant={tenant}
+                              onClick={() => openTenantDrawer(tenant, review.drawerTab)}
+                            />
+                          </td>
 
-                        {/* Needs Attention Column */}
-                        <td className="py-3.5 px-4 whitespace-nowrap">
-                          {attentionItems.length > 0 ? (
-                            <button
-                              type="button"
-                              onClick={() => setSelectedDrawerTenant(tenant)}
-                              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-300 border border-amber-200 dark:border-amber-900 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors text-xs font-semibold text-left"
+                          {/* Strictly Required Microsoft Permissions */}
+                          <td className="py-3.5 px-4 whitespace-nowrap">
+                            <TenantPermissionSummary tenant={tenant} />
+                          </td>
+
+                          {/* Latest Successful Resource Sync */}
+                          <td className="py-3.5 px-4 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-medium">
+                            <div
+                              className="flex items-center gap-1.5"
+                              title={
+                                tenant.lastSync
+                                  ? `Latest successful resource collection reported: ${tenant.lastSync}`
+                                  : 'No successful resource collection reported.'
+                              }
                             >
-                              <AlertTriangle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
-                              <span>{attentionItems.length} reported action{attentionItems.length === 1 ? '' : 's'}</span>
-                              <ChevronRight className="h-3.5 w-3.5 opacity-60 ml-0.5" />
-                            </button>
-                          ) : actionableHealth.status === 'UNAVAILABLE' ? (
-                            <span className="inline-flex items-center gap-1 text-xs text-slate-500 dark:text-slate-400 font-medium">
-                              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
-                              <span>Customer action total unavailable</span>
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1 text-xs text-slate-400 dark:text-slate-500 font-medium">
-                              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 shrink-0" />
-                              <span>No actions reported</span>
-                            </span>
-                          )}
-                        </td>
+                              <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" aria-hidden="true" />
+                              <span>{formatSyncTime(tenant.lastSync)}</span>
+                            </div>
+                          </td>
 
-                        {/* Only verified permission gaps belong in this column. */}
-                        <td className="py-3.5 px-4 whitespace-nowrap">
-                          <TenantPermissionSummary tenant={tenant} />
-                        </td>
+                          {/* Context-Sensitive Single Primary Action */}
+                          <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                            <div className="flex items-center justify-end">
+                              {tenant.onboarding?.complete === false ||
+                              tenant.status === 'pending' ||
+                              tenant.connectionStatus === 'pending-consent' ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() => openTenantSetup(String(tenant.id))}
+                                  className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
+                                >
+                                  <span>Continue setup</span>
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : review.tone === 'error' ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() => openTenantDrawer(tenant, 'action')}
+                                  className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white shadow-sm"
+                                >
+                                  <span>{review.primaryActionLabel}</span>
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : review.tone === 'warning' ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() => openTenantDrawer(tenant, review.drawerTab)}
+                                  className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white shadow-sm"
+                                >
+                                  <span>{review.primaryActionLabel}</span>
+                                  <ChevronRight className="h-3.5 w-3.5" />
+                                </Button>
+                              ) : (
+                                <Link href={tenantOverviewPath(String(tenant.id))}>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800"
+                                  >
+                                    <span>Review tenant</span>
+                                    <ChevronRight className="h-3.5 w-3.5" />
+                                  </Button>
+                                </Link>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
 
-                        {/* Latest successful resource; not a whole-tenant pass */}
-                        <td className="py-3.5 px-4 whitespace-nowrap text-xs text-slate-600 dark:text-slate-400 font-medium">
-                          <div
-                            className="flex items-center gap-1.5"
-                            title={tenant.lastSync
-                              ? `Latest successful resource collection: ${tenant.lastSync}. Other services may be older or incomplete.`
-                              : 'No successful resource collection reported.'}
+                        {/* Expandable Disclosure Panel */}
+                        {isExpanded && (
+                          <tr
+                            id={`tenant-disclosure-${tenant.id}`}
+                            className="bg-slate-50/70 dark:bg-slate-900/50 border-b border-slate-200/80 dark:border-slate-800/80"
                           >
-                            <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" />
-                            <span>{formatSyncTime(tenant.lastSync)}</span>
-                          </div>
-                        </td>
+                            <td colSpan={5} className="px-6 py-4">
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                                {/* Panel 1: Optional Capabilities */}
+                                <div className="p-3.5 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm">
+                                  <TenantOptionalPermissionsDisclosure tenant={tenant} />
+                                </div>
 
-                        {/* Context-Sensitive Primary Action */}
-                        <td className="py-3.5 px-4 text-right whitespace-nowrap">
-                          <div className="flex items-center justify-end gap-2">
-                          {directoryHealthAction(tenant)}
-                          {tenant.onboarding?.complete === false ? (
-                            <Button
-                              size="sm"
-                              onClick={() => openTenantSetup(String(tenant.id))}
-                              className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white shadow-sm"
-                            >
-                              <span>Continue setup</span>
-                              <ChevronRight className="h-3.5 w-3.5" />
-                            </Button>
-                          ) : statusInfo.key === 'needs_attention' ? (
-                            <Button
-                              size="sm"
-                              onClick={() => setSelectedDrawerTenant(tenant)}
-                              className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white shadow-sm"
-                            >
-                              <span>{statusInfo.primaryActionLabel}</span>
-                              <ChevronRight className="h-3.5 w-3.5" />
-                            </Button>
-                          ) : (
-                            <Link href={tenantOverviewPath(String(tenant.id))}>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-8 px-3 gap-1 rounded-lg text-xs font-semibold text-blue-600 dark:text-blue-400 border-slate-200 dark:border-slate-800 hover:bg-blue-50 dark:hover:bg-blue-950/50"
-                              >
-                                <span>{statusInfo.primaryActionLabel}</span>
-                                <ChevronRight className="h-3.5 w-3.5" />
-                              </Button>
-                            </Link>
-                          )}
-                          </div>
-                        </td>
-                      </tr>
+                                {/* Panel 2: Evidence & Collection Freshness */}
+                                <div className="p-3.5 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2.5">
+                                  <div className="flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200">
+                                    <Clock className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                                    <span>Evidence & Collection Freshness</span>
+                                  </div>
+                                  <div className="space-y-1.5 text-slate-600 dark:text-slate-300 text-[11px]">
+                                    <div>
+                                      <span className="text-slate-400">Latest successful resource: </span>
+                                      <span className="font-mono font-medium">
+                                        {formatSyncTime(tenant.lastSync)}
+                                      </span>
+                                    </div>
+                                    <div>
+                                      <span className="text-slate-400">Connection Mode: </span>
+                                      <span className="capitalize font-medium">
+                                        {tenant.connectionMode?.replace('-', ' ') || 'HawkView managed'}
+                                      </span>
+                                    </div>
+                                    <div>
+                                      <span className="text-slate-400">Assessment Status: </span>
+                                      <span>
+                                        {customerAttention(tenant).incomplete
+                                          ? 'Tenant summary evidence incomplete'
+                                          : 'No summary evidence limitation reported'}
+                                      </span>
+                                    </div>
+                                    <div className="pt-1.5 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                                      <span className="text-slate-400">Directory role health:</span>
+                                      {directoryHealthAction(tenant)}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* Panel 3: Contextual Navigation & Issues */}
+                                <div className="p-3.5 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm space-y-2.5">
+                                  <div className="flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200">
+                                    <Building2 className="h-3.5 w-3.5 text-slate-400 shrink-0" />
+                                    <span>Operator Investigation</span>
+                                  </div>
+                                  <div className="space-y-2 text-[11px]">
+                                    <div className="flex items-center justify-between">
+                                      <span className="text-slate-400">Review status:</span>
+                                      <span className="font-semibold text-slate-700 dark:text-slate-200">
+                                        {review.headline}
+                                      </span>
+                                    </div>
+                                    <div className="flex flex-col gap-1.5 pt-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => openTenantDrawer(tenant, review.drawerTab)}
+                                        className="text-left text-blue-600 hover:text-blue-500 font-semibold inline-flex items-center gap-1"
+                                      >
+                                        <span>Open issue drawer ({review.drawerTab === 'findings' ? 'Security findings' : 'Required actions'})</span>
+                                        <ChevronRight className="h-3 w-3" />
+                                      </button>
+                                      <Link
+                                        href={tenantOverviewPath(String(tenant.id))}
+                                        className="text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white font-medium inline-flex items-center gap-1"
+                                      >
+                                        <span>Go to full tenant overview</span>
+                                        <ChevronRight className="h-3 w-3" />
+                                      </Link>
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
                     )
                   })}
                 </tbody>
@@ -1824,9 +2018,7 @@ export default function TenantsPage() {
           /* Card View */
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
             {sortedTenants.map((tenant) => {
-              const statusInfo = getTenantDisplayStatus(tenant)
-              const actionableHealth = tenantActionableHealthProjection(tenant)
-              const attentionItems = actionableHealth.items
+              const review = getTenantReviewSummary(tenant)
 
               return (
                 <Card
@@ -1848,57 +2040,46 @@ export default function TenantsPage() {
                         </p>
                       </div>
                     </div>
-                    <TenantStatusBadge tenant={tenant} />
+                    {directoryHealthAction(tenant)}
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 text-xs border-y border-slate-100 dark:border-slate-800/80 py-3">
+                  {/* Single Review Summary block */}
+                  <div className="p-2.5 rounded-xl bg-slate-50 dark:bg-slate-800/40 border border-slate-100 dark:border-slate-800">
+                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
+                      Review Summary
+                    </span>
+                    <TenantStatusBadge
+                      tenant={tenant}
+                      onClick={() => openTenantDrawer(tenant, review.drawerTab)}
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs py-1">
                     <div>
                       <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
-                        Issues
+                        Microsoft Permissions
                       </span>
-                      {attentionItems.length > 0 ? (
-                        <button
-                          type="button"
-                          onClick={() => setSelectedDrawerTenant(tenant)}
-                          className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-bold hover:underline"
-                        >
-                          <AlertTriangle className="h-3.5 w-3.5" />
-                          <span>{attentionItems.length} reported action{attentionItems.length === 1 ? '' : 's'}</span>
-                        </button>
-                      ) : actionableHealth.status === 'UNAVAILABLE' ? (
-                        <span className="text-slate-500 dark:text-slate-400 font-semibold flex items-center gap-1">
-                          <AlertCircle className="h-3.5 w-3.5" />
-                          <span>Customer action total unavailable</span>
-                        </span>
-                      ) : (
-                        <span className="text-emerald-600 font-semibold flex items-center gap-1">
-                          <CheckCircle2 className="h-3.5 w-3.5" />
-                          <span>No actions reported</span>
-                        </span>
-                      )}
+                      <TenantPermissionSummary tenant={tenant} />
                     </div>
 
                     <div>
                       <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1">
                         Latest Resource Sync
                       </span>
-                      <span className="text-slate-600 dark:text-slate-300 font-medium truncate block">
+                      <span
+                        className="text-slate-600 dark:text-slate-300 font-medium truncate block"
+                        title={tenant.lastSync ? `Latest successful resource collection reported: ${tenant.lastSync}` : 'No successful collection reported'}
+                      >
                         {formatSyncTime(tenant.lastSync)}
                       </span>
                     </div>
                   </div>
 
-                  <div>
-                    <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
-                      Microsoft Permissions
-                    </span>
-                    <TenantPermissionSummary tenant={tenant} />
-                  </div>
-
-                  <div className="flex justify-end">{directoryHealthAction(tenant)}</div>
-                  <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
+                  <div className="pt-3 flex items-center justify-between border-t border-slate-100 dark:border-slate-800">
                     <TenantIdPill tenantId={tenant.microsoftTenantId || tenant.id} />
-                    {tenant.onboarding?.complete === false ? (
+                    {tenant.onboarding?.complete === false ||
+                    tenant.status === 'pending' ||
+                    tenant.connectionStatus === 'pending-consent' ? (
                       <Button
                         size="sm"
                         onClick={() => openTenantSetup(String(tenant.id))}
@@ -1907,13 +2088,22 @@ export default function TenantsPage() {
                         <span>Continue setup</span>
                         <ChevronRight className="h-3.5 w-3.5" />
                       </Button>
-                    ) : statusInfo.key === 'needs_attention' ? (
+                    ) : review.tone === 'error' ? (
                       <Button
                         size="sm"
-                        onClick={() => setSelectedDrawerTenant(tenant)}
+                        onClick={() => openTenantDrawer(tenant, 'action')}
+                        className="h-8 px-3 gap-1 text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white"
+                      >
+                        <span>{review.primaryActionLabel}</span>
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </Button>
+                    ) : review.tone === 'warning' ? (
+                      <Button
+                        size="sm"
+                        onClick={() => openTenantDrawer(tenant, review.drawerTab)}
                         className="h-8 px-3 gap-1 text-xs font-semibold bg-amber-600 hover:bg-amber-700 text-white"
                       >
-                        <span>{statusInfo.primaryActionLabel}</span>
+                        <span>{review.primaryActionLabel}</span>
                         <ChevronRight className="h-3.5 w-3.5" />
                       </Button>
                     ) : (
@@ -1921,9 +2111,9 @@ export default function TenantsPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          className="h-8 px-3 gap-1 text-xs font-semibold text-blue-600 dark:text-blue-400 border-slate-200 dark:border-slate-800"
+                          className="h-8 px-3 gap-1 text-xs font-semibold text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-800"
                         >
-                          <span>{statusInfo.primaryActionLabel}</span>
+                          <span>Review tenant</span>
                           <ChevronRight className="h-3.5 w-3.5" />
                         </Button>
                       </Link>
