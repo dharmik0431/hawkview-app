@@ -222,6 +222,7 @@ const TARGETED_RETRY_EXCLUDED_ERROR_CODES = [
   '403',
   'sharepoint_sites-capacity',
   'MICROSOFT_AUTHENTICATION_REQUIRED',
+  'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED',
   'MICROSOFT_PERMISSION_REQUIRED',
   'HAWKVIEW_CAPACITY_GUARD',
   'MICROSOFT_INVALID_RESPONSE',
@@ -241,21 +242,24 @@ export function shouldRunTargetedTransientRetry(
 }
 
 /**
- * Healthy-state hourly eligibility. Deliberately orthogonal to the failure
- * path rather than a replacement for it:
+ * Hourly eligibility for healthy inventory and abandoned clean RUNNING rows.
+ * Deliberately orthogonal to the failure path rather than a replacement:
  *
  *   - FAILED always makes this false, so a failed resource keeps its existing
  *     failure policy. Targeted retries are FASTER than hourly for the original
  *     seven resources (15 minutes on a first failure), so routing failures here
  *     would delay them, and a stale hourly age must never shortcut a longer
  *     accumulated backoff.
- *   - RUNNING makes this false, so an in-flight collection is not duplicated.
- *   - A missing lastSuccessfulAt makes this false. A never-collected resource
- *     belongs to the initial/daily path; admitting it here would re-attempt it
- *     on every scheduler tick.
- *   - A future or otherwise invalid lastSuccessfulAt makes this false, for the
- *     same reason the USERS rule documents: it is an anomaly to report, not an
- *     immediate retry signal.
+ *   - A recent RUNNING attempt stays excluded. An attempt still RUNNING after
+ *     an entire hour can recover only if it has no recorded error; partial
+ *     collection states retain their existing policy. The tenant-wide USERS
+ *     lease independently excludes a concurrently active visit.
+ *   - A missing lastSuccessfulAt on a non-RUNNING row makes this false. A
+ *     never-collected resource belongs to the initial/daily path; admitting it
+ *     here would re-attempt it on every scheduler tick. A clean abandoned
+ *     RUNNING row instead uses its old attempt clock, even on a first run.
+ *   - A future or otherwise invalid lastSuccessfulAt makes this false for
+ *     either path: it is an anomaly to report, not an immediate retry signal.
  */
 export function shouldRunHourlyInventoryRefresh(
   state: DailyInventoryState | undefined,
@@ -263,7 +267,13 @@ export function shouldRunHourlyInventoryRefresh(
 ) {
   if (!state) return false
   if (!(HOURLY_INVENTORY_RESOURCES as readonly string[]).includes(state.resourceType)) return false
-  if (state.status === SyncStateStatus.RUNNING || state.status === SyncStateStatus.FAILED) return false
+  if (state.status === SyncStateStatus.FAILED) return false
+  if (state.status === SyncStateStatus.RUNNING) {
+    if (state.lastErrorCode != null || state.lastErrorMessage != null) return false
+    if (!validPastTime(state.lastAttemptAt, now)) return false
+    if (state.lastSuccessfulAt != null && !validPastTime(state.lastSuccessfulAt, now)) return false
+    return now.getTime() - state.lastAttemptAt!.getTime() >= HOURLY_INVENTORY_REFRESH_MS
+  }
   if (!validPastTime(state.lastSuccessfulAt, now)) return false
   // Inclusive at exactly one hour, matching the `lte` bound the candidate
   // query uses, so the pure rule and the database filter agree on the boundary.
@@ -497,6 +507,22 @@ export function scheduledSyncTenantWhere(
             // A null lastSuccessfulAt never satisfies `lte`, so a
             // never-collected resource is excluded here as well as in the rule.
             lastSuccessfulAt: { lte: hourlyStaleBefore },
+          },
+        },
+      },
+      {
+        // Recover a collector whose clean RUNNING attempt outlived the
+        // tenant lease by an entire hourly interval. Partial/initializing
+        // RUNNING rows have an error marker and remain excluded. Keep the
+        // database candidate exactly aligned with the pure dispatch rule.
+        syncStates: {
+          some: {
+            resourceType: { in: [...HOURLY_INVENTORY_RESOURCES] },
+            status: SyncStateStatus.RUNNING,
+            lastErrorCode: null,
+            lastErrorMessage: null,
+            lastAttemptAt: { lte: hourlyStaleBefore },
+            OR: [{ lastSuccessfulAt: null }, { lastSuccessfulAt: { lte: now } }],
           },
         },
       },

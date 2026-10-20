@@ -256,6 +256,18 @@ test('a fresh resource is not collected, so the request above came from the hour
   assert.ok(urls.some((url) => /\/users/.test(url)), 'the visit still performs its own user collection')
 })
 
+test('an abandoned clean organization RUNNING row reaches the real incremental collector once', async () => {
+  const running = { ...healthy('ORGANIZATION_CONFIGURATION', 2 * 60 * MINUTE),
+    status: 'RUNNING', lastErrorCode: null, lastErrorMessage: null }
+  const { urls, writes } = await runIncrementalVisit([running], url =>
+    url.includes(ENDPOINT.organization)
+      ? graphPage({ value: [{ id: tenant().microsoftTenantId, displayName: 'Synthetic Tenant' }] })
+      : undefined)
+  assert.equal(requested(urls, ENDPOINT.organization), 1)
+  assert.deepEqual(writes.filter(w => w.model === 'syncState' && writtenResource(w) === 'ORGANIZATION_CONFIGURATION')
+    .map(w => (w.data as { status: string }).status), ['RUNNING', 'SUCCEEDED'])
+})
+
 test('every allowlisted resource is reachable through the real module map', async () => {
   const { urls, dnsCalls } = await runIncrementalVisit(
     HOURLY_INVENTORY_RESOURCES.map((resource) => healthy(resource, 2 * 60 * MINUTE)),
@@ -301,10 +313,10 @@ test('healthy hourly anchors run their existing bounded collectors and persist r
   assert.deepEqual(states, before)
 })
 
-test('fresh, running, undated and authorization-failed anchors do not use healthy hourly dispatch', async () => {
+test('fresh, in-flight, undated and authorization-failed anchors do not use hourly dispatch', async () => {
   for (const resource of ['LICENSES', 'DOMAINS']) {
     for (const row of [healthy(resource, 5 * MINUTE),
-      { ...healthy(resource, 2 * 60 * MINUTE), status: 'RUNNING' },
+      { ...healthy(resource, 2 * 60 * MINUTE), status: 'RUNNING', lastAttemptAt: new Date() },
       { ...healthy(resource, 2 * 60 * MINUTE), lastSuccessfulAt: null },
       { ...healthy(resource, 2 * 60 * MINUTE), lastSuccessfulAt: new Date(Date.now() + 60 * MINUTE) },
       { ...healthy(resource, 2 * 60 * MINUTE), status: 'FAILED', lastErrorCode: 'MICROSOFT_PERMISSION_REQUIRED' }]) {
@@ -463,9 +475,9 @@ test('hourly DNS persists its real collector result once without advancing ancho
   assert.ok(urls.some(url => /\/users/.test(url)), 'coupled users work remains')
 })
 
-test('fresh, failed or running DNS never dispatches through hourly or targeted retries', async () => {
+test('fresh, failed or in-flight DNS never dispatches through hourly or targeted retries', async () => {
   for (const dns of [healthy('DOMAIN_DNS_HEALTH', 5 * MINUTE),
-    { ...healthy('DOMAIN_DNS_HEALTH', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('DOMAIN_DNS_HEALTH', 6 * 60 * MINUTE), status: 'RUNNING', lastAttemptAt: new Date() },
     { ...healthy('DOMAIN_DNS_HEALTH', 6 * 60 * MINUTE), status: 'FAILED', lastAttemptAt: new Date(Date.now() - 31 * MINUTE), lastErrorCode: 'MICROSOFT_TRANSIENT' }]) {
     const { dnsCalls, domainReads, writes } = await runIncrementalVisit([dns])
     assert.deepEqual(dnsCalls, [])
@@ -506,9 +518,9 @@ test('hourly secure-score persists the existing current-score collector once wit
   assert.ok(urls.some(url => /\/users/.test(url)), 'coupled users work remains')
 })
 
-test('fresh, failed, running or undated secure-score never dispatches hourly or as a targeted retry', async () => {
+test('fresh, failed, in-flight or undated secure-score never dispatches hourly or as a targeted retry', async () => {
   for (const score of [healthy('SECURE_SCORES', 5 * MINUTE),
-    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), status: 'RUNNING', lastAttemptAt: new Date() },
     { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), status: 'FAILED', lastAttemptAt: new Date(Date.now() - 31 * MINUTE), lastErrorCode: 'MICROSOFT_TRANSIENT' },
     { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), lastSuccessfulAt: null },
     { ...healthy('SECURE_SCORES', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(NaN) },
@@ -553,7 +565,7 @@ test('hourly risky users persist the existing paged collector without advancing 
 
 test('risky users preserve blocked and undated dispatch controls', async () => {
   for (const risk of [healthy('RISKY_USERS', 5 * MINUTE),
-    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), status: 'RUNNING' },
+    { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), status: 'RUNNING', lastAttemptAt: new Date() },
     { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: null },
     { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(NaN) },
     { ...healthy('RISKY_USERS', 6 * 60 * MINUTE), lastSuccessfulAt: new Date(Date.now() + 60 * MINUTE) },

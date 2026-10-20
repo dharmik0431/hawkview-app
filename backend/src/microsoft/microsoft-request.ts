@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 export type MicrosoftFailureClass =
   | 'AUTHENTICATION_REQUIRED'
+  | 'RESOURCE_AUTHENTICATION_UNAVAILABLE'
   | 'PERMISSION_REQUIRED'
   | 'THROTTLED'
   | 'MICROSOFT_TRANSIENT'
@@ -155,6 +156,16 @@ export function classifyMicrosoftFailure(
       status, microsoftCode, requestId, retryable: true, customerAction: 'NONE',
     }
   }
+  if (status === 400 && normalizedCode === 'authenticationerror') {
+    // Graph reported a resource authentication failure, not a credential
+    // acquisition failure. Do not label it a HawkView internal fault or assert
+    // that reconnecting the tenant fixes it.
+    return {
+      failureClass: 'RESOURCE_AUTHENTICATION_UNAVAILABLE',
+      reasonCode: 'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED',
+      status, microsoftCode, requestId, retryable: false, customerAction: 'CONTACT_SUPPORT',
+    }
+  }
   if (status === 401 || AUTHENTICATION_CODES.has(normalizedCode)) {
     return {
       failureClass: 'AUTHENTICATION_REQUIRED', reasonCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
@@ -207,6 +218,9 @@ export function customerCollectionFailureMessage(
   }
   if (failure.failureClass === 'AUTHENTICATION_REQUIRED') {
     return `Microsoft rejected the tenant authorization required for ${resourceLabel}. Reconnect the Microsoft tenant.`
+  }
+  if (failure.failureClass === 'RESOURCE_AUTHENTICATION_UNAVAILABLE') {
+    return `Microsoft could not authenticate the ${resourceLabel} resource request.${retained} HawkView support should investigate this source.`
   }
   if (failure.failureClass === 'PERMISSION_REQUIRED') {
     return `Microsoft denied access to ${resourceLabel}. Review the required Microsoft permissions or workload role.`

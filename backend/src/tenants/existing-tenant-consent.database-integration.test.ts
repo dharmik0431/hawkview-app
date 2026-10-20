@@ -452,15 +452,29 @@ test('a migrated PostgreSQL database selects hourly inventory while USERS and bo
     assert.equal(work[0]!.fullInventoryDue, false)
   })
 
-  await t.test('RUNNING, never-collected and future timestamps are not candidates', async () => {
+  await t.test('recent or partial RUNNING, never-collected and future timestamps are not candidates', async () => {
     for (const data of [
-      { status: 'RUNNING', lastSuccessfulAt: before(6 * HOUR), lastAttemptAt: before(6 * HOUR) },
+      { status: 'RUNNING', lastSuccessfulAt: before(6 * HOUR), lastAttemptAt: before(HOUR - 1) },
+      { status: 'RUNNING', lastSuccessfulAt: before(6 * HOUR), lastAttemptAt: before(6 * HOUR), lastErrorCode: 'PARTIAL_COLLECTION' },
       { status: 'SUCCEEDED', lastSuccessfulAt: null, lastAttemptAt: before(6 * HOUR) },
       { status: 'SUCCEEDED', lastSuccessfulAt: new Date(CLOCK.getTime() + HOUR), lastAttemptAt: before(60_000) },
     ]) {
       await setInventory(workspace, data)
       assert.deepEqual(await candidateFound(workspace), [], JSON.stringify(data))
     }
+  })
+
+  await t.test('an abandoned clean RUNNING hourly resource is selected at the one-hour boundary', async () => {
+    await setInventory(workspace, {
+      status: 'RUNNING', lastSuccessfulAt: before(6 * HOUR), lastAttemptAt: before(HOUR),
+      lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+    })
+    const found = await candidateFound(workspace)
+    assert.equal(found.length, 1)
+    const work = selectScheduledTenantWork(found as never, CLOCK, 10)
+    assert.equal(work.length, 1)
+    assert.equal(work[0]!.tenantId, workspace.tenantId)
+    assert.equal(work[0]!.fullInventoryDue, false)
   })
 
   const failedInventory = async (attemptedAgoMs: number, consecutiveFailures: number) => {
