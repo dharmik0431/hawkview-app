@@ -14,7 +14,8 @@ import {
 import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from '@/lib/api/client'
 import { canManagePolicies } from '@/lib/auth/policy-access'
-import { baselineServiceIcons, PRODUCT_ICON_STROKE_WIDTH } from '@/lib/ui/product-icons'
+import { PRODUCT_ICON_STROKE_WIDTH } from '@/lib/ui/product-icons'
+import { serviceStyleFor as styleFor } from '@/lib/ui/service-appearance'
 
 type Check = {
   id: string
@@ -147,54 +148,6 @@ const services = [
   'Microsoft 365',
 ]
 const service = (check: Check) => check.service
-// Service glyphs are shared with tenant navigation and collection status.
-const serviceStyles = {
-  Entra: {
-    icon: baselineServiceIcons.Entra,
-    mark: 'bg-indigo-100 text-indigo-700 ring-indigo-200 dark:bg-indigo-950 dark:text-indigo-200 dark:ring-indigo-800',
-    card: 'border-indigo-200 bg-indigo-50/60 dark:border-indigo-900 dark:bg-indigo-950/30',
-    pill: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-200',
-    accent: 'border-l-indigo-400',
-  },
-  SharePoint: {
-    icon: baselineServiceIcons.SharePoint,
-    mark: 'bg-emerald-100 text-emerald-700 ring-emerald-200 dark:bg-emerald-950 dark:text-emerald-200 dark:ring-emerald-800',
-    card: 'border-emerald-200 bg-emerald-50/60 dark:border-emerald-900 dark:bg-emerald-950/30',
-    pill: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200',
-    accent: 'border-l-emerald-400',
-  },
-  OneDrive: {
-    icon: baselineServiceIcons.OneDrive,
-    mark: 'bg-cyan-100 text-cyan-700 ring-cyan-200 dark:bg-cyan-950 dark:text-cyan-200 dark:ring-cyan-800',
-    card: 'border-cyan-200 bg-cyan-50/60 dark:border-cyan-900 dark:bg-cyan-950/30',
-    pill: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-950 dark:text-cyan-200',
-    accent: 'border-l-cyan-400',
-  },
-  Exchange: {
-    icon: baselineServiceIcons.Exchange,
-    mark: 'bg-teal-100 text-teal-700 ring-teal-200 dark:bg-teal-950 dark:text-teal-200 dark:ring-teal-800',
-    card: 'border-teal-200 bg-teal-50/60 dark:border-teal-900 dark:bg-teal-950/30',
-    pill: 'bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-200',
-    accent: 'border-l-teal-400',
-  },
-  'Microsoft 365': {
-    icon: baselineServiceIcons['Microsoft 365'],
-    mark: 'bg-sky-100 text-sky-700 ring-sky-200 dark:bg-sky-950 dark:text-sky-200 dark:ring-sky-800',
-    card: 'border-sky-200 bg-sky-50/60 dark:border-sky-900 dark:bg-sky-950/30',
-    pill: 'bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-200',
-    accent: 'border-l-sky-400',
-  },
-} as const
-type ServiceName = keyof typeof serviceStyles
-const fallbackStyle = {
-  icon: Layers3,
-  mark: 'bg-slate-100 text-slate-700 ring-slate-200 dark:bg-slate-800 dark:text-slate-200 dark:ring-slate-700',
-  card: 'border-slate-200 bg-slate-50/60 dark:border-slate-700 dark:bg-slate-800/30',
-  pill: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200',
-  accent: 'border-l-slate-400',
-} as const
-const styleFor = (name: string) =>
-  serviceStyles[name as ServiceName] ?? fallbackStyle
 
 function ServiceMark({
   name,
@@ -623,21 +576,21 @@ export default function BaselinesPage() {
       : null
   return (
     <div className="space-y-5 pb-8">
-      <header className="relative overflow-hidden rounded-2xl border border-indigo-200 bg-gradient-to-br from-indigo-50 via-white to-cyan-50 p-5 dark:border-indigo-900 dark:from-indigo-950/60 dark:via-slate-900 dark:to-cyan-950/40 sm:p-6">
+      <header className="relative overflow-hidden rounded-2xl border border-blue-200 bg-gradient-to-br from-blue-50 via-white to-slate-50 p-5 dark:border-blue-900 dark:from-blue-950/50 dark:via-slate-900 dark:to-slate-900 sm:p-6">
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute -right-12 -top-20 h-52 w-52 rounded-full border-[24px] border-indigo-100/70 dark:border-indigo-900/30"
+          className="pointer-events-none absolute -right-12 -top-20 h-52 w-52 rounded-full border-[24px] border-blue-100/70 dark:border-blue-900/30"
         />
         <div className="relative flex flex-wrap items-start justify-between gap-4">
           <div className="flex min-w-0 items-start gap-4">
             <span
               aria-hidden="true"
-              className="inline-flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-600 to-cyan-600 text-white shadow-lg shadow-indigo-200/70 dark:shadow-none"
+              className="inline-flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-blue-600 text-white shadow-lg shadow-blue-200/70 dark:shadow-none"
             >
               <ShieldCheck size={28} strokeWidth={1.8} />
             </span>
             <div>
-              <p className="text-xs font-bold uppercase tracking-[0.15em] text-indigo-700 dark:text-indigo-200">
+              <p className="text-xs font-bold uppercase tracking-[0.15em] text-blue-700 dark:text-blue-300">
                 Policies / Baseline
               </p>
               <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-950 dark:text-white">
@@ -679,7 +632,7 @@ export default function BaselinesPage() {
       {error && (
         <div
           role="alert"
-          className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+          className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200"
         >
           {error}{' '}
           <button
@@ -707,38 +660,28 @@ export default function BaselinesPage() {
             <div
               className={
                 panel +
-                ' border-indigo-200 bg-indigo-50/60 p-4 dark:border-indigo-900 dark:bg-indigo-950/25'
+                ' border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900 dark:bg-blue-950/25'
               }
             >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-indigo-700 dark:text-indigo-200">
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-blue-700 dark:text-blue-300">
                 {listFilter ? 'Matching baselines' : 'Named baselines'}
                 <Layers3 size={19} aria-hidden="true" />
               </div>
-              <div className="mt-2 text-3xl font-bold text-indigo-950 dark:text-white">
+              <div className="mt-2 text-3xl font-bold text-blue-950 dark:text-white">
                 {library.total}
               </div>
             </div>
-            <div
-              className={
-                panel +
-                ' border-cyan-200 bg-cyan-50/60 p-4 dark:border-cyan-900 dark:bg-cyan-950/25'
-              }
-            >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-cyan-800 dark:text-cyan-200">
+            <div className={panel + ' p-4'}>
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-slate-600 dark:text-slate-300">
                 Offered checks
                 <ListChecks size={19} aria-hidden="true" />
               </div>
-              <div className="mt-2 text-3xl font-bold text-cyan-950 dark:text-white">
+              <div className="mt-2 text-3xl font-bold text-slate-950 dark:text-white">
                 {library.catalog.length}
               </div>
             </div>
-            <div
-              className={
-                panel +
-                ' border-fuchsia-200 bg-fuchsia-50/50 p-4 dark:border-fuchsia-900 dark:bg-fuchsia-950/25 sm:col-span-2 xl:col-span-1'
-              }
-            >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-fuchsia-800 dark:text-fuchsia-200">
+            <div className={panel + ' p-4 sm:col-span-2 xl:col-span-1'}>
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-slate-600 dark:text-slate-300">
                 Assessable categories
                 <Grid2X2 size={19} aria-hidden="true" />
               </div>
@@ -765,14 +708,14 @@ export default function BaselinesPage() {
           <section
             className={
               panel +
-              ' flex flex-wrap items-start justify-between gap-4 border-indigo-200 bg-gradient-to-r from-indigo-50 via-white to-sky-50 p-5 dark:border-indigo-900 dark:from-indigo-950/35 dark:via-slate-900 dark:to-sky-950/25'
+              ' flex flex-wrap items-start justify-between gap-4 border-blue-200 bg-blue-50/60 p-5 dark:border-blue-900 dark:bg-blue-950/25'
             }
             aria-label="HawkView starter template"
           >
             <div className="flex max-w-3xl items-start gap-4">
               <span
                 aria-hidden="true"
-                className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-md shadow-indigo-200 dark:shadow-none"
+                className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-blue-600 text-white shadow-md shadow-blue-200 dark:shadow-none"
               >
                 <Sparkles size={23} strokeWidth={1.8} />
               </span>
@@ -786,7 +729,7 @@ export default function BaselinesPage() {
                 <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
                   {library.starter.description}
                 </p>
-                <p className="mt-2 text-xs text-slate-500">
+                <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">
                   {library.starter.boundary}
                 </p>
                 <p className="mt-2 text-xs font-medium text-slate-600 dark:text-slate-300">
@@ -942,10 +885,10 @@ export default function BaselinesPage() {
             <div
               className={
                 panel +
-                ' border-indigo-200 bg-indigo-50/60 p-4 dark:border-indigo-900 dark:bg-indigo-950/25'
+                ' border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900 dark:bg-blue-950/25'
               }
             >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-indigo-700 dark:text-indigo-200">
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-blue-700 dark:text-blue-300">
                 Required checks
                 <ListChecks size={19} aria-hidden="true" />
               </div>
@@ -953,13 +896,8 @@ export default function BaselinesPage() {
                 {detail.baseline.checkIds.length}
               </div>
             </div>
-            <div
-              className={
-                panel +
-                ' border-teal-200 bg-teal-50/60 p-4 dark:border-teal-900 dark:bg-teal-950/25'
-              }
-            >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-teal-700 dark:text-teal-200">
+            <div className={panel + ' p-4'}>
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-slate-600 dark:text-slate-300">
                 Applied tenants
                 <Building2 size={19} aria-hidden="true" />
               </div>
@@ -967,13 +905,8 @@ export default function BaselinesPage() {
                 {detail.baseline.assignedTenantCount}
               </div>
             </div>
-            <div
-              className={
-                panel +
-                ' border-fuchsia-200 bg-fuchsia-50/50 p-4 dark:border-fuchsia-900 dark:bg-fuchsia-950/25'
-              }
-            >
-              <div className="flex items-center justify-between text-xs font-semibold uppercase text-fuchsia-700 dark:text-fuchsia-200">
+            <div className={panel + ' p-4'}>
+              <div className="flex items-center justify-between text-xs font-semibold uppercase text-slate-600 dark:text-slate-300">
                 Current version
                 <Layers3 size={19} aria-hidden="true" />
               </div>
