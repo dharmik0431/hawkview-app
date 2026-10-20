@@ -12,6 +12,9 @@ import { NotificationsModule } from '../notifications/notifications.module.js'
 import { ChangesModule } from '../changes/changes.module.js'
 import { M365ManagementActivityService } from './m365-management-activity.service.js'
 import { IdentityRiskModule } from '../identity-risk/identity-risk.module.js'
+import { SecurityRequirementsController } from '../security-requirements/security-requirements.controller.js'
+import { SecurityRequirementsService } from '../security-requirements/security-requirements.service.js'
+import { BaselineLibraryController } from '../security-requirements/baseline-library.controller.js'
 
 @Module({
   imports: [
@@ -20,7 +23,7 @@ import { IdentityRiskModule } from '../identity-risk/identity-risk.module.js'
     ChangesModule,
     IdentityRiskModule,
   ],
-  controllers: [TenantsController, ScheduledSyncController],
+  controllers: [TenantsController, ScheduledSyncController, SecurityRequirementsController, BaselineLibraryController],
   providers: [
     AlertIntakeService,
     EmailAlertReleaseService,
@@ -29,6 +32,7 @@ import { IdentityRiskModule } from '../identity-risk/identity-risk.module.js'
     SchedulerTokenVerifier,
     IpGeolocationService,
     M365ManagementActivityService,
+    SecurityRequirementsService,
   ],
 })
 export class TenantsModule {}
