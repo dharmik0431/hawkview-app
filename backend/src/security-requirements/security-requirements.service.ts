@@ -25,6 +25,12 @@ function searchInput(value: unknown) {
   return value.trim().slice(0, 100)
 }
 
+function coverageStatusInput(value: unknown): 'ALL' | 'MET' | 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS' {
+  if (value === undefined || value === 'ALL') return 'ALL'
+  if (value === 'MET' || value === 'NEEDS_ACTION' || value === 'UNABLE_TO_ASSESS') return value
+  throw new BadRequestException('Invalid baseline result filter.')
+}
+
 function parseBaseline(body: unknown) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BadRequestException('Enter a baseline name and checks.')
   const input = body as Record<string, unknown>
@@ -60,6 +66,17 @@ function expectedRevision(body: unknown): number {
 @Injectable()
 export class SecurityRequirementsService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  private evaluateSelected(checkIds: string[], checkSettings: unknown, evidence: Partial<Record<ResourceType, EvidenceInput>>, now: Date) {
+    return checkIds.map((id) => CHECK_IDS.has(id)
+      ? evaluateCheck(id as CheckId, evidence, now, checkSettings as CheckSettings ?? {})
+      : {
+          id, title: 'Unsupported saved check', service: 'Unsupported', recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library', expected: 'A supported check definition',
+          guidance: 'Edit this baseline and choose a currently offered check.', resourceType: null,
+          outcome: 'UNABLE_TO_ASSESS' as const, observed: 'Unavailable', observedAt: null,
+          reason: 'This saved check is no longer available in the current catalog.',
+        })
+  }
 
   private async workspace(identity: AuthenticatedIdentity, organizationId: string) {
     validUuid(organizationId)
@@ -123,6 +140,116 @@ export class SecurityRequirementsService {
       assignments: assignments.map((row) => ({ tenantId: row.customerTenantId, assignedAt: row.assignedAt, name: row.customerTenant.displayName || row.customerTenant.primaryDomain || 'Unnamed tenant', domain: row.customerTenant.primaryDomain, microsoftTenantId: row.customerTenant.microsoftTenantId })),
       matchingTenants, page, pageSize: 25, revisions,
     }
+  }
+
+  // A baseline is evaluated only when its overview is opened. Read the assigned
+  // tenant set and its stored evidence in bounded batches, rather than issuing
+  // one assessment request per tenant or evaluating every baseline on the list.
+  async baselineCoverage(identity: AuthenticatedIdentity, organizationId: string, baselineId: string, pageValue: unknown, searchValue: unknown, statusValue: unknown) {
+    await this.workspace(identity, organizationId)
+    validUuid(baselineId)
+    const page = pageInput(pageValue)
+    const search = searchInput(searchValue).toLowerCase()
+    const status = coverageStatusInput(statusValue)
+    return this.prisma.$transaction(async (transaction) => {
+      const baseline = await transaction.securityBaseline.findFirst({
+        where: { id: baselineId, organizationId },
+        select: { id: true, revision: true, checkIds: true, checkSettings: true },
+      })
+      if (!baseline) throw new ForbiddenException('Baseline is not in this MSP workspace.')
+      const [assignments, workspaceTenantCount] = await Promise.all([
+        transaction.tenantSecurityBaselineAssignment.findMany({
+          where: { organizationId, baselineId },
+          orderBy: { customerTenantId: 'asc' },
+          select: { customerTenantId: true, assignedAt: true, customerTenant: { select: { displayName: true, primaryDomain: true } } },
+        }),
+        transaction.customerTenant.count({ where: { organizationId } }),
+      ])
+      const resources = Array.from(new Set(baseline.checkIds
+        .map((id) => CHECKS.find((check) => check.id === id)?.resourceType)
+        .filter((resource): resource is ResourceType => Boolean(resource))))
+      const assessedAt = new Date()
+      const checkImpact = new Map(baseline.checkIds.map((id) => [id, {
+        id, title: CHECKS.find((check) => check.id === id)?.title ?? 'Unsupported saved check',
+        met: 0, needsAction: 0, unableToAssess: 0,
+      }]))
+      const items: Array<{
+        tenantId: string; name: string; domain: string | null; assignedAt: Date;
+        outcome: 'MET' | 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS';
+        met: number; needsAction: number; unableToAssess: number;
+        attention: Array<{ id: string; title: string; outcome: 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS' }>
+      }> = []
+      for (let offset = 0; offset < assignments.length; offset += 100) {
+        const batch = assignments.slice(offset, offset + 100)
+        const tenantIds = batch.map((assignment) => assignment.customerTenantId)
+        const [states, snapshots] = resources.length ? await Promise.all([
+          transaction.syncState.findMany({
+            where: { organizationId, customerTenantId: { in: tenantIds }, resourceType: { in: resources } },
+            select: { customerTenantId: true, resourceType: true, status: true, lastErrorCode: true, lastAttemptAt: true, lastSuccessfulAt: true },
+          }),
+          transaction.tenantEntraSnapshot.findMany({
+            where: { organizationId, customerTenantId: { in: tenantIds }, resourceType: { in: resources } },
+            select: { customerTenantId: true, resourceType: true, observedAt: true, payload: true },
+          }),
+        ]) : [[], []]
+        const evidenceByTenant = new Map<string, Partial<Record<ResourceType, EvidenceInput>>>()
+        const snapshotByKey = new Map(snapshots.map((row) => [`${row.customerTenantId}:${row.resourceType}`, row]))
+        for (const state of states) {
+          const tenantEvidence = evidenceByTenant.get(state.customerTenantId) ?? {}
+          const stored = snapshotByKey.get(`${state.customerTenantId}:${state.resourceType}`)
+          tenantEvidence[state.resourceType as ResourceType] = {
+            status: state.status, lastErrorCode: state.lastErrorCode,
+            lastAttemptAt: state.lastAttemptAt, lastSuccessfulAt: state.lastSuccessfulAt,
+            observedAt: stored?.observedAt, payload: stored?.payload,
+          }
+          evidenceByTenant.set(state.customerTenantId, tenantEvidence)
+        }
+        for (const assignment of batch) {
+          const results = this.evaluateSelected(baseline.checkIds, baseline.checkSettings,
+            evidenceByTenant.get(assignment.customerTenantId) ?? {}, assessedAt)
+          const needsAction = results.filter((result) => result.outcome === 'NEEDS_ACTION')
+          const unable = results.filter((result) => result.outcome === 'UNABLE_TO_ASSESS')
+          for (const result of results) {
+            const impact = checkImpact.get(result.id)
+            if (!impact) continue
+            if (result.outcome === 'MET') impact.met += 1
+            else if (result.outcome === 'NEEDS_ACTION') impact.needsAction += 1
+            else impact.unableToAssess += 1
+          }
+          items.push({
+            tenantId: assignment.customerTenantId,
+            name: assignment.customerTenant.displayName || assignment.customerTenant.primaryDomain || 'Unnamed tenant',
+            domain: assignment.customerTenant.primaryDomain,
+            assignedAt: assignment.assignedAt,
+            outcome: needsAction.length ? 'NEEDS_ACTION' : unable.length ? 'UNABLE_TO_ASSESS' : 'MET',
+            met: results.length - needsAction.length - unable.length,
+            needsAction: needsAction.length,
+            unableToAssess: unable.length,
+            attention: [...needsAction, ...unable].map((result) => ({ id: result.id, title: result.title, outcome: result.outcome as 'NEEDS_ACTION' | 'UNABLE_TO_ASSESS' })),
+          })
+        }
+      }
+      const counts = {
+        assigned: assignments.length,
+        met: items.filter((item) => item.outcome === 'MET').length,
+        needsAction: items.filter((item) => item.outcome === 'NEEDS_ACTION').length,
+        unableToAssess: items.filter((item) => item.outcome === 'UNABLE_TO_ASSESS').length,
+        notApplied: Math.max(0, workspaceTenantCount - assignments.length),
+      }
+      const matching = items.filter((item) =>
+        (status === 'ALL' || item.outcome === status) &&
+        (!search || `${item.name} ${item.domain ?? ''}`.toLowerCase().includes(search)))
+      const priority = { NEEDS_ACTION: 0, UNABLE_TO_ASSESS: 1, MET: 2 }
+      matching.sort((a, b) => priority[a.outcome] - priority[b.outcome] ||
+        a.name.localeCompare(b.name) || a.tenantId.localeCompare(b.tenantId))
+      return {
+        baselineId: baseline.id, revision: baseline.revision, counts,
+        checkImpact: Array.from(checkImpact.values()).sort((a, b) =>
+          b.needsAction - a.needsAction || b.unableToAssess - a.unableToAssess || a.title.localeCompare(b.title)),
+        items: matching.slice((page - 1) * 25, page * 25), matchingTenants: matching.length,
+        page, pageSize: 25, search, statusFilter: status, assessedAt: assessedAt.toISOString(),
+      }
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, timeout: 30000 })
   }
 
   async tenantChoices(identity: AuthenticatedIdentity, organizationId: string, pageValue: unknown, searchValue: unknown) {
@@ -245,14 +372,7 @@ export class SecurityRequirementsService {
       }
     }
     const now = new Date()
-    const results = (selected?.checkIds ?? []).map((id) => CHECK_IDS.has(id)
-      ? evaluateCheck(id as CheckId, evidence, now, selected?.checkSettings as CheckSettings ?? {})
-      : {
-          id, title: 'Unsupported saved check', service: 'Unsupported', recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library', expected: 'A supported check definition',
-          guidance: 'Edit this baseline and choose a currently offered check.', resourceType: null,
-          outcome: 'UNABLE_TO_ASSESS' as const, observed: 'Unavailable', observedAt: null,
-          reason: 'This saved check is no longer available in the current catalog.',
-        })
+    const results = this.evaluateSelected(selected?.checkIds ?? [], selected?.checkSettings, evidence, now)
     const summary = {
       selected: results.length,
       met: results.filter((result) => result.outcome === 'MET').length,

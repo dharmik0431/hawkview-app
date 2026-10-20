@@ -201,6 +201,104 @@ test('detail and tenant choices restrict every read to the same workspace and bo
   assert.equal(tenantQueries[1].skip, 25)
 })
 
+test('baseline impact counts observed gaps separately from missing evidence and filters tenant rows', async () => {
+  const metTenant = '44444444-4444-4444-8444-444444444444'
+  const gapTenant = '55555555-5555-4555-8555-555555555555'
+  const unknownTenant = '66666666-6666-4666-8666-666666666666'
+  const now = Date.now()
+  const tenantIds = [metTenant, gapTenant, unknownTenant]
+  const stateReads: unknown[] = []
+  const snapshotReads: unknown[] = []
+  const prisma = {
+    user: { findUnique: async () => ({ id: 'owner', disabledAt: null, memberships: [{ organizationId: org }] }) },
+    securityBaseline: { findFirst: async ({ where }: { where: { id: string; organizationId: string } }) => {
+      assert.deepEqual(where, { id: baselineId, organizationId: org })
+      return { id: baselineId, revision: 2, checkIds: ['security-defaults-enabled'], checkSettings: {} }
+    } },
+    tenantSecurityBaselineAssignment: { findMany: async ({ where }: { where: { organizationId: string; baselineId: string } }) => {
+      assert.deepEqual(where, { organizationId: org, baselineId })
+      return tenantIds.map((id, index) => ({ customerTenantId: id, assignedAt: new Date(now - 60_000),
+        customerTenant: { displayName: ['Met', 'Gap', 'Unknown'][index], primaryDomain: `${index}.example.test` } }))
+    } },
+    customerTenant: { count: async ({ where }: { where: { organizationId: string } }) => {
+      assert.deepEqual(where, { organizationId: org })
+      return 4
+    } },
+    syncState: { findMany: async ({ where }: { where: Record<string, unknown> }) => {
+      stateReads.push(where)
+      assert.equal(where.organizationId, org)
+      assert.deepEqual(where.customerTenantId, { in: tenantIds })
+      assert.deepEqual(where.resourceType, { in: ['SECURITY_DEFAULTS'] })
+      return [metTenant, gapTenant].map((id) => ({ customerTenantId: id, resourceType: 'SECURITY_DEFAULTS',
+        status: 'SUCCEEDED', lastErrorCode: null, lastAttemptAt: new Date(now - 120_000),
+        lastSuccessfulAt: new Date(now - 30_000) }))
+    } },
+    tenantEntraSnapshot: { findMany: async ({ where }: { where: Record<string, unknown> }) => {
+      snapshotReads.push(where)
+      assert.equal(where.organizationId, org)
+      return [metTenant, gapTenant].map((id) => ({ customerTenantId: id, resourceType: 'SECURITY_DEFAULTS',
+        observedAt: new Date(now - 60_000), payload: [{ isEnabled: id === metTenant }] }))
+    } },
+    $transaction: async (action: (tx: unknown) => Promise<unknown>, options: Record<string, unknown>) => {
+      assert.equal(options.isolationLevel, 'RepeatableRead')
+      return action(prisma)
+    },
+  }
+  const service = new SecurityRequirementsService(prisma as unknown as PrismaService)
+  const coverage = await service.baselineCoverage(identity, org, baselineId, '1', '', 'NEEDS_ACTION')
+  assert.deepEqual(coverage.counts, { assigned: 3, met: 1, needsAction: 1, unableToAssess: 1, notApplied: 1 })
+  assert.deepEqual(coverage.checkImpact.map(({ met, needsAction, unableToAssess }) => ({ met, needsAction, unableToAssess })),
+    [{ met: 1, needsAction: 1, unableToAssess: 1 }])
+  assert.equal(coverage.matchingTenants, 1)
+  assert.equal(coverage.items[0].tenantId, gapTenant)
+  assert.equal(coverage.items[0].attention[0].title, 'Microsoft security defaults are enabled')
+  assert.equal(stateReads.length, 1)
+  assert.equal(snapshotReads.length, 1)
+  const all = await service.baselineCoverage(identity, org, baselineId, '1', '', 'ALL')
+  assert.deepEqual(all.items.map((item) => item.outcome),
+    ['NEEDS_ACTION', 'UNABLE_TO_ASSESS', 'MET'])
+})
+
+test('baseline impact reads large assigned sets in bounded evidence batches, not one query per tenant', async () => {
+  const assignmentIds = Array.from({ length: 201 }, (_, index) =>
+    `${String(index + 1).padStart(8, '0')}-4444-4444-8444-444444444444`)
+  const readSizes: number[] = []
+  const prisma = {
+    user: { findUnique: async () => ({ id: 'owner', disabledAt: null, memberships: [{ organizationId: org }] }) },
+    securityBaseline: { findFirst: async () => ({ id: baselineId, revision: 1,
+      checkIds: ['security-defaults-enabled'], checkSettings: {} }) },
+    tenantSecurityBaselineAssignment: { findMany: async () => assignmentIds.map((id) => ({
+      customerTenantId: id, assignedAt: new Date(),
+      customerTenant: { displayName: id, primaryDomain: null },
+    })) },
+    customerTenant: { count: async () => 201 },
+    syncState: { findMany: async ({ where }: { where: { organizationId: string; customerTenantId: { in: string[] } } }) => {
+      assert.equal(where.organizationId, org)
+      readSizes.push(where.customerTenantId.in.length)
+      return []
+    } },
+    tenantEntraSnapshot: { findMany: async () => [] },
+    $transaction: async (action: (tx: unknown) => Promise<unknown>) => action(prisma),
+  }
+  const service = new SecurityRequirementsService(prisma as unknown as PrismaService)
+  const result = await service.baselineCoverage(identity, org, baselineId, '2', '', 'ALL')
+  assert.deepEqual(readSizes, [100, 100, 1])
+  assert.equal(result.counts.unableToAssess, 201)
+  assert.equal(result.items.length, 25)
+  assert.equal(result.page, 2)
+})
+
+test('baseline impact denies a workspace viewer before reading assignment evidence', async () => {
+  let read = false
+  const prisma = {
+    user: { findUnique: async () => ({ id: 'viewer', disabledAt: null, memberships: [] }) },
+    $transaction: async () => { read = true },
+  }
+  const service = new SecurityRequirementsService(prisma as unknown as PrismaService)
+  await assert.rejects(service.baselineCoverage(identity, org, baselineId, '1', '', 'ALL'), ForbiddenException)
+  assert.equal(read, false)
+})
+
 test('assignment refuses a tenant outside the selected workspace before writing', async () => {
   let wrote = false
   const prisma = {
