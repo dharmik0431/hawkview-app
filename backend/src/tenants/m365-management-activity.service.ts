@@ -1100,7 +1100,7 @@ export class M365ManagementActivityService {
         }
       }
       const retainedById = new Map<string, { record: JsonObject; role: ManagementActivityRole }>()
-      const supportingGroups = new Map<string, JsonObject[]>()
+      const supportingGroups = new Map<string, Map<string, JsonObject>>()
       for (const record of allRecords) {
         const role = classifyManagementActivity(record)
         if (role === 'routine_activity') continue
@@ -1125,11 +1125,12 @@ export class M365ManagementActivityService {
           text(record.MailboxOwnerUPN) ?? text(record.TargetUserOrGroupName) ?? '',
           String(bucket),
         ].join('\u0000').toLowerCase()
-        const group = supportingGroups.get(groupingKey) ?? []
-        if (!group.some((candidate) => text(candidate.Id) === id)) group.push(record)
+        const group = supportingGroups.get(groupingKey) ?? new Map<string, JsonObject>()
+        if (!group.has(id)) group.set(id, record)
         supportingGroups.set(groupingKey, group)
       }
-      for (const [groupingKey, records] of supportingGroups) {
+      for (const [groupingKey, uniqueRecords] of supportingGroups) {
+        const records = [...uniqueRecords.values()]
         records.sort((left, right) => validDate(left.CreationTime)!.getTime() - validDate(right.CreationTime)!.getTime())
         const first = records[0]!
         const last = records.at(-1)!

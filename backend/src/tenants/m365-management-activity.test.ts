@@ -434,6 +434,7 @@ test('writes raw and normalized evidence and completes a content ledger in one t
       record({ Id: 'record-already-accepted-concurrently' }),
       record({ Id: 'supporting-record', Operation: 'MoveToDeletedItems', ObjectId: 'message-1', MailboxOwnerUPN: 'victim@example.test', CorrelationId: 'request-1' }),
       record({ Id: 'supporting-record-2', Operation: 'MoveToDeletedItems', ObjectId: 'message-2', MailboxOwnerUPN: 'victim@example.test', CorrelationId: 'request-2', CreationTime: '2026-08-17T12:31:00.000Z' }),
+      record({ Id: 'supporting-record-2', Operation: 'MoveToDeletedItems', ObjectId: 'message-2', MailboxOwnerUPN: 'victim@example.test', CorrelationId: 'request-3', CreationTime: '2026-08-17T12:31:00.000Z' }),
       record({ Id: 'other-mailbox', Operation: 'MoveToDeletedItems', ObjectId: 'message-3', MailboxOwnerUPN: 'other@example.test', CreationTime: '2026-08-17T12:32:00.000Z' }),
       record({ Id: 'next-window', Operation: 'MoveToDeletedItems', ObjectId: 'message-4', MailboxOwnerUPN: 'victim@example.test', CreationTime: '2026-08-17T12:46:00.000Z' }),
       record({ Id: 'routine-record', Operation: 'FileAccessed' }),
