@@ -7,14 +7,19 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { initializePrismaUtcSession } from './prisma-utc-session.js'
 
-function createAdapter() {
-  const connectionString = process.env.DATABASE_URL
-
+export function createAdapter(connectionString = process.env.DATABASE_URL) {
   if (!connectionString) {
     throw new Error('DATABASE_URL is required to start the HawkView API.')
   }
 
-  return new PrismaPg({ connectionString, onConnect: initializePrismaUtcSession })
+  // Supavisor allows 15 session clients for this database role. Render briefly
+  // overlaps API processes during deployment; leave room for migrations and
+  // other pooler clients instead of using pg's ten-client default per process.
+  return new PrismaPg({
+    connectionString,
+    max: 3,
+    onConnect: initializePrismaUtcSession,
+  })
 }
 
 @Injectable()
