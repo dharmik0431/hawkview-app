@@ -7,6 +7,7 @@ import { Menu, ShieldCheck, X } from 'lucide-react'
 import { SiteVersion } from '@/components/layout/site-version'
 import { HawkViewBrand } from '@/components/brand/hawkview-brand'
 import { useAuth } from '@/components/providers/auth-provider'
+import { canManagePolicies } from '@/lib/auth/policy-access'
 import { cn } from '@/lib/utils'
 import { coreNavigation } from '@/components/layout/sidebar'
 
@@ -20,6 +21,7 @@ export function MobileNavigation() {
   const isMspOwner = Boolean(
     session?.user?.memberships?.some((membership) => membership.role === 'MSP_OWNER')
   )
+  const canSeePolicies = canManagePolicies(session)
 
   useEffect(() => {
     if (!isOpen) return
@@ -108,7 +110,7 @@ export function MobileNavigation() {
             </div>
 
             <nav className="flex-1 overflow-y-auto py-5" aria-label="Mobile navigation">
-              {coreNavigation.map((group) => (
+              {coreNavigation.filter((group) => !group.adminOnly || canSeePolicies).map((group) => (
                 <div key={group.title} className="mb-6">
                   <p className="mb-2 px-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
                     {group.title}

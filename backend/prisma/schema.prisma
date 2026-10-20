@@ -593,6 +593,8 @@ model Organization {
   updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
   memberships        Membership[]
   customerTenants    CustomerTenant[]
+  securityBaselines  SecurityBaseline[]
+  securityBaselineAssignments TenantSecurityBaselineAssignment[]
   directoryUsers     DirectoryUser[]
   directoryGroups    DirectoryGroup[]
   groupMemberships   DirectoryGroupMembership[]
@@ -698,6 +700,7 @@ model CustomerTenant {
   updatedAt          DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(6)
   organization       Organization               @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   connection         TenantConnection?
+  securityBaselineAssignment TenantSecurityBaselineAssignment?
   directoryUsers     DirectoryUser[]
   directoryGroups    DirectoryGroup[]
   groupMemberships   DirectoryGroupMembership[]
@@ -954,6 +957,60 @@ model TenantEntraSnapshot {
   @@unique([customerTenantId, resourceType])
   @@index([organizationId, customerTenantId])
   @@map("tenant_entra_snapshots")
+}
+
+/// MSP-owned choices. The HawkView starter is a versioned application template,
+/// never silently assigned or stored as the customer's chosen standard.
+model SecurityBaseline {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  name           String    @db.VarChar(100)
+  checkIds       String[]  @map("check_ids")
+  checkSettings  Json      @default("{}") @map("check_settings")
+  revision       Int       @default(1)
+  createdByUserId String   @map("created_by_user_id") @db.Uuid
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignments   TenantSecurityBaselineAssignment[]
+  revisions     SecurityBaselineRevision[]
+
+  @@unique([id, organizationId])
+  @@unique([organizationId, name])
+  @@map("security_baselines")
+}
+
+/// Append-only through the API: workspace-scoped record of each saved MSP baseline definition.
+model SecurityBaselineRevision {
+  id              String @id @default(uuid()) @db.Uuid
+  organizationId  String @map("organization_id") @db.Uuid
+  baselineId      String @map("baseline_id") @db.Uuid
+  revision        Int
+  name            String @db.VarChar(100)
+  checkIds        String[] @map("check_ids")
+  checkSettings   Json @map("check_settings")
+  changedByUserId String @map("changed_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  baseline        SecurityBaseline @relation(fields: [baselineId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "security_baseline_revisions_scope_fkey")
+
+  @@unique([baselineId, revision])
+  @@index([organizationId, baselineId, revision])
+  @@map("security_baseline_revisions")
+}
+
+model TenantSecurityBaselineAssignment {
+  customerTenantId String @id @map("customer_tenant_id") @db.Uuid
+  organizationId   String @map("organization_id") @db.Uuid
+  baselineId       String @map("baseline_id") @db.Uuid
+  assignedByUserId String @map("assigned_by_user_id") @db.Uuid
+  assignedAt       DateTime @default(now()) @map("assigned_at") @db.Timestamptz(6)
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "tenant_baseline_assignment_tenant_scope_fkey")
+  baseline         SecurityBaseline @relation(fields: [baselineId, organizationId], references: [id, organizationId], onDelete: Restrict, map: "tenant_baseline_assignment_baseline_scope_fkey")
+
+  @@unique([customerTenantId, organizationId], map: "tenant_baseline_assignment_scope_key")
+  @@index([organizationId, baselineId])
+  @@map("tenant_security_baseline_assignments")
 }
 
 model SignInLog {

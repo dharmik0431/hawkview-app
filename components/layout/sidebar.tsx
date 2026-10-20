@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation'
 import { cn } from '@/lib/utils'
 import { History as HistoryIcon, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useAuth } from '@/components/providers/auth-provider'
+import { canManagePolicies } from '@/lib/auth/policy-access'
 import { useSidebar } from '@/components/providers/sidebar-provider'
 import { SiteVersion } from '@/components/layout/site-version'
 import { HawkViewBrand } from '@/components/brand/hawkview-brand'
@@ -27,6 +28,7 @@ import {
 export const coreNavigation = [
   {
     title: 'MAIN',
+    adminOnly: false,
     items: [
       { name: 'Dashboard', href: '/dashboard', icon: LayoutDashboard },
       { name: 'Tenants', href: '/tenants', icon: Building2 },
@@ -34,6 +36,11 @@ export const coreNavigation = [
       { name: 'What Changed?', href: '/what-changed', icon: HistoryIcon },
       { name: 'Risky Users', href: '/risky-users', icon: ShieldAlert },
     ],
+  },
+  {
+    title: 'POLICIES',
+    adminOnly: true,
+    items: [{ name: 'Baseline', href: '/policies/baselines', icon: ShieldCheck }],
   },
 ]
 
@@ -45,6 +52,7 @@ export function Sidebar() {
   const isMspOwner = Boolean(
     session?.user?.memberships?.some((m) => m.role === 'MSP_OWNER')
   )
+  const canSeePolicies = canManagePolicies(session)
 
   return (
     <TooltipProvider delayDuration={100}>
@@ -99,7 +107,7 @@ export function Sidebar() {
             aria-label="Main navigation"
           >
             <ul role="list" className="flex flex-col gap-y-6">
-              {coreNavigation.map((group) => (
+              {coreNavigation.filter((group) => !group.adminOnly || canSeePolicies).map((group) => (
                 <li key={group.title}>
                   {!isCollapsed && (
                     <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider px-2 mb-2 whitespace-nowrap overflow-hidden">

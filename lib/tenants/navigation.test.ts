@@ -28,6 +28,10 @@ test('Risky Users is addressable at tenant top level', () => {
   assert.equal(parsed.canonicalPath, '/tenants/synthetic-tenant/risky-users')
 })
 
+test('the former tenant baseline path no longer renders inside the tenant blade', () => {
+  assert.equal(parseTenantPath('/tenants/synthetic-tenant/security-requirements', tenantId).section, 'overview')
+})
+
 test('tenant ids are encoded in the path', () => {
   assert.equal(tenantRiskyUsersPath('a b/c'), '/tenants/a%20b%2Fc/risky-users')
 })
