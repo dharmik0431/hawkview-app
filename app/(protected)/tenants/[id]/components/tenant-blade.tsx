@@ -9,17 +9,15 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Cloud,
-  HardDrive,
-  Mail,
   Search,
   Settings,
-  Users,
   X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { TenantWorkspaceDisplay } from '@/lib/tenant-workspace-state'
 import { getServiceTheme } from './service-theme'
+import { productIcons, PRODUCT_ICON_STROKE_WIDTH } from '@/lib/ui/product-icons'
+import { ProviderMark } from '@/components/icons/provider-mark'
 
 export type TenantSection = string
 
@@ -44,10 +42,10 @@ const NAV_GROUPS: NavGroup[] = [
   {
     title: 'Services',
     items: [
-      { key: 'home', label: 'Office 365', icon: Cloud },
-      { key: 'entra', label: 'Entra ID', icon: Users },
-      { key: 'exchange', label: 'Exchange', icon: Mail },
-      { key: 'sharepoint', label: 'SharePoint / OneDrive', icon: HardDrive },
+      { key: 'home', label: 'Office 365', icon: productIcons.microsoft365 },
+      { key: 'entra', label: 'Entra ID', icon: productIcons.entra },
+      { key: 'exchange', label: 'Exchange', icon: productIcons.exchange },
+      { key: 'sharepoint', label: 'SharePoint / OneDrive', icon: productIcons.sharepointOneDrive },
       { key: 'teams', label: 'Teams', icon: Building2, disabled: true },
     ],
   },
@@ -58,17 +56,6 @@ const NAV_GROUPS: NavGroup[] = [
     ],
   },
 ]
-
-function MicrosoftMark() {
-  return (
-    <div className="grid h-5 w-5 grid-cols-2 gap-0.5 shrink-0" aria-hidden="true">
-      <span className="h-2 w-2 rounded-[1px] bg-[#F25022]" />
-      <span className="h-2 w-2 rounded-[1px] bg-[#7FBA00]" />
-      <span className="h-2 w-2 rounded-[1px] bg-[#00A4EF]" />
-      <span className="h-2 w-2 rounded-[1px] bg-[#FFB900]" />
-    </div>
-  )
-}
 
 export function TenantBlade({
   tenant,
@@ -148,7 +135,7 @@ export function TenantBlade({
           )}
         >
           <div className="flex items-center gap-2 min-w-0">
-            <MicrosoftMark />
+            <ProviderMark provider={tenant?.provider === 'google' ? 'google' : 'microsoft'} size="compact" />
             {!isCollapsed && (
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold text-slate-900 dark:text-white">
@@ -238,7 +225,7 @@ export function TenantBlade({
                           isCollapsed && 'justify-center px-2'
                         )}
                       >
-                        <Icon className="h-[18px] w-[18px] shrink-0 text-slate-400" aria-hidden="true" />
+                        <Icon className="h-[18px] w-[18px] shrink-0 text-slate-400" strokeWidth={PRODUCT_ICON_STROKE_WIDTH} aria-hidden="true" />
                         {!isCollapsed && <span className="truncate">{item.label}</span>}
                       </button>
                     </span>
@@ -274,6 +261,7 @@ export function TenantBlade({
                         isActive ? theme.bladeActiveIcon : 'text-slate-500 dark:text-slate-400'
                       )}
                       aria-hidden="true"
+                      strokeWidth={PRODUCT_ICON_STROKE_WIDTH}
                     />
                     {!isCollapsed && <span className="truncate">{item.label}</span>}
                   </button>

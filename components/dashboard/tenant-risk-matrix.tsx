@@ -36,6 +36,7 @@ import {
   type NativeTenantRiskSummary,
 } from '@/lib/dashboard/hawkview-risk-summary'
 import { tenantRiskyUsersPath } from '@/lib/tenants/navigation'
+import { ProviderMark } from '@/components/icons/provider-mark'
 
 import {
   getTenantSecureScoreInfo,
@@ -134,27 +135,6 @@ export function sortTenantRiskMatrixTenants(
     return sortDir === 'asc' ? cmp : -cmp
   })
   return list
-}
-
-function ProviderMark({ provider }: { provider: 'microsoft' | 'google' }) {
-  if (provider === 'microsoft') {
-    return (
-      <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0">
-        <span className="grid grid-cols-2 gap-[2px]">
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#F25022]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#7FBA00]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#00A4EF]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#FFB900]" />
-        </span>
-      </span>
-    )
-  }
-
-  return (
-    <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shrink-0">
-      <span className="h-3.5 w-3.5 rounded-full border-2 border-blue-500 border-t-red-500 border-r-yellow-500 border-b-green-500" />
-    </span>
-  )
 }
 
 function clamp(val: number, min: number, max: number) {
@@ -349,7 +329,7 @@ export function TenantRiskMatrix({
                       {/* 1. Tenant */}
                       <td className="py-3.5 px-4 align-middle">
                         <div className="flex items-center gap-2.5">
-                          <ProviderMark provider={t.provider} />
+                          <ProviderMark provider={t.provider} size="compact" />
                           <div className="min-w-0">
                             <div className="font-bold text-slate-900 dark:text-slate-100 truncate group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
                               {t.name}
@@ -611,7 +591,7 @@ export function TenantRiskMatrix({
                   {/* Top line: Provider mark, tenant name, domain, overall badge */}
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex items-center gap-2.5 min-w-0">
-                      <ProviderMark provider={t.provider} />
+                      <ProviderMark provider={t.provider} size="compact" />
                       <div className="min-w-0">
                         <div className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
                           {t.name}
