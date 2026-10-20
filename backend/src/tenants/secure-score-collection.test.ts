@@ -1,7 +1,7 @@
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { TenantSyncService, entraCollectionLimitsForResource, currentScoreSnapshot, authoritativeSnapshot, partialSnapshot } from './tenant-sync.service.js'
+import { TenantSyncService, MicrosoftGraphCollectionError, entraCollectionLimitsForResource, currentScoreSnapshot, authoritativeSnapshot, partialSnapshot } from './tenant-sync.service.js'
 import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreResponseError } from './secure-score-collection.js'
 import { getMicrosoftSecureScore } from './secure-score.util.js'
 
@@ -150,6 +150,23 @@ test('invalid JSON and transport failure preserve last good state', async (t) =>
     assert.equal(h.recovered, 0)
     assert.equal(h.state.lastSuccessfulAt, h.lastSuccessfulAt)
   }
+})
+
+test('Graph rejection records only bounded provider status and code', async (t) => {
+  t.mock.method(Date, 'now', () => now)
+  const h = harness(() => {
+    throw new MicrosoftGraphCollectionError('Bearer secret-token and sensitive response', 400, 'InvalidRequest', 'request-id')
+  })
+  await assert.rejects(h.run)
+  const diagnostic = h.diagnostics.map((entry) => JSON.parse(entry)).find((entry) => entry.event === 'secure_score_collection_rejected')
+  assert.deepEqual(diagnostic, {
+    event: 'secure_score_collection_rejected', phase: 'TRANSPORT', reason: 'READ_OR_TRANSPORT_FAILURE',
+    status: 400, graphCode: 'InvalidRequest',
+  })
+  assert.ok(!h.diagnostics.join('').includes('secret-token'))
+  assert.ok(!h.diagnostics.join('').includes('request-id'))
+  assert.equal(h.saved.length, 0)
+  assert.equal(h.state.lastSuccessfulAt, h.lastSuccessfulAt)
 })
 
 test('nonfinite score values are refused before projection', () => {

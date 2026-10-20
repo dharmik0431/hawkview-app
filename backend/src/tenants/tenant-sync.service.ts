@@ -3373,14 +3373,21 @@ export class TenantSyncService {
           throw new Error('Microsoft secure scores exceeded the bounded collection retained-byte limit.')
         }
       } catch (error) {
-        // Fixed enums only: no response content, URL, credentials or identity.
+        // Keep provider diagnostics bounded: no response content, URL,
+        // credentials, request ID or tenant identity.
         const message = error instanceof Error ? error.message : ''
         const reason = error instanceof SecureScoreResponseError ? error.reason
           : /bounded collection deadline/.test(message) ? 'DEADLINE_LIMIT'
           : /bounded response-size limit/.test(message) ? 'RAW_BYTE_LIMIT'
           : /retained-byte limit/.test(message) ? 'RETAINED_BYTE_LIMIT'
           : 'READ_OR_TRANSPORT_FAILURE'
-        this.logger.warn(JSON.stringify({ event: 'secure_score_collection_rejected', phase, reason }))
+        const graphError = error instanceof MicrosoftGraphCollectionError ? error : null
+        const graphCode = graphError?.graphErrorCode && /^[A-Za-z0-9_.-]{1,128}$/.test(graphError.graphErrorCode)
+          ? graphError.graphErrorCode : null
+        this.logger.warn(JSON.stringify({
+          event: 'secure_score_collection_rejected', phase, reason,
+          status: graphError?.status ?? null, graphCode,
+        }))
         throw error
       }
       // Complete for the explicitly scoped current-score query, not history.
