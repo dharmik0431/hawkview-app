@@ -75,6 +75,19 @@ test('classifies customer action independently from human-readable messages', ()
     classifyMicrosoftFailure(new MicrosoftRequestError('oauth rejected', 400, 'AADSTS7000215', null)).customerAction,
     'RECONNECT',
   )
+  const resourceAuth = classifyMicrosoftFailure(
+    new MicrosoftRequestError('opaque', 400, 'AuthenticationError', null),
+  )
+  assert.deepEqual(resourceAuth, {
+    failureClass: 'RESOURCE_AUTHENTICATION_UNAVAILABLE',
+    reasonCode: 'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED',
+    status: 400, microsoftCode: 'AuthenticationError', requestId: null,
+    retryable: false, customerAction: 'CONTACT_SUPPORT',
+  })
+  const resourceMessage = customerCollectionFailureMessage('secure scores', resourceAuth, true)
+  assert.match(resourceMessage, /Microsoft could not authenticate the secure scores resource request/)
+  assert.match(resourceMessage, /retained the last successful data/)
+  assert.doesNotMatch(resourceMessage, /reconnect|permission/i)
   assert.equal(classifyMicrosoftFailure(new Error('HTTP 410 syncStateNotFound')).failureClass, 'DELTA_RESET_REQUIRED')
   assert.equal(classifyMicrosoftFailure(new Error('fetch failed')).failureClass, 'NETWORK_TIMEOUT')
 })

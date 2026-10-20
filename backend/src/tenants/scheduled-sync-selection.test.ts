@@ -163,6 +163,10 @@ test('uses stable failure codes and cost-aware retry windows', () => {
     ...lightTransient,
     lastErrorCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
   }, now), false)
+  assert.equal(shouldRunTargetedTransientRetry({
+    ...lightTransient,
+    lastErrorCode: 'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED',
+  }, now), false)
 })
 
 test('selects a tenant for an eligible Named Locations retry without forcing full inventory', () => {
@@ -647,7 +651,8 @@ test('both failed candidacy branches carry an identical error exclusion list', (
   const failed = failedCandidacyBranches(now)
   assert.equal(failed.length, 2)
   assert.deepEqual([...failed[0]!.lastErrorCode.notIn].sort(), [...failed[1]!.lastErrorCode.notIn].sort())
-  for (const code of ['401', '403', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_PERMISSION_REQUIRED']) {
+  for (const code of ['401', '403', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_PERMISSION_REQUIRED',
+    'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED']) {
     assert.ok(failed[0]!.lastErrorCode.notIn.includes(code), code)
   }
 })

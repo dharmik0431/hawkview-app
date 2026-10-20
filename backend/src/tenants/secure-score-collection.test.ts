@@ -169,6 +169,24 @@ test('Graph rejection records only bounded provider status and code', async (t) 
   assert.equal(h.state.lastSuccessfulAt, h.lastSuccessfulAt)
 })
 
+test('Graph resource AuthenticationError remains resource-scoped without inventing a reconnect', async (t) => {
+  t.mock.method(Date, 'now', () => now)
+  const h = harness(() => {
+    throw new MicrosoftGraphCollectionError('opaque Microsoft rejection', 400, 'AuthenticationError', null)
+  })
+  await assert.rejects(h.run)
+  assert.equal(h.saved.length, 0)
+  assert.equal(h.state.status, 'FAILED')
+  assert.equal(h.state.lastSuccessfulAt, h.lastSuccessfulAt)
+  assert.equal(h.state.lastErrorCode, 'MICROSOFT_RESOURCE_AUTHENTICATION_FAILED')
+  assert.match(h.state.lastErrorMessage, /Microsoft could not authenticate the secure scores resource request/)
+  assert.doesNotMatch(h.state.lastErrorMessage, /Reconnect|permission/i)
+  assert.deepEqual(JSON.parse(h.diagnostics[0]), {
+    event: 'secure_score_collection_rejected', phase: 'TRANSPORT', reason: 'READ_OR_TRANSPORT_FAILURE',
+    status: 400, graphCode: 'AuthenticationError',
+  })
+})
+
 test('nonfinite score values are refused before projection', () => {
   for (const value of [NaN, Infinity, -Infinity]) {
     assert.throws(() => currentSecureScoresFromResponse({ value: [{ ...valid, currentScore: value }] }, now), /INVALID_RESPONSE/)
