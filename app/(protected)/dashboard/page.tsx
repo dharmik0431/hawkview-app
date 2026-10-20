@@ -39,6 +39,7 @@ import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { queueSummary } from '@/lib/dashboard/queue-summary'
 import { EmptyState } from '@/components/common/empty-state'
+import { ProviderMark } from '@/components/icons/provider-mark'
 import {
   normalizeMicrosoftRiskSummary,
   presentMicrosoftRiskSummary,
@@ -161,24 +162,7 @@ function actionLabel(sev: Severity) {
 }
 
 function providerMark(provider: 'microsoft' | 'google') {
-  if (provider === 'microsoft') {
-    return (
-      <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-slate-100 border">
-        <span className="grid grid-cols-2 gap-[2px]">
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#F25022]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#7FBA00]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#00A4EF]" />
-          <span className="h-2.5 w-2.5 rounded-[2px] bg-[#FFB900]" />
-        </span>
-      </span>
-    )
-  }
-
-  return (
-    <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-slate-100 border">
-      <span className="h-3.5 w-3.5 rounded-full border-2 border-blue-500 border-t-red-500 border-r-yellow-500 border-b-green-500" />
-    </span>
-  )
+  return <ProviderMark provider={provider} size="compact" />
 }
 
 function ScrollPanel({ children }: { children: React.ReactNode }) {

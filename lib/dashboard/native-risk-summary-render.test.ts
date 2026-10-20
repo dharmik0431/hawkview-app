@@ -36,6 +36,7 @@ const shared = {
   '@/components/ui/button': { Button: button },
   '@/components/ui/badge': { Badge: box },
   '@/components/ui/card': { Card: box, CardContent: box },
+  '@/components/icons/provider-mark': { ProviderMark: () => null },
   '@/lib/dashboard/hawkview-risk-summary': native,
   '@/lib/identity-risk/microsoft-risk-summary': microsoft,
   '@/lib/tenants/navigation': navigation,

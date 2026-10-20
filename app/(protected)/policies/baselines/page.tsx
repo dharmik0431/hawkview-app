@@ -5,19 +5,16 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import {
   ArrowLeft,
   Building2,
-  Cloud,
-  Fingerprint,
-  FolderOpen,
   Grid2X2,
   Layers3,
   ListChecks,
-  Mail,
   ShieldCheck,
   Sparkles,
 } from 'lucide-react'
 import { useAuth } from '@/components/providers/auth-provider'
 import { apiClient } from '@/lib/api/client'
 import { canManagePolicies } from '@/lib/auth/policy-access'
+import { baselineServiceIcons, PRODUCT_ICON_STROKE_WIDTH } from '@/lib/ui/product-icons'
 
 type Check = {
   id: string
@@ -150,47 +147,47 @@ const services = [
   'Microsoft 365',
 ]
 const service = (check: Check) => check.service
-// These are generic Lucide symbols, not Microsoft product logos or brand marks.
+// Service glyphs are shared with tenant navigation and collection status.
 const serviceStyles = {
   Entra: {
-    icon: Fingerprint,
-    mark: 'bg-violet-100 text-violet-700 ring-violet-200 dark:bg-violet-950 dark:text-violet-200 dark:ring-violet-800',
-    card: 'border-violet-200 bg-violet-50/60 dark:border-violet-900 dark:bg-violet-950/30',
-    pill: 'bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-200',
-    accent: 'border-l-violet-400',
+    icon: baselineServiceIcons.Entra,
+    mark: 'bg-indigo-100 text-indigo-700 ring-indigo-200 dark:bg-indigo-950 dark:text-indigo-200 dark:ring-indigo-800',
+    card: 'border-indigo-200 bg-indigo-50/60 dark:border-indigo-900 dark:bg-indigo-950/30',
+    pill: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-950 dark:text-indigo-200',
+    accent: 'border-l-indigo-400',
   },
   SharePoint: {
-    icon: FolderOpen,
+    icon: baselineServiceIcons.SharePoint,
+    mark: 'bg-emerald-100 text-emerald-700 ring-emerald-200 dark:bg-emerald-950 dark:text-emerald-200 dark:ring-emerald-800',
+    card: 'border-emerald-200 bg-emerald-50/60 dark:border-emerald-900 dark:bg-emerald-950/30',
+    pill: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-200',
+    accent: 'border-l-emerald-400',
+  },
+  OneDrive: {
+    icon: baselineServiceIcons.OneDrive,
+    mark: 'bg-cyan-100 text-cyan-700 ring-cyan-200 dark:bg-cyan-950 dark:text-cyan-200 dark:ring-cyan-800',
+    card: 'border-cyan-200 bg-cyan-50/60 dark:border-cyan-900 dark:bg-cyan-950/30',
+    pill: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-950 dark:text-cyan-200',
+    accent: 'border-l-cyan-400',
+  },
+  Exchange: {
+    icon: baselineServiceIcons.Exchange,
     mark: 'bg-teal-100 text-teal-700 ring-teal-200 dark:bg-teal-950 dark:text-teal-200 dark:ring-teal-800',
     card: 'border-teal-200 bg-teal-50/60 dark:border-teal-900 dark:bg-teal-950/30',
     pill: 'bg-teal-100 text-teal-800 dark:bg-teal-950 dark:text-teal-200',
     accent: 'border-l-teal-400',
   },
-  OneDrive: {
-    icon: Cloud,
+  'Microsoft 365': {
+    icon: baselineServiceIcons['Microsoft 365'],
     mark: 'bg-sky-100 text-sky-700 ring-sky-200 dark:bg-sky-950 dark:text-sky-200 dark:ring-sky-800',
     card: 'border-sky-200 bg-sky-50/60 dark:border-sky-900 dark:bg-sky-950/30',
     pill: 'bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-200',
     accent: 'border-l-sky-400',
   },
-  Exchange: {
-    icon: Mail,
-    mark: 'bg-amber-100 text-amber-700 ring-amber-200 dark:bg-amber-950 dark:text-amber-200 dark:ring-amber-800',
-    card: 'border-amber-200 bg-amber-50/60 dark:border-amber-900 dark:bg-amber-950/30',
-    pill: 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200',
-    accent: 'border-l-amber-400',
-  },
-  'Microsoft 365': {
-    icon: Grid2X2,
-    mark: 'bg-fuchsia-100 text-fuchsia-700 ring-fuchsia-200 dark:bg-fuchsia-950 dark:text-fuchsia-200 dark:ring-fuchsia-800',
-    card: 'border-fuchsia-200 bg-fuchsia-50/60 dark:border-fuchsia-900 dark:bg-fuchsia-950/30',
-    pill: 'bg-fuchsia-100 text-fuchsia-800 dark:bg-fuchsia-950 dark:text-fuchsia-200',
-    accent: 'border-l-fuchsia-400',
-  },
 } as const
 type ServiceName = keyof typeof serviceStyles
 const fallbackStyle = {
-  icon: ShieldCheck,
+  icon: Layers3,
   mark: 'bg-slate-100 text-slate-700 ring-slate-200 dark:bg-slate-800 dark:text-slate-200 dark:ring-slate-700',
   card: 'border-slate-200 bg-slate-50/60 dark:border-slate-700 dark:bg-slate-800/30',
   pill: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-200',
@@ -213,7 +210,7 @@ function ServiceMark({
       aria-hidden="true"
       className={`inline-flex shrink-0 items-center justify-center rounded-lg ring-1 ${small ? 'h-7 w-7' : 'h-10 w-10'} ${style.mark}`}
     >
-      <Icon size={small ? 15 : 21} strokeWidth={1.9} />
+      <Icon size={small ? 15 : 21} strokeWidth={PRODUCT_ICON_STROKE_WIDTH} />
     </span>
   )
 }
@@ -225,7 +222,7 @@ function ServicePill({ name }: { name: string }) {
     <span
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${style.pill}`}
     >
-      <Icon size={14} strokeWidth={2} aria-hidden="true" />
+      <Icon size={14} strokeWidth={PRODUCT_ICON_STROKE_WIDTH} aria-hidden="true" />
       {name}
     </span>
   )

@@ -55,6 +55,7 @@ import {
 } from '@/lib/tenants/modal-tenant-onboarding'
 import { useQueryClient } from '@tanstack/react-query'
 import { cn } from '@/lib/utils'
+import { ProviderMark } from '@/components/icons/provider-mark'
 
 import {
   computeTenantAttention,
@@ -194,74 +195,8 @@ function formatSyncTime(timeStr: string | null) {
   }
 }
 
-function ProviderIcon({
-  provider,
-  size = 'small',
-}: {
-  provider: Provider
-  size?: 'normal' | 'small'
-}) {
-  return provider === 'microsoft' ? (
-    <MicrosoftMark size={size} />
-  ) : (
-    <GoogleMark size={size} />
-  )
-}
-
-function MicrosoftMark({ size = 'small' }: { size?: 'normal' | 'small' }) {
-  const isSmall = size === 'small'
-  return (
-    <div
-      className={cn(
-        'flex items-center justify-center border shadow-sm shrink-0 rounded-lg',
-        isSmall ? 'w-8 h-8 bg-blue-50/80 border-blue-100 dark:bg-blue-950/40 dark:border-blue-900' : 'w-10 h-10 bg-blue-50 border-blue-100 dark:bg-blue-950 dark:border-blue-900'
-      )}
-      title="Microsoft 365 Tenant"
-    >
-      <div className="grid grid-cols-2 gap-0.5">
-        <span className={cn('bg-[#F25022] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
-        <span className={cn('bg-[#7FBA00] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
-        <span className={cn('bg-[#00A4EF] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
-        <span className={cn('bg-[#FFB900] rounded-[1px]', isSmall ? 'h-1.5 w-1.5' : 'h-2 w-2')} />
-      </div>
-    </div>
-  )
-}
-
-function GoogleMark({ size = 'small' }: { size?: 'normal' | 'small' }) {
-  const isSmall = size === 'small'
-  return (
-    <div
-      className={cn(
-        'flex items-center justify-center border shadow-sm shrink-0 rounded-lg',
-        isSmall ? 'w-8 h-8 bg-red-50/80 border-red-100 dark:bg-red-950/40 dark:border-red-900' : 'w-10 h-10 bg-red-50 border-red-100 dark:bg-red-950 dark:border-red-900'
-      )}
-    >
-      <svg
-        width={isSmall ? '16' : '20'}
-        height={isSmall ? '16' : '20'}
-        viewBox="0 0 48 48"
-        aria-hidden="true"
-      >
-        <path
-          fill="#FFC107"
-          d="M43.611 20.083H42V20H24v8h11.303C33.708 32.91 29.22 36 24 36c-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.971 3.029l5.657-5.657C34.046 6.053 29.272 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.651-.389-3.917z"
-        />
-        <path
-          fill="#FF3D00"
-          d="M6.306 14.691l6.571 4.819C14.655 16.108 19.009 12 24 12c3.059 0 5.842 1.154 7.971 3.029l5.657-5.657C34.046 6.053 29.272 4 24 4c-7.682 0-14.409 4.328-17.694 10.691z"
-        />
-        <path
-          fill="#4CAF50"
-          d="M24 44c5.118 0 9.786-1.969 13.314-5.186l-6.143-5.197C29.136 35.091 26.7 36 24 36c-5.199 0-9.677-3.067-11.29-7.463l-6.52 5.02C9.44 39.556 16.227 44 24 44z"
-        />
-        <path
-          fill="#1976D2"
-          d="M43.611 20.083H42V20H24v8h11.303c-.792 2.26-2.231 4.191-4.132 5.617l.002-.001 6.143 5.197C36.91 39.186 44 34 44 24c0-1.341-.138-2.651-.389-3.917z"
-        />
-      </svg>
-    </div>
-  )
+function ProviderIcon({ provider, size = 'small' }: { provider: Provider; size?: 'normal' | 'small' }) {
+  return <ProviderMark provider={provider} size={size} />
 }
 
 function TenantIdPill({ tenantId }: { tenantId: string }) {
@@ -1285,14 +1220,7 @@ export default function TenantsPage() {
             ) : onboardingStep === 'hawkview' ? (
               <div className="space-y-5">
                 <div className="flex items-start gap-3.5 pr-8">
-                  <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-blue-950/60 border border-blue-100 dark:border-blue-900/50 flex items-center justify-center shrink-0">
-                    <div className="grid grid-cols-2 gap-0.5">
-                      <span className="h-2 w-2 bg-[#F25022] rounded-[1px]" />
-                      <span className="h-2 w-2 bg-[#7FBA00] rounded-[1px]" />
-                      <span className="h-2 w-2 bg-[#00A4EF] rounded-[1px]" />
-                      <span className="h-2 w-2 bg-[#FFB900] rounded-[1px]" />
-                    </div>
-                  </div>
+                  <ProviderMark provider="microsoft" size="normal" />
                   <div>
                     <h2
                       id="onboarding-modal-title"

@@ -75,6 +75,7 @@ function compileMatrix(helpers: ReturnType<typeof compileHelpers>) {
       '@/lib/attention/customer-attention': customerAttentionModule,
       '@/components/ui/button': { Button: () => null },
       '@/components/ui/badge': { Badge: () => null },
+      '@/components/icons/provider-mark': { ProviderMark: () => null },
       '@/components/ui/tooltip': {
         Tooltip: () => null,
         TooltipContent: () => null,

@@ -83,7 +83,6 @@ import {
   Minus,
   RotateCcw,
   KeyRound,
-  Folder,
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
@@ -103,6 +102,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { productIcons, PRODUCT_ICON_STROKE_WIDTH } from '@/lib/ui/product-icons'
+import { ProviderMark } from '@/components/icons/provider-mark'
 import { LoadingState } from '@/components/common/loading-state'
 import { ErrorState } from '@/components/common/error-state'
 import { useAuth } from '@/components/providers/auth-provider'
@@ -764,30 +765,7 @@ function statusBadge(status: TenantStatus) {
 }
 
 function ProviderIcon({ provider }: { provider: Provider }) {
-  return provider === 'microsoft' ? <MicrosoftMark /> : <GoogleMark />
-}
-
-function MicrosoftMark() {
-  return (
-    <div className="h-10 w-10 rounded-xl bg-blue-50 border border-blue-100 flex items-center justify-center">
-      <div className="grid grid-cols-2 gap-0.5">
-        <span className="h-2.5 w-2.5 bg-[#F25022] rounded-[2px]" />
-        <span className="h-2.5 w-2.5 bg-[#7FBA00] rounded-[2px]" />
-        <span className="h-2.5 w-2.5 bg-[#00A4EF] rounded-[2px]" />
-        <span className="h-2.5 w-2.5 bg-[#FFB900] rounded-[2px]" />
-      </div>
-    </div>
-  )
-}
-
-function GoogleMark() {
-  return (
-    <div className="h-10 w-10 rounded-xl bg-red-50 border border-red-100 flex items-center justify-center">
-      <span className="font-bold text-lg" style={{ color: '#4285F4' }}>
-        G
-      </span>
-    </div>
-  )
+  return <ProviderMark provider={provider} size="normal" />
 }
 
 function SectionButton({
@@ -2200,22 +2178,22 @@ function TenantDetailsWorkspace() {
         {
           key: 'home' as const,
           label: 'Office 365',
-          icon: <Shield className="h-5 w-5" />,
+          icon: <productIcons.microsoft365 className="h-5 w-5" strokeWidth={PRODUCT_ICON_STROKE_WIDTH} />,
         },
         {
           key: 'entra' as const,
           label: 'Entra ID',
-          icon: <Users className="h-5 w-5" />,
+          icon: <productIcons.entra className="h-5 w-5" strokeWidth={PRODUCT_ICON_STROKE_WIDTH} />,
         },
         {
           key: 'exchange' as const,
           label: 'Exchange',
-          icon: <Mail className="h-5 w-5" />,
+          icon: <productIcons.exchange className="h-5 w-5" strokeWidth={PRODUCT_ICON_STROKE_WIDTH} />,
         },
         {
           key: 'sharepoint' as const,
           label: 'SharePoint/OneDrive',
-          icon: <Folder className="h-5 w-5" />,
+          icon: <productIcons.sharepointOneDrive className="h-5 w-5" strokeWidth={PRODUCT_ICON_STROKE_WIDTH} />,
         },
         {
           key: 'teams' as const,
