@@ -103,14 +103,36 @@ is the single change that would lock the API out of its own tables.
 
 ## Known residue
 
-- `PUBLIC` retains `EXECUTE` on the three `identity_risk_*` trigger functions.
-  Not exploitable: PostgREST does not expose trigger-returning functions as RPC,
-  and no table privileges remain. Fold into the `search_path` follow-up, which
-  has to rewrite those functions anyway.
+- ~~`PUBLIC` retains `EXECUTE` on the three `identity_risk_*` trigger
+  functions.~~ Closed by `20260910040000_pin_function_search_path`, which
+  revokes it alongside pinning `search_path`. `service_role` keeps `EXECUTE`.
 - `anon` / `authenticated` keep `USAGE` on the `public` schema, which `PUBLIC`
   also holds via `pg_database_owner`. Worthless without object privileges.
 - A second default-ACL entry for `public` is owned by `supabase_admin`. It only
   applies to objects that `supabase_admin` creates; Prisma creates as `postgres`.
+
+## Function hardening (follow-up, landed separately)
+
+`backend/prisma/migrations/20260910040000_pin_function_search_path`
+
+The three `identity_risk_*` trigger guards ran with a role-mutable
+`search_path`. For `identity_risk_wrapped_key_guard` that was not cosmetic: it
+resolved `identity_risk_pseudonym_key_versions` unqualified three times, so a
+caller could put their own schema earlier in `search_path` and point the scope
+check at a table they control. Each function now sets `search_path = ''` and
+qualifies every reference, and `EXECUTE` is revoked from `PUBLIC`.
+
+`CREATE OR REPLACE` keeps the function OIDs, so the triggers stay bound and
+none is recreated. Every guard branch was exercised against the live schema in a
+rolled-back transaction first: identity-immutability, wrong-name rejection, a
+valid insert still accepted, update rejection, the DELETE branch still running
+its (now qualified) `UPDATE`, and reactivation rejection.
+
+Rollback is the previous definitions from
+`20260904090000_identity_risk_pseudonym_versions` and
+`20260904100000_wrapped_identity_risk_pilot`, replayed with
+`CREATE OR REPLACE` and no `SET search_path`, plus
+`GRANT EXECUTE ON FUNCTION <name>() TO PUBLIC` if the grant is wanted back.
 
 ## Follow-ups
 
@@ -118,6 +140,5 @@ is the single change that would lock the API out of its own tables.
   exposure window is unbounded, so rotation is the only way to invalidate
   anything already harvested. Couples to a frontend redeploy.
 - Enable leaked-password protection (advisor WARN).
-- Pin `search_path` on the three trigger functions (advisor WARN).
 - Split dev from production. Every merge to `main` deploys straight to the only
   environment holding real customer data.
