@@ -349,7 +349,16 @@ export function selectScheduledTenantWork(
     return [{
       tenantId: candidate.id,
       fullInventoryDue,
-      dueAt: earliestDue([...dailyDueDates, ...dueStates.flatMap((state) => [state.lastAttemptAt, state.lastSuccessfulAt])], now),
+      // Rank by the clock that made each resource eligible. An old success
+      // followed by a recent failed attempt must not make that retry appear
+      // older than genuinely overdue inventory on another tenant.
+      dueAt: earliestDue([
+        ...dailyDueDates,
+        ...dueStates.map((state) =>
+          state.status === SyncStateStatus.FAILED || state.status === SyncStateStatus.RUNNING
+            ? state.lastAttemptAt
+            : state.lastSuccessfulAt),
+      ], now),
     }]
   })
 

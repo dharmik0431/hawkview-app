@@ -783,6 +783,47 @@ test('fair ranking uses the overdue non-anchor rather than fresh licence/domain 
   assert.equal(result[0]?.tenantId, 'z-daily')
 })
 
+test('a recent targeted failure does not outrank overdue daily work using its old success clock', () => {
+  const base = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS')]
+  const daily = { id: 'z-daily', syncStates: base.map(s =>
+    s.resourceType === 'GROUPS' ? state('GROUPS', 'SUCCEEDED', ago(26 * HOUR)) : s) }
+  const retry = { id: 'a-retry', syncStates: [...base, {
+    ...state('ORGANIZATION_CONFIGURATION', 'FAILED', ago(10 * 24 * HOUR), ago(16 * 60_000)),
+    lastErrorCode: 'MICROSOFT_TRANSIENT', consecutiveFailures: 1,
+  }] }
+
+  const ranked = selectScheduledTenantWork([retry, daily], now, 2)
+  assert.deepEqual(ranked.map(work => work.tenantId), ['z-daily', 'a-retry'])
+  assert.deepEqual(ranked.map(work => work.dueAt.getTime()), [
+    ago(26 * HOUR).getTime(), ago(16 * 60_000).getTime(),
+  ])
+})
+
+test('a recent failed USERS attempt does not outrank overdue daily work using its old success clock', () => {
+  const base = [...dailyCoverage(), state('LICENSES'), state('DOMAINS')]
+  const daily = { id: 'z-daily', syncStates: [...base.filter(s => s.resourceType !== 'GROUPS'),
+    state('GROUPS', 'SUCCEEDED', ago(26 * HOUR)), state('USERS', 'SUCCEEDED', now)] }
+  const usersFailure = { id: 'a-users-failed', syncStates: [...base,
+    state('USERS', 'FAILED', ago(10 * 24 * HOUR), ago(60_000))] }
+
+  const ranked = selectScheduledTenantWork([usersFailure, daily], now, 2)
+  assert.deepEqual(ranked.map(work => work.tenantId), ['z-daily', 'a-users-failed'])
+  assert.equal(ranked[1]?.dueAt.getTime(), ago(60_000).getTime())
+})
+
+test('an abandoned hourly RUNNING row ranks by its attempt rather than an old success', () => {
+  const base = [...dailyCoverage(), state('USERS', 'SUCCEEDED', now), state('LICENSES'), state('DOMAINS')]
+  const daily = { id: 'z-daily', syncStates: base.map(s =>
+    s.resourceType === 'GROUPS' ? state('GROUPS', 'SUCCEEDED', ago(26 * HOUR)) : s) }
+  const abandoned = { id: 'a-running', syncStates: [...base, {
+    ...state('ORGANIZATION_CONFIGURATION', 'RUNNING', ago(10 * 24 * HOUR), ago(HOUR)),
+    lastErrorCode: null, lastErrorMessage: null,
+  }] }
+
+  const ranked = selectScheduledTenantWork([abandoned, daily], now, 2)
+  assert.deepEqual(ranked.map(work => work.tenantId), ['z-daily', 'a-running'])
+  assert.equal(ranked[1]?.dueAt.getTime(), ago(HOUR).getTime())
+})
 
 test('healthy secure-score alone selects incremental work at its one-hour boundary', () => {
   for (const age of [HOUR - 1, HOUR, HOUR + 1]) {
