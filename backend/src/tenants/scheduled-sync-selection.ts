@@ -171,7 +171,10 @@ function boundedCapacityFailure(state: DailyInventoryState) {
 }
 
 function retryableFailure(state: DailyInventoryState) {
-  if (authorizationFailure(state) || boundedCapacityFailure(state)) return false
+  // The candidate query already excludes internal failures. Keep the final
+  // dispatch gate aligned so an unrelated USERS visit cannot bypass it.
+  if (authorizationFailure(state) || boundedCapacityFailure(state) ||
+    state.lastErrorCode === 'HAWKVIEW_INTERNAL_FAILURE') return false
   if (state.lastErrorCode?.startsWith('MICROSOFT_')) {
     return [
       'MICROSOFT_TRANSIENT',

@@ -1,15 +1,16 @@
 # HawkView PM Continuity
 
-Last updated: 2026-10-21 for the local SYNC reliability review
+Last updated: 2026-10-21 for SYNC reliability release and retry review
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
 
-## SYNC reliability — fair work ranking (local, unpublished)
+## SYNC reliability — fair work ranking released; retry consistency under review
 
 - On the accepted PR #360 source base, a failed resource with an old prior success could rank by that old success instead of its recent failed attempt. A focused test reproduced a 16-minute targeted retry outranking a tenant whose daily inventory was overdue by 26 hours. The local repair ranks FAILED and abandoned RUNNING work by `lastAttemptAt`, successful work by `lastSuccessfulAt`, while preserving the existing eligibility and retry rules. Separate tests cover failed USERS and abandoned hourly RUNNING work.
-- The focused selection/admission suite passes 54/54, backend TypeScript and targeted ESLint pass. This branch has not been pushed, reviewed through protected CI, merged, released, or verified against a deployed scheduler. The full disposition and remaining reliability risks are in `docs/sync-reliability-audit-20261021.md`.
+- The focused selection/admission suite passed 54/54, backend TypeScript and targeted ESLint passed. PR #361 exact head `3891e5758dbfecf76d37e55d19707bac99e7d226` passed both required CI jobs in run `39715578990`, including migrated PostgreSQL and cron-image smoke. It protected-merged as `b1db4463def640f13e74713d1d74b57ad954b011` on 2026-10-22 at 03:30:42 UTC. The automatic API deploy `dep-dbco6p3m8hqs73ahlk1g` and cron deploy `dep-dbco6pbm8hqs73ahlkvg` became live for that exact merge; deployed API health run `39717343859` and authenticated two-MSP canary `39717343840` passed. This proves release health, not scheduler or payload completeness.
+- A separate local correction makes the final targeted-retry predicate exclude `HAWKVIEW_INTERNAL_FAILURE`, matching the database candidate filter so an unrelated USERS visit cannot dispatch it. After rebasing onto the PR #361 merge, 55 focused selection/admission tests, backend TypeScript and targeted ESLint passed. This second correction is not yet merged or released. The full disposition and remaining risks are in `docs/sync-reliability-audit-20261021.md`.
 - All six GreenTech MSP tenants had successful Secure Score collection by 2026-10-21 23:36:34 UTC, including the three normal scheduled recoveries recorded in `/private/tmp/hawkview-sync-today-20261021.md`. This is scoped stored-state evidence, not full payload completeness or all-SYNC acceptance. Five tenants still have Microsoft RISKY_USERS P2/access limits, five use limited non-premium SIGN_INS fallback, and the GreenTech DIRECTORY_ROLES role-OFF hold remains.
 
 ## P0 — branded production API origin (implementation ready; deployment cutover pending)
