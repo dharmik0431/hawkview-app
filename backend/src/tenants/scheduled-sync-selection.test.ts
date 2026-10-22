@@ -138,6 +138,24 @@ test('targeted retry backs off and the scheduler query excludes known authorizat
   assert.match(where, /403/)
 })
 
+test('an internal failure excluded from candidacy cannot retry through an unrelated USERS visit', () => {
+  const failed = {
+    ...state('SHAREPOINT_SETTINGS', 'FAILED', new Date('2026-08-16T15:00:00.000Z'),
+      new Date('2026-08-17T15:29:00.000Z')),
+    lastErrorCode: 'HAWKVIEW_INTERNAL_FAILURE',
+    lastErrorMessage: 'Internal collection failed.',
+    consecutiveFailures: 1,
+  }
+  assert.equal(shouldRunTargetedTransientRetry(failed, now), false)
+  const candidate = {
+    id: 'due-users',
+    syncStates: [...dailyCoverage(), state('LICENSES'), state('DOMAINS'),
+      state('USERS', 'SUCCEEDED', new Date('2026-08-17T15:54:00.000Z')), failed],
+  }
+  assert.equal(selectScheduledTenantWork([candidate], now, 1).length, 1,
+    'the tenant still has legitimate USERS work')
+})
+
 test('uses stable failure codes and cost-aware retry windows', () => {
   const lightTransient = {
     ...state('NAMED_LOCATIONS', 'FAILED', null, new Date('2026-08-17T15:44:00.000Z')),
