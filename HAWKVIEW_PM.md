@@ -1,10 +1,16 @@
 # HawkView PM Continuity
 
-Last updated: 2026-08-24 for the branded production API origin cutover preparation
+Last updated: 2026-10-21 for the local SYNC reliability review
 
 This file is the durable product-management handoff for HawkView. Read it before planning or changing the product after a new Codex session, and update it whenever a milestone, scope decision, blocker, deployment, or working agreement changes.
 
 Continuity rule: every HawkView task must read this file before making product or implementation decisions. Before finishing a milestone, update this file with the actual merged and deployed state—not merely the planned state. If repository code, GitHub, and this file disagree, verify the external state and correct this file.
+
+## SYNC reliability — fair work ranking (local, unpublished)
+
+- On the accepted PR #360 source base, a failed resource with an old prior success could rank by that old success instead of its recent failed attempt. A focused test reproduced a 16-minute targeted retry outranking a tenant whose daily inventory was overdue by 26 hours. The local repair ranks FAILED and abandoned RUNNING work by `lastAttemptAt`, successful work by `lastSuccessfulAt`, while preserving the existing eligibility and retry rules. Separate tests cover failed USERS and abandoned hourly RUNNING work.
+- The focused selection/admission suite passes 54/54, backend TypeScript and targeted ESLint pass. This branch has not been pushed, reviewed through protected CI, merged, released, or verified against a deployed scheduler. The full disposition and remaining reliability risks are in `docs/sync-reliability-audit-20261021.md`.
+- All six GreenTech MSP tenants had successful Secure Score collection by 2026-10-21 23:36:34 UTC, including the three normal scheduled recoveries recorded in `/private/tmp/hawkview-sync-today-20261021.md`. This is scoped stored-state evidence, not full payload completeness or all-SYNC acceptance. Five tenants still have Microsoft RISKY_USERS P2/access limits, five use limited non-premium SIGN_INS fallback, and the GreenTech DIRECTORY_ROLES role-OFF hold remains.
 
 ## P0 — branded production API origin (implementation ready; deployment cutover pending)
 
