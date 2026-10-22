@@ -1,12 +1,16 @@
 # SYNC reliability assessment — 2026-10-21
 
-This review starts at accepted PR #360 (`505503c7c7922dfc8792cdefd292ac4a2a94f9de`). It is a source review plus the previously recorded six-tenant GreenTech MSP observation, not a fleet-wide or payload-completeness certification. No tenant, Microsoft, production database, scheduler, or release operation was changed by this local branch.
+This review starts at accepted PR #360 (`505503c7c7922dfc8792cdefd292ac4a2a94f9de`). It combines source review with the previously recorded six-tenant GreenTech MSP observation, not a fleet-wide or payload-completeness certification. No Microsoft tenant settings, permissions, licences, or manual sync were changed by these source corrections.
 
 ## Concrete correction
 
 `selectScheduledTenantWork` previously ranked each eligible resource by the earlier of both its last attempt and last success. A recent FAILED attempt following an old success could therefore jump ahead of truly overdue daily work. A failing synthetic case placed a 16-minute targeted retry ahead of a 26-hour overdue daily resource because the retry's last success was ten days old. The corrected ranking uses the clock that governs the eligible work: the attempt for FAILED and abandoned RUNNING rows, and the success for healthy rows. It leaves the daily/full-pass decision, 5-minute USERS interval, hourly eligibility, retry backoff, and failure exclusions unchanged.
 
-The focused synthetic selection/admission tests pass 54/54, including independent cases for targeted failure, failed USERS, and abandoned RUNNING. Backend TypeScript, targeted ESLint, and diff checks pass. This is a local result. Protected CI, merge, automatic deployment, and an exact deployed behavior check remain absent.
+The focused synthetic selection/admission tests passed 54/54, including independent cases for targeted failure, failed USERS, and abandoned RUNNING. PR #361 exact head `3891e5758dbfecf76d37e55d19707bac99e7d226` passed both required CI jobs in run `39715578990`, including migrated PostgreSQL and cron-image smoke. Protected merge `b1db4463def640f13e74713d1d74b57ad954b011` occurred at 2026-10-22 03:30:42 UTC. Automatic API deploy `dep-dbco6p3m8hqs73ahlk1g` and cron deploy `dep-dbco6pbm8hqs73ahlkvg` became live for that revision, and exact deployed API health run `39717343859` plus authenticated two-MSP canary `39717343840` passed. No post-release scheduler-selection observation or payload-completeness proof is inferred from those checks.
+
+## Separate targeted-retry consistency correction
+
+The database candidate filter already excludes `HAWKVIEW_INTERNAL_FAILURE`, but the final pure predicate allowed it when another resource such as USERS admitted the tenant. A falsifying test reproduced that inconsistent dispatch path. The local correction excludes the internal failure from `shouldRunTargetedTransientRetry` without changing other retry policy, cadence, or collection. On the PR #361 merge base, 55 focused selection/admission tests, backend TypeScript, targeted ESLint, and diff check pass. This correction still needs its own protected CI, merge, and automatic release; do not count it as live.
 
 ## Remaining limits to a “bulletproof” claim
 
