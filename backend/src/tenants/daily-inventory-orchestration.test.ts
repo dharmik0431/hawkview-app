@@ -38,7 +38,17 @@ function fixture() {
       return next
     },
   }
+  let cursor = { scopeKey: 'TENANT_SYNC', afterTenantId: null as string | null, revision: 0 }
   const prisma: any = { syncState,
+    scheduledSyncCursor: {
+      createMany: async () => ({ count: 1 }),
+      findUnique: async () => ({ ...cursor }),
+      updateMany: async ({ where, data }: any) => {
+        if (where.revision !== cursor.revision) return { count: 0 }
+        cursor = { ...cursor, afterTenantId: data.afterTenantId, revision: cursor.revision + 1 }
+        return { count: 1 }
+      },
+    },
     tenantDomain: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
     customerTenant: { update: async () => tenant, findMany: async (args: any) => {
       query.push(args)

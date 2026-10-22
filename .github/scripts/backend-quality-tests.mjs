@@ -44,6 +44,7 @@ export const databaseTests = Object.freeze([
   'tenants/customer-connection-verification.database-integration.test.ts',
   'tenants/directory-role-receipt-store.database-integration.test.ts',
   'tenants/existing-tenant-consent.database-integration.test.ts',
+  'tenants/scheduled-sync-cursor.database-integration.test.ts',
   'tenants/tenant-directory.database-integration.test.ts',
   'workspace/workspace-audit.database-integration.test.ts',
   // This older filename contains an explicitly opted-in real PostgreSQL test.
@@ -86,7 +87,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: 'f984da4737e824e1fffecc1c1579934f4f1c74e2',
+    blob: 'cffb69c4b677acb882bdde2b4d846addea8353fd',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });
