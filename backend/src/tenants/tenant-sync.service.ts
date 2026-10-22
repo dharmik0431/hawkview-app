@@ -5668,6 +5668,7 @@ export class TenantSyncService {
     deltaLink: string | null,
     allowDeltaReset = true,
     limits: Readonly<EntraCollectionLimits> = USER_DELTA_COLLECTION_LIMITS,
+    budget: MicrosoftCollectionBudget = new MicrosoftCollectionBudget(limits, 'users'),
   ): Promise<{ deltaLink: string }> {
     const fullSyncStartedAt = deltaLink ? null : new Date()
     let nextUrl =
@@ -5675,8 +5676,6 @@ export class TenantSyncService {
       `https://graph.microsoft.com/v1.0/users/delta?$select=${USER_SELECT}`
     let finalDeltaLink: string | null = null
     const users: GraphUser[] = []
-    const budget = new MicrosoftCollectionBudget(limits, 'users')
-
     while (nextUrl) {
       budget.begin(nextUrl)
       if (!nextUrl.startsWith('https://graph.microsoft.com/')) {
@@ -5692,7 +5691,9 @@ export class TenantSyncService {
         if (deltaLink && allowDeltaReset) {
           this.logger.warn(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'USERS', phase: 'SNAPSHOT', outcome: 'REBUILDING', reasonCode: 'DELTA_CHECKPOINT_INVALIDATED' }))
           users.length = 0
-          return this.synchronizeUsers(tenant, accessToken, null, false, limits)
+          // A 410 invalidates the checkpoint, not the whole-visit resource
+          // budget. Rebuild with the same page, byte, and deadline ceilings.
+          return this.synchronizeUsers(tenant, accessToken, null, false, limits, budget)
         }
         throw new MicrosoftGraphCollectionError(
           `Microsoft users synchronization returned 410${metadata.suffix}.`,

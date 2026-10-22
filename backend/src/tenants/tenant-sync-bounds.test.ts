@@ -157,6 +157,35 @@ test('actual USERS delta fully validates bounded pages before any directory writ
   await assert.rejects(() => (service as any).synchronizeUsers(boundedTenant, 'token', initial, true, { ...limits, collectorDeadlineMs: 0 }), /bounded collection limit/)
 })
 
+test('a 410 delta reset cannot restart the USERS whole-collector page budget', async () => {
+  const writes: unknown[] = []
+  const service = new TenantSyncService({
+    directoryUser: {
+      upsert: async (value: unknown) => { writes.push(value) },
+      updateMany: async (value: unknown) => { writes.push(value) },
+    },
+    $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
+  } as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  const requests: string[] = []
+  ;(service as any).fetchGraphPage = async (url: string) => {
+    requests.push(url)
+    return requests.length === 1
+      ? new Response(JSON.stringify({ error: { code: 'syncStateNotFound' } }), { status: 410 })
+      : new Response(JSON.stringify({
+          value: [{ id: 'user-1', userPrincipalName: 'user@example.test' }],
+          '@odata.deltaLink': 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=new',
+        }))
+  }
+  const oldCheckpoint = 'https://graph.microsoft.com/v1.0/users/delta?checkpoint=old'
+  await assert.rejects(
+    () => (service as any).synchronizeUsers(boundedTenant, 'token', oldCheckpoint, true,
+      { ...USER_DELTA_COLLECTION_LIMITS, pages: 1 }),
+    /bounded collection limit/,
+  )
+  assert.equal(requests.length, 1, 'rebuild must stop before another provider request when page budget is exhausted')
+  assert.deepEqual(writes, [], 'no partial user inventory or checkpoint can be committed')
+})
+
 test('actual mailbox directory, settings, rules and optional configuration enforce transport and deadline before save', async () => {
   const methods = ['syncExchangeMailboxDirectory', 'syncExchangeMailboxSettings', 'syncExchangeMailboxRules', 'collectExchangeReadOnlyMailboxes']
   for (const method of methods) {
