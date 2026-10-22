@@ -1874,12 +1874,38 @@ function scheduledTenant(id: number) {
   }
 }
 
+function scheduledCursorPrisma(candidates: ReturnType<typeof scheduledTenant>[], queries: any[] = []) {
+  let cursor = { scopeKey: 'TENANT_SYNC', afterTenantId: null as string | null, revision: 0 }
+  return {
+    customerTenant: {
+      findMany: async (query: any) => {
+        queries.push(query)
+        const idFilter = query.where?.AND?.[1]?.id
+        return candidates.filter((tenant) =>
+          (!idFilter?.gt || tenant.id > idFilter.gt) &&
+          (!idFilter?.lte || tenant.id <= idFilter.lte)).slice(0, query.take)
+      },
+    },
+    scheduledSyncCursor: {
+      createMany: async () => ({ count: 0 }),
+      findUnique: async () => ({ ...cursor }),
+      updateMany: async (query: any) => {
+        if (query.where.revision !== cursor.revision) return { count: 0 }
+        cursor = {
+          ...cursor,
+          afterTenantId: query.data.afterTenantId,
+          revision: cursor.revision + 1,
+        }
+        return { count: 1 }
+      },
+    },
+  }
+}
+
 test('actual scheduled service excludes active leases before its 1,000-candidate window and rotates productive work after lock losses', async () => {
   const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
   const queries: any[] = []
-  const prisma = {
-    customerTenant: { findMany: async (query: any) => { queries.push(query); return candidates } },
-  }
+  const prisma = scheduledCursorPrisma(candidates, queries)
   const service = new TenantSyncService(prisma as never, {} as never, {} as never, {} as never, new ChangeEvidenceService({} as never), {} as never)
   const attempted: string[] = []
   ;(service as any).syncConnectedTenant = async (tenant: any) => {
@@ -1896,7 +1922,7 @@ test('actual scheduled service excludes active leases before its 1,000-candidate
     assert.equal(summary.skipped, 1)
     assert.equal(attempted.length, 26, 'a lock loser must not consume a productive slot')
     assert.equal(attempted.at(-1), 'tenant-0026')
-    const leaseClause = queries[0]?.where?.AND?.[0]?.syncStates?.none
+    const leaseClause = queries[0]?.where?.AND?.[0]?.AND?.[0]?.syncStates?.none
     assert.equal(leaseClause?.resourceType, 'USERS')
     assert.equal(leaseClause?.status, 'RUNNING')
     assert.ok(leaseClause?.lastAttemptAt?.gt instanceof Date, 'active USERS leases are filtered by the database query before take:1000')
@@ -1919,7 +1945,7 @@ test('production scheduled sync invokes the approved identity-risk scheduler con
     },
   }
   const service = new TenantSyncService(
-    { customerTenant: { findMany: async () => [tenant] } } as never,
+    scheduledCursorPrisma([tenant]) as never,
     {} as never,
     {} as never,
     {} as never,
@@ -1991,7 +2017,7 @@ test('targeted retry maps Named Locations to its exact tenant-level Graph collec
 
 test('two actual scheduled service runs share leases without duplicate productive tenants and advance beyond the first batch', async () => {
   const candidates = Array.from({ length: 1_000 }, (_, index) => scheduledTenant(index + 1))
-  const prisma = { customerTenant: { findMany: async () => candidates } }
+  const prisma = scheduledCursorPrisma(candidates)
   const active = new Set<string>()
   const completed = new Set<string>()
   const executed: string[] = []

@@ -1839,63 +1839,24 @@ export class TenantSyncService {
       1,
       Math.min(25, Number(process.env.SCHEDULED_SYNC_BATCH_SIZE ?? 10) || 10)
     )
-    // Read a bounded fair-candidate window, then rank it by the due resource
-    // state below.  `updatedAt` is intentionally not a scheduling signal:
-    // a noisy tenant must not starve 1,000 other due tenants.
+    // Rotate a bounded candidate window across the entire durable tenant ID
+    // space. `updatedAt` is not a scheduling signal: a noisy tenant cannot
+    // pin every tick to the first 1,000 due IDs.
     const candidateLimit = Math.max(limit, Math.min(1_000, Number(process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT ?? 1_000) || 1_000))
-    const candidateTenants = await this.prisma.customerTenant.findMany({
-      where: scheduledSyncTenantWhere(now),
-      orderBy: { id: 'asc' },
-      take: candidateLimit,
-      select: {
-        id: true,
-        organizationId: true,
-        microsoftTenantId: true,
-        displayName: true,
-        primaryDomain: true,
-        status: true,
-        connection: {
-          select: {
-            status: true,
-            connectionMode: true,
-            clientId: true,
-            credentialReference: true,
-            lastVerifiedAt: true,
-            consentedAt: true,
-            onboardingCompletedAt: true,
-            exchangeReadOnlyEnabledAt: true,
-          },
-        },
-        syncStates: {
-          where: {
-            resourceType: {
-              in: [
-                'USERS',
-                ...DAILY_INVENTORY_ANCHORS,
-                ...DAILY_INVENTORY_RESOURCES,
-                'EXCHANGE_MAILBOX_CONFIGURATION',
-                ...TARGETED_TRANSIENT_RETRY_RESOURCES,
-              ],
-            },
-          },
-          select: {
-            resourceType: true,
-            status: true,
-            lastAttemptAt: true,
-            lastSuccessfulAt: true,
-            lastErrorCode: true,
-            lastErrorMessage: true,
-            consecutiveFailures: true,
-          },
-        },
-      },
-    })
+    const { candidateTenants, firstSegmentLength } = await this.readScheduledCandidateWindow(now, candidateLimit)
 
     const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit)
     const selectedById = new Map(selectedWork.map((work) => [work.tenantId, work]))
+    const scanSegmentById = new Map(candidateTenants.map((tenant, index) =>
+      [tenant.id, index < firstSegmentLength ? 0 : 1]))
     const tenants = candidateTenants
       .filter((tenant) => selectedById.has(tenant.id))
       .sort((left, right) => {
+        // When a scan wraps, finish the IDs beyond the old cursor before
+        // returning to the prefix. Otherwise old dueAt ties in the prefix
+        // could still hide tenants beyond the 1,000-row window forever.
+        const segment = (scanSegmentById.get(left.id) ?? 0) - (scanSegmentById.get(right.id) ?? 0)
+        if (segment) return segment
         const leftWork = selectedById.get(left.id)!
         const rightWork = selectedById.get(right.id)!
         return leftWork.dueAt.getTime() - rightWork.dueAt.getTime() || left.id.localeCompare(right.id)
@@ -1947,6 +1908,82 @@ export class TenantSyncService {
       `Scheduled tenant synchronization: ${JSON.stringify({ checkedAt: summary.checkedAt, due: summary.due, succeeded: summary.succeeded, partial: summary.partial, failed: summary.failed, skipped: summary.skipped })}`
     )
     return summary
+  }
+
+  private async readScheduledCandidateWindow(now: Date, candidateLimit: number) {
+    const select = {
+        id: true,
+        organizationId: true,
+        microsoftTenantId: true,
+        displayName: true,
+        primaryDomain: true,
+        status: true,
+        connection: {
+          select: {
+            status: true,
+            connectionMode: true,
+            clientId: true,
+            credentialReference: true,
+            lastVerifiedAt: true,
+            consentedAt: true,
+            onboardingCompletedAt: true,
+            exchangeReadOnlyEnabledAt: true,
+          },
+        },
+        syncStates: {
+          where: {
+            resourceType: {
+              in: [
+                'USERS',
+                ...DAILY_INVENTORY_ANCHORS,
+                ...DAILY_INVENTORY_RESOURCES,
+                'EXCHANGE_MAILBOX_CONFIGURATION',
+                ...TARGETED_TRANSIENT_RETRY_RESOURCES,
+              ],
+            },
+          },
+          select: {
+            resourceType: true,
+            status: true,
+            lastAttemptAt: true,
+            lastSuccessfulAt: true,
+            lastErrorCode: true,
+            lastErrorMessage: true,
+            consecutiveFailures: true,
+          },
+        },
+      } as const satisfies Prisma.CustomerTenantSelect
+    const scopeKey = 'TENANT_SYNC'
+    await this.prisma.scheduledSyncCursor.createMany({
+      data: [{ scopeKey }],
+      skipDuplicates: true,
+    })
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const cursor = await this.prisma.scheduledSyncCursor.findUnique({ where: { scopeKey } })
+      if (!cursor) throw new Error('Scheduled sync cursor unavailable')
+      const baseWhere = scheduledSyncTenantWhere(now)
+      const readPage = (idWhere: Prisma.CustomerTenantWhereInput, take: number) =>
+        this.prisma.customerTenant.findMany({
+          where: { AND: [baseWhere, idWhere] },
+          orderBy: { id: 'asc' },
+          take,
+          select,
+        })
+      const first = await readPage(cursor.afterTenantId ? { id: { gt: cursor.afterTenantId } } : {}, candidateLimit)
+      const wrapped = cursor.afterTenantId && first.length < candidateLimit
+        ? await readPage({ id: { lte: cursor.afterTenantId } }, candidateLimit - first.length)
+        : []
+      const candidateTenants = [...first, ...wrapped]
+      const afterTenantId = candidateTenants.at(-1)?.id ?? cursor.afterTenantId
+      const advanced = await this.prisma.scheduledSyncCursor.updateMany({
+        where: { scopeKey, revision: cursor.revision },
+        data: { afterTenantId, revision: { increment: 1 } },
+      })
+      if (advanced.count === 1) return { candidateTenants, firstSegmentLength: first.length }
+    }
+    // Another scheduler won every compare-and-swap. Failing closed is safer
+    // than returning a duplicate first page; the next normal tick retries.
+    throw new Error('Scheduled sync cursor contention')
   }
 
   /**

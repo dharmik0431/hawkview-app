@@ -1255,6 +1255,16 @@ model IdentityRiskSchedulerCursor {
   @@map("identity_risk_scheduler_cursors")
 }
 
+// Internal scan position for scheduled tenant collection. It is independent
+// from the identity-risk scheduler and contains no tenant payload or secret.
+model ScheduledSyncCursor {
+  scopeKey String @id @map("scope_key") @db.VarChar(40)
+  afterTenantId String? @map("after_tenant_id") @db.Uuid
+  revision Int @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+  @@map("scheduled_sync_cursors")
+}
+
 model IdentityRiskAttemptHead {
   organizationId String @map("organization_id") @db.Uuid
   customerTenantId String @map("customer_tenant_id") @db.Uuid
