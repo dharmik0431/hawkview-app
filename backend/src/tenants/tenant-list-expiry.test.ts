@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TenantsService } from './tenants.service.js'
 import { TENANT_HEALTH_RESOURCE_REGISTRY } from './tenant-health.js'
-import { TENANT_DIRECTORY_AUDIT_LIMIT } from './tenant-directory-audit-reader.js'
+import { TENANT_DIRECTORY_AUDIT_EVENT_BYTES, TENANT_DIRECTORY_AUDIT_LIMIT } from './tenant-directory-audit-reader.js'
 
 const NOW = new Date('2026-10-12T01:00:00.000Z')
 const DAY = 24 * 60 * 60 * 1000
@@ -210,6 +210,55 @@ test('tenant list expiry: noisy tenant cannot hide a quiet tenant critical findi
   assert.deepEqual(auditKeys(savedQuiet.payload), ['audit-ca-quiet-critical'])
   assert.equal(savedQuiet.payload.security.directoryAuditRead.eligibleEventCount, 1)
   assert.equal(f.queries.length, 1, 'a large tenant list does not fan out per tenant')
+})
+
+test('tenant list expiry: oversized audit payload fails only its tenant closed', async () => {
+  const priorCritical = { ...audit('prior-critical', 1, -50, 'a'),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }
+  const oversized = { ...audit('oversized', 1, -100, 'a'),
+    targetResources: [{ type: 'authenticationMethod', displayName: 'x'.repeat(TENANT_DIRECTORY_AUDIT_EVENT_BYTES + 1) }] }
+  const quiet = { ...audit('quiet', 1, -200, 'b'),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }
+  const f = fixture([priorCritical, oversized, quiet], { tenants: [healthyTenant('a'), healthyTenant('b')] })
+  const result = await read(f)
+  const large = result.tenants.find(tenant => tenant.id === 'a')!
+  const other = result.tenants.find(tenant => tenant.id === 'b')!
+  assert.equal(large.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.equal(large.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.equal(large.tenantHealth.security.status, 'CRITICAL')
+  assert.notEqual(large.tenantHealth.overallStatus, 'HEALTHY')
+  assert.deepEqual(auditKeys(large), ['audit-ca-prior-critical'])
+  assert.equal(other.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(other.tenantHealth.security.status, 'CRITICAL')
+  assert.deepEqual(auditKeys(other), ['audit-ca-quiet'])
+  assert.deepEqual(f.writes.map(write => write.payload.security.directoryAuditRead.status),
+    ['NOT_READ', 'COMPLETE'])
+})
+
+test('tenant list expiry: deeply nested audit payload cannot recurse into a healthy verdict', async () => {
+  let nested: unknown = { displayName: 'Synthetic target' }
+  for (let depth = 0; depth < 40; depth++) nested = { nested }
+  const row = { ...audit('deep', 1), targetResources: nested as never }
+  const f = fixture([row], { tenants: [healthyTenant('a')] })
+  const result = await read(f)
+  assert.equal(result.tenants[0]!.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.notEqual(result.tenants[0]!.tenantHealth.overallStatus, 'HEALTHY')
+  assert.equal(f.writes[0].payload.security.directoryAuditRead.status, 'NOT_READ')
+})
+
+test('tenant list expiry: individually bounded events cannot exceed one tenant projection budget', async () => {
+  const rows = Array.from({ length: 9 }, (_, index) => ({
+    ...audit(`large-${index}`, 1, -index),
+    activityDisplayName: 'Read directory configuration', operationType: 'Read',
+    targetResources: [{ type: 'directory', displayName: 'x'.repeat(8 * 1024) }],
+  }))
+  const f = fixture(rows, { tenants: [healthyTenant('a')] })
+  const result = await read(f)
+  assert.equal(result.tenants[0]!.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.notEqual(result.tenants[0]!.tenantHealth.overallStatus, 'HEALTHY')
+  assert.equal(f.writes[0].payload.security.directoryAuditRead.status, 'NOT_READ')
 })
 
 test('tenant mapping without an audit read does not claim an authoritative empty window', t => {

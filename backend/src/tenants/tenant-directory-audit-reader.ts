@@ -11,6 +11,13 @@ import type { DirectoryAuditReadStatus, TenantAuditEvent } from './tenant-health
  * plan, row widths, and latency in disposable CI before claiming that scale.
  */
 export const TENANT_DIRECTORY_AUDIT_LIMIT = 16
+// These limits protect health projection after the database read. They do not
+// bound SQL transfer or duration; the two-phase read is still required before
+// this candidate can be released at MSP scale.
+export const TENANT_DIRECTORY_AUDIT_EVENT_BYTES = 16 * 1024
+const TENANT_DIRECTORY_AUDIT_TENANT_BYTES = 64 * 1024
+const TENANT_DIRECTORY_AUDIT_PAYLOAD_NODES = 2_048
+const TENANT_DIRECTORY_AUDIT_PAYLOAD_DEPTH = 24
 
 type AuthorizedTenant = { id: string; organizationId: string }
 export type TenantDirectoryAuditWindow = {
@@ -30,6 +37,42 @@ type AuditRow = {
   result: string | null
   initiatedBy: unknown
   targetResources: unknown
+}
+
+function boundedPayloadBytes(row: AuditRow): number | null {
+  const values: Array<{ value: unknown; depth: number }> = [
+    row.microsoftAuditId, row.activityDisplayName, row.category,
+    row.operationType, row.result, row.initiatedBy, row.targetResources,
+  ].map(value => ({ value, depth: 0 }))
+  const seen = new Set<object>()
+  let nodes = 0
+  let bytes = 0
+  while (values.length > 0) {
+    const { value, depth } = values.pop()!
+    if (++nodes > TENANT_DIRECTORY_AUDIT_PAYLOAD_NODES || depth > TENANT_DIRECTORY_AUDIT_PAYLOAD_DEPTH) return null
+    if (typeof value === 'string') {
+      if (value.length > TENANT_DIRECTORY_AUDIT_EVENT_BYTES - bytes) return null
+      bytes += Buffer.byteLength(value, 'utf8')
+    } else if (Array.isArray(value)) {
+      if (seen.has(value) || value.length > TENANT_DIRECTORY_AUDIT_PAYLOAD_NODES - nodes - values.length) return null
+      seen.add(value)
+      for (const item of value) values.push({ value: item, depth: depth + 1 })
+    } else if (value !== null && typeof value === 'object') {
+      if (seen.has(value)) return null
+      seen.add(value)
+      for (const key in value) {
+        if (!Object.hasOwn(value, key)) continue
+        if (key.length > TENANT_DIRECTORY_AUDIT_EVENT_BYTES - bytes) return null
+        bytes += Buffer.byteLength(key, 'utf8')
+        values.push({ value: (value as Record<string, unknown>)[key], depth: depth + 1 })
+        if (values.length + nodes > TENANT_DIRECTORY_AUDIT_PAYLOAD_NODES) return null
+      }
+    } else {
+      bytes += 8
+    }
+    if (bytes > TENANT_DIRECTORY_AUDIT_EVENT_BYTES) return null
+  }
+  return bytes
 }
 
 /**
@@ -85,12 +128,14 @@ export async function readTenantDirectoryAuditWindows(
     { status: 'COMPLETE' as DirectoryAuditReadStatus, events: [] as TenantAuditEvent[] },
   ]))
   const seen = new Set<string>()
+  const payloadBytes = new Map<string, number>()
   for (const row of rows) {
     const key = `${row.organizationId}:${row.customerTenantId}`
     const window = expected.get(key)
     if (!window) throw new Error('Directory audit read returned an unauthorized tenant scope.')
     seen.add(key)
     if (row.eventId === null) continue
+    if (window.status === 'NOT_READ') continue
     if (typeof row.eventId !== 'string' || typeof row.microsoftAuditId !== 'string' ||
         !(row.eventDateTime instanceof Date) || Number.isNaN(row.eventDateTime.getTime()) ||
         typeof row.activityDisplayName !== 'string') {
@@ -100,6 +145,15 @@ export async function readTenantDirectoryAuditWindows(
       window.status = 'CAPPED'
       continue
     }
+    const eventBytes = boundedPayloadBytes(row)
+    const nextBytes = (payloadBytes.get(key) ?? 0) + (eventBytes ?? 0)
+    if (eventBytes === null || nextBytes > TENANT_DIRECTORY_AUDIT_TENANT_BYTES) {
+      // Some evidence was unreadable within the projection budget. Do not
+      // present a truncated or empty window as an authoritative healthy one.
+      window.status = 'NOT_READ'
+      continue
+    }
+    payloadBytes.set(key, nextBytes)
     window.events.push({
       microsoftAuditId: row.microsoftAuditId,
       eventDateTime: row.eventDateTime,
