@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
   intakeReviewReason, isActiveIntakeFinding, sameIntakeSourceSnapshot,
@@ -28,7 +29,9 @@ const receipt = (
   outcome: IntakeDecisionReceipt['outcome'],
   selected: IntakeSourceSnapshot = source,
 ): IntakeDecisionReceipt => ({
-  source: selected, outcome, mappingRevision: 'reviewed-map-a',
+  findingId: selected.id, organizationId: selected.organizationId,
+  customerTenantId: selected.customerTenantId, ruleId: selected.ruleId,
+  ruleVersion: selected.ruleVersion, outcome, mappingRevision: 'reviewed-map-a',
 })
 
 test('OPEN and UPDATED are both active; resolved, expired and unknown are not', () => {
@@ -72,6 +75,8 @@ test('completed findings remain terminal across ordinary source refreshes', () =
     observedAt: '2026-10-25T11:00:00.123456Z', updatedAt: '2026-10-25T11:01:00.123456Z' },
   receipt('COMPLETED'), 'reviewed-map-a'), 'UNCHANGED')
   assert.equal(intakeReviewReason({ ...source, dedupeKey: 'new-evidence' },
+    receipt('COMPLETED'), 'reviewed-map-a'), 'UNCHANGED')
+  assert.equal(intakeReviewReason({ ...source, id: 'finding-b' },
     receipt('COMPLETED'), 'reviewed-map-a'), 'IDENTITY_CHANGED')
   assert.equal(intakeReviewReason({ ...source, organizationId: 'another-org' },
     receipt('COMPLETED'), 'reviewed-map-a'), 'SCOPE_MISMATCH')
@@ -112,13 +117,31 @@ test('unmapped rules stay blocked across ordinary refreshes and reopen for mappi
     blocked, 'reviewed-map-a'), 'MAPPING_CHANGED')
   assert.equal(intakeReviewReason({ ...source, ruleVersion: 'v2' },
     blocked, 'reviewed-map-a'), 'MAPPING_CHANGED')
-  for (const changedIdentity of [{ id: 'finding-b' }, { dedupeKey: 'evidence-b' }])
+  for (const changedIdentity of [{ id: 'finding-b' }])
     assert.equal(intakeReviewReason({ ...source, ...changedIdentity }, blocked, 'reviewed-map-a'),
       'IDENTITY_CHANGED')
+  assert.equal(intakeReviewReason({ ...source, dedupeKey: 'evidence-b' }, blocked,
+    'reviewed-map-a'), 'BLOCKED_UNMAPPED')
   for (const changedScope of [{ organizationId: 'org-b' }, { customerTenantId: 'tenant-b' }])
     assert.equal(intakeReviewReason({ ...source, ...changedScope }, blocked, 'reviewed-map-a'),
       'SCOPE_MISMATCH')
   for (const changedSubject of [{ subjectType: 'APPLICATION' }, { subjectId: 'subject-b' }])
     assert.equal(intakeReviewReason({ ...source, ...changedSubject }, blocked, 'reviewed-map-a'),
       'BLOCKED_UNMAPPED')
+})
+
+test('both current producers keep the dedupe identity on same-row upsert', () => {
+  const evaluator = readFileSync(new URL('../identity-risk/identity-risk-evaluator.service.ts', import.meta.url), 'utf8')
+  const evaluatorUpsert = evaluator.split('transaction.identityRiskFinding.upsert({')[1]
+  assert.ok(evaluatorUpsert, 'expected the evaluator finding upsert')
+  assert.match(evaluatorUpsert, /organizationId_customerTenantId_dedupeKey/)
+  const evaluatorUpdate = evaluatorUpsert.split('update: {')[1]?.split('},\n        })')[0]
+  assert.ok(evaluatorUpdate, 'expected the evaluator finding update projection')
+  assert.doesNotMatch(evaluatorUpdate, /\bdedupeKey\s*:/)
+
+  const native = readFileSync(new URL('../risky-users-wiring/native-alert-publisher.ts', import.meta.url), 'utf8')
+  const nativeUpdate = native.split('ON CONFLICT (organization_id, customer_tenant_id, dedupe_key) DO UPDATE SET')[1]
+    ?.split('`')[0]
+  assert.ok(nativeUpdate, 'expected the native publisher conflict update')
+  assert.doesNotMatch(nativeUpdate, /\bdedupe_key\s*=/)
 })

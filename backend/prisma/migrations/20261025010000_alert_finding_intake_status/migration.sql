@@ -8,27 +8,20 @@ CREATE TABLE "public"."alert_finding_intake_status" (
   "finding_id" UUID NOT NULL,
   "organization_id" UUID NOT NULL,
   "customer_tenant_id" UUID NOT NULL,
-  "dedupe_key" VARCHAR(128) NOT NULL,
-  "source_matched_result_id" UUID NOT NULL,
   "source_rule_id" VARCHAR(150) NOT NULL,
   "source_rule_version" VARCHAR(100) NOT NULL,
-  "source_subject_type" VARCHAR(50) NOT NULL,
-  "source_subject_id" VARCHAR(128) NOT NULL,
-  "source_state" VARCHAR(30) NOT NULL,
-  "source_severity" VARCHAR(20) NOT NULL,
-  "source_confidence" VARCHAR(20) NOT NULL,
-  "source_coverage" VARCHAR(20) NOT NULL,
-  "source_observed_at" TIMESTAMPTZ(6) NOT NULL,
-  "source_expires_at" TIMESTAMPTZ(6) NOT NULL,
-  "source_updated_at" TIMESTAMPTZ(6) NOT NULL,
   "outcome" VARCHAR(30) NOT NULL,
   "mapping_revision" VARCHAR(64) NOT NULL,
   "decided_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "next_cleanup_check_at" TIMESTAMPTZ(6) NOT NULL,
   "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updated_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "alert_finding_intake_status_pkey" PRIMARY KEY ("finding_id"),
   CONSTRAINT "alert_finding_intake_status_outcome_check" CHECK ("outcome" IN
     ('COMPLETED', 'BLOCKED_UNMAPPED', 'AGED_OUT_RECORDED', 'EXPIRED_BEFORE_INTAKE')),
+  CONSTRAINT "alert_finding_intake_status_cleanup_window_check" CHECK (
+    isfinite("decided_at") AND isfinite("next_cleanup_check_at")
+    AND "next_cleanup_check_at" >= "decided_at" + INTERVAL '2160 hours'),
   CONSTRAINT "alert_finding_intake_status_tenant_scope_fkey"
     FOREIGN KEY ("customer_tenant_id", "organization_id")
     REFERENCES "public"."customer_tenants"("id", "organization_id") ON DELETE CASCADE ON UPDATE CASCADE
@@ -37,6 +30,10 @@ CREATE TABLE "public"."alert_finding_intake_status" (
 CREATE INDEX "alert_finding_intake_status_scope_outcome"
   ON "public"."alert_finding_intake_status"
   ("organization_id", "customer_tenant_id", "outcome", "decided_at" DESC);
+
+CREATE INDEX "alert_finding_intake_status_cleanup_due"
+  ON "public"."alert_finding_intake_status"
+  ("next_cleanup_check_at", "finding_id");
 
 -- Match the public-schema deny-all boundary: only the backend table owner
 -- accesses this receipt store. CI stock PostgreSQL may lack browser roles.

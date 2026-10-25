@@ -27,7 +27,11 @@ export type IntakeSourceSnapshot = Readonly<{
 }>
 
 export type IntakeDecisionReceipt = Readonly<{
-  source: IntakeSourceSnapshot
+  findingId: string
+  organizationId: string
+  customerTenantId: string
+  ruleId: string
+  ruleVersion: string
   outcome: 'COMPLETED' | 'BLOCKED_UNMAPPED' | 'AGED_OUT_RECORDED' | 'EXPIRED_BEFORE_INTAKE'
   mappingRevision: string
 }>
@@ -69,9 +73,11 @@ export function sameIntakeSourceSnapshot(
 }
 
 /**
- * Durable eligibility follows finding/dedupe identity, not the evaluator's
+ * Durable eligibility follows the immutable finding UUID, not the evaluator's
  * mutable source version. Its routine OPEN -> UPDATED and timestamp refreshes
  * must not requeue a completed or terminal finding ahead of unseen evidence.
+ * Producers upsert by scoped dedupe key without updating that key on the same
+ * finding row. A deliberate new evidence identity must create a new UUID.
  * A changed tenant scope requires explicit review; it is not a candidate.
  * Unmapped rules reopen only when their rule id/version or reviewed mapping
  * revision changes. The future SQL selector must apply this predicate before
@@ -84,13 +90,12 @@ export function intakeReviewReason(
 ): IntakeReviewReason {
   if (!isActiveIntakeFinding(source.state)) return 'INACTIVE'
   if (receipt === null) return 'UNSEEN'
-  if (receipt.source.organizationId !== source.organizationId ||
-    receipt.source.customerTenantId !== source.customerTenantId) return 'SCOPE_MISMATCH'
-  if (receipt.source.id !== source.id ||
-    receipt.source.dedupeKey !== source.dedupeKey) return 'IDENTITY_CHANGED'
+  if (receipt.organizationId !== source.organizationId ||
+    receipt.customerTenantId !== source.customerTenantId) return 'SCOPE_MISMATCH'
+  if (receipt.findingId !== source.id) return 'IDENTITY_CHANGED'
   if (receipt.outcome === 'BLOCKED_UNMAPPED') {
-    return receipt.source.ruleId !== source.ruleId ||
-      receipt.source.ruleVersion !== source.ruleVersion ||
+    return receipt.ruleId !== source.ruleId ||
+      receipt.ruleVersion !== source.ruleVersion ||
       receipt.mappingRevision !== mappingRevision
       ? 'MAPPING_CHANGED' : 'BLOCKED_UNMAPPED'
   }
