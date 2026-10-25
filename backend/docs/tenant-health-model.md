@@ -24,13 +24,19 @@ and operational evidence. A connected tenant is not automatically healthy.
   current required data, healthy security evidence, and no failed jobs.
 - `security.directoryAuditRead.status` describes the local retained-event
   read, separately from Microsoft collector completeness. It is `COMPLETE`
-  only when the bounded tenant-directory query did not truncate its eligible
-  24-hour window. An exact 500 rows is complete; a 501st row makes the read
-  `CAPPED`. Other tenant mapping paths use `NOT_READ`. For `CAPPED` or
-  `NOT_READ`, `eligibleEventCount` is `null` and absent audit findings cannot
+  only when that tenant's bounded audit query did not truncate its eligible
+  24-hour window. The tenant-directory query uses one parameterized lateral
+  read for the authorized tenant pairs and reads at most 17 eligible events
+  per tenant: an exact 16 is complete and a 17th makes that tenant `CAPPED`.
+  The event and saved-expiry predicates run before the per-tenant limit, and
+  ordering is by event time then row ID. A query error makes all returned
+  tenant windows `NOT_READ`; other tenant mapping paths also use `NOT_READ`.
+  For `CAPPED` or `NOT_READ`, `eligibleEventCount` is `null` and absent audit findings cannot
   make security or overall status healthy. Observed high or critical findings
-  still take precedence. The current global limit can hide a quiet tenant's
-  finding; tenant-fair retrieval remains separate work.
+  still take precedence. One noisy tenant no longer consumes a quiet tenant's
+  event allowance. The 16-event threshold still limits deep per-tenant review;
+  1,000-tenant throughput and row size need disposable-CI measurements. The
+  separate per-tenant health snapshot writes remain a scaling issue.
 
 Every list evaluation returns the legacy `healthScore`, `mfaCoverage`, and
 `attention` fields plus a versioned `tenantHealth` object. It also saves an

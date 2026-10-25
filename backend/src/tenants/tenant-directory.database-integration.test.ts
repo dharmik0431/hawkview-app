@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangesService } from '../changes/changes.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantsService } from './tenants.service.js'
+import { readTenantDirectoryAuditWindows, TENANT_DIRECTORY_AUDIT_LIMIT } from './tenant-directory-audit-reader.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 
 const databaseIntegrationEnabled =
@@ -1214,5 +1215,72 @@ test(
       assert.doesNotMatch(text, new RegExp(leak), leak)
     }
     assert.match(text, /kept-note/)
+  },
+)
+
+test(
+  'a migrated PostgreSQL database reads bounded eligible audit windows independently per tenant',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const testRun = randomUUID()
+    const noisy = await seedExportWorkspace(prisma, 'fair-audit-noisy', testRun, track)
+    const foreign = await seedExportWorkspace(prisma, 'fair-audit-foreign', testRun, track)
+    const quietTenant = await prisma.customerTenant.create({ data: {
+      organizationId: noisy.organizationId, microsoftTenantId: randomUUID(),
+      displayName: 'Fair audit quiet tenant', status: 'ACTIVE',
+    } })
+    const emptyTenant = await prisma.customerTenant.create({ data: {
+      organizationId: noisy.organizationId, microsoftTenantId: randomUUID(),
+      displayName: 'Fair audit empty tenant', status: 'ACTIVE',
+    } })
+    const quiet = { ...noisy, tenantId: quietTenant.id }
+    const at = READ_CLOCK
+    const base = (workspace: ExportWorkspace, index: number, overrides: Record<string, unknown> = {}) => ({
+      ...exportAuditRow(workspace, index, {
+        eventDateTime: readDate(-index), expiresAt: readDate(1), ...overrides,
+      }),
+      id: randomUUID(),
+    })
+    const noisyRows = Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT }, (_, i) =>
+      base(noisy, i, { eventDateTime: readDate(-100) }))
+    await prisma.directoryAuditLog.createMany({ data: [
+      ...noisyRows,
+      base(quiet, 300, { activityDisplayName: 'Disable conditional access policy' }),
+      base(quiet, 301, { eventDateTime: readDate(-1), expiresAt: at }),
+      base(quiet, 302, { eventDateTime: readDate(-24 * 60 * 60 * 1000 - 1) }),
+      base(foreign, 303),
+    ] })
+    const requested = [
+      { id: noisy.tenantId, organizationId: noisy.organizationId },
+      { id: quiet.tenantId, organizationId: quiet.organizationId },
+      { id: emptyTenant.id, organizationId: noisy.organizationId },
+      // A foreign tenant ID paired with this organization cannot join a row.
+      { id: foreign.tenantId, organizationId: noisy.organizationId },
+    ]
+    const exact = await readTenantDirectoryAuditWindows(prisma, requested, at)
+    assert.equal(exact.get(noisy.tenantId)?.status, 'COMPLETE')
+    assert.equal(exact.get(noisy.tenantId)?.events.length, TENANT_DIRECTORY_AUDIT_LIMIT)
+    assert.deepEqual(exact.get(noisy.tenantId)?.events.map(row => row.microsoftAuditId),
+      [...noisyRows].sort((a, b) => b.id.localeCompare(a.id)).map(row => row.microsoftAuditId),
+      'equal event times use the row ID as a deterministic tie-breaker')
+    assert.deepEqual(exact.get(quiet.tenantId)?.events.map(row => row.microsoftAuditId),
+      [`export-${quiet.tenantId}-300`], 'expiry and 24-hour eligibility precede LIMIT')
+    assert.deepEqual(exact.get(emptyTenant.id), { status: 'COMPLETE', events: [] })
+    assert.deepEqual(exact.get(foreign.tenantId), { status: 'COMPLETE', events: [] })
+
+    const overflow = base(noisy, 400, { eventDateTime: readDate(-100) })
+    await prisma.directoryAuditLog.create({ data: overflow })
+    const capped = await readTenantDirectoryAuditWindows(prisma, requested, at)
+    assert.equal(capped.get(noisy.tenantId)?.status, 'CAPPED')
+    assert.equal(capped.get(noisy.tenantId)?.events.length, TENANT_DIRECTORY_AUDIT_LIMIT)
+    assert.deepEqual(capped.get(noisy.tenantId)?.events.map(row => row.microsoftAuditId),
+      [...noisyRows, overflow].sort((a, b) => b.id.localeCompare(a.id))
+        .slice(0, TENANT_DIRECTORY_AUDIT_LIMIT).map(row => row.microsoftAuditId))
+    assert.equal(capped.get(quiet.tenantId)?.status, 'COMPLETE')
+    assert.deepEqual(capped.get(quiet.tenantId)?.events.map(row => row.microsoftAuditId),
+      [`export-${quiet.tenantId}-300`])
   },
 )

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TenantsService } from './tenants.service.js'
 import { TENANT_HEALTH_RESOURCE_REGISTRY } from './tenant-health.js'
+import { TENANT_DIRECTORY_AUDIT_LIMIT } from './tenant-directory-audit-reader.js'
 
 const NOW = new Date('2026-10-12T01:00:00.000Z')
 const DAY = 24 * 60 * 60 * 1000
@@ -17,7 +18,7 @@ const consent = {
 // in the recent24h window. These deliberately pin the independent saved field.
 function audit(id: string, expiry: number, event = -1000, tenant = 'a', org = 'org-a') {
   return {
-    customerTenantId: tenant, organizationId: org, microsoftAuditId: id,
+    id, customerTenantId: tenant, organizationId: org, microsoftAuditId: id,
     eventDateTime: date(event), expiresAt: date(expiry), ingestedAt: date(-2000),
     activityDisplayName: 'Update authentication method', category: 'UserManagement',
     operationType: 'Update', result: 'success',
@@ -46,7 +47,7 @@ function healthyTenant(id: string) {
     lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
   })) }
 }
-function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[] } = {}) {
+function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string } = {}) {
   const writes: any[] = []
   const previous = new Map<string, any>()
   const queries: any[] = []
@@ -66,23 +67,38 @@ function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnTyp
       return tenants.filter(t => where.organizationId.in.includes(t.organization.id))
         .sort((a, b) => a.displayName.localeCompare(b.displayName))
     } },
-    directoryAuditLog: { findMany: async (query: any) => {
-      queries.push(query)
-      const { where, orderBy, take, select } = query
-      assert.deepEqual(orderBy, { eventDateTime: 'desc' })
-      assert.deepEqual(Object.keys(select).sort(), ['activityDisplayName', 'category', 'customerTenantId',
-        'eventDateTime', 'initiatedBy', 'microsoftAuditId', 'operationType', 'result', 'targetResources'].sort())
-      // Query-sensitive: omission, inclusive expiry and post-take filtering
-      // change the actual service output instead of just changing spy metadata.
-      return rows.filter(r => where.organizationId.in.includes(r.organizationId)
-          && where.customerTenantId.in.includes(r.customerTenantId)
-          && r.eventDateTime >= where.eventDateTime.gte)
-        .filter(r => !where.expiresAt || (where.expiresAt.gt
-          ? r.expiresAt > where.expiresAt.gt : r.expiresAt >= where.expiresAt.gte))
-        .sort((a, b) => b.eventDateTime.getTime() - a.eventDateTime.getTime())
-        .slice(0, take)
-        .map(r => Object.fromEntries(Object.keys(select).map(k => [k, (r as any)[k]])))
-    } },
+    $queryRaw: async (query: any) => {
+      const [pairJson, since, asOf, take] = query.values
+      const sql = query.strings.join('?')
+      const pairs = JSON.parse(pairJson) as Array<{ organization_id: string; customer_tenant_id: string }>
+      queries.push({ pairs, since, asOf, take, sql })
+      if (options.auditReadError) throw new Error('synthetic audit read timeout')
+      assert.match(sql, /LEFT JOIN LATERAL/)
+      assert.match(sql, /organization_id = requested\.organization_id/)
+      assert.match(sql, /customer_tenant_id = requested\.customer_tenant_id/)
+      assert.match(sql, /event_date_time >= \?/)
+      assert.match(sql, /expires_at > \?/)
+      assert.match(sql, /ORDER BY event_date_time DESC, id DESC\s+LIMIT \?/)
+      assert.match(sql, /ORDER BY requested\.organization_id, requested\.customer_tenant_id,\s+audit\.event_date_time DESC NULLS LAST, audit\.id DESC NULLS LAST/)
+      // This fake executes the bound query's per-pair eligibility, ordering,
+      // and LEFT JOIN semantics. The physical CI case proves PostgreSQL syntax.
+      return pairs.flatMap<any>(pair => {
+        if (pair.customer_tenant_id === options.omitCoverageTenant) return []
+        const matching = rows.filter(r => r.organizationId === pair.organization_id &&
+          r.customerTenantId === pair.customer_tenant_id &&
+          r.eventDateTime >= since && r.expiresAt > asOf)
+          .sort((a, b) => b.eventDateTime.getTime() - a.eventDateTime.getTime() || b.id.localeCompare(a.id))
+          .slice(0, take)
+        return matching.length ? matching.map(r => ({
+          organizationId: pair.organization_id, customerTenantId: pair.customer_tenant_id,
+          eventId: r.id, microsoftAuditId: r.microsoftAuditId, eventDateTime: r.eventDateTime,
+          activityDisplayName: r.activityDisplayName, category: r.category,
+          operationType: r.operationType, result: r.result,
+          initiatedBy: r.initiatedBy, targetResources: r.targetResources,
+        })) : [{ organizationId: pair.organization_id,
+          customerTenantId: pair.customer_tenant_id, eventId: null }]
+      })
+    },
     tenantHealthSnapshot: {
       findFirst: async ({ where }: any) => previous.get(where.customerTenantId) ?? null,
       create: async ({ data }: any) => { writes.push(data); return data },
@@ -113,8 +129,8 @@ test('tenant list expiry: strict boundary, event window, presentation and snapsh
   assert.equal('raw' in finding, false)
 })
 
-test('tenant list expiry: expired rows cannot crowd eligible attention out of take500', async () => {
-  const rows = [...Array.from({ length: 501 }, (_, i) => audit(`expired-${i}`, -1, -i)),
+test('tenant list expiry: expired rows cannot crowd eligible attention out of the per-tenant cap', async () => {
+  const rows = [...Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT + 1 }, (_, i) => audit(`expired-${i}`, -1, -i)),
     audit('equal', 0, -600), audit('eligible-newer', 1, -700), audit('eligible-older', 2, -800)]
   const f = fixture(rows)
   const result = await read(f)
@@ -122,32 +138,33 @@ test('tenant list expiry: expired rows cannot crowd eligible attention out of ta
   assert.deepEqual(auditKeys(f.writes[0].payload), auditKeys(result.tenants[0]!))
 })
 
-test('tenant list expiry: global500 cap retains observed findings but marks the read incomplete', async () => {
-  const rows = Array.from({ length: 500 }, (_, i) => audit(`first-${i}`, 1, -i))
-  rows.push(audit('beyond-global-cap', 1, -600, 'b'))
+test('tenant list expiry: a capped tenant does not cap a quiet tenant', async () => {
+  const rows = Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT + 1 }, (_, i) => audit(`first-${i}`, 1, -i))
+  rows.push(audit('quiet', 1, -600, 'b'))
   // An exact duplicate label still picks the newer evidence, not another item.
   rows[1] = { ...rows[1]!, targetResources: rows[0]!.targetResources }
   const f = fixture(rows.reverse(), { tenants: [tenant('b'), tenant('a')] })
   const result = await read(f)
   assert.deepEqual(result.tenants.map(t => t.id), ['a', 'b'])
   assert.deepEqual(auditKeys(result.tenants[0]!), ['audit-auth-first-0', 'audit-auth-first-2', 'audit-auth-first-3'])
-  assert.deepEqual(auditKeys(result.tenants[1]!), [], 'the cap is shared, not500 per tenant')
-  assert.equal(f.queries[0].take, 501)
-  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
-  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.deepEqual(auditKeys(result.tenants[1]!), ['audit-auth-quiet'])
+  assert.equal(f.queries[0].take, TENANT_DIRECTORY_AUDIT_LIMIT + 1)
+  assert.equal(result.tenants[0]!.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
+  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.eligibleEventCount, 1)
 })
 
-test('tenant list expiry: exactly 500 is complete; the 501st switches and saves unknown health', async t => {
+test('tenant list expiry: exact per-tenant cap is complete; one extra saves unknown health', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: NOW })
   const benign = (id: string, event: number) => ({
     ...audit(id, 1, event), activityDisplayName: 'Read directory configuration',
     operationType: 'Read', targetResources: [],
   })
-  const f = fixture(Array.from({ length: 500 }, (_, i) => benign(`event-${i}`, -i)),
+  const f = fixture(Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT }, (_, i) => benign(`event-${i}`, -i)),
     { tenants: [healthyTenant('a')] })
   const complete = (await read(f)).tenants[0]!
   assert.equal(complete.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
-  assert.equal(complete.tenantHealth.security.directoryAuditRead.eligibleEventCount, 500)
+  assert.equal(complete.tenantHealth.security.directoryAuditRead.eligibleEventCount, TENANT_DIRECTORY_AUDIT_LIMIT)
   assert.equal(complete.tenantHealth.overallStatus, 'HEALTHY')
   assert.equal(f.writes[0].overallStatus, 'HEALTHY')
 
@@ -163,12 +180,12 @@ test('tenant list expiry: exactly 500 is complete; the 501st switches and saves 
   assert.equal(f.writes.length, 1, 'a fresh healthy snapshot cannot hide the coverage change')
   assert.equal(f.writes[0].overallStatus, 'UNKNOWN')
   assert.equal(f.writes[0].payload.security.directoryAuditRead.status, 'CAPPED')
-  assert.deepEqual(f.queries.map(query => query.take), [501, 501])
+  assert.deepEqual(f.queries.map(query => query.take), [TENANT_DIRECTORY_AUDIT_LIMIT + 1, TENANT_DIRECTORY_AUDIT_LIMIT + 1])
 })
 
-test('tenant list expiry: noisy tenant cannot make a quiet tenant or its saved snapshot healthy', async t => {
+test('tenant list expiry: noisy tenant cannot hide a quiet tenant critical finding or saved snapshot', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: NOW })
-  const noisyRows = Array.from({ length: 500 }, (_, i) => ({
+  const noisyRows = Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT + 1 }, (_, i) => ({
     ...audit(`noisy-${i}`, 1, -i, 'noisy'),
     activityDisplayName: 'Read directory configuration', operationType: 'Read',
     targetResources: [],
@@ -182,15 +199,16 @@ test('tenant list expiry: noisy tenant cannot make a quiet tenant or its saved s
 
   const result = await read(f)
   const quiet = result.tenants.find(tenant => tenant.id === 'quiet')!
-  assert.deepEqual(auditKeys(quiet), [], 'critical event is beyond the bounded global read')
-  assert.equal(quiet.tenantHealth.security.status, 'UNKNOWN')
-  assert.equal(quiet.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
-  assert.equal(quiet.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.deepEqual(auditKeys(quiet), ['audit-ca-quiet-critical'])
+  assert.equal(quiet.tenantHealth.security.status, 'CRITICAL')
+  assert.equal(quiet.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(quiet.tenantHealth.security.directoryAuditRead.eligibleEventCount, 1)
   assert.notEqual(quiet.tenantHealth.overallStatus, 'HEALTHY')
   const savedQuiet = f.writes.find(write => write.customerTenantId === 'quiet')!
   assert.ok(savedQuiet)
   assert.notEqual(savedQuiet.overallStatus, 'HEALTHY')
-  assert.equal(savedQuiet.payload.security.directoryAuditRead.eligibleEventCount, null)
+  assert.deepEqual(auditKeys(savedQuiet.payload), ['audit-ca-quiet-critical'])
+  assert.equal(savedQuiet.payload.security.directoryAuditRead.eligibleEventCount, 1)
   assert.equal(f.queries.length, 1, 'a large tenant list does not fan out per tenant')
 })
 
@@ -206,7 +224,8 @@ test('tenant mapping without an audit read does not claim an authoritative empty
 
 test('tenant list expiry: multiple authorized organizations and foreign/unselected isolation', async () => {
   const f = fixture([audit('a', 1), audit('b', 1, -1000, 'b', 'org-b'),
-    audit('foreign', 1, 0, 'foreign', 'org-foreign'), audit('unselected', 1, 0, 'unselected')], {
+    audit('foreign', 1, 0, 'foreign', 'org-foreign'), audit('cross-org', 1, 0, 'a', 'org-foreign'),
+    audit('unselected', 1, 0, 'unselected')], {
     organizations: ['org-a', 'org-b'], tenants: [tenant('b', 'org-b'), tenant('a'), tenant('foreign', 'org-foreign')],
   })
   const result = await read(f)
@@ -214,6 +233,47 @@ test('tenant list expiry: multiple authorized organizations and foreign/unselect
     ['a', ['audit-auth-a']], ['b', ['audit-auth-b']],
   ])
   assert.deepEqual(f.writes.map(w => [w.organizationId, w.customerTenantId]), [['org-a', 'a'], ['org-b', 'b']])
+  assert.deepEqual(f.queries[0].pairs, [
+    { organization_id: 'org-a', customer_tenant_id: 'a' },
+    { organization_id: 'org-b', customer_tenant_id: 'b' },
+  ])
+})
+
+test('tenant list expiry: empty eligible tenant has complete coverage', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('expired', -1)], { tenants: [healthyTenant('a'), healthyTenant('b')] })
+  const result = await read(f)
+  for (const mapped of result.tenants) {
+    assert.equal(mapped.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+    assert.equal(mapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, 0)
+  }
+})
+
+test('tenant list expiry: audit read failure cannot save healthy coverage', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('unread-critical', 1)], {
+    tenants: [healthyTenant('a'), healthyTenant('b')], auditReadError: true,
+  })
+  const result = await read(f)
+  assert.equal(f.queries.length, 1)
+  for (const mapped of result.tenants) {
+    assert.equal(mapped.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+    assert.equal(mapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+    assert.notEqual(mapped.tenantHealth.overallStatus, 'HEALTHY')
+  }
+  assert.deepEqual(f.writes.map(write => write.payload.security.directoryAuditRead.status), ['NOT_READ', 'NOT_READ'])
+})
+
+test('tenant list expiry: missing tenant coverage witness fails the whole read closed', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('observed', 1)], {
+    tenants: [healthyTenant('a'), healthyTenant('b')], omitCoverageTenant: 'b',
+  })
+  const result = await read(f)
+  assert.deepEqual(result.tenants.map(mapped => mapped.tenantHealth.security.directoryAuditRead.status),
+    ['NOT_READ', 'NOT_READ'])
+  assert.deepEqual(f.writes.map(write => write.payload.security.directoryAuditRead.status),
+    ['NOT_READ', 'NOT_READ'])
 })
 
 test('tenant list expiry: event window and expiry share one query clock', async () => {
@@ -222,7 +282,8 @@ test('tenant list expiry: event window and expiry share one query clock', async 
   const result = await f.service.listForIdentity(identity, { now: () => date(calls++ * 2) })
   assert.deepEqual(auditKeys(result.tenants[0]!), ['audit-auth-shared'])
   assert.equal(calls, 1)
-  assert.equal(f.queries[0].where.eventDateTime.gte.getTime(), NOW.getTime() - DAY)
+  assert.equal(f.queries[0].since.getTime(), NOW.getTime() - DAY)
+  assert.equal(f.queries[0].asOf.getTime(), NOW.getTime())
 })
 
 test('tenant list expiry: normal caller uses platform time', async t => {
@@ -253,7 +314,7 @@ test('tenant list expiry: existing conditional snapshot decision uses eligible h
   f.writes.length = 0
   await read(f)
   assert.equal(f.writes.length, 0, 'same eligible status/signature within15minutes skips snapshot')
-  f.rows.push(...Array.from({ length: 500 }, (_, i) => ({
+  f.rows.push(...Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT }, (_, i) => ({
     ...audit(`benign-${i}`, 1, -300 - i), activityDisplayName: 'Read directory configuration',
     operationType: 'Read', targetResources: [],
   })))

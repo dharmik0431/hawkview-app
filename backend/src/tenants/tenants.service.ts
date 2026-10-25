@@ -33,6 +33,7 @@ import {
   type TenantAuditEvent,
   type DirectoryAuditReadStatus,
 } from './tenant-health.js'
+import { readTenantDirectoryAuditWindows } from './tenant-directory-audit-reader.js'
 import { deriveCollectionReadiness, collectedLicenseServicePlans, effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 export { effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 import {
@@ -696,50 +697,30 @@ export class TenantsService {
       select: this.tenantSelect(),
     })
 
-    const tenantIds = tenants.map((tenant) => tenant.id)
-    if (tenantIds.length === 0) return { tenants: [] }
+    if (tenants.length === 0) return { tenants: [] }
     // Event recency and saved retention are independent eligibility rules.
-    // Capture once for this query; HTTP callers never supply the clock. Read
-    // one extra row so an exact 500 is distinguishable from truncation. A
-    // truncated global window is not evidence that omitted tenants are clean.
+    // Capture once for this query; HTTP callers never supply the clock. The
+    // bounded lateral read has an independent coverage witness per tenant.
     const auditReadAt = internals.now?.() ?? new Date()
-    const auditEvents = await this.prisma.directoryAuditLog.findMany({
-        where: {
-          organizationId: { in: organizationIds },
-          customerTenantId: { in: tenantIds },
-          eventDateTime: {
-            gte: new Date(auditReadAt.getTime() - 24 * 60 * 60 * 1000),
-          },
-          expiresAt: { gt: auditReadAt },
-        },
-        orderBy: { eventDateTime: 'desc' },
-        take: 501,
-        select: {
-          customerTenantId: true,
-          microsoftAuditId: true,
-          eventDateTime: true,
-          activityDisplayName: true,
-          category: true,
-          operationType: true,
-          result: true,
-          initiatedBy: true,
-          targetResources: true,
-        },
-      })
-
-    const auditEventsByTenant = new Map<string, TenantAuditEvent[]>()
-    const directoryAuditReadStatus: DirectoryAuditReadStatus = auditEvents.length > 500 ? 'CAPPED' : 'COMPLETE'
-    for (const event of auditEvents.slice(0, 500)) {
-      const events = auditEventsByTenant.get(event.customerTenantId) ?? []
-      events.push(event)
-      auditEventsByTenant.set(event.customerTenantId, events)
+    let auditWindows: Map<string, { events: TenantAuditEvent[]; status: DirectoryAuditReadStatus }>
+    try {
+      auditWindows = await readTenantDirectoryAuditWindows(
+        this.prisma,
+        tenants.map((tenant) => ({ id: tenant.id, organizationId: tenant.organization.id })),
+        auditReadAt,
+      )
+    } catch {
+      // A failed read cannot authorize an empty window or a healthy verdict.
+      // Keep the tenant directory available with explicit unknown coverage.
+      this.logger.warn('Tenant directory audit read failed; coverage is unknown.')
+      auditWindows = new Map()
     }
 
     const mappedTenants = tenants.map((tenant) =>
         this.mapTenant(
           tenant,
-          auditEventsByTenant.get(tenant.id) ?? [],
-          directoryAuditReadStatus,
+          auditWindows.get(tenant.id)?.events ?? [],
+          auditWindows.get(tenant.id)?.status ?? 'NOT_READ',
         )
       )
 
