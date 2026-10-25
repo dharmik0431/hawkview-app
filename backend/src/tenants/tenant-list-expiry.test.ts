@@ -47,7 +47,7 @@ function healthyTenant(id: string) {
     lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
   })) }
 }
-function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string } = {}) {
+function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string; snapshotRead?: () => Promise<void> } = {}) {
   const writes: any[] = []
   const previous = new Map<string, any>()
   const queries: any[] = []
@@ -100,7 +100,10 @@ function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnTyp
       })
     },
     tenantHealthSnapshot: {
-      findFirst: async ({ where }: any) => previous.get(where.customerTenantId) ?? null,
+      findFirst: async ({ where }: any) => {
+        await options.snapshotRead?.()
+        return previous.get(where.customerTenantId) ?? null
+      },
       create: async ({ data }: any) => { writes.push(data); return data },
     },
   }
@@ -210,6 +213,35 @@ test('tenant list expiry: noisy tenant cannot hide a quiet tenant critical findi
   assert.deepEqual(auditKeys(savedQuiet.payload), ['audit-ca-quiet-critical'])
   assert.equal(savedQuiet.payload.security.directoryAuditRead.eligibleEventCount, 1)
   assert.equal(f.queries.length, 1, 'a large tenant list does not fan out per tenant')
+})
+
+test('tenant list expiry: snapshot persistence bounds per-request database fanout', async () => {
+  let releaseReads!: () => void
+  const readGate = new Promise<void>(resolve => { releaseReads = resolve })
+  let activeReads = 0
+  let peakReads = 0
+  const f = fixture([], {
+    tenants: Array.from({ length: 32 }, (_, index) => tenant(`tenant-${index}`)),
+    snapshotRead: async () => {
+      activeReads++
+      peakReads = Math.max(peakReads, activeReads)
+      try { await readGate } finally { activeReads-- }
+    },
+  })
+  const pending = read(f)
+  try {
+    for (let attempt = 0; attempt < 20 && peakReads < 4; attempt++) {
+      await new Promise<void>(resolve => setImmediate(resolve))
+    }
+    assert.equal(peakReads, 4, 'only four snapshot reads may run at once')
+    assert.equal(f.writes.length, 0, 'workers wait for their own prior snapshot read')
+  } finally {
+    releaseReads()
+  }
+  const result = await pending
+  assert.equal(result.tenants.length, 32)
+  assert.equal(f.writes.length, 32)
+  assert.equal(peakReads, 4)
 })
 
 test('tenant list expiry: oversized audit payload fails only its tenant closed', async () => {

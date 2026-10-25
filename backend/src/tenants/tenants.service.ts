@@ -82,6 +82,10 @@ const TENANT_ONBOARDING_ROLES = [
 const MICROSOFT_TENANT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
+// Per-request database fanout only. Cross-request snapshot deduplication
+// requires a separate database fence before this HAW-70 candidate can ship.
+const TENANT_HEALTH_SNAPSHOT_WORKERS = 4
+
 export const preserveOptionalExchangeConsent = (
   graphPermissions: string[],
   previouslyRecorded: string[]
@@ -727,10 +731,14 @@ export class TenantsService {
     // Retain auditable health history. A persistence failure must never make a
     // tenant list unavailable, and every row is scoped to the same workspace
     // used to load the tenant above.
-    await Promise.all(mappedTenants.map(async (mapped, index) => {
-      const tenant = tenants[index]
-      if (!tenant) return
-      await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
+    const snapshotWorkers = Math.min(TENANT_HEALTH_SNAPSHOT_WORKERS, mappedTenants.length)
+    await Promise.all(Array.from({ length: snapshotWorkers }, async (_, worker) => {
+      for (let index = worker; index < mappedTenants.length; index += snapshotWorkers) {
+        const tenant = tenants[index]
+        const mapped = mappedTenants[index]
+        if (!tenant || !mapped) continue
+        await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
+      }
     }))
 
     return { tenants: mappedTenants }
