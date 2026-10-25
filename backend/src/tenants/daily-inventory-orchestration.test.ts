@@ -62,7 +62,7 @@ function fixture() {
   service.logger = { log() {}, warn() {}, error() {} }
   service.saveSnapshot = async () => {}
   service.fetchGraphPage = async (url: string) => Response.json(url.includes('subscribedSkus')
-    ? { value: [] } : { value: [{ displayName: 'Synthetic', verifiedDomains: [] }] })
+    ? { value: [] } : { value: [{ displayName: 'Synthetic', verifiedDomains: [{ name: 'synthetic.example', isDefault: true }] }] })
   service.runPostSyncIdentityRiskEvaluation = async () => {}
   return { service, rows, query }
 }

@@ -39,7 +39,7 @@ import { isGlobalRiskConfig, riskRuntimeConfig } from '../identity-risk/risk-run
 import { RiskGlobalWorkStore } from '../identity-risk/risk-global-work-store.js'
 import { WrappedRiskKeyStore } from '../identity-risk/wrapped-risk-key-store.js'
 import { runGlobalRiskCycle } from '../identity-risk/risk-global-cycle.js'
-import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedOrganizationDomains,
+import { mailboxSourceDigest, sourceAttestationKey, MAILBOX_SOURCE_VERSION, verifiedDomain, verifiedOrganizationDomains,
   mailboxAttestationReason, type MailboxAttestationFailureReason } from '../identity-risk/mailbox-source-attestation.js'
 import { enforceRiskUtcTransaction, requiresRiskUtcSnapshot } from '../identity-risk/risk-utc-session.js'
 import type { AuthenticatedIdentity } from '../auth/auth.types.js'
@@ -3016,22 +3016,34 @@ export class TenantSyncService {
         'domain',
         { timeoutMs: 20_000 },
       )
-      const body = await readBoundedSingleton(response) as { value?: GraphOrganization[] }
-      const organization = body.value?.[0]
-      if (!organization) {
-        throw new Error('Microsoft did not return organization information.')
+      const body = await readBoundedSingleton(response)
+      if (!Array.isArray(body.value) || body.value.length !== 1 || !plainRecord(body.value[0])) {
+        throw new Error('Microsoft returned an incomplete organization response; domain baseline was not advanced.')
       }
+      const organization = body.value[0] as GraphOrganization
+      if (!Array.isArray(organization.verifiedDomains) || organization.verifiedDomains.length === 0) {
+        throw new Error('Microsoft returned an incomplete verified-domain inventory; domain baseline was not advanced.')
+      }
+      if (organization.verifiedDomains.length > 1_000) throw new Error('Microsoft domains exceeded the bounded record limit.')
+      // A shortened inventory is not authoritative: dropping one malformed row
+      // would erase its old tenantDomain row and make required-domain checks
+      // report an absence that Microsoft never established.
+      const seenDomains = new Set<string>()
+      const domains = organization.verifiedDomains.map((domain) => {
+        const name = plainRecord(domain) ? verifiedDomain(domain.name) : null
+        if (!name || seenDomains.has(name)) {
+          throw new Error('Microsoft returned a malformed or duplicate verified domain; domain baseline was not advanced.')
+        }
+        seenDomains.add(name)
+        return closedFields(domain, ['name', 'isDefault', 'isInitial', 'capabilities', 'type']) as NonNullable<GraphOrganization['verifiedDomains']>[number]
+      })
       const observedAt = new Date()
-      const domains = (organization.verifiedDomains ?? []).filter(
-        (domain) => typeof domain.name === 'string' && domain.name.trim()
-      ).map((domain) => closedFields(domain, ['name', 'isDefault', 'isInitial', 'capabilities', 'type']) as NonNullable<GraphOrganization['verifiedDomains']>[number])
-      if (domains.length > 1_000) throw new Error('Microsoft domains exceeded the bounded record limit.')
       const primaryDomain =
         domains.find((domain) => domain.isDefault)?.name?.trim() ??
         domains.find((domain) => domain.isInitial)?.name?.trim() ??
         null
 
-      await this.prisma.$transaction(async (transaction) => {
+      await this.saveSnapshot(tenant, 'DOMAINS', authoritativeSnapshot(domains), async (transaction) => {
         for (const domain of domains) {
           const name = (domain.name as string).trim().toLowerCase()
           await transaction.tenantDomain.upsert({
@@ -3070,7 +3082,6 @@ export class TenantSyncService {
           },
         })
       })
-      await this.saveSnapshot(tenant, 'DOMAINS', authoritativeSnapshot(domains))
     })
   }
 
