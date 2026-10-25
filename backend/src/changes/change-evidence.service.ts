@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { legacyCategory } from './change-classification.js'
 import { DIRECTORY_AUDIT_METADATA_KEY, directoryAuditMetadata } from './directory-audit-projection-metadata.js'
+import { verifiedDomain } from '../identity-risk/mailbox-source-attestation.js'
 import {
   SNAPSHOT_DIFFERENCE_SPECS,
   type EvidenceOrigin,
@@ -112,6 +113,18 @@ function actor(initiatedBy: unknown) {
 
 function snapshotObjects(value: unknown): JsonObject[] {
   return array(value).map(object).filter((item) => Object.keys(item).length > 0)
+}
+
+function evidenceRows(value: unknown, resourceType: string): JsonObject[] {
+  const rows = snapshotObjects(value)
+  if (resourceType !== 'DOMAINS') return rows
+  // Older successful snapshots stored the Graph spelling, while the collector
+  // now stores canonical ASCII names. Compare equivalent names as one domain
+  // so the first upgraded collection cannot invent a removal and addition.
+  return rows.map((row) => {
+    const name = verifiedDomain(row.name)
+    return name ? { ...row, name } : row
+  })
 }
 
 function identifierFor(
@@ -270,8 +283,8 @@ export class ChangeEvidenceService {
     const spec = SNAPSHOT_DIFFERENCE_SPECS[input.resourceType]
     if (!spec || input.previousPayload == null) return []
 
-    const previous = snapshotObjects(input.previousPayload)
-    const current = snapshotObjects(input.currentPayload)
+    const previous = evidenceRows(input.previousPayload, input.resourceType)
+    const current = evidenceRows(input.currentPayload, input.resourceType)
     const previousById = new Map(
       previous
         .map((row) => [identifierFor(row, spec.identifierFields, spec.compoundIdentifierFields), row] as const)

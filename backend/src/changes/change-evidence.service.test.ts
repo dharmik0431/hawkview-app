@@ -1152,6 +1152,28 @@ test('records domain additions, removals, and default transitions with domain gu
   assert.deepEqual(removed[0]?.afterState, null)
 })
 
+test('domain evidence treats legacy Unicode and mixed-case spellings as the same domain', () => {
+  const service = new ChangeEvidenceService({} as never)
+  const common = {
+    tenant: { id: 'tenant-1', organizationId: 'org-1' }, resourceType: 'DOMAINS',
+    observedAt: new Date('2026-10-25T12:00:00.000Z'),
+    baselineObservedAt: new Date('2026-10-24T12:00:00.000Z'),
+    expiresAt: new Date('2027-04-25T12:00:00.000Z'),
+    previousPayload: [{ name: 'Bücher.Example', isDefault: false, isInitial: true }],
+  }
+  const same = [{ name: 'XN--BCHER-KVA.example', isDefault: false, isInitial: true }]
+  assert.deepEqual(service.buildSnapshotDifferenceEvidence({ ...common, currentPayload: same }), [])
+
+  const changed = service.buildSnapshotDifferenceEvidence({
+    ...common, currentPayload: [{ ...same[0], isDefault: true }],
+  })
+  assert.equal(changed.length, 1)
+  assert.equal(changed[0]?.targetId, 'xn--bcher-kva.example')
+  assert.deepEqual(changed[0]?.changedFields, ['isDefault'])
+  assert.deepEqual(changed[0]?.beforeState, { name: 'xn--bcher-kva.example', isDefault: false, isInitial: true })
+  assert.deepEqual(changed[0]?.afterState, { name: 'xn--bcher-kva.example', isDefault: true, isInitial: true })
+})
+
 test('records SKU capacity and capability differences as guidance, not a billing or per-user assignment claim', () => {
   const service = new ChangeEvidenceService({} as never)
   const evidence = service.buildSnapshotDifferenceEvidence({
