@@ -25,12 +25,15 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Verify release PR number
+      - name: Verify release PR number for frontend changes
         if: github.event_name == 'pull_request'
         env:
+          HAWKVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HAWKVIEW_PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
-        run: node scripts/frontend-release.cjs check
+        run: node .github/scripts/frontend-release-pr-check.mjs
       - run: npm ci
+      - name: Frontend release gate contract tests
+        run: node --test .github/scripts/frontend-release-pr-check.test.mjs
       - name: Frontend tests
         shell: bash
         run: |
