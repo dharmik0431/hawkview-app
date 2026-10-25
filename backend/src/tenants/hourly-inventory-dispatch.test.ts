@@ -28,7 +28,7 @@ const ENDPOINT = {
   secureScore: 'security/secureScores?$top=1',
   riskyUsers: 'identityProtection/riskyUsers',
   licenses: 'subscribedSkus',
-  domains: 'organization?$select=displayName,verifiedDomains',
+  domains: 'organization?$select=id,displayName,verifiedDomains',
   // Excluded resources, asserted absent.
   directoryRoles: 'roleManagement/directory/roleAssignments',
 } as const
@@ -224,7 +224,9 @@ async function runIncrementalVisit(
 }
 
 const requested = (urls: string[], fragment: string) =>
-  urls.filter((url) => url.includes(fragment)).length
+  urls.filter((url) => fragment === ENDPOINT.organization || fragment === ENDPOINT.domains
+    ? url.endsWith(`/${fragment}`)
+    : url.includes(fragment)).length
 
 const healthy = (resourceType: string, ageMs: number): SyntheticState => ({
   resourceType,
@@ -260,7 +262,7 @@ test('an abandoned clean organization RUNNING row reaches the real incremental c
   const running = { ...healthy('ORGANIZATION_CONFIGURATION', 2 * 60 * MINUTE),
     status: 'RUNNING', lastErrorCode: null, lastErrorMessage: null }
   const { urls, writes } = await runIncrementalVisit([running], url =>
-    url.includes(ENDPOINT.organization)
+    url.endsWith(`/${ENDPOINT.organization}`)
       ? graphPage({ value: [{ id: tenant().microsoftTenantId, displayName: 'Synthetic Tenant' }] })
       : undefined)
   assert.equal(requested(urls, ENDPOINT.organization), 1)
@@ -291,8 +293,8 @@ test('healthy hourly anchors run their existing bounded collectors and persist r
   const domains = [{ name: 'new.example', isDefault: true, isInitial: false }]
   const { urls, writes, resourceReads, dnsCalls } = await runIncrementalVisit(states, url => {
     if (url.endsWith('/subscribedSkus')) return graphPage({ value: [license] })
-    if (url.endsWith('/organization?$select=displayName,verifiedDomains')) {
-      return graphPage({ value: [{ displayName: 'Synthetic Tenant', verifiedDomains: domains }] })
+    if (url.endsWith('/organization?$select=id,displayName,verifiedDomains')) {
+      return graphPage({ value: [{ id: tenant().microsoftTenantId, displayName: 'Synthetic Tenant', verifiedDomains: domains }] })
     }
     return undefined
   })

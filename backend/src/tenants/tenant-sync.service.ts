@@ -3006,12 +3006,12 @@ export class TenantSyncService {
   }
 
   private async syncDomains(
-    tenant: { id: string; organizationId: string },
+    tenant: { id: string; organizationId: string; microsoftTenantId: string },
     accessToken: string
   ) {
     return this.runSnapshotSync(tenant, 'DOMAINS', async () => {
       const response = await this.fetchGraphPage(
-        'https://graph.microsoft.com/v1.0/organization?$select=displayName,verifiedDomains',
+        'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',
         accessToken,
         'domain',
         { timeoutMs: 20_000 },
@@ -3021,6 +3021,12 @@ export class TenantSyncService {
         throw new Error('Microsoft returned an incomplete organization response; domain baseline was not advanced.')
       }
       const organization = body.value[0] as GraphOrganization
+      if (typeof organization.id !== 'string' || organization.id.toLowerCase() !== tenant.microsoftTenantId.toLowerCase()) {
+        throw new Error('Microsoft returned organization details for a different tenant; domain baseline was not advanced.')
+      }
+      if (organization.displayName != null && typeof organization.displayName !== 'string') {
+        throw new Error('Microsoft returned an invalid organization name; domain baseline was not advanced.')
+      }
       if (!Array.isArray(organization.verifiedDomains) || organization.verifiedDomains.length === 0) {
         throw new Error('Microsoft returned an incomplete verified-domain inventory; domain baseline was not advanced.')
       }
@@ -3031,11 +3037,11 @@ export class TenantSyncService {
       const seenDomains = new Set<string>()
       const domains = organization.verifiedDomains.map((domain) => {
         const name = plainRecord(domain) ? verifiedDomain(domain.name) : null
-        if (!name || seenDomains.has(name)) {
+        if (!name || seenDomains.has(name) || typeof domain.isDefault !== 'boolean' || typeof domain.isInitial !== 'boolean') {
           throw new Error('Microsoft returned a malformed or duplicate verified domain; domain baseline was not advanced.')
         }
         seenDomains.add(name)
-        return closedFields(domain, ['name', 'isDefault', 'isInitial', 'capabilities', 'type']) as NonNullable<GraphOrganization['verifiedDomains']>[number]
+        return { ...closedFields(domain, ['isDefault', 'isInitial', 'capabilities', 'type']), name } as NonNullable<GraphOrganization['verifiedDomains']>[number]
       })
       const observedAt = new Date()
       const primaryDomain =
@@ -3045,7 +3051,7 @@ export class TenantSyncService {
 
       await this.saveSnapshot(tenant, 'DOMAINS', authoritativeSnapshot(domains), async (transaction) => {
         for (const domain of domains) {
-          const name = (domain.name as string).trim().toLowerCase()
+          const name = domain.name as string
           await transaction.tenantDomain.upsert({
             where: {
               customerTenantId_name: {
@@ -3071,7 +3077,8 @@ export class TenantSyncService {
         await transaction.tenantDomain.deleteMany({
           where: {
             customerTenantId: tenant.id,
-            lastSeenAt: { lt: observedAt },
+            organizationId: tenant.organizationId,
+            name: { notIn: domains.map((domain) => domain.name as string) },
           },
         })
         await transaction.customerTenant.update({

@@ -275,13 +275,21 @@ test('singletons and accepted domains reject oversized streaming bodies before s
 
 test('domain collection rejects incomplete verified-domain inventories before replacing stored domains', async () => {
   const valid = { name: 'new.example', isDefault: true, isInitial: false }
+  const organization = (verifiedDomains: unknown) => ({ id: boundedTenant.microsoftTenantId, displayName: 'Synthetic', verifiedDomains })
   const attempts = [
-    { value: [{ displayName: 'Synthetic', verifiedDomains: [valid, { isDefault: false }] }] },
-    { value: [{ displayName: 'Synthetic' }] },
-    { value: [{ displayName: 'Synthetic', verifiedDomains: 'new.example' }] },
-    { value: [{ displayName: 'Synthetic', verifiedDomains: [] }] },
-    { value: [{ displayName: 'Synthetic', verifiedDomains: [valid, { name: 'NEW.EXAMPLE' }] }] },
-    { value: [{ displayName: 'Synthetic', verifiedDomains: [valid] }, { verifiedDomains: [valid] }] },
+    { value: [organization([valid, { isDefault: false, isInitial: false }])] },
+    { value: [{ id: boundedTenant.microsoftTenantId, displayName: 'Synthetic' }] },
+    { value: [organization('new.example')] },
+    { value: [organization([])] },
+    { value: [organization([valid, { name: 'NEW.EXAMPLE', isDefault: false, isInitial: false }])] },
+    { value: [organization([valid, { name: 'Bücher.example', isDefault: false, isInitial: false },
+      { name: 'xn--bcher-kva.example', isDefault: false, isInitial: false }])] },
+    { value: [organization([{ name: 'new.example', isInitial: false }])] },
+    { value: [organization([{ name: 'new.example', isDefault: true }])] },
+    { value: [organization([{ name: 'new.example', isDefault: 'true', isInitial: false }])] },
+    { value: [organization([{ name: 'new.example', isDefault: true, isInitial: 'false' }])] },
+    { value: [{ ...organization([valid]), id: 'other-microsoft-tenant' }] },
+    { value: [organization([valid]), organization([valid])] },
     { value: [null] },
   ]
   for (const body of attempts) {
@@ -321,7 +329,8 @@ test('incomplete domain inventory fails collection without replacing prior succe
   } as any, {} as any, {} as any)
   ;(service as any).logger = { warn: () => undefined }
   ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{
-    verifiedDomains: [{ name: 'new.example' }, { isDefault: false }],
+    id: boundedTenant.microsoftTenantId,
+    verifiedDomains: [{ name: 'new.example', isDefault: true, isInitial: false }, { isDefault: false, isInitial: false }],
   }] }))
   await assert.rejects(() => (service as any).syncDomains(boundedTenant, 'token'))
   assert.deepEqual(forbidden, [])
@@ -333,13 +342,15 @@ test('incomplete domain inventory fails collection without replacing prior succe
 test('domain collection keeps the ordinary complete inventory and successful snapshot path', async () => {
   const writes: string[] = []
   const domainRows: unknown[] = []
+  const deletions: unknown[] = []
+  const tenantUpdates: unknown[] = []
   const snapshots: unknown[] = []
   const transaction = {
     tenantDomain: {
       upsert: async (input: unknown) => { writes.push('domain-upsert'); domainRows.push(input) },
-      deleteMany: async () => { writes.push('domain-delete') },
+      deleteMany: async (input: unknown) => { writes.push('domain-delete'); deletions.push(input) },
     },
-    customerTenant: { update: async () => { writes.push('tenant-update') } },
+    customerTenant: { update: async (input: unknown) => { writes.push('tenant-update'); tenantUpdates.push(input) } },
   }
   const service = new TenantSyncService({ $transaction: async (work: (tx: typeof transaction) => Promise<void>) => work(transaction) } as any,
     {} as any, {} as any, {} as any, {} as any, {} as any)
@@ -350,13 +361,46 @@ test('domain collection keeps the ordinary complete inventory and successful sna
     await persist(transaction)
     writes.push('snapshot')
   }
-  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ displayName: 'Synthetic', verifiedDomains: [
-    { name: 'new.example', isDefault: true, isInitial: false, unselected: 'not-retained' },
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ id: boundedTenant.microsoftTenantId, displayName: 'Synthetic', verifiedDomains: [
+    { name: 'Bücher.example', isDefault: true, isInitial: false, unselected: 'not-retained' },
   ] }] }))
   await (service as any).syncDomains(boundedTenant, 'token')
   assert.deepEqual(writes, ['domain-upsert', 'domain-delete', 'tenant-update', 'snapshot'])
-  assert.equal((domainRows[0] as any).create.name, 'new.example')
-  assert.deepEqual(snapshots, [{ rows: [{ name: 'new.example', isDefault: true, isInitial: false }], completeness: 'authoritative_complete' }])
+  assert.equal((domainRows[0] as any).create.name, 'xn--bcher-kva.example')
+  assert.deepEqual((deletions[0] as any).where, {
+    customerTenantId: boundedTenant.id, organizationId: boundedTenant.organizationId,
+    name: { notIn: ['xn--bcher-kva.example'] },
+  })
+  assert.equal((tenantUpdates[0] as any).data.primaryDomain, 'xn--bcher-kva.example')
+  assert.deepEqual(snapshots, [{ rows: [{ name: 'xn--bcher-kva.example', isDefault: true, isInitial: false }], completeness: 'authoritative_complete' }])
+})
+
+test('domain replacement removes absent rows even when the old and new writes share one millisecond', async (t) => {
+  const at = new Date('2026-10-25T00:00:00.000Z')
+  t.mock.timers.enable({ apis: ['Date'], now: at })
+  const domains = new Map([['old.example', at], ['kept.example', at]])
+  const transaction = {
+    tenantDomain: {
+      upsert: async ({ create }: { create: { name: string; lastSeenAt: Date } }) => {
+        domains.set(create.name, create.lastSeenAt)
+      },
+      deleteMany: async ({ where }: { where: { name: { notIn: string[] } } }) => {
+        for (const name of domains.keys()) if (!where.name.notIn.includes(name)) domains.delete(name)
+      },
+    },
+    customerTenant: { update: async () => undefined },
+  }
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (_t: unknown, _r: string, _snapshot: unknown,
+    persist: (tx: typeof transaction) => Promise<void>) => persist(transaction)
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{
+    id: boundedTenant.microsoftTenantId,
+    verifiedDomains: [{ name: 'kept.example', isDefault: true, isInitial: false }],
+  }] }))
+  await (service as any).syncDomains(boundedTenant, 'token')
+  assert.deepEqual([...domains.keys()], ['kept.example'])
+  assert.equal(domains.get('kept.example')?.getTime(), at.getTime())
 })
 
 test('domain inventory writes roll back if the co-transactional snapshot cannot be saved', async () => {
@@ -385,7 +429,7 @@ test('domain inventory writes roll back if the co-transactional snapshot cannot 
     { buildSnapshotDifferenceEvidence: () => [] } as any, {} as any)
   ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
   ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{
-    displayName: 'Synthetic', verifiedDomains: [{ name: 'new.example', isDefault: true }],
+    id: boundedTenant.microsoftTenantId, displayName: 'Synthetic', verifiedDomains: [{ name: 'new.example', isDefault: true, isInitial: false }],
   }] }))
   await assert.rejects(() => (service as any).syncDomains(boundedTenant, 'token'), /synthetic snapshot failure/)
   assert.deepEqual(attempted, ['domain-upsert', 'domain-delete', 'tenant-update', 'snapshot'])
