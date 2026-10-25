@@ -5568,16 +5568,19 @@ export class TenantSyncService {
       )
       const body = await readBoundedSingleton(response)
       // Microsoft documentation has shown both the resource directly and a
-      // single resource under `value`; normalize either response shape.
-      const settings = Array.isArray(body?.value)
-        ? body.value[0]
-        : body?.value && typeof body.value === 'object'
-          ? body.value
-          : body
+      // single resource under `value`. A wrapped collection is usable only
+      // when it contains exactly one record; silently taking its first row
+      // could turn ambiguous provider evidence into a passing baseline.
+      const wrapped = Object.hasOwn(body, 'value')
+      const settings = wrapped
+        ? Array.isArray(body.value)
+          ? body.value.length === 1 ? body.value[0] : null
+          : body.value
+        : body
 
-      if (!settings || typeof settings !== 'object') {
+      if (!plainRecord(settings)) {
         throw new Error(
-          'Microsoft SharePoint settings synchronization returned an empty response.'
+          'Microsoft SharePoint settings synchronization returned an invalid singleton response.'
         )
       }
 

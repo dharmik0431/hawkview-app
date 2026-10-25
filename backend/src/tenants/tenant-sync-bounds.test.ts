@@ -273,6 +273,54 @@ test('singletons and accepted domains reject oversized streaming bodies before s
   }
 })
 
+test('SharePoint settings accepts one record and rejects ambiguous wrapped evidence before saving', async () => {
+  const setting = { sharingCapability: 'disabled', unselected: 'not-retained' }
+  for (const body of [setting, { value: setting }, { value: { ...setting, '@odata.type': '#microsoft.graph.sharePointSettings' } }, { value: [setting] }]) {
+    const saved: Array<{ rows: unknown[]; completeness: string }> = []
+    const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async (_t: unknown, _r: string, snapshot: { rows: unknown[]; completeness: string }) => { saved.push(snapshot) }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify(body))
+    await (service as any).syncSharePointSettings(boundedTenant, 'token')
+    assert.deepEqual(saved, [{ rows: [{ sharingCapability: 'disabled' }], completeness: 'authoritative_complete' }])
+  }
+  for (const body of [{ value: [] }, { value: [setting, setting] }, { value: 'invalid' }]) {
+    let saved = 0
+    const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_t: unknown, _r: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async () => { saved += 1 }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify(body))
+    await assert.rejects(() => (service as any).syncSharePointSettings(boundedTenant, 'token'), /invalid singleton response/)
+    assert.equal(saved, 0)
+  }
+})
+
+test('ambiguous SharePoint settings fails the collection without advancing success or saving a snapshot', async () => {
+  const updates: Array<Record<string, unknown>> = []
+  const saved: unknown[] = []
+  const previousSuccess = new Date('2026-10-20T00:00:00Z')
+  const service = new TenantSyncService({
+    syncState: {
+      upsert: async () => ({ lastSuccessfulAt: previousSuccess }),
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        updates.push(data)
+        return { consecutiveFailures: 1 }
+      },
+    },
+  } as any, {} as any, {} as any, {
+    publishIncident: async () => undefined,
+  } as any, {} as any, {} as any)
+  ;(service as any).logger = { warn: () => undefined }
+  ;(service as any).saveSnapshot = async (_t: unknown, _r: string, snapshot: unknown) => { saved.push(snapshot) }
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ value: [{ sharingCapability: 'disabled' }, { sharingCapability: 'disabled' }] }))
+
+  await assert.rejects(() => (service as any).syncSharePointSettings(boundedTenant, 'token'))
+  assert.deepEqual(saved, [])
+  assert.equal(updates.length, 1)
+  assert.equal(updates[0].status, 'FAILED')
+  assert.equal(Object.hasOwn(updates[0], 'lastSuccessfulAt'), false)
+})
+
 test('actual Exchange JSON paths accept the exact streamed page-byte cap with closed projections', async () => {
   const fixtures = [
     ['syncExchangeMailboxDirectory', { value: [{ id: 'u', mail: 'u@example.test', unselected: 'not-retained' }] }],

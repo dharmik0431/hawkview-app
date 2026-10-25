@@ -33,6 +33,42 @@ test('observed MSFT SharePoint values produce distinct outcomes', () => {
   assert.equal(evaluateCheck('sharepoint-guest-resharing-disabled', evidence, now).outcome, 'NEEDS_ACTION')
 })
 
+test('all fifteen selected checks classify a tenant-shaped stored snapshot without treating missing fields as gaps', () => {
+  const evidence = {
+    SHAREPOINT_SETTINGS: { ...collected, payload: [{
+      sharingCapability: 'externalUserAndGuestSharing',
+      sharingDomainRestrictionMode: 'none',
+      sharingAllowedDomainList: [],
+      isLegacyAuthProtocolsEnabled: true,
+      isResharingByExternalUsersEnabled: true,
+      isRequireAcceptingUserToMatchInvitedUserEnabled: null,
+      idleSessionSignOut: { isEnabled: false },
+      isUnmanagedSyncAppForTenantRestricted: false,
+      allowedDomainGuidsForSyncApp: [],
+      deletedUserPersonalSiteRetentionPeriodInDays: 30,
+    }] },
+    SECURITY_DEFAULTS: { ...collected, payload: [{ isEnabled: false }] },
+    AUTH_METHOD_POLICIES: { ...collected, payload: [{
+      id: 'Fido2', state: 'disabled',
+      includeTargets: [{ id: 'all_users', targetType: 'group' }], excludeTargets: [],
+    }] },
+    DOMAINS: { ...collected, payload: [{ name: 'other.example' }] },
+  }
+  const settings = {
+    'sharepoint-approved-partner-domains-v1': { approvedDomains: ['partner.example'] },
+    'onedrive-sync-approved-domain-guids-v1': { approvedDomainGuids: ['11111111-1111-4111-8111-111111111111'] },
+    'onedrive-deleted-user-retention-minimum-v1': { minimumDays: 90 },
+    'm365-required-verified-domains-v1': { requiredDomains: ['required.example'] },
+  }
+  const results = CHECKS.map((check) => evaluateCheck(check.id, evidence, now, settings))
+  assert.equal(results.length, 15)
+  assert.equal(results.filter((result) => result.outcome === 'NEEDS_ACTION').length, 14)
+  const unavailable = results.filter((result) => result.outcome === 'UNABLE_TO_ASSESS')
+  assert.deepEqual(unavailable.map((result) => result.id), ['sharepoint-invitation-account-match-enabled'])
+  assert.match(unavailable[0].reason ?? '', /absent or has an unrecognized value/)
+  assert.equal(results.some((result) => result.outcome === 'MET'), false)
+})
+
 test('security defaults are an opt-in exact check, not a proxy for Conditional Access', () => {
   const evidence = { SECURITY_DEFAULTS: { ...collected, payload: [{ isEnabled: false }] } }
   assert.equal(evaluateCheck('security-defaults-enabled', evidence, now).outcome, 'NEEDS_ACTION')
@@ -71,6 +107,8 @@ test('external sharing domain restriction requires a usable allow list', () => {
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'blockList' }).outcome, 'NEEDS_ACTION')
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList' }).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: [''] }).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: ['not a domain'] }).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: ['example.org', 'bad domain'] }).outcome, 'UNABLE_TO_ASSESS')
 })
 
 test('OneDrive sync needs a valid nonempty domain list before it can pass', () => {
@@ -151,6 +189,7 @@ test('absent, failed, stale, conflicting and malformed evidence never produce a 
     undefined,
     { ...collected, status: 'FAILED' },
     { ...collected, lastSuccessfulAt: new Date('2026-10-14T00:00:00Z') },
+    { ...collected, lastAttemptAt: new Date('2026-10-13T23:59:00Z'), observedAt: new Date('2026-10-14T00:00:00Z') },
     { ...collected, observedAt: new Date('2026-10-16T04:02:00Z') },
     { ...collected, payload: [] },
     { ...collected, payload: [{}] },
@@ -159,6 +198,26 @@ test('absent, failed, stale, conflicting and malformed evidence never produce a 
   for (const variant of variants) {
     assert.equal(evaluateCheck('sharepoint-anonymous-links-disabled', { SHAREPOINT_SETTINGS: variant }, now).outcome, 'UNABLE_TO_ASSESS')
   }
+})
+
+test('new success cannot make an old row-collection snapshot look current', () => {
+  const staleSnapshot = { ...collected, lastAttemptAt: new Date('2026-10-13T23:59:00Z'), observedAt: new Date('2026-10-14T00:00:00Z') }
+  const result = evaluateCheck('entra-fido2-method-all-users-enabled-v1', {
+    AUTH_METHOD_POLICIES: { ...staleSnapshot, payload: [{ id: 'Fido2', state: 'enabled', includeTargets: [{ id: 'all_users', targetType: 'group' }], excludeTargets: [] }] },
+  }, now)
+  assert.equal(result.outcome, 'UNABLE_TO_ASSESS')
+  assert.match(result.reason ?? '', /snapshot is older than 26 hours/)
+})
+
+test('snapshot freshness uses the 26-hour observation boundary', () => {
+  const boundary = new Date(now.getTime() - 26 * 60 * 60 * 1000)
+  const evidence = { ...collected, lastAttemptAt: new Date(boundary.getTime() - 1000), observedAt: boundary }
+  assert.equal(evaluateCheck('security-defaults-enabled', {
+    SECURITY_DEFAULTS: { ...evidence, payload: [{ isEnabled: true }] },
+  }, now).outcome, 'MET')
+  assert.equal(evaluateCheck('security-defaults-enabled', {
+    SECURITY_DEFAULTS: { ...evidence, observedAt: new Date(boundary.getTime() - 1), payload: [{ isEnabled: true }] },
+  }, now).outcome, 'UNABLE_TO_ASSESS')
 })
 
 test('exact Microsoft permission and licensing errors explain unavailable evidence without failing a setting', () => {
