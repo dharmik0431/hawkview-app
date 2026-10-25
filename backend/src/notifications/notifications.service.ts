@@ -262,16 +262,26 @@ export class NotificationsService {
 
   async markAllRead(identity: AuthenticatedIdentity) {
     const context = await this.context(identity)
-    const rows = await this.prisma.notification.findMany({
-      where: { organizationId: { in: context.organizationIds }, OR: [{ recipientUserId: null }, { recipientUserId: context.userId }] },
-      select: { id: true },
-    })
-    const now = new Date()
-    await this.prisma.$transaction(rows.map(({ id }) => this.prisma.notificationUserState.upsert({
-      where: { notificationId_userId: { notificationId: id, userId: context.userId } },
-      create: { notificationId: id, userId: context.userId, readAt: now },
-      update: { readAt: now },
-    })))
+    const readAt = new Date()
+    // One set-based statement keeps application memory and query count independent of the
+    // number of retained notifications. Keep the existing scope: all notifications in active
+    // member organizations addressed to this user or everyone, including expired, dismissed,
+    // and already-read rows. Recheck membership and account status in the write statement's
+    // snapshot, respecting revocations committed after the context read but before that snapshot.
+    await this.prisma.$executeRaw`
+      INSERT INTO notification_user_states (notification_id, user_id, read_at, updated_at)
+      SELECT n.id, u.id, ${readAt}::timestamptz, ${readAt}::timestamptz
+      FROM users u
+      JOIN memberships m ON m.user_id = u.id AND m.status = 'ACTIVE'
+      JOIN organizations o ON o.id = m.organization_id AND o.status = 'ACTIVE'
+      JOIN notifications n ON n.organization_id = o.id
+        AND (n.recipient_user_id IS NULL OR n.recipient_user_id = u.id)
+      WHERE u.id = ${context.userId}::uuid
+        AND u.auth_provider_user_id = ${identity.subject}
+        AND u.disabled_at IS NULL
+      ON CONFLICT (notification_id, user_id) DO UPDATE
+      SET read_at = EXCLUDED.read_at, updated_at = EXCLUDED.updated_at
+    `
     return { success: true }
   }
 

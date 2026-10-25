@@ -33,6 +33,7 @@ const expected = [
   "microsoft/consent-operation-store.database-integration.test.ts",
   "microsoft/managed-connector-authority.database-integration.test.ts",
   "microsoft/managed-connector-configuration.database-integration.test.ts",
+  "notifications/notifications-mark-all-read.database-integration.test.ts",
   "prisma/alert-table-rls.database-integration.test.ts",
   "prisma/public-schema-lockdown.database-integration.test.ts",
   "risky-users-wiring/native-risk-summary.database-integration.test.ts",
