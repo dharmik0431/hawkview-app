@@ -575,6 +575,37 @@ model AlertWebhookRejection {
   @@map("alert_webhook_rejections")
 }
 
+/// Inactive until the bounded alert-intake selector and atomic writer are reviewed.
+/// The finding id is provenance, deliberately not a relation: bounded finding
+/// retention must neither be blocked by this receipt nor delete it implicitly.
+model AlertFindingIntakeStatus {
+  findingId             String   @id @map("finding_id") @db.Uuid
+  organizationId        String   @map("organization_id") @db.Uuid
+  customerTenantId      String   @map("customer_tenant_id") @db.Uuid
+  dedupeKey             String   @map("dedupe_key") @db.VarChar(128)
+  sourceMatchedResultId String   @map("source_matched_result_id") @db.Uuid
+  sourceRuleId          String   @map("source_rule_id") @db.VarChar(150)
+  sourceRuleVersion     String   @map("source_rule_version") @db.VarChar(100)
+  sourceSubjectType     String   @map("source_subject_type") @db.VarChar(50)
+  sourceSubjectId       String   @map("source_subject_id") @db.VarChar(128)
+  sourceState           String   @map("source_state") @db.VarChar(30)
+  sourceSeverity        String   @map("source_severity") @db.VarChar(20)
+  sourceConfidence      String   @map("source_confidence") @db.VarChar(20)
+  sourceCoverage        String   @map("source_coverage") @db.VarChar(20)
+  sourceObservedAt      DateTime @map("source_observed_at") @db.Timestamptz(6)
+  sourceExpiresAt       DateTime @map("source_expires_at") @db.Timestamptz(6)
+  sourceUpdatedAt       DateTime @map("source_updated_at") @db.Timestamptz(6)
+  outcome               String   @db.VarChar(30)
+  mappingRevision       String   @map("mapping_revision") @db.VarChar(64)
+  decidedAt             DateTime @default(now()) @map("decided_at") @db.Timestamptz(6)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  customerTenant        CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "alert_finding_intake_status_tenant_scope_fkey")
+
+  @@index([organizationId, customerTenantId, outcome, decidedAt(sort: Desc)], map: "alert_finding_intake_status_scope_outcome")
+  @@map("alert_finding_intake_status")
+}
+
 model Organization {
   pimScheduleScopes PimScheduleScope[]
   pimScheduleAttempts PimScheduleAttempt[]
@@ -721,6 +752,7 @@ model CustomerTenant {
   identityRiskRuleCoverage IdentityRiskRuleCoverage[]
   identityRiskMatchedResults IdentityRiskMatchedResult[]
   identityRiskFindings IdentityRiskFinding[]
+  alertFindingIntakeStatuses AlertFindingIntakeStatus[]
   identityRiskOperationalControls IdentityRiskOperationalControl[]
   healthSnapshots      TenantHealthSnapshot[]
   notifications      Notification[]
