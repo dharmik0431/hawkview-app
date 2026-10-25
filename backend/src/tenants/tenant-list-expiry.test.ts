@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { TenantsService } from './tenants.service.js'
+import { TENANT_HEALTH_RESOURCE_REGISTRY } from './tenant-health.js'
 
 const NOW = new Date('2026-10-12T01:00:00.000Z')
 const DAY = 24 * 60 * 60 * 1000
@@ -25,15 +26,25 @@ function audit(id: string, expiry: number, event = -1000, tenant = 'a', org = 'o
   }
 }
 type Audit = ReturnType<typeof audit>
+type SyncStateFixture = {
+  resourceType: string; status: string; lastAttemptAt: Date; lastSuccessfulAt: Date
+  lastErrorCode: string | null; lastErrorMessage: string | null; consecutiveFailures: number
+}
 function tenant(id: string, org = 'org-a') {
   return {
     id, microsoftTenantId: `microsoft-${id}`, displayName: id, primaryDomain: null,
     status: 'ACTIVE', organization: { id: org, name: org, slug: org },
     connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED',
       consentedPermissions: [], lastVerifiedAt: NOW, lastErrorCode: null },
-    tenantLicenses: [], syncStates: [], entraSnapshots: [],
+    tenantLicenses: [], syncStates: [] as SyncStateFixture[], entraSnapshots: [],
     collectionFieldStates: [], m365ActivitySubscriptions: [],
   }
+}
+function healthyTenant(id: string) {
+  return { ...tenant(id), syncStates: TENANT_HEALTH_RESOURCE_REGISTRY.map(({ resourceType }) => ({
+    resourceType, status: 'SUCCEEDED', lastAttemptAt: NOW, lastSuccessfulAt: NOW,
+    lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+  })) }
 }
 function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[] } = {}) {
   const writes: any[] = []
@@ -111,7 +122,7 @@ test('tenant list expiry: expired rows cannot crowd eligible attention out of ta
   assert.deepEqual(auditKeys(f.writes[0].payload), auditKeys(result.tenants[0]!))
 })
 
-test('tenant list expiry: global500 cap, event order, label dedup and max3 remain', async () => {
+test('tenant list expiry: global500 cap retains observed findings but marks the read incomplete', async () => {
   const rows = Array.from({ length: 500 }, (_, i) => audit(`first-${i}`, 1, -i))
   rows.push(audit('beyond-global-cap', 1, -600, 'b'))
   // An exact duplicate label still picks the newer evidence, not another item.
@@ -121,6 +132,76 @@ test('tenant list expiry: global500 cap, event order, label dedup and max3 remai
   assert.deepEqual(result.tenants.map(t => t.id), ['a', 'b'])
   assert.deepEqual(auditKeys(result.tenants[0]!), ['audit-auth-first-0', 'audit-auth-first-2', 'audit-auth-first-3'])
   assert.deepEqual(auditKeys(result.tenants[1]!), [], 'the cap is shared, not500 per tenant')
+  assert.equal(f.queries[0].take, 501)
+  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
+  assert.equal(result.tenants[1]!.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+})
+
+test('tenant list expiry: exactly 500 is complete; the 501st switches and saves unknown health', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const benign = (id: string, event: number) => ({
+    ...audit(id, 1, event), activityDisplayName: 'Read directory configuration',
+    operationType: 'Read', targetResources: [],
+  })
+  const f = fixture(Array.from({ length: 500 }, (_, i) => benign(`event-${i}`, -i)),
+    { tenants: [healthyTenant('a')] })
+  const complete = (await read(f)).tenants[0]!
+  assert.equal(complete.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(complete.tenantHealth.security.directoryAuditRead.eligibleEventCount, 500)
+  assert.equal(complete.tenantHealth.overallStatus, 'HEALTHY')
+  assert.equal(f.writes[0].overallStatus, 'HEALTHY')
+
+  f.previous.set('a', { overallStatus: 'HEALTHY', payload: f.writes[0].payload,
+    evaluatedAt: date(-1) })
+  f.writes.length = 0
+  f.rows.push(benign('overflow', -600))
+  const capped = (await read(f)).tenants[0]!
+  assert.equal(capped.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
+  assert.equal(capped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.equal(capped.tenantHealth.security.status, 'UNKNOWN')
+  assert.equal(capped.tenantHealth.overallStatus, 'UNKNOWN')
+  assert.equal(f.writes.length, 1, 'a fresh healthy snapshot cannot hide the coverage change')
+  assert.equal(f.writes[0].overallStatus, 'UNKNOWN')
+  assert.equal(f.writes[0].payload.security.directoryAuditRead.status, 'CAPPED')
+  assert.deepEqual(f.queries.map(query => query.take), [501, 501])
+})
+
+test('tenant list expiry: noisy tenant cannot make a quiet tenant or its saved snapshot healthy', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const noisyRows = Array.from({ length: 500 }, (_, i) => ({
+    ...audit(`noisy-${i}`, 1, -i, 'noisy'),
+    activityDisplayName: 'Read directory configuration', operationType: 'Read',
+    targetResources: [],
+  }))
+  const quietCritical = { ...audit('quiet-critical', 1, -600, 'quiet'),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }
+  const f = fixture([...noisyRows, quietCritical], { tenants: [healthyTenant('noisy'), healthyTenant('quiet')] })
+  const completeQuiet = (f.service as any).mapTenant(healthyTenant('quiet'), [], 'COMPLETE')
+  assert.equal(completeQuiet.tenantHealth.overallStatus, 'HEALTHY', 'all other evidence would have allowed a false healthy result')
+
+  const result = await read(f)
+  const quiet = result.tenants.find(tenant => tenant.id === 'quiet')!
+  assert.deepEqual(auditKeys(quiet), [], 'critical event is beyond the bounded global read')
+  assert.equal(quiet.tenantHealth.security.status, 'UNKNOWN')
+  assert.equal(quiet.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
+  assert.equal(quiet.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.notEqual(quiet.tenantHealth.overallStatus, 'HEALTHY')
+  const savedQuiet = f.writes.find(write => write.customerTenantId === 'quiet')!
+  assert.ok(savedQuiet)
+  assert.notEqual(savedQuiet.overallStatus, 'HEALTHY')
+  assert.equal(savedQuiet.payload.security.directoryAuditRead.eligibleEventCount, null)
+  assert.equal(f.queries.length, 1, 'a large tenant list does not fan out per tenant')
+})
+
+test('tenant mapping without an audit read does not claim an authoritative empty window', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([], { tenants: [healthyTenant('a')] })
+  const mapped = (f.service as any).mapTenant(healthyTenant('a'))
+  assert.equal(mapped.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.equal(mapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.notEqual(mapped.tenantHealth.security.status, 'HEALTHY')
+  assert.notEqual(mapped.tenantHealth.overallStatus, 'HEALTHY')
 })
 
 test('tenant list expiry: multiple authorized organizations and foreign/unselected isolation', async () => {
@@ -172,6 +253,15 @@ test('tenant list expiry: existing conditional snapshot decision uses eligible h
   f.writes.length = 0
   await read(f)
   assert.equal(f.writes.length, 0, 'same eligible status/signature within15minutes skips snapshot')
+  f.rows.push(...Array.from({ length: 500 }, (_, i) => ({
+    ...audit(`benign-${i}`, 1, -300 - i), activityDisplayName: 'Read directory configuration',
+    operationType: 'Read', targetResources: [],
+  })))
+  await read(f)
+  assert.equal(f.writes.length, 1, 'audit read coverage transition persists despite the same overall status')
+  assert.equal(f.writes[0].overallStatus, 'ATTENTION')
+  assert.equal(f.writes[0].payload.security.directoryAuditRead.status, 'CAPPED')
+  f.writes.length = 0
   f.previous.set('a', { overallStatus: 'CRITICAL', payload: previous.payload, evaluatedAt: date(-1) })
   await read(f)
   assert.equal(f.writes.length, 1, 'different eligible status retains existing create decision')

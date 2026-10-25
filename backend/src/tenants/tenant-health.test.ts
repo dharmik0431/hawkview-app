@@ -6,6 +6,7 @@ import {
   TENANT_HEALTH_RESOURCE_REGISTRY,
   type TenantAuditEvent,
 } from './tenant-health'
+import { readAttentionProvenance } from './attention-provenance.js'
 import { sanitizeHealthMessage } from './sanitize-health-message'
 
 function baseInput() {
@@ -18,6 +19,7 @@ function baseInput() {
     authSnapshot: null,
     riskyIdentityCount: 0,
     auditEvents: [] as TenantAuditEvent[],
+    directoryAuditReadStatus: 'COMPLETE' as const,
   }
 }
 
@@ -97,6 +99,9 @@ test('reports current limited sign-in fallback without a synchronization-failure
   assert.equal(result.operations.failedJobs, 0)
   assert.equal(result.operations.partialJobs, 1)
   assert.equal(result.riskyIdentityCount, null)
+  assert.equal(result.security.lowFindings, 1)
+  assert.equal(result.security.recommendationCount, 1)
+  assert.equal(result.healthScore, 95)
 })
 
 test('uses selected current limited evidence instead of a failed non-selected Graph state', () => {
@@ -446,6 +451,35 @@ test('healthy connection, complete current data, and no findings is healthy', ()
   assert.equal(result.connection.status, 'HEALTHY')
   assert.equal(result.data.status, 'COMPLETE')
   assert.equal(result.overallStatus, 'HEALTHY')
+})
+
+test('unread or capped directory audit evidence cannot attest to healthy security', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  for (const directoryAuditReadStatus of ['NOT_READ', 'CAPPED'] as const) {
+    const result = deriveTenantHealth({
+      ...baseInput(), syncStates: completeCurrentStates(now), now,
+      directoryAuditReadStatus,
+    })
+    assert.equal(result.data.status, 'COMPLETE')
+    assert.equal(result.security.status, 'UNKNOWN')
+    assert.equal(result.security.directoryAuditRead.status, directoryAuditReadStatus)
+    assert.equal(result.security.directoryAuditRead.eligibleEventCount, null)
+    assert.notEqual(result.overallStatus, 'HEALTHY')
+    const limitation = result.attention.find(item => item.key === 'directory-audit-read-incomplete')!
+    assert.equal(limitation.severity, 'low')
+    assert.deepEqual(readAttentionProvenance(JSON.parse(JSON.stringify(limitation.provenance))), {
+      version: 1, origin: 'EVIDENCE_LIMITATION', kind: 'DIRECTORY_AUDIT_READ_INCOMPLETE',
+      remediationOwner: 'UNDETERMINED',
+    })
+    assert.equal(result.security.lowFindings, 0)
+    assert.equal(result.security.recommendationCount, 0)
+    assert.equal(result.healthScore, 100)
+  }
+  const omittedStatus = deriveTenantHealth({ ...baseInput(), syncStates: completeCurrentStates(now), now,
+    directoryAuditReadStatus: undefined })
+  assert.equal(omittedStatus.security.directoryAuditRead.status, 'NOT_READ')
+  assert.equal(omittedStatus.security.status, 'UNKNOWN')
+  assert.notEqual(omittedStatus.overallStatus, 'HEALTHY')
 })
 
 test('security recommendations produce attention without changing the connection state', () => {

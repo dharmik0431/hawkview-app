@@ -4,7 +4,7 @@ import { deriveTenantHealth, TENANT_HEALTH_RESOURCE_REGISTRY } from './tenant-he
 import { ATTENTION_COLLECTOR_RESOURCES, readAttentionProvenance, collectorAttentionProvenance } from './attention-provenance.js'
 import { summarizeMicrosoftRisk } from '../identity-risk/microsoft-risk-summary.js'
 const now = new Date('2026-09-29T12:00:00Z')
-const base = { tenantId: 'synthetic', effectiveStatus: 'active', connectionStatus: 'ACTIVE', missingPermissions: [] as string[], syncStates: [], authSnapshot: null, riskyIdentityCount: null, now }
+const base = { tenantId: 'synthetic', effectiveStatus: 'active', connectionStatus: 'ACTIVE', missingPermissions: [] as string[], syncStates: [], authSnapshot: null, riskyIdentityCount: null, directoryAuditReadStatus: 'COMPLETE' as const, now }
 const failed = (resourceType: string, code = 'HAWKVIEW_INTERNAL_FAILURE') => ({ resourceType, status: 'FAILED', lastAttemptAt: now, lastSuccessfulAt: now, lastErrorCode: code, lastErrorMessage: 'opaque test message', consecutiveFailures: 3 })
 test('resource mapping is exhaustive against the health registry', () => assert.deepEqual([...ATTENTION_COLLECTOR_RESOURCES].sort(), TENANT_HEALTH_RESOURCE_REGISTRY.map(r => r.resourceType).sort()))
 for (const resource of ATTENTION_COLLECTOR_RESOURCES) test(`actual collector constructor ${resource}`, () => {

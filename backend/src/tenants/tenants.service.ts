@@ -31,6 +31,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import {
   deriveTenantHealth,
   type TenantAuditEvent,
+  type DirectoryAuditReadStatus,
 } from './tenant-health.js'
 import { deriveCollectionReadiness, collectedLicenseServicePlans, effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 export { effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
@@ -326,7 +327,7 @@ export class TenantsService {
       lastSuccessfulPollAt: Date | null
       lastError: string | null
     }>
-  }, auditEvents: TenantAuditEvent[] = []) {
+  }, auditEvents: TenantAuditEvent[] = [], directoryAuditReadStatus: DirectoryAuditReadStatus = 'NOT_READ') {
     const secureScoreDetails = getMicrosoftSecureScoreDetails(
       tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES),
       tenant.syncStates.find((state) => state.resourceType === SyncResourceType.SECURE_SCORES)?.lastSuccessfulAt,
@@ -414,6 +415,7 @@ export class TenantsService {
       microsoftRiskSummary: collectionReadiness.evidence.riskyIdentities.microsoftRiskSummary,
       signInEvidence: collectionReadiness.evidence.signIns,
       auditEvents,
+      directoryAuditReadStatus,
       notApplicableResourceTypes,
       unsupportedResourceTypes,
     })
@@ -695,8 +697,11 @@ export class TenantsService {
     })
 
     const tenantIds = tenants.map((tenant) => tenant.id)
+    if (tenantIds.length === 0) return { tenants: [] }
     // Event recency and saved retention are independent eligibility rules.
-    // Capture once for this query; HTTP callers never supply the clock.
+    // Capture once for this query; HTTP callers never supply the clock. Read
+    // one extra row so an exact 500 is distinguishable from truncation. A
+    // truncated global window is not evidence that omitted tenants are clean.
     const auditReadAt = internals.now?.() ?? new Date()
     const auditEvents = await this.prisma.directoryAuditLog.findMany({
         where: {
@@ -708,7 +713,7 @@ export class TenantsService {
           expiresAt: { gt: auditReadAt },
         },
         orderBy: { eventDateTime: 'desc' },
-        take: 500,
+        take: 501,
         select: {
           customerTenantId: true,
           microsoftAuditId: true,
@@ -723,7 +728,8 @@ export class TenantsService {
       })
 
     const auditEventsByTenant = new Map<string, TenantAuditEvent[]>()
-    for (const event of auditEvents) {
+    const directoryAuditReadStatus: DirectoryAuditReadStatus = auditEvents.length > 500 ? 'CAPPED' : 'COMPLETE'
+    for (const event of auditEvents.slice(0, 500)) {
       const events = auditEventsByTenant.get(event.customerTenantId) ?? []
       events.push(event)
       auditEventsByTenant.set(event.customerTenantId, events)
@@ -732,7 +738,8 @@ export class TenantsService {
     const mappedTenants = tenants.map((tenant) =>
         this.mapTenant(
           tenant,
-          auditEventsByTenant.get(tenant.id) ?? []
+          auditEventsByTenant.get(tenant.id) ?? [],
+          directoryAuditReadStatus,
         )
       )
 
@@ -761,12 +768,14 @@ export class TenantsService {
       })
       const evaluatedAt = new Date(health.evaluatedAt)
       const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-      const previousPayload = previous?.payload as { syncFreshness?: TenantSyncFreshness } | null
+      const previousPayload = previous?.payload as { syncFreshness?: TenantSyncFreshness; security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } } } | null
       const previousSignature = previousPayload?.syncFreshness
         ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
         : null
       // Keep evidence history without producing a row on every tenant-list poll.
-      if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature && evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
+      if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature &&
+        previousPayload?.security?.directoryAuditRead?.status === health.security.directoryAuditRead.status &&
+        evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
       await this.prisma.tenantHealthSnapshot.create({
         // Preserve the existing health fields for snapshot consumers; freshness
         // is additive rather than wrapping the prior payload shape.

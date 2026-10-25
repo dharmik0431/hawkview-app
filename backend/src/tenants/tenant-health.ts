@@ -1,4 +1,4 @@
-import { type AttentionProvenance, accessProvenance, collectorAttentionProvenance, limitedEvidenceProvenance, tenantFindingProvenance } from './attention-provenance.js'
+import { type AttentionProvenance, accessProvenance, collectorAttentionProvenance, directoryAuditReadIncompleteProvenance, limitedEvidenceProvenance, tenantFindingProvenance } from './attention-provenance.js'
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { classifyEvidence, isKnownMicrosoftSystemEvent, PRIMARY_CHANGE_CLASSIFICATIONS } from '../changes/change-classification.js'
 import type { PilotEvidenceProjection } from './collection-readiness.js'
@@ -9,7 +9,7 @@ import type { MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summa
  * collection, security, and operational evidence separate: a working OAuth
  * connection must never be reported as a fully healthy tenant by itself.
  */
-export const TENANT_HEALTH_MODEL_VERSION = 2
+export const TENANT_HEALTH_MODEL_VERSION = 3
 
 type Severity = 'critical' | 'high' | 'medium' | 'low'
 export type OverallStatus = 'HEALTHY' | 'ATTENTION' | 'DEGRADED' | 'CRITICAL' | 'DISCONNECTED' | 'PENDING' | 'UNKNOWN'
@@ -23,9 +23,10 @@ export type ResourceClassification = 'SUCCESS' | 'EMPTY' | 'PARTIAL' | 'PENDING'
 export type TenantAttention = { provenance: AttentionProvenance; key: string; label: string; severity: Severity; why: string; detectedAt: string | null; actionLabel: string; actionUrl: string }
 type SyncState = { resourceType: string; status: string; lastAttemptAt: Date | null; lastSuccessfulAt: Date | null; lastErrorCode: string | null; lastErrorMessage: string | null; consecutiveFailures: number }
 export type TenantAuditEvent = { microsoftAuditId: string; eventDateTime: Date; activityDisplayName: string; category: string | null; operationType: string | null; result: string | null; initiatedBy: unknown; targetResources: unknown }
+export type DirectoryAuditReadStatus = 'COMPLETE' | 'CAPPED' | 'NOT_READ'
 
 export type ResourceHealth = { resourceType: string; required: boolean; classification: ResourceClassification; reasonCode: string | null; message: string | null; lastAttemptAt: string | null; lastSuccessfulAt: string | null }
-type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number | null; signInEvidence?: PilotEvidenceProjection['signIns']; auditEvents?: TenantAuditEvent[]; /** Only collector components backed by an authoritative NOT_LICENSED readiness row. */ notApplicableResourceTypes?: string[]; /** Collector components backed by an explicit unsupported capability boundary, never a licensing inference. */ unsupportedResourceTypes?: string[]; now?: Date }
+type HealthInput = { tenantId: string; effectiveStatus: string; connectionStatus: string | null; connectionLastVerifiedAt?: Date | null; missingPermissions: string[]; syncStates: SyncState[]; authSnapshot: { payload: unknown; observedAt: Date } | null; riskyIdentityCount: number | null; signInEvidence?: PilotEvidenceProjection['signIns']; auditEvents?: TenantAuditEvent[]; /** A missing read status never attests to an empty audit window. */ directoryAuditReadStatus?: DirectoryAuditReadStatus; /** Only collector components backed by an authoritative NOT_LICENSED readiness row. */ notApplicableResourceTypes?: string[]; /** Collector components backed by an explicit unsupported capability boundary, never a licensing inference. */ unsupportedResourceTypes?: string[]; now?: Date }
 
 /** Central policy.  Optional collectors affect completeness but are never used
  * to claim that a tenant is disconnected or that required telemetry succeeded. */
@@ -215,8 +216,37 @@ export function deriveTenantHealth(input: HealthInput & { microsoftRiskSummary?:
   const limitedSignIns = resources.find((resource) => resource.resourceType === 'SIGN_INS' && resource.classification === 'PARTIAL')
   if (limitedSignIns) attention.push({ provenance: limitedEvidenceProvenance(), key: 'sign-ins-limited-evidence', label: 'Limited sign-in evidence is active', severity: 'low', why: limitedSignIns.message ?? 'HawkView has current audit-feed login evidence; full Microsoft Graph sign-in details are unavailable.', detectedAt: limitedSignIns.lastSuccessfulAt, actionLabel: 'Review sign-in coverage', actionUrl: syncAction(input.tenantId, 'SIGN_INS').url })
   for (const event of input.auditEvents ?? []) { const finding = auditFinding(input.tenantId, event); if (finding && !attention.some((item) => item.label === finding.label)) attention.push(finding); if (attention.filter((item) => item.key.startsWith('audit-')).length >= 3) break }
-  const securityCollectorStates = ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].map((name) => resources.find((r) => r.resourceType === name)).filter((r): r is ResourceHealth => Boolean(r)); const securityIncomplete = securityCollectorStates.some((r) => !['SUCCESS', 'EMPTY', 'NOT_LICENSED', 'UNSUPPORTED'].includes(r.classification)); const criticalFindings = attention.filter((a) => a.severity === 'critical' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const highFindings = attention.filter((a) => a.severity === 'high' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length; const mediumFindings = attention.filter((a) => a.severity === 'medium').length; const lowFindings = attention.filter((a) => a.severity === 'low').length
-  const security = { status: criticalFindings > 0 ? 'CRITICAL' as SecurityStatus : highFindings > 0 ? 'AT_RISK' as SecurityStatus : securityIncomplete ? 'UNKNOWN' as SecurityStatus : mediumFindings + lowFindings > 0 ? 'NEEDS_REVIEW' as SecurityStatus : 'HEALTHY' as SecurityStatus, criticalFindings, highFindings, mediumFindings, lowFindings, recommendationCount: mediumFindings + lowFindings, lastEvaluatedAt: latestDate([input.authSnapshot?.observedAt ?? null, ...input.syncStates.filter((s) => ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(s.resourceType)).map((s) => s.lastSuccessfulAt)]) }
+  const directoryAuditReadStatus = input.directoryAuditReadStatus ?? 'NOT_READ'
+  if (directoryAuditReadStatus !== 'COMPLETE') {
+    attention.push({
+      provenance: directoryAuditReadIncompleteProvenance(),
+      key: 'directory-audit-read-incomplete',
+      label: 'Recent directory audit review is incomplete',
+      severity: 'low',
+      why: directoryAuditReadStatus === 'CAPPED'
+        ? 'The retained audit read reached its limit, so findings for this tenant may be missing.'
+        : 'Recent directory audit events were not checked in this operation.',
+      detectedAt: null,
+      actionLabel: 'View data freshness',
+      actionUrl: `/tenants/${encodeURIComponent(input.tenantId)}/data-freshness`,
+    })
+  }
+  const securityCollectorStates = ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].map((name) => resources.find((r) => r.resourceType === name)).filter((r): r is ResourceHealth => Boolean(r))
+  const securityIncomplete = securityCollectorStates.some((r) => !['SUCCESS', 'EMPTY', 'NOT_LICENSED', 'UNSUPPORTED'].includes(r.classification))
+  // Preserve the pre-existing limited-sign-in recommendation behavior; only
+  // the new read-coverage limitation is excluded from security finding totals.
+  const securityFindings = attention.filter((item) => item.provenance.kind !== 'DIRECTORY_AUDIT_READ_INCOMPLETE')
+  const criticalFindings = securityFindings.filter((a) => a.severity === 'critical' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length
+  const highFindings = securityFindings.filter((a) => a.severity === 'high' && !a.key.startsWith('connection') && !a.key.startsWith('sync-')).length
+  const mediumFindings = securityFindings.filter((a) => a.severity === 'medium').length
+  const lowFindings = securityFindings.filter((a) => a.severity === 'low').length
+  const directoryAuditRead = {
+    status: directoryAuditReadStatus,
+    // A capped or omitted read has no authoritative zero, even if the rows we
+    // did see happened not to contain a finding for this tenant.
+    eligibleEventCount: directoryAuditReadStatus === 'COMPLETE' ? (input.auditEvents?.length ?? 0) : null,
+  }
+  const security = { status: criticalFindings > 0 ? 'CRITICAL' as SecurityStatus : highFindings > 0 ? 'AT_RISK' as SecurityStatus : securityIncomplete || directoryAuditReadStatus !== 'COMPLETE' ? 'UNKNOWN' as SecurityStatus : mediumFindings + lowFindings > 0 ? 'NEEDS_REVIEW' as SecurityStatus : 'HEALTHY' as SecurityStatus, criticalFindings, highFindings, mediumFindings, lowFindings, recommendationCount: mediumFindings + lowFindings, directoryAuditRead, lastEvaluatedAt: latestDate([input.authSnapshot?.observedAt ?? null, ...input.syncStates.filter((s) => ['AUTH_REGISTRATIONS', 'CONDITIONAL_ACCESS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(s.resourceType)).map((s) => s.lastSuccessfulAt)]) }
   // A successful OAuth connection is not an operational-health attestation.
   // Required workload collectors, including SharePoint,
   // participate in this summary so legacy tenant-directory health cannot say
@@ -253,6 +283,9 @@ export function deriveTenantHealth(input: HealthInput & { microsoftRiskSummary?:
   // Apply the published precedence in order. Pending consent is informative,
   // but must never hide a critical finding or a failed synchronization job.
   const overallStatus: OverallStatus = connection.status === 'DISCONNECTED' ? 'DISCONNECTED' : security.status === 'CRITICAL' || operations.status === 'FAILED' ? 'CRITICAL' : requiredProblems.length > 0 || operations.status === 'DEGRADED' || security.highFindings >= 2 ? 'DEGRADED' : connection.status === 'PENDING' ? 'PENDING' : data.status === 'PARTIAL' || security.status === 'AT_RISK' || security.status === 'NEEDS_REVIEW' || unsupported.length > 0 ? 'ATTENTION' : connection.status === 'HEALTHY' && data.status === 'COMPLETE' && data.freshnessStatus === 'CURRENT' && security.status === 'HEALTHY' && operations.status === 'HEALTHY' ? 'HEALTHY' : 'UNKNOWN'
-  const penalty = attention.reduce((total, item) => total + (item.severity === 'critical' ? 30 : item.severity === 'high' ? 20 : item.severity === 'medium' ? 10 : 5), 0)
+  const penalty = securityFindings.reduce((total, item) => total + (item.severity === 'critical' ? 30 : item.severity === 'high' ? 20 : item.severity === 'medium' ? 10 : 5), 0)
+  // Keep the legacy numeric attention score compatible. The versioned
+  // security.directoryAuditRead status and overallStatus carry the read-side
+  // completeness decision; this score is not a security attestation.
   return { healthModelVersion: TENANT_HEALTH_MODEL_VERSION, overallStatus, connection, data, security, operations, resourceHealth: resources, evaluatedAt: now.toISOString(), legacyHealthStatus: overallStatus === 'HEALTHY' ? 'healthy' : overallStatus === 'PENDING' ? 'pending' : overallStatus === 'DISCONNECTED' ? 'disconnected' : 'attention', healthScore: Math.max(0, 100 - penalty), mfaCoverage: coverage, riskyIdentityCount: microsoftRiskSummary?.activeDistinctUserCount ?? null, microsoftRiskSummary: microsoftRiskSummary ?? null, attention }
 }

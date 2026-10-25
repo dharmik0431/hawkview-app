@@ -14,7 +14,7 @@ export type AttentionProvenance = { version: 1 } & (
   | { origin: 'TENANT_FINDING'; kind: TenantFindingKind; remediationOwner: 'CUSTOMER_ADMIN' }
   | { origin: 'ACCESS_CONFIGURATION'; kind: 'CONNECTION_UNAVAILABLE' | 'AUTHORIZATION_REQUIRED'; remediationOwner: 'CUSTOMER_ADMIN' | 'UNDETERMINED' }
   | { origin: 'COLLECTION_OPERATION'; kind: 'COLLECTOR_ATTENTION'; resourceType: AttentionCollectorResource; remediationOwner: 'HAWKVIEW_OPERATIONS' | 'UNDETERMINED' }
-  | { origin: 'EVIDENCE_LIMITATION'; kind: 'LIMITED_SIGN_IN_EVIDENCE'; remediationOwner: 'UNDETERMINED' }
+  | { origin: 'EVIDENCE_LIMITATION'; kind: 'LIMITED_SIGN_IN_EVIDENCE' | 'DIRECTORY_AUDIT_READ_INCOMPLETE'; remediationOwner: 'UNDETERMINED' }
   | { origin: 'UNKNOWN'; kind: 'UNKNOWN'; remediationOwner: 'UNDETERMINED' }
 )
 export const unknownAttentionProvenance = (): AttentionProvenance => ({ version: 1, origin: 'UNKNOWN', kind: 'UNKNOWN', remediationOwner: 'UNDETERMINED' })
@@ -35,6 +35,7 @@ export function collectorAttentionProvenance(resource: string, reasonCode: strin
     remediationOwner: knownOperatorIssue ? 'HAWKVIEW_OPERATIONS' : 'UNDETERMINED' }
 }
 export const limitedEvidenceProvenance = (): AttentionProvenance => ({ version: 1, origin: 'EVIDENCE_LIMITATION', kind: 'LIMITED_SIGN_IN_EVIDENCE', remediationOwner: 'UNDETERMINED' })
+export const directoryAuditReadIncompleteProvenance = (): AttentionProvenance => ({ version: 1, origin: 'EVIDENCE_LIMITATION', kind: 'DIRECTORY_AUDIT_READ_INCOMPLETE', remediationOwner: 'UNDETERMINED' })
 
 /** Historical/malformed/future tags are unclassified, not permission to drop an item. */
 export function readAttentionProvenance(value: unknown): AttentionProvenance {
@@ -52,5 +53,6 @@ export function readAttentionProvenance(value: unknown): AttentionProvenance {
     typeof v.resourceType === 'string' && (ATTENTION_COLLECTOR_RESOURCES as readonly string[]).includes(v.resourceType) &&
     ['HAWKVIEW_OPERATIONS', 'UNDETERMINED'].includes(owner)) return { version: 1, origin: 'COLLECTION_OPERATION', kind: 'COLLECTOR_ATTENTION', resourceType: v.resourceType as AttentionCollectorResource, remediationOwner: owner as 'HAWKVIEW_OPERATIONS' | 'UNDETERMINED' }
   if (keys === basicKeys && v.origin === 'EVIDENCE_LIMITATION' && v.kind === 'LIMITED_SIGN_IN_EVIDENCE' && owner === 'UNDETERMINED') return limitedEvidenceProvenance()
+  if (keys === basicKeys && v.origin === 'EVIDENCE_LIMITATION' && v.kind === 'DIRECTORY_AUDIT_READ_INCOMPLETE' && owner === 'UNDETERMINED') return directoryAuditReadIncompleteProvenance()
   return unknownAttentionProvenance()
 }

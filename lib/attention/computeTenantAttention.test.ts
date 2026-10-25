@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { computeTenantAttention, tenantActionableHealthProjection } from './computeTenantAttention.ts'
 import { customerAttention, customerTarget, customerHealthScore } from './customer-attention.ts'
-import { tenantFindingProvenance, collectorAttentionProvenance, accessProvenance, limitedEvidenceProvenance } from '../../backend/src/tenants/attention-provenance.ts'
+import { tenantFindingProvenance, collectorAttentionProvenance, accessProvenance, directoryAuditReadIncompleteProvenance, limitedEvidenceProvenance } from '../../backend/src/tenants/attention-provenance.ts'
 const row = (provenance?: unknown, overrides = {}) => ({key:'arbitrary',label:'Reported evidence',why:'Supporting evidence.',severity:'high',provenance,...overrides})
 const finding = () => row(tenantFindingProvenance('MICROSOFT_ACTIVE_RISK'))
 const source = (attention: unknown) => ({data:{status:'COMPLETE'},attention})
@@ -30,6 +30,19 @@ test('authoritative malformed source never falls through to another container', 
 test('empty supplied coverage is distinguished from unavailable, capped, and historical data', () => {
  assert.equal(customerAttention(source([])).incomplete,false)
  for (const value of [{},source(null),source(Array(101).fill(finding())),{attention:[]}]) assert.equal(customerAttention(value).incomplete,true)
+})
+test('capped audit evidence limitation prevents a clean customer summary without becoming a finding', () => {
+ const limitation = row(directoryAuditReadIncompleteProvenance(), {
+  key: 'directory-audit-read-incomplete', label: 'Recent directory audit review is incomplete',
+  why: 'The retained audit read reached its limit.', severity: 'low',
+ })
+ const v = customerAttention(source([limitation]))
+ assert.equal(v.limitations.length, 1)
+ assert.equal(v.findings.length, 0)
+ assert.equal(v.accessActions.length, 0)
+ assert.equal(v.incomplete, true)
+ assert.equal(v.sourceAvailable, true)
+ assert.equal(tenantActionableHealthProjection(source([limitation])).status, 'UNAVAILABLE')
 })
 test('all collector resource kinds remain diagnostics even with threatening labels', () => {
  for (const resource of ['USERS','SIGN_INS','LICENSES','APPLICATIONS','EXCHANGE_MAILBOXES']) {
