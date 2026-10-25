@@ -241,6 +241,11 @@ function usableRecord(evidence: EvidenceInput | undefined, now: Date):
   if (now.getTime() - success > MAX_EVIDENCE_AGE_MS) {
     return { reason: 'The last successful collection is older than 26 hours.' }
   }
+  // The state can advance independently of an older stored snapshot. Do not
+  // borrow its newer success clock to make that snapshot appear current.
+  if (now.getTime() - observed > MAX_EVIDENCE_AGE_MS) {
+    return { reason: 'The stored configuration snapshot is older than 26 hours.' }
+  }
   if (!Array.isArray(evidence.payload) || evidence.payload.length !== 1 ||
       !evidence.payload[0] || typeof evidence.payload[0] !== 'object' ||
       Array.isArray(evidence.payload[0])) {
@@ -262,6 +267,7 @@ function usableRows(evidence: EvidenceInput | undefined, now: Date, label: strin
     return { reason: `The ${label} evidence and success clocks cannot be correlated.` }
   }
   if (now.getTime() - success > MAX_EVIDENCE_AGE_MS) return { reason: `The last successful ${label} collection is older than 26 hours.` }
+  if (now.getTime() - observed > MAX_EVIDENCE_AGE_MS) return { reason: `The stored ${label} snapshot is older than 26 hours.` }
   if (!Array.isArray(evidence.payload) || evidence.payload.length > maximumRows ||
       evidence.payload.some((row) => !row || typeof row !== 'object' || Array.isArray(row))) {
     return { reason: `The stored ${label} collection is malformed.` }
@@ -426,7 +432,7 @@ export function evaluateCheck(
     if (value === 'disabled') met = true
     if (value === 'externalUserSharingOnly' || value === 'existingExternalUserSharingOnly' || value === 'externalUserAndGuestSharing') {
       if (mode === 'none' || mode === 'blockList') met = false
-      if (mode === 'allowList' && Array.isArray(domains) && domains.every((domain) => typeof domain === 'string' && domain.trim().length > 0)) {
+      if (mode === 'allowList' && Array.isArray(domains) && domains.every((domain) => normalizeDomain(domain) !== null)) {
         met = domains.length > 0
         observed = `Allow list with ${domains.length} domain${domains.length === 1 ? '' : 's'}`
       }
