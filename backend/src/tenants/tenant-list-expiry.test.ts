@@ -410,3 +410,30 @@ test('tenant list expiry: existing conditional snapshot decision uses eligible h
   assert.equal(f.writes[0].overallStatus, 'ATTENTION')
   assert.deepEqual(auditKeys(f.writes[0].payload), ['audit-auth-eligible'])
 })
+
+test('tenant list expiry: changed audit evidence creates history despite unchanged health and coverage', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('first', 1, -100), audit('second', 1, -200)])
+  const first = (await read(f)).tenants[0]!
+  assert.equal(f.writes.length, 1)
+  assert.equal(first.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  const prior = f.writes[0]
+  f.previous.set('a', { overallStatus: prior.overallStatus, payload: prior.payload, evaluatedAt: date(-1) })
+  f.rows.push(audit('third', 1, -300))
+
+  const changed = (await read(f)).tenants[0]!
+  assert.equal(changed.tenantHealth.overallStatus, first.tenantHealth.overallStatus)
+  assert.equal(changed.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.deepEqual(auditKeys(changed), ['audit-auth-first', 'audit-auth-second', 'audit-auth-third'])
+  assert.equal(f.writes.length, 2, 'new finding should be retained in history inside the 15-minute polling window')
+  assert.deepEqual(auditKeys(f.writes[1].payload), auditKeys(changed))
+
+  const nextPrior = f.writes[1]
+  f.previous.set('a', { overallStatus: nextPrior.overallStatus, payload: nextPrior.payload, evaluatedAt: date(-1) })
+  f.rows.splice(2, 1, audit('replacement', 1, -300))
+  const replaced = (await read(f)).tenants[0]!
+  assert.equal(replaced.tenantHealth.overallStatus, changed.tenantHealth.overallStatus)
+  assert.equal(replaced.tenantHealth.security.directoryAuditRead.eligibleEventCount, 3)
+  assert.equal(f.writes.length, 3, 'replacement evidence should be retained even when the event count is unchanged')
+  assert.deepEqual(auditKeys(f.writes[2].payload), ['audit-auth-first', 'audit-auth-second', 'audit-auth-replacement'])
+})

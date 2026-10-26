@@ -757,13 +757,22 @@ export class TenantsService {
       })
       const evaluatedAt = new Date(health.evaluatedAt)
       const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-      const previousPayload = previous?.payload as { syncFreshness?: TenantSyncFreshness; security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } } } | null
+      const previousPayload = previous?.payload as {
+        syncFreshness?: TenantSyncFreshness
+        attention?: ReturnType<typeof deriveTenantHealth>['attention']
+        security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } }
+      } | null
       const previousSignature = previousPayload?.syncFreshness
         ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
+        : null
+      const currentAuditFindings = JSON.stringify(health.attention.filter((item) => item.key.startsWith('audit-')))
+      const previousAuditFindings = Array.isArray(previousPayload?.attention)
+        ? JSON.stringify(previousPayload.attention.filter((item) => item?.key?.startsWith('audit-')))
         : null
       // Keep evidence history without producing a row on every tenant-list poll.
       if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature &&
         previousPayload?.security?.directoryAuditRead?.status === health.security.directoryAuditRead.status &&
+        previousAuditFindings === currentAuditFindings &&
         evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
       await this.prisma.tenantHealthSnapshot.create({
         // Preserve the existing health fields for snapshot consumers; freshness
