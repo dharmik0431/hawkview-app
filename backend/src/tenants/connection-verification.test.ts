@@ -157,6 +157,9 @@ class Database {
   roles: any = { id: randomUUID(), role_scope_incarnation: randomUUID(), role_scope_version: 'scope-v1', role_attempt_id: randomUUID(),
     role_attempt_outcome: 'RUNNING', role_complete_id: randomUUID(), role_complete_digest: 'historical', role_complete_count: 5 }
   observations = [{ id: 'stored-before-verification', payload: ['historical'] }]
+  auditRows: any[] = []
+  auditReads: Array<{ pairs: unknown; asOf: Date }> = []
+  refreshedOrganizationId: string | undefined
   trace: string[] = []
   statements: string[] = []
   active = false
@@ -177,9 +180,24 @@ class Database {
     findUnique: async (_args: any) => copy({ ...this.tenant, connection: { ...this.connection, connectionMode: this.connection.mode, consentedPermissions: this.connection.permissions } }),
     findFirst: async (args: any) => args.where.id === this.tenant.id && args.where.organizationId.in.includes(this.tenant.organizationId)
       ? copy({ ...this.tenant, connection: { ...this.connection, connectionMode: this.connection.mode, consentedPermissions: this.connection.permissions } }) : null,
-    findUniqueOrThrow: async (_args: any) => { if (this.failAt === 'read') throw new Error('injected-response-read'); return copy(this.tenant) },
+    findUniqueOrThrow: async (_args: any) => {
+      if (this.failAt === 'read') throw new Error('injected-response-read')
+      return copy({ ...this.tenant, organization: {
+        id: this.refreshedOrganizationId ?? this.organizationId, name: 'Fixture', slug: 'fixture',
+      } })
+    },
     // Deferred old-path operations support the regression run against released source.
     update: (args: any) => ({ legacy: () => { this.tenantWrites++; Object.assign(this.tenant, args.data) } }),
+  }
+  async $queryRaw(query: any) {
+    assert.equal(this.active, false, 'retained audit evidence is read after publication')
+    assert.equal(this.connectionWrites, 1, 'audit evidence is read after the connection write')
+    const pairs = JSON.parse(query.values[0])
+    assert.deepEqual(pairs, [{ organization_id: this.tenant.organizationId, customer_tenant_id: this.tenant.id }])
+    this.auditReads.push({ pairs, asOf: query.values[2] })
+    return this.auditRows.length > 0 ? this.auditRows : [{
+      organizationId: this.tenant.organizationId, customerTenantId: this.tenant.id, eventId: null,
+    }]
   }
   tenantConnection = { update: (args: any) => ({ legacy: () => {
     this.connectionWrites++; Object.assign(this.connection, args.data)
@@ -287,6 +305,35 @@ test('current success rotates C, invalidates only the attempt and retains scope/
   assert.deepEqual(f.db.observations, before.observations)
   assert.deepEqual(f.db.trace, ['G-lock', 'G-row', 'T', 'C', 'G-lock', 'G-row', 'T', 'C', 'R'])
   assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.auditReads.length, 1)
+})
+test('managed verification maps its own retained audit evidence after publication', async () => {
+  const f = fixture()
+  const observedAt = new Date(Date.now() - 60_000)
+  f.db.auditRows = [{
+    organizationId: f.db.organizationId, customerTenantId: f.db.tenant.id,
+    eventId: 'retained-critical', microsoftAuditId: 'retained-critical', eventDateTime: observedAt,
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    operationType: 'Update', result: 'success', initiatedBy: {},
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }],
+  }]
+  ;(f.service as any).mapTenant = (_tenant: unknown, window: { status: string; events: Array<{ microsoftAuditId: string }> }) => ({
+    auditStatus: window.status, auditIds: window.events.map(event => event.microsoftAuditId),
+  })
+  const result = await f.run()
+  assert.deepEqual(result.tenant, { auditStatus: 'COMPLETE', auditIds: ['retained-critical'] })
+  assert.equal(result.connected, true)
+  assert.equal(f.db.auditReads.length, 1)
+  assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.connectionWrites, 1)
+})
+test('managed verification cannot read audit evidence after a post-publication organization move', async () => {
+  const f = fixture()
+  f.db.refreshedOrganizationId = randomUUID()
+  await assert.rejects(f.run(), ConflictException)
+  assert.equal(f.db.auditReads.length, 0)
+  assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.connectionWrites, 1)
 })
 test('current provider failure rotates C, clears grants and preserves completed observations', async () => {
   const f = fixture(async () => { throw Error('synthetic provider failure') }); const before = f.db.snapshot()

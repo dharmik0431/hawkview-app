@@ -31,10 +31,9 @@ import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   deriveTenantHealth,
-  type TenantAuditEvent,
   type DirectoryAuditReadStatus,
 } from './tenant-health.js'
-import { readTenantDirectoryAuditWindows } from './tenant-directory-audit-reader.js'
+import { readTenantDirectoryAuditWindows, type TenantDirectoryAuditWindow } from './tenant-directory-audit-reader.js'
 import { deriveCollectionReadiness, collectedLicenseServicePlans, effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 export { effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 import {
@@ -88,7 +87,11 @@ const MICROSOFT_TENANT_ID_PATTERN =
 // separate release gate for this HAW-70 candidate.
 const TENANT_HEALTH_SNAPSHOT_WORKERS = 4
 
-function auditWindowSignature(window: { status: DirectoryAuditReadStatus; events: TenantAuditEvent[] } | undefined): string | null {
+// Connection verification and onboarding do not read directory audit events.
+// Their tenant response must say so instead of treating an absent read as empty.
+const DIRECTORY_AUDIT_NOT_READ: TenantDirectoryAuditWindow = { events: [], status: 'NOT_READ' }
+
+function auditWindowSignature(window: TenantDirectoryAuditWindow | undefined): string | null {
   if (window?.status !== 'COMPLETE') return null
   // A displayed attention list holds only three findings. The complete,
   // bounded audit window may change outside those three, including a
@@ -343,7 +346,7 @@ export class TenantsService {
       lastSuccessfulPollAt: Date | null
       lastError: string | null
     }>
-  }, auditEvents: TenantAuditEvent[] = [], directoryAuditReadStatus: DirectoryAuditReadStatus = 'NOT_READ', now = new Date()) {
+  }, auditWindow: TenantDirectoryAuditWindow, now = new Date()) {
     const secureScoreDetails = getMicrosoftSecureScoreDetails(
       tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES),
       tenant.syncStates.find((state) => state.resourceType === SyncResourceType.SECURE_SCORES)?.lastSuccessfulAt,
@@ -430,8 +433,8 @@ export class TenantsService {
       riskyIdentityCount: collectionReadiness.evidence.riskyIdentities.count,
       microsoftRiskSummary: collectionReadiness.evidence.riskyIdentities.microsoftRiskSummary,
       signInEvidence: collectionReadiness.evidence.signIns,
-      auditEvents,
-      directoryAuditReadStatus,
+      auditEvents: auditWindow.events,
+      directoryAuditReadStatus: auditWindow.status,
       notApplicableResourceTypes,
       unsupportedResourceTypes,
       now,
@@ -597,7 +600,7 @@ export class TenantsService {
         where: { id: captured.tenant.id },
         select: this.tenantSelect(),
       })
-      return { tenant: this.mapTenant(refreshed), connected: published.connected }
+      return { tenant: await this.mapVerifiedTenant(refreshed, captured.tenant.organizationId), connected: published.connected }
     }
 
     const capture = await captureConnectionVerification(this.prisma, {
@@ -634,7 +637,35 @@ export class TenantsService {
       where: { id: tenant.id },
       select: this.tenantSelect(),
     })
-    return { tenant: this.mapTenant(refreshed), connected: published.connected }
+    return { tenant: await this.mapVerifiedTenant(refreshed, tenant.organizationId), connected: published.connected }
+  }
+
+  private async mapVerifiedTenant(
+    tenant: Parameters<TenantsService['mapTenant']>[0],
+    expectedOrganizationId: string,
+  ) {
+    // Verification has already published its provider result and reloaded this
+    // tenant. A retained-evidence read may fail, but cannot turn a successful
+    // provider verdict into a second connection failure or a healthy guess.
+    if (tenant.organization.id !== expectedOrganizationId) {
+      throw new ConflictException({
+        code: 'CONNECTION_VERIFICATION_SUPERSEDED',
+        message: 'The tenant changed organizations during verification.',
+      })
+    }
+    const auditReadAt = new Date()
+    let auditWindow = DIRECTORY_AUDIT_NOT_READ
+    try {
+      const windows = await readTenantDirectoryAuditWindows(
+        this.prisma,
+        [{ id: tenant.id, organizationId: tenant.organization.id }],
+        auditReadAt,
+      )
+      auditWindow = windows.get(tenant.id) ?? DIRECTORY_AUDIT_NOT_READ
+    } catch {
+      this.logger.warn('Tenant verification directory audit read failed; coverage is unknown.')
+    }
+    return this.mapTenant(tenant, auditWindow, auditReadAt)
   }
 
   private tenantSelect() {
@@ -721,7 +752,7 @@ export class TenantsService {
     // Event recency and saved retention are independent eligibility rules.
     // Capture once for this query; HTTP callers never supply the clock. The
     // bounded lateral read has an independent coverage witness per tenant.
-    let auditWindows: Map<string, { events: TenantAuditEvent[]; status: DirectoryAuditReadStatus }>
+    let auditWindows: Map<string, TenantDirectoryAuditWindow>
     try {
       auditWindows = await readTenantDirectoryAuditWindows(
         this.prisma,
@@ -738,8 +769,7 @@ export class TenantsService {
     const mappedTenants = tenants.map((tenant) =>
         this.mapTenant(
           tenant,
-          auditWindows.get(tenant.id)?.events ?? [],
-          auditWindows.get(tenant.id)?.status ?? 'NOT_READ',
+          auditWindows.get(tenant.id) ?? DIRECTORY_AUDIT_NOT_READ,
           auditReadAt,
         )
       )
@@ -943,14 +973,14 @@ export class TenantsService {
           })
         })
         await this.markInitialSyncDue(tenant.id, organizationIds[0])
-        return { tenant: this.mapTenant(tenant), requiresConsent: false }
+        return { tenant: this.mapTenant(tenant, DIRECTORY_AUDIT_NOT_READ), requiresConsent: false }
       }
 
       const tenant = await this.prisma.customerTenant.findUniqueOrThrow({
         where: { id: existing.id },
         select: this.tenantSelect(),
       })
-      return { tenant: this.mapTenant(tenant), requiresConsent: true }
+      return { tenant: this.mapTenant(tenant, DIRECTORY_AUDIT_NOT_READ), requiresConsent: true }
     }
 
     if (input.connectionMode === 'CUSTOMER_MANAGED') {
@@ -988,7 +1018,7 @@ export class TenantsService {
         select: this.tenantSelect(),
       })
       await this.markInitialSyncDue(tenant.id, organizationIds[0])
-      return { tenant: this.mapTenant(tenant), requiresConsent: false }
+      return { tenant: this.mapTenant(tenant, DIRECTORY_AUDIT_NOT_READ), requiresConsent: false }
     }
 
     const tenant = await this.prisma.customerTenant.create({
@@ -1003,7 +1033,7 @@ export class TenantsService {
       select: this.tenantSelect(),
     })
 
-    return { tenant: this.mapTenant(tenant), requiresConsent: true }
+    return { tenant: this.mapTenant(tenant, DIRECTORY_AUDIT_NOT_READ), requiresConsent: true }
   }
 
   async removeTenantForIdentity(

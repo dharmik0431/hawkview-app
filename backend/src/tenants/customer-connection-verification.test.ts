@@ -40,6 +40,10 @@ class CustomerDatabase {
   events: string[] = []
   statements: Array<{ sql: string; binds: any[] }> = []
   providerCalls = 0; credentialReads = 0; connectionWrites = 0; tenantWrites = 0
+  auditRows: any[] = []
+  auditReads: Array<{ pairs: unknown; asOf: Date }> = []
+  auditReadError = false
+  refreshedOrganizationId: string | undefined
   transactions = 0
   injectedError: Error | undefined
   failAt: 'before-commit' | 'after-commit' | 'read' | 'mapper' | 'connection-write' | 'tenant-write' | null = null
@@ -66,9 +70,22 @@ class CustomerDatabase {
       assert.equal(this.active, false); assert.equal(args.where.id, TEN)
       this.events.push('refresh:read')
       if (this.failAt === 'read') this.fail('injected-response-read')
-      return copy(this.tenant)
+      return copy({ ...this.tenant, organization: {
+        id: this.refreshedOrganizationId ?? ORG, name: 'Fixture', slug: 'fixture',
+      } })
     },
     update: () => { throw Error('unfenced tenant update') },
+  }
+  async $queryRaw(query: any) {
+    assert.equal(this.active, false, 'retained audit evidence is read after publication')
+    assert.equal(this.connectionWrites, 1, 'audit evidence is read after the connection write')
+    const pairs = JSON.parse(query.values[0])
+    assert.deepEqual(pairs, [{ organization_id: ORG, customer_tenant_id: TEN }])
+    this.auditReads.push({ pairs, asOf: query.values[2] })
+    if (this.auditReadError) throw new Error('synthetic retained audit read failure')
+    return this.auditRows.length > 0 ? this.auditRows : [{
+      organizationId: ORG, customerTenantId: TEN, eventId: null,
+    }]
   }
   tenantConnection = { update: () => { throw Error('unfenced connection update') } }
   async $transaction<T>(work: (tx: CustomerDatabase) => Promise<T>, options: any): Promise<T> {
@@ -187,6 +204,50 @@ test('A1 clean customer success publishes with captured dispatch, grants and unc
   assert.equal(f.db.connection.status, 'CONNECTED'); assert.deepEqual(f.db.connection.permissions, PERMS_NEW)
   assert.equal(f.db.tenant.displayName, 'Verified tenant'); assert.equal(f.db.tenant.primaryDomain, 'contoso.example')
   assert.equal(f.db.connection.lastErrorCode, null); assert.equal(f.db.connection.incarnation, INCARN)
+  assert.equal(f.db.auditReads.length, 1)
+})
+
+test('customer verification maps its own retained audit evidence after publication', async () => {
+  const f = fixture()
+  f.db.auditRows = [{
+    organizationId: ORG, customerTenantId: TEN,
+    eventId: 'retained-critical', microsoftAuditId: 'retained-critical', eventDateTime: new Date(Date.now() - 60_000),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    operationType: 'Update', result: 'success', initiatedBy: {},
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }],
+  }]
+  f.service.mapTenant = (_tenant: unknown, window: { status: string; events: Array<{ microsoftAuditId: string }> }) => ({
+    auditStatus: window.status, auditIds: window.events.map(event => event.microsoftAuditId),
+  })
+  const response = await f.run()
+  assert.deepEqual(response.tenant, { auditStatus: 'COMPLETE', auditIds: ['retained-critical'] })
+  assert.equal(response.connected, true)
+  assert.equal(f.db.auditReads.length, 1)
+  assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.connectionWrites, 1)
+})
+
+test('customer verification keeps its published verdict when retained audit read fails', async () => {
+  const f = fixture()
+  f.db.auditReadError = true
+  f.service.mapTenant = (_tenant: unknown, window: { status: string }) => ({ auditStatus: window.status })
+  const response = await f.run()
+  assert.deepEqual(response.tenant, { auditStatus: 'NOT_READ' })
+  assert.equal(response.connected, true)
+  assert.equal(f.db.auditReads.length, 1)
+  assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.connectionWrites, 1)
+  assert.equal(f.db.tenantWrites, 1)
+})
+
+test('customer verification cannot read audit evidence after a post-publication organization move', async () => {
+  const f = fixture()
+  f.db.refreshedOrganizationId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  await assert.rejects(f.run(), ConflictException)
+  assert.equal(f.db.auditReads.length, 0)
+  assert.equal(f.db.providerCalls, 1)
+  assert.equal(f.db.connectionWrites, 1)
+  assert.equal(f.db.tenantWrites, 1)
 })
 
 test('A2 connection-row revision-only change refuses stale publication (not a credential-value fence)', async () => {

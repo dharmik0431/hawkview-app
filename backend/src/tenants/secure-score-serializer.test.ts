@@ -21,7 +21,9 @@ const fixture = () => ({
   entraSnapshots: [{ resourceType: 'SECURE_SCORES', observedAt: saved, payload: [{ currentScore: 0, maxScore: 100, createdDateTime: scoreDate }] }],
   m365ActivitySubscriptions: [],
 })
-function map(tenant: ReturnType<typeof fixture>) { return (service as any).mapTenant(tenant) }
+function map(tenant: ReturnType<typeof fixture>) {
+  return (service as any).mapTenant(tenant, { events: [], status: 'NOT_READ' })
+}
 
 test('actual tenant serializer scopes score clocks and preserves retained zero on failed/new attempt', () => {
   const mapped = map(fixture())

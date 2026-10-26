@@ -235,7 +235,7 @@ test('tenant list expiry: noisy tenant cannot hide a quiet tenant critical findi
     activityDisplayName: 'Disable conditional access policy', category: 'Policy',
     targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }
   const f = fixture([...noisyRows, quietCritical], { tenants: [healthyTenant('noisy'), healthyTenant('quiet')] })
-  const completeQuiet = (f.service as any).mapTenant(healthyTenant('quiet'), [], 'COMPLETE')
+  const completeQuiet = (f.service as any).mapTenant(healthyTenant('quiet'), { events: [], status: 'COMPLETE' })
   assert.equal(completeQuiet.tenantHealth.overallStatus, 'HEALTHY', 'all other evidence would have allowed a false healthy result')
 
   const result = await read(f)
@@ -334,11 +334,61 @@ test('tenant list expiry: individually bounded events cannot exceed one tenant p
 test('tenant mapping without an audit read does not claim an authoritative empty window', t => {
   t.mock.timers.enable({ apis: ['Date'], now: NOW })
   const f = fixture([], { tenants: [healthyTenant('a')] })
-  const mapped = (f.service as any).mapTenant(healthyTenant('a'))
+  const mapped = (f.service as any).mapTenant(healthyTenant('a'), { events: [], status: 'NOT_READ' })
   assert.equal(mapped.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
   assert.equal(mapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
   assert.notEqual(mapped.tenantHealth.security.status, 'HEALTHY')
   assert.notEqual(mapped.tenantHealth.overallStatus, 'HEALTHY')
+})
+
+test('verified tenant and tenant list agree on retained critical audit evidence', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const critical = { ...audit('quiet-critical', 1, -600, 'quiet'),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }] }
+  const f = fixture([critical, audit('other', 1, -500, 'other')],
+    { tenants: [healthyTenant('quiet'), healthyTenant('other')] })
+
+  const verified = await (f.service as any).mapVerifiedTenant(healthyTenant('quiet'), 'org-a')
+  assert.deepEqual(f.queries[0].pairs,
+    [{ organization_id: 'org-a', customer_tenant_id: 'quiet' }],
+    'verification reads only the refreshed tenant and organization')
+  assert.equal(f.queries[0].asOf.getTime(), NOW.getTime())
+  assert.deepEqual(auditKeys(verified), ['audit-ca-quiet-critical'])
+  assert.equal(verified.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(verified.tenantHealth.overallStatus, 'CRITICAL')
+  assert.equal(f.writes.length, 0, 'verification does not write a directory snapshot')
+
+  const listed = (await read(f)).tenants.find(mapped => mapped.id === 'quiet')!
+  assert.deepEqual(auditKeys(listed), auditKeys(verified))
+  assert.equal(listed.tenantHealth.overallStatus, verified.tenantHealth.overallStatus)
+  assert.equal(listed.tenantHealth.security.directoryAuditRead.status,
+    verified.tenantHealth.security.directoryAuditRead.status)
+})
+
+test('verified tenant fails closed when its audit read fails or reaches the cap', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const benign = (id: string, event: number) => ({
+    ...audit(id, 1, event), activityDisplayName: 'Read directory configuration',
+    operationType: 'Read', targetResources: [],
+  })
+  const failed = fixture([benign('unread', -100)],
+    { tenants: [healthyTenant('a')], auditReadError: true })
+  const failedMapped = await (failed.service as any).mapVerifiedTenant(healthyTenant('a'), 'org-a')
+  assert.equal(failed.queries.length, 1)
+  assert.equal(failedMapped.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.equal(failedMapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.notEqual(failedMapped.tenantHealth.overallStatus, 'HEALTHY')
+
+  const capped = fixture(Array.from({ length: TENANT_DIRECTORY_AUDIT_LIMIT + 1 },
+    (_, index) => benign(`event-${index}`, -index)), { tenants: [healthyTenant('a')] })
+  const cappedMapped = await (capped.service as any).mapVerifiedTenant(healthyTenant('a'), 'org-a')
+  assert.equal(capped.queries.length, 1)
+  assert.deepEqual(capped.queries[0].pairs, [{ organization_id: 'org-a', customer_tenant_id: 'a' }])
+  assert.equal(cappedMapped.tenantHealth.security.directoryAuditRead.status, 'CAPPED')
+  assert.equal(cappedMapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
+  assert.notEqual(cappedMapped.tenantHealth.overallStatus, 'HEALTHY')
+  assert.equal(capped.writes.length, 0)
 })
 
 test('tenant list expiry: multiple authorized organizations and foreign/unselected isolation', async () => {
