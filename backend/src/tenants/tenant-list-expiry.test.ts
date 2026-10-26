@@ -47,14 +47,25 @@ function healthyTenant(id: string) {
     lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
   })) }
 }
-function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string; snapshotRead?: () => Promise<void>; snapshotLockMode?: 'serialized' | 'fail'; visibleSnapshotWrites?: boolean } = {}) {
+function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; auditReadDelay?: () => Promise<void>; omitCoverageTenant?: string; snapshotRead?: () => Promise<void>; snapshotLockMode?: 'serialized' | 'fail'; visibleSnapshotWrites?: boolean } = {}) {
   const writes: any[] = []
   const previous = new Map<string, any>()
   const snapshotLocks = new Map<string, Promise<void>>()
   const queries: any[] = []
+  const auditTransactions: Array<{ statements: string[] }> = []
   const tenants = options.tenants ?? [tenant('a')]
   const prisma: any = {
     $transaction: async (work: (tx: any) => Promise<unknown>, settings: any) => {
+      if (settings.timeout === 2000) {
+        assert.deepEqual(settings, { isolationLevel: 'ReadCommitted', maxWait: 500, timeout: 2000 })
+        const audit = { statements: [] as string[] }
+        auditTransactions.push(audit)
+        const tx = { ...prisma, $executeRawUnsafe: async (sql: string) => {
+          audit.statements.push(sql)
+          return 0
+        } }
+        return work(tx)
+      }
       assert.deepEqual(settings, { isolationLevel: 'ReadCommitted', maxWait: 1000, timeout: 3500 })
       let releaseLock: (() => void) | undefined
       const tx = { ...prisma, $queryRawUnsafe: async (sql: string, ...args: unknown[]) => {
@@ -103,6 +114,7 @@ function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnTyp
       const sql = query.strings.join('?')
       const pairs = JSON.parse(pairJson) as Array<{ organization_id: string; customer_tenant_id: string }>
       queries.push({ pairs, since, asOf, take, sql })
+      await options.auditReadDelay?.()
       if (options.auditReadError) throw new Error('synthetic audit read timeout')
       assert.match(sql, /LEFT JOIN LATERAL/)
       assert.match(sql, /organization_id = requested\.organization_id/)
@@ -147,7 +159,7 @@ function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnTyp
   }
   const service = new TenantsService(prisma, consent as never, {} as never)
   ;(service as any).logger = { debug() {}, warn() {} }
-  return { service, writes, previous, queries, rows }
+  return { service, writes, previous, queries, auditTransactions, rows }
 }
 const auditKeys = (value: { attention: { key: string }[] }) =>
   value.attention.filter(a => a.key.startsWith('audit-')).map(a => a.key)
@@ -350,6 +362,11 @@ test('verified tenant and tenant list agree on retained critical audit evidence'
     { tenants: [healthyTenant('quiet'), healthyTenant('other')] })
 
   const verified = await (f.service as any).mapVerifiedTenant(healthyTenant('quiet'), 'org-a')
+  assert.deepEqual(f.auditTransactions[0]?.statements, [
+    "SET LOCAL statement_timeout = '1200ms'",
+    "SET LOCAL lock_timeout = '250ms'",
+  ])
+  assert.equal(f.auditTransactions.length, 1)
   assert.deepEqual(f.queries[0].pairs,
     [{ organization_id: 'org-a', customer_tenant_id: 'quiet' }],
     'verification reads only the refreshed tenant and organization')
@@ -389,6 +406,25 @@ test('verified tenant fails closed when its audit read fails or reaches the cap'
   assert.equal(cappedMapped.tenantHealth.security.directoryAuditRead.eligibleEventCount, null)
   assert.notEqual(cappedMapped.tenantHealth.overallStatus, 'HEALTHY')
   assert.equal(capped.writes.length, 0)
+})
+
+test('delayed verification audit query timeout fails closed without retry', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('critical', 1, -100)], {
+    tenants: [healthyTenant('a')],
+    auditReadDelay: () => new Promise(resolve => setImmediate(resolve)),
+    auditReadError: true,
+  })
+  const mapped = await (f.service as any).mapVerifiedTenant(healthyTenant('a'), 'org-a')
+  assert.equal(f.auditTransactions.length, 1, 'one bounded transaction, with no retry after a timeout')
+  assert.deepEqual(f.auditTransactions[0]?.statements, [
+    "SET LOCAL statement_timeout = '1200ms'",
+    "SET LOCAL lock_timeout = '250ms'",
+  ])
+  assert.equal(f.queries.length, 1)
+  assert.equal(mapped.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+  assert.notEqual(mapped.tenantHealth.overallStatus, 'HEALTHY')
+  assert.equal(f.writes.length, 0)
 })
 
 test('tenant list expiry: multiple authorized organizations and foreign/unselected isolation', async () => {

@@ -159,6 +159,8 @@ class Database {
   observations = [{ id: 'stored-before-verification', payload: ['historical'] }]
   auditRows: any[] = []
   auditReads: Array<{ pairs: unknown; asOf: Date }> = []
+  auditStatements: string[] = []
+  auditTransaction = false
   refreshedOrganizationId: string | undefined
   trace: string[] = []
   statements: string[] = []
@@ -190,7 +192,7 @@ class Database {
     update: (args: any) => ({ legacy: () => { this.tenantWrites++; Object.assign(this.tenant, args.data) } }),
   }
   async $queryRaw(query: any) {
-    assert.equal(this.active, false, 'retained audit evidence is read after publication')
+    assert.equal(this.auditTransaction, true, 'retained audit evidence uses a bounded post-publication transaction')
     assert.equal(this.connectionWrites, 1, 'audit evidence is read after the connection write')
     const pairs = JSON.parse(query.values[0])
     assert.deepEqual(pairs, [{ organization_id: this.tenant.organizationId, customer_tenant_id: this.tenant.id }])
@@ -209,8 +211,15 @@ class Database {
     updateMany: async (_args: any) => ({ count: 1 }),
     update: async (_args: any) => ({ consecutiveFailures: 1 }),
   }
-  async $transaction(work: any) {
+  async $transaction(work: any, options?: any) {
     assert.equal(this.active, false, 'provider/caller must not nest transactions')
+    if (options?.timeout === 2000) {
+      assert.deepEqual(options, { isolationLevel: 'ReadCommitted', maxWait: 500, timeout: 2000 })
+      this.active = true
+      this.auditTransaction = true
+      try { return await work(this) }
+      finally { this.auditTransaction = false; this.active = false }
+    }
     const before = this.snapshot(), writes = this.connectionWrites
     this.active = true
     try {
@@ -251,6 +260,10 @@ class Database {
     throw Error('Unexpected query: ' + query)
   }
   async $executeRawUnsafe(query: string, ...v: any[]) {
+    if (this.auditTransaction && query.startsWith('SET LOCAL')) {
+      this.auditStatements.push(query)
+      return 0
+    }
     this.statements.push(query)
     if (query.startsWith('SET LOCAL')) return 0
     if (query.includes('verification:publish-tenant')) {
@@ -306,6 +319,7 @@ test('current success rotates C, invalidates only the attempt and retains scope/
   assert.deepEqual(f.db.trace, ['G-lock', 'G-row', 'T', 'C', 'G-lock', 'G-row', 'T', 'C', 'R'])
   assert.equal(f.db.providerCalls, 1)
   assert.equal(f.db.auditReads.length, 1)
+  assert.deepEqual(f.db.auditStatements, ["SET LOCAL statement_timeout = '1200ms'", "SET LOCAL lock_timeout = '250ms'"])
 })
 test('managed verification maps its own retained audit evidence after publication', async () => {
   const f = fixture()

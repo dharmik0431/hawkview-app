@@ -87,6 +87,13 @@ const MICROSOFT_TENANT_ID_PATTERN =
 // separate release gate for this HAW-70 candidate.
 const TENANT_HEALTH_SNAPSHOT_WORKERS = 4
 
+// Verification is an interactive request. Its optional retained-audit read
+// must not hold an already published connection response behind a slow query.
+const VERIFICATION_AUDIT_MAX_WAIT_MS = 500
+const VERIFICATION_AUDIT_TRANSACTION_MS = 2000
+const VERIFICATION_AUDIT_STATEMENT_MS = 1200
+const VERIFICATION_AUDIT_LOCK_MS = 250
+
 // Connection verification and onboarding do not read directory audit events.
 // Their tenant response must say so instead of treating an absent read as empty.
 const DIRECTORY_AUDIT_NOT_READ: TenantDirectoryAuditWindow = { events: [], status: 'NOT_READ' }
@@ -656,11 +663,19 @@ export class TenantsService {
     const auditReadAt = new Date()
     let auditWindow = DIRECTORY_AUDIT_NOT_READ
     try {
-      const windows = await readTenantDirectoryAuditWindows(
-        this.prisma,
-        [{ id: tenant.id, organizationId: tenant.organization.id }],
-        auditReadAt,
-      )
+      const windows = await this.prisma.$transaction(async (tx) => {
+        await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${VERIFICATION_AUDIT_STATEMENT_MS}ms'`)
+        await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${VERIFICATION_AUDIT_LOCK_MS}ms'`)
+        return readTenantDirectoryAuditWindows(
+          tx,
+          [{ id: tenant.id, organizationId: tenant.organization.id }],
+          auditReadAt,
+        )
+      }, {
+        isolationLevel: 'ReadCommitted',
+        maxWait: VERIFICATION_AUDIT_MAX_WAIT_MS,
+        timeout: VERIFICATION_AUDIT_TRANSACTION_MS,
+      })
       auditWindow = windows.get(tenant.id) ?? DIRECTORY_AUDIT_NOT_READ
     } catch {
       this.logger.warn('Tenant verification directory audit read failed; coverage is unknown.')

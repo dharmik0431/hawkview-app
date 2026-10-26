@@ -43,6 +43,9 @@ class CustomerDatabase {
   auditRows: any[] = []
   auditReads: Array<{ pairs: unknown; asOf: Date }> = []
   auditReadError = false
+  auditReadDelay?: () => Promise<void>
+  auditStatements: string[] = []
+  auditTransaction = false
   refreshedOrganizationId: string | undefined
   transactions = 0
   injectedError: Error | undefined
@@ -77,11 +80,12 @@ class CustomerDatabase {
     update: () => { throw Error('unfenced tenant update') },
   }
   async $queryRaw(query: any) {
-    assert.equal(this.active, false, 'retained audit evidence is read after publication')
+    assert.equal(this.auditTransaction, true, 'retained audit evidence uses a bounded post-publication transaction')
     assert.equal(this.connectionWrites, 1, 'audit evidence is read after the connection write')
     const pairs = JSON.parse(query.values[0])
     assert.deepEqual(pairs, [{ organization_id: ORG, customer_tenant_id: TEN }])
     this.auditReads.push({ pairs, asOf: query.values[2] })
+    await this.auditReadDelay?.()
     if (this.auditReadError) throw new Error('synthetic retained audit read failure')
     return this.auditRows.length > 0 ? this.auditRows : [{
       organizationId: ORG, customerTenantId: TEN, eventId: null,
@@ -91,6 +95,13 @@ class CustomerDatabase {
   async $transaction<T>(work: (tx: CustomerDatabase) => Promise<T>, options: any): Promise<T> {
     assert.equal(this.active, false)
     assert.equal(typeof work, 'function', 'array transaction would bypass the capture/publication contract')
+    if (options?.timeout === 2000) {
+      assert.deepEqual(options, { isolationLevel: 'ReadCommitted', maxWait: 500, timeout: 2000 })
+      this.active = true
+      this.auditTransaction = true
+      try { return await work(this) }
+      finally { this.auditTransaction = false; this.active = false }
+    }
     assert.deepEqual(options, { isolationLevel: 'ReadCommitted' })
     const phase = this.transactions++ === 0 ? 'capture' : 'publish'
     const before = this.snapshot()
@@ -124,6 +135,10 @@ class CustomerDatabase {
     throw Error('Unexpected query: ' + sql)
   }
   async $executeRawUnsafe(sql: string, ...binds: any[]): Promise<number> {
+    if (this.auditTransaction && sql.startsWith('SET LOCAL')) {
+      this.auditStatements.push(sql)
+      return 0
+    }
     assert.equal(this.active, true); this.statements.push({ sql, binds: copy(binds) })
     const revisionGuard = /AND\s+updated_at::text\s*=\s*\$4/.test(sql)
     if (sql.includes('customer-fence:publish-connection')) {
@@ -205,6 +220,7 @@ test('A1 clean customer success publishes with captured dispatch, grants and unc
   assert.equal(f.db.tenant.displayName, 'Verified tenant'); assert.equal(f.db.tenant.primaryDomain, 'contoso.example')
   assert.equal(f.db.connection.lastErrorCode, null); assert.equal(f.db.connection.incarnation, INCARN)
   assert.equal(f.db.auditReads.length, 1)
+  assert.deepEqual(f.db.auditStatements, ["SET LOCAL statement_timeout = '1200ms'", "SET LOCAL lock_timeout = '250ms'"])
 })
 
 test('customer verification maps its own retained audit evidence after publication', async () => {
@@ -230,6 +246,7 @@ test('customer verification maps its own retained audit evidence after publicati
 test('customer verification keeps its published verdict when retained audit read fails', async () => {
   const f = fixture()
   f.db.auditReadError = true
+  f.db.auditReadDelay = () => new Promise(resolve => setImmediate(resolve))
   f.service.mapTenant = (_tenant: unknown, window: { status: string }) => ({ auditStatus: window.status })
   const response = await f.run()
   assert.deepEqual(response.tenant, { auditStatus: 'NOT_READ' })
@@ -238,6 +255,7 @@ test('customer verification keeps its published verdict when retained audit read
   assert.equal(f.db.providerCalls, 1)
   assert.equal(f.db.connectionWrites, 1)
   assert.equal(f.db.tenantWrites, 1)
+  assert.deepEqual(f.db.auditStatements, ["SET LOCAL statement_timeout = '1200ms'", "SET LOCAL lock_timeout = '250ms'"])
 })
 
 test('customer verification cannot read audit evidence after a post-publication organization move', async () => {
