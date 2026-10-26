@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { commitActiveIntakeReceipt } from './intake-continuation-writer.js'
+import {
+  commitActiveIntakeReceipt, INTAKE_RECEIPT_TRANSACTION_LIMITS,
+  type IntakeReceiptRunner, type IntakeReceiptTransactionLimits,
+} from './intake-continuation-writer.js'
 import type { IntakeSourceSnapshot } from './intake-continuation-policy.js'
 import type { SqlRunner } from './pipeline-store.js'
 
@@ -35,11 +38,13 @@ function fixture(options: {
   current?: IntakeSourceSnapshot | null
   prior?: { organizationId?: string; outcome: string; mappingRevision?: string } | null
   claimed?: number
+  receiptLockError?: Error
 } = {}) {
   const attempted: string[] = []
   const committed: string[] = []
   const queries: Array<{ sql: string; params: readonly unknown[] }> = []
   const executes: Array<{ sql: string; params: readonly unknown[] }> = []
+  const transactionLimits: IntakeReceiptTransactionLimits[] = []
   const transactionRunner: SqlRunner = {
     async query<T>(sql: string, params: readonly unknown[]): Promise<readonly T[]> {
       queries.push({ sql, params })
@@ -48,6 +53,7 @@ function fixture(options: {
         return (current === null ? [] : [sourceRow(current)]) as T[]
       }
       if (sql.includes('FROM alert_finding_intake_status')) {
+        if (options.receiptLockError) throw options.receiptLockError
         if (!options.prior) return []
         return [{
           finding_id: source.id,
@@ -62,6 +68,7 @@ function fixture(options: {
     },
     async execute(sql: string, params: readonly unknown[]): Promise<number> {
       executes.push({ sql, params })
+      if (sql.startsWith('SET LOCAL ')) return 0
       if (sql.includes('INSERT INTO alert_finding_intake_status')) {
         attempted.push('receipt')
         return options.claimed ?? 1
@@ -73,19 +80,28 @@ function fixture(options: {
       return run(transactionRunner)
     },
   }
-  const runner: SqlRunner = {
+  const runner: IntakeReceiptRunner = {
     query: transactionRunner.query,
     execute: transactionRunner.execute,
-    async transaction<T>(run: (tx: SqlRunner) => Promise<T>): Promise<T> {
+    async transaction<T>(_run: (tx: SqlRunner) => Promise<T>): Promise<T> {
+      throw new Error('UNBOUNDED_TRANSACTION_USED')
+    },
+    async transactionWithLimits<T>(
+      limits: IntakeReceiptTransactionLimits,
+      run: (tx: SqlRunner) => Promise<T>,
+    ): Promise<T> {
+      transactionLimits.push(limits)
       const result = await run(transactionRunner)
       committed.push(...attempted)
       return result
     },
   }
-  return { runner, attempted, committed, queries, executes }
+  return { runner, attempted, committed, queries, executes, transactionLimits }
 }
 
 const writeEffect = (tx: SqlRunner) => tx.execute('INSERT INTO synthetic_effect VALUES (1)', []).then(() => undefined)
+const dataWrites = (f: ReturnType<typeof fixture>) =>
+  f.executes.filter(each => !each.sql.startsWith('SET LOCAL '))
 
 test('inactive seam locks exact source and claims receipt before database-only effects', async () => {
   const f = fixture()
@@ -93,13 +109,47 @@ test('inactive seam locks exact source and claims receipt before database-only e
     '2026-10-25T12:00:00.000Z', writeEffect)
   assert.deepEqual(result, { kind: 'COMMITTED' })
   assert.deepEqual(f.committed, ['receipt', 'effect'])
+  assert.deepEqual(f.transactionLimits, [INTAKE_RECEIPT_TRANSACTION_LIMITS])
+  assert.deepEqual(f.executes.slice(0, 2).map(each => each.sql),
+    ["SET LOCAL lock_timeout = '500ms'", "SET LOCAL statement_timeout = '2500ms'"])
+  assert.deepEqual(f.executes.slice(0, 2).map(each => each.params), [[], []])
   assert.match(f.queries[0].sql, /FOR UPDATE OF f NOWAIT/)
   assert.deepEqual(f.queries[0].params,
     [source.id, source.organizationId, source.customerTenantId])
   assert.match(f.queries[1].sql, /FOR UPDATE/)
-  assert.match(f.executes[0].sql, /ON CONFLICT \(finding_id\) DO UPDATE/)
-  assert.match(f.executes[0].sql, /outcome = 'BLOCKED_UNMAPPED'/)
-  assert.match(f.executes[0].sql, /INTERVAL '2160 hours'/)
+  assert.match(f.executes[2].sql, /ON CONFLICT \(finding_id\) DO UPDATE/)
+  assert.match(f.executes[2].sql, /outcome = 'BLOCKED_UNMAPPED'/)
+  assert.match(f.executes[2].sql, /INTERVAL '2160 hours'/)
+})
+
+test('decision time requires a round-trippable UTC instant before opening a transaction', async () => {
+  for (const invalid of [
+    '2026-10-25T12:00:00.000',
+    '2026-10-25T12:00:00.000+00:00',
+    '2026-10-25T12:00:00Z',
+    '2026-02-30T12:00:00.000Z',
+    '2026-10-25T12:00:00.1234Z',
+  ]) {
+    const f = fixture()
+    await assert.rejects(commitActiveIntakeReceipt(f.runner, source, 'map-a', 'COMPLETED',
+      invalid, writeEffect), /INVALID_INTAKE_RECEIPT_INPUT/)
+    assert.deepEqual(f.transactionLimits, [], invalid)
+    assert.deepEqual(f.executes, [], invalid)
+  }
+  const precise = fixture()
+  assert.deepEqual(await commitActiveIntakeReceipt(precise.runner, source, 'map-a', 'COMPLETED',
+    '2026-10-25T12:00:00.123456Z', writeEffect), { kind: 'COMMITTED' })
+  assert.equal(precise.executes[2].params[7], '2026-10-25T12:00:00.123456Z')
+})
+
+test('receipt-row lock failure rolls back before the claim and effects', async () => {
+  const lockError = Object.assign(new Error('LOCK_NOT_AVAILABLE'), { code: '55P03' })
+  const f = fixture({ receiptLockError: lockError })
+  await assert.rejects(commitActiveIntakeReceipt(f.runner, source, 'map-a', 'COMPLETED',
+    '2026-10-25T12:00:00.000Z', writeEffect), (error: unknown) => error === lockError)
+  assert.deepEqual(f.transactionLimits, [INTAKE_RECEIPT_TRANSACTION_LIMITS])
+  assert.deepEqual(f.attempted, [])
+  assert.deepEqual(f.committed, [])
 })
 
 test('changed microsecond source version refuses all receipt and effect writes', async () => {
@@ -108,7 +158,7 @@ test('changed microsecond source version refuses all receipt and effect writes',
     '2026-10-25T12:00:00.000Z', writeEffect),
   { kind: 'REFUSED', reason: 'SOURCE_CHANGED' })
   assert.deepEqual(f.committed, [])
-  assert.deepEqual(f.executes, [])
+  assert.deepEqual(dataWrites(f), [])
 })
 
 test('source removed or moved before lock cannot get a receipt', async () => {
@@ -116,7 +166,7 @@ test('source removed or moved before lock cannot get a receipt', async () => {
   assert.deepEqual(await commitActiveIntakeReceipt(f.runner, source, 'map-a', 'COMPLETED',
     '2026-10-25T12:00:00.000Z', writeEffect),
   { kind: 'REFUSED', reason: 'SOURCE_MISSING_OR_MOVED' })
-  assert.deepEqual(f.executes, [])
+  assert.deepEqual(dataWrites(f), [])
 })
 
 test('terminal receipt and unchanged unmapped receipt cannot run effects again', async () => {
@@ -125,7 +175,7 @@ test('terminal receipt and unchanged unmapped receipt cannot run effects again',
     assert.deepEqual(await commitActiveIntakeReceipt(f.runner, source, 'map-a', 'COMPLETED',
       '2026-10-25T12:00:00.000Z', writeEffect),
     { kind: 'REFUSED', reason: 'ALREADY_DECIDED' })
-    assert.deepEqual(f.executes, [])
+    assert.deepEqual(dataWrites(f), [])
   }
 })
 
@@ -142,7 +192,7 @@ test('scope-conflicting receipt is refused without effects', async () => {
   assert.deepEqual(await commitActiveIntakeReceipt(f.runner, source, 'map-a', 'COMPLETED',
     '2026-10-25T12:00:00.000Z', writeEffect),
   { kind: 'REFUSED', reason: 'SCOPE_MISMATCH' })
-  assert.deepEqual(f.executes, [])
+  assert.deepEqual(dataWrites(f), [])
 })
 
 test('lost receipt claim aborts before effects; later effect failure rolls receipt back', async () => {

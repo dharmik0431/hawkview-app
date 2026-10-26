@@ -4,6 +4,24 @@ import {
 } from './intake-continuation-policy.js'
 import type { SqlRunner } from './pipeline-store.js'
 
+/** A future adapter must enforce both limits on the actual database transaction.
+ * Prisma maps these to interactive transaction maxWait/timeout; the physical
+ * test adapter must bound its BEGIN-to-COMMIT interval too. Plain SqlRunner
+ * is insufficient. Unit mocks only verify the requested limits. */
+export type IntakeReceiptTransactionLimits = Readonly<{ maxWaitMs: number; timeoutMs: number }>
+export interface IntakeReceiptRunner extends SqlRunner {
+  transactionWithLimits<T>(
+    limits: IntakeReceiptTransactionLimits,
+    run: (tx: SqlRunner) => Promise<T>,
+  ): Promise<T>
+}
+
+// Provisional one-finding bounds. Physical database and intake-budget tests
+// must establish throughput before this inactive seam can be wired in.
+export const INTAKE_RECEIPT_TRANSACTION_LIMITS = { maxWaitMs: 250, timeoutMs: 3_500 } as const
+const INTAKE_RECEIPT_LOCK_WAIT_MS = 500
+const INTAKE_RECEIPT_STATEMENT_MS = 2_500
+
 /**
  * Inactive HAW-19 writer seam. No production service imports this module.
  * It is deliberately one finding per transaction until the registered physical
@@ -70,18 +88,30 @@ function receiptFromRow(row: ReceiptRow): IntakeDecisionReceipt {
 }
 
 export async function commitActiveIntakeReceipt(
-  runner: SqlRunner,
+  runner: IntakeReceiptRunner,
   selected: IntakeSourceSnapshot,
   mappingRevision: string,
   outcome: IntakeDecisionReceipt['outcome'],
   decidedAtIso: string,
   writeEffects: (tx: SqlRunner) => Promise<void>,
 ): Promise<IntakeReceiptWriteResult> {
+  // Date.parse accepts timezone-less and normalized dates that PostgreSQL can
+  // interpret differently under a pooled connection's TimeZone setting.
+  // The selector preserves microseconds, while application clocks usually
+  // provide milliseconds. Validate calendar fields at millisecond precision
+  // without discarding a valid six-digit fraction sent to PostgreSQL.
+  const millisecondIso = decidedAtIso.replace(/\.(\d{3})\d{3}Z$/, '.$1Z')
+  const decidedAtMs = Date.parse(millisecondIso)
   if (!mappingRevision || mappingRevision.length > 64 ||
-      !Number.isFinite(Date.parse(decidedAtIso))) {
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(?:\d{3}|\d{6})Z$/.test(decidedAtIso) ||
+      !Number.isFinite(decidedAtMs) || new Date(decidedAtMs).toISOString() !== millisecondIso) {
     throw new Error('INVALID_INTAKE_RECEIPT_INPUT')
   }
-  return runner.transaction(async tx => {
+  return runner.transactionWithLimits(INTAKE_RECEIPT_TRANSACTION_LIMITS, async tx => {
+    // NOWAIT below covers the finding row only. Bound receipt/foreign-key and
+    // table-lock waits, and every SQL statement, without changing pool defaults.
+    await tx.execute(`SET LOCAL lock_timeout = '${INTAKE_RECEIPT_LOCK_WAIT_MS}ms'`, [])
+    await tx.execute(`SET LOCAL statement_timeout = '${INTAKE_RECEIPT_STATEMENT_MS}ms'`, [])
     // Lock the exact source scope. NOWAIT returns a retryable transaction error
     // rather than spending collection's time waiting behind evaluation or
     // retention. The latter also locks finding rows before deletion.
