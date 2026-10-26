@@ -26,6 +26,74 @@ export type IntakeSourceSnapshot = Readonly<{
   updatedAt: string
 }>
 
+/** A pure classification of a *locked* finding against one UTC clock sampled
+ * by the database at decision time. It does not authorize any write or send.
+ * Trusted outcomes preserve the source's exact observed timestamp for history;
+ * an untrusted observation must never be presented as a confirmed event time. */
+export type IntakeMode =
+  | Readonly<{ kind: 'ACTIVE_ELIGIBLE'; observedAtExact: string; processedAtExact: string }>
+  | Readonly<{ kind: 'HISTORICAL_ONLY'; reason: 'AGED_OUT' | 'EXPIRED_AT_PROCESSING' |
+      'SOURCE_EXPIRED'; observedAtExact: string; processedAtExact: string }>
+  | Readonly<{ kind: 'INELIGIBLE'; reason: 'SOURCE_NOT_ACTIVE';
+      observedAtExact: string; processedAtExact: string }>
+  | Readonly<{ kind: 'UNTRUSTED_TIME'; reason: 'PROCESSING_CLOCK_INVALID' |
+      'OBSERVATION_INVALID' | 'OBSERVATION_IN_FUTURE' | 'EXPIRY_INVALID' |
+      'EXPIRY_BEFORE_OBSERVATION'; observedAtExact: string | null;
+      processedAtExact: string | null }>
+
+const MICROSECONDS_PER_DAY = 86_400_000_000n
+
+/** PostgreSQL `to_char(... AT TIME ZONE 'UTC', ...US...)` preserves six digits;
+ * application ISO clocks may have three. Date.parse alone loses the remainder. */
+function exactUtcMicroseconds(value: string | null | undefined): bigint | null {
+  if (typeof value !== 'string') return null
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{3}|\d{6})Z$/.exec(value)
+  if (!match) return null
+  const millisecondsIso = `${match[1]}.${match[2].slice(0, 3)}Z`
+  const milliseconds = Date.parse(millisecondsIso)
+  if (!Number.isFinite(milliseconds) ||
+      new Date(milliseconds).toISOString() !== millisecondsIso) return null
+  const remainder = match[2].length === 6 ? match[2].slice(3) : '0'
+  return BigInt(milliseconds) * 1_000n + BigInt(remainder)
+}
+
+export function classifyLockedIntakeMode(
+  source: Pick<IntakeSourceSnapshot, 'state' | 'observedAt' | 'expiresAt'>,
+  processingClockUtcIso: string,
+): IntakeMode {
+  const processed = exactUtcMicroseconds(processingClockUtcIso)
+  if (processed === null) return {
+    kind: 'UNTRUSTED_TIME', reason: 'PROCESSING_CLOCK_INVALID',
+    observedAtExact: null, processedAtExact: null,
+  }
+  const observed = exactUtcMicroseconds(source.observedAt)
+  if (observed === null) return {
+    kind: 'UNTRUSTED_TIME', reason: 'OBSERVATION_INVALID',
+    observedAtExact: null, processedAtExact: processingClockUtcIso,
+  }
+  if (observed > processed) return {
+    kind: 'UNTRUSTED_TIME', reason: 'OBSERVATION_IN_FUTURE',
+    observedAtExact: null, processedAtExact: processingClockUtcIso,
+  }
+  const expires = exactUtcMicroseconds(source.expiresAt)
+  if (expires === null) return {
+    kind: 'UNTRUSTED_TIME', reason: 'EXPIRY_INVALID',
+    observedAtExact: null, processedAtExact: processingClockUtcIso,
+  }
+  if (expires < observed) return {
+    kind: 'UNTRUSTED_TIME', reason: 'EXPIRY_BEFORE_OBSERVATION',
+    observedAtExact: null, processedAtExact: processingClockUtcIso,
+  }
+  const times = { observedAtExact: source.observedAt, processedAtExact: processingClockUtcIso }
+  if (source.state === 'EXPIRED') return { kind: 'HISTORICAL_ONLY', reason: 'SOURCE_EXPIRED', ...times }
+  if (!isActiveIntakeFinding(source.state)) return { kind: 'INELIGIBLE', reason: 'SOURCE_NOT_ACTIVE', ...times }
+  if (expires <= processed) return { kind: 'HISTORICAL_ONLY', reason: 'EXPIRED_AT_PROCESSING', ...times }
+  if (processed - observed > MICROSECONDS_PER_DAY) {
+    return { kind: 'HISTORICAL_ONLY', reason: 'AGED_OUT', ...times }
+  }
+  return { kind: 'ACTIVE_ELIGIBLE', ...times }
+}
+
 export type IntakeDecisionReceipt = Readonly<{
   findingId: string
   organizationId: string

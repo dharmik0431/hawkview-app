@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
-  intakeReviewReason, isActiveIntakeFinding, sameIntakeSourceSnapshot,
+  classifyLockedIntakeMode, intakeReviewReason, isActiveIntakeFinding, sameIntakeSourceSnapshot,
   type IntakeDecisionReceipt, type IntakeSourceSnapshot,
 } from './intake-continuation-policy.js'
 
@@ -32,6 +32,77 @@ const receipt = (
   findingId: selected.id, organizationId: selected.organizationId,
   customerTenantId: selected.customerTenantId, ruleId: selected.ruleId,
   ruleVersion: selected.ruleVersion, outcome, mappingRevision: 'reviewed-map-a',
+})
+
+const processingClock = '2026-10-26T10:00:00.000000Z'
+const locked = {
+  state: 'OPEN', observedAt: '2026-10-25T10:00:00.000000Z',
+  expiresAt: '2026-10-27T10:00:00.000000Z',
+}
+
+test('locked intake mode compares an injected UTC clock at the exact 24-hour boundary', () => {
+  const oneMillisecondNewer = '2026-10-25T10:00:00.001000Z'
+  const oneMillisecondOlder = '2026-10-25T09:59:59.999000Z'
+  for (const observedAt of [oneMillisecondNewer, locked.observedAt]) {
+    assert.deepEqual(classifyLockedIntakeMode({ ...locked, observedAt }, processingClock), {
+      kind: 'ACTIVE_ELIGIBLE', observedAtExact: observedAt,
+      processedAtExact: processingClock,
+    })
+  }
+  assert.deepEqual(classifyLockedIntakeMode({ ...locked, observedAt: oneMillisecondOlder }, processingClock), {
+    kind: 'HISTORICAL_ONLY', reason: 'AGED_OUT', observedAtExact: oneMillisecondOlder,
+    processedAtExact: processingClock,
+  })
+  assert.equal(classifyLockedIntakeMode({ ...locked,
+    observedAt: '2026-10-25T09:59:59.999999Z' }, processingClock).kind, 'HISTORICAL_ONLY')
+  assert.equal(classifyLockedIntakeMode({ ...locked,
+    observedAt: '2026-10-25T10:00:00.000001Z' }, processingClock).kind, 'ACTIVE_ELIGIBLE')
+})
+
+test('expiry equality and EXPIRED source state are historical-only even when recent', () => {
+  const recent = { ...locked, observedAt: '2026-10-26T09:00:00.123456Z' }
+  assert.deepEqual(classifyLockedIntakeMode({ ...recent, expiresAt: processingClock }, processingClock), {
+    kind: 'HISTORICAL_ONLY', reason: 'EXPIRED_AT_PROCESSING',
+    observedAtExact: recent.observedAt, processedAtExact: processingClock,
+  })
+  assert.equal(classifyLockedIntakeMode({ ...recent,
+    expiresAt: '2026-10-26T10:00:00.000001Z' }, processingClock).kind, 'ACTIVE_ELIGIBLE')
+  assert.deepEqual(classifyLockedIntakeMode({ ...recent, state: 'EXPIRED' }, processingClock), {
+    kind: 'HISTORICAL_ONLY', reason: 'SOURCE_EXPIRED',
+    observedAtExact: recent.observedAt, processedAtExact: processingClock,
+  })
+  for (const state of ['UNKNOWN', 'RESOLVED']) {
+    assert.equal(classifyLockedIntakeMode({ ...recent, state }, processingClock).kind, 'INELIGIBLE')
+  }
+})
+
+test('future, missing, malformed and non-finite times never become active', () => {
+  assert.deepEqual(classifyLockedIntakeMode({ ...locked,
+    observedAt: '2026-10-26T10:00:00.000001Z' }, processingClock), {
+    kind: 'UNTRUSTED_TIME', reason: 'OBSERVATION_IN_FUTURE',
+    observedAtExact: null, processedAtExact: processingClock,
+  })
+  for (const observedAt of ['', 'infinity', '2026-02-30T10:00:00.000000Z',
+    '2026-10-25T10:00:00']) {
+    const result = classifyLockedIntakeMode({ ...locked, observedAt }, processingClock)
+    assert.deepEqual(result, { kind: 'UNTRUSTED_TIME', reason: 'OBSERVATION_INVALID',
+      observedAtExact: null, processedAtExact: processingClock }, observedAt)
+  }
+  assert.equal(classifyLockedIntakeMode({ ...locked,
+    observedAt: null as unknown as string }, processingClock).kind, 'UNTRUSTED_TIME')
+  assert.deepEqual(classifyLockedIntakeMode(locked, '2026-10-26T10:00:00'), {
+    kind: 'UNTRUSTED_TIME', reason: 'PROCESSING_CLOCK_INVALID',
+    observedAtExact: null, processedAtExact: null,
+  })
+  assert.deepEqual(classifyLockedIntakeMode({ ...locked, expiresAt: '-infinity' }, processingClock), {
+    kind: 'UNTRUSTED_TIME', reason: 'EXPIRY_INVALID',
+    observedAtExact: null, processedAtExact: processingClock,
+  })
+  assert.deepEqual(classifyLockedIntakeMode({ ...locked,
+    expiresAt: '2026-10-25T09:59:59.999999Z' }, processingClock), {
+    kind: 'UNTRUSTED_TIME', reason: 'EXPIRY_BEFORE_OBSERVATION',
+    observedAtExact: null, processedAtExact: processingClock,
+  })
 })
 
 test('OPEN and UPDATED are both active; resolved, expired and unknown are not', () => {
