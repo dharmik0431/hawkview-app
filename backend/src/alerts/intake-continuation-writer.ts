@@ -1,5 +1,5 @@
 import {
-  intakeReviewReason, sameIntakeSourceSnapshot,
+  classifyLockedIntakeMode, intakeReviewReason, sameIntakeSourceSnapshot,
   type IntakeDecisionReceipt, type IntakeSourceSnapshot,
 } from './intake-continuation-policy.js'
 import type { SqlRunner } from './pipeline-store.js'
@@ -35,7 +35,8 @@ const INTAKE_RECEIPT_STATEMENT_MS = 2_500
 export type IntakeReceiptWriteResult =
   | Readonly<{ kind: 'COMMITTED' }>
   | Readonly<{ kind: 'REFUSED'; reason: 'SOURCE_MISSING_OR_MOVED' | 'SOURCE_CHANGED'
-      | 'ALREADY_DECIDED' | 'INACTIVE' | 'SCOPE_MISMATCH' }>
+      | 'ALREADY_DECIDED' | 'INACTIVE' | 'SCOPE_MISMATCH'
+      | 'HISTORICAL_ONLY' | 'UNTRUSTED_TIME' | 'INELIGIBLE' }>
 
 type SourceRow = Readonly<{
   id: string
@@ -66,6 +67,8 @@ type ReceiptRow = Readonly<{
   mapping_revision: string
 }>
 
+type DecisionClockRow = Readonly<{ decided_at_exact: string }>
+
 function sourceFromRow(row: SourceRow): IntakeSourceSnapshot {
   return {
     id: row.id, organizationId: row.organization_id,
@@ -91,20 +94,11 @@ export async function commitActiveIntakeReceipt(
   runner: IntakeReceiptRunner,
   selected: IntakeSourceSnapshot,
   mappingRevision: string,
-  outcome: IntakeDecisionReceipt['outcome'],
-  decidedAtIso: string,
+  outcome: 'COMPLETED' | 'BLOCKED_UNMAPPED',
   writeEffects: (tx: SqlRunner) => Promise<void>,
 ): Promise<IntakeReceiptWriteResult> {
-  // Date.parse accepts timezone-less and normalized dates that PostgreSQL can
-  // interpret differently under a pooled connection's TimeZone setting.
-  // The selector preserves microseconds, while application clocks usually
-  // provide milliseconds. Validate calendar fields at millisecond precision
-  // without discarding a valid six-digit fraction sent to PostgreSQL.
-  const millisecondIso = decidedAtIso.replace(/\.(\d{3})\d{3}Z$/, '.$1Z')
-  const decidedAtMs = Date.parse(millisecondIso)
   if (!mappingRevision || mappingRevision.length > 64 ||
-      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(?:\d{3}|\d{6})Z$/.test(decidedAtIso) ||
-      !Number.isFinite(decidedAtMs) || new Date(decidedAtMs).toISOString() !== millisecondIso) {
+      (outcome !== 'COMPLETED' && outcome !== 'BLOCKED_UNMAPPED')) {
     throw new Error('INVALID_INTAKE_RECEIPT_INPUT')
   }
   return runner.transactionWithLimits(INTAKE_RECEIPT_TRANSACTION_LIMITS, async tx => {
@@ -130,7 +124,8 @@ export async function commitActiveIntakeReceipt(
     )
     const current = locked[0]
     if (!current) return { kind: 'REFUSED', reason: 'SOURCE_MISSING_OR_MOVED' }
-    if (!sameIntakeSourceSnapshot(selected, sourceFromRow(current))) {
+    const lockedSource = sourceFromRow(current)
+    if (!sameIntakeSourceSnapshot(selected, lockedSource)) {
       return { kind: 'REFUSED', reason: 'SOURCE_CHANGED' }
     }
 
@@ -143,13 +138,27 @@ export async function commitActiveIntakeReceipt(
     )
     const review = intakeReviewReason(selected,
       priorRows[0] ? receiptFromRow(priorRows[0]) : null, mappingRevision)
-    if (review === 'INACTIVE') return { kind: 'REFUSED', reason: 'INACTIVE' }
     if (review === 'SCOPE_MISMATCH' || review === 'IDENTITY_CHANGED') {
       return { kind: 'REFUSED', reason: 'SCOPE_MISMATCH' }
     }
-    if (review !== 'UNSEEN' && review !== 'MAPPING_CHANGED') {
+    if (review !== 'UNSEEN' && review !== 'MAPPING_CHANGED' && review !== 'INACTIVE') {
       return { kind: 'REFUSED', reason: 'ALREADY_DECIDED' }
     }
+
+    // PostgreSQL now()/CURRENT_TIMESTAMP are transaction-start clocks. Read
+    // clock_timestamp() once, after both row locks, so a finding that aged out
+    // while waiting cannot enter the active-effects path. This inactive seam
+    // refuses historical/untrusted findings until a separate history writer
+    // can durably record them without notifications or email.
+    const clockRows = await tx.query<DecisionClockRow>(
+      `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS decided_at_exact`,
+      [],
+    )
+    const decisionClock = clockRows.length === 1 ? clockRows[0]?.decided_at_exact : undefined
+    const mode = classifyLockedIntakeMode(lockedSource, decisionClock ?? '')
+    if (mode.kind !== 'ACTIVE_ELIGIBLE') return { kind: 'REFUSED', reason: mode.kind }
+    if (review === 'INACTIVE') return { kind: 'REFUSED', reason: 'INACTIVE' }
 
     // This conditional write is the claim. A second writer that did not take
     // the source lock cannot overwrite a terminal receipt. Both the claim and
@@ -176,7 +185,7 @@ export async function commitActiveIntakeReceipt(
            OR alert_finding_intake_status.source_rule_version IS DISTINCT FROM EXCLUDED.source_rule_version
            OR alert_finding_intake_status.mapping_revision IS DISTINCT FROM EXCLUDED.mapping_revision)`,
       [selected.id, selected.organizationId, selected.customerTenantId,
-        selected.ruleId, selected.ruleVersion, outcome, mappingRevision, decidedAtIso],
+        selected.ruleId, selected.ruleVersion, outcome, mappingRevision, mode.processedAtExact],
     )
     if (claimed !== 1) throw new Error('INTAKE_RECEIPT_CLAIM_LOST')
     await writeEffects(tx)
