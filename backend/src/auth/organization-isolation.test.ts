@@ -368,8 +368,9 @@ test('notifications cannot fall back to email or query data without a subject-li
   assert.equal(notificationQueries, 0)
 })
 
-test('tenant list scopes authoritative snapshots and audit queries by organization and tenant', async () => {
+test('tenant list scopes authoritative snapshots and skips audit reads for an empty tenant set', async () => {
   const observed: Record<string, unknown> = {}
+  let auditQueries = 0
   const prisma = {
     user: {
       findUnique: async ({ where }: { where: unknown }) => {
@@ -387,11 +388,9 @@ test('tenant list scopes authoritative snapshots and audit queries by organizati
         return []
       },
     },
-    directoryAuditLog: {
-      findMany: async ({ where }: { where: unknown }) => {
-        observed.auditWhere = where
-        return []
-      },
+    $queryRawUnsafe: async () => {
+      auditQueries += 1
+      return []
     },
   } as unknown as PrismaService
 
@@ -427,14 +426,7 @@ test('tenant list scopes authoritative snapshots and audit queries by organizati
     (observed.tenantSelect as any).connection.select.onboardingCompletedAt,
     true,
   )
-  assert.deepEqual(
-    (observed.auditWhere as Record<string, unknown>).organizationId,
-    { in: ['organization-a'] },
-  )
-  assert.deepEqual(
-    (observed.auditWhere as Record<string, unknown>).customerTenantId,
-    { in: [] },
-  )
+  assert.equal(auditQueries, 0)
 })
 
 test('tenant bundle scopes sync state and daily usage by the readable tenant organization', async () => {
