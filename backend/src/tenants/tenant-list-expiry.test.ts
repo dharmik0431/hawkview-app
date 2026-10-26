@@ -47,12 +47,43 @@ function healthyTenant(id: string) {
     lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
   })) }
 }
-function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string; snapshotRead?: () => Promise<void> } = {}) {
+function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnType<typeof tenant>[]; organizations?: string[]; auditReadError?: boolean; omitCoverageTenant?: string; snapshotRead?: () => Promise<void>; snapshotLockMode?: 'serialized' | 'fail'; visibleSnapshotWrites?: boolean } = {}) {
   const writes: any[] = []
   const previous = new Map<string, any>()
+  const snapshotLocks = new Map<string, Promise<void>>()
   const queries: any[] = []
   const tenants = options.tenants ?? [tenant('a')]
   const prisma: any = {
+    $transaction: async (work: (tx: any) => Promise<unknown>, settings: any) => {
+      assert.deepEqual(settings, { isolationLevel: 'ReadCommitted', maxWait: 1000, timeout: 3500 })
+      let releaseLock: (() => void) | undefined
+      const tx = { ...prisma, $queryRawUnsafe: async (sql: string, ...args: unknown[]) => {
+        if (sql.includes('pg_advisory_xact_lock') && options.snapshotLockMode === 'fail') {
+          throw new Error('synthetic snapshot lock timeout')
+        }
+        if (sql.includes('pg_advisory_xact_lock') && options.snapshotLockMode === 'serialized') {
+          const key = String(args[0])
+          const prior = snapshotLocks.get(key) ?? Promise.resolve()
+          const mine = new Promise<void>(resolve => { releaseLock = resolve })
+          snapshotLocks.set(key, mine)
+          await prior
+        }
+        return prisma.$queryRawUnsafe(sql, ...args)
+      } }
+      try { return await work(tx) } finally { releaseLock?.() }
+    },
+    $executeRawUnsafe: async (sql: string) => {
+      assert.match(sql, /^SET LOCAL (lock_timeout|statement_timeout) = /)
+      return 0
+    },
+    $queryRawUnsafe: async (sql: string, ...args: unknown[]) => {
+      if (sql.includes('pg_advisory_xact_lock')) {
+        assert.match(String(args[0]), /^hawkview:tenant-health-snapshot:/)
+        return [{ locked: 1 }]
+      }
+      assert.equal(sql, 'SELECT clock_timestamp() AS "databaseNow"')
+      return [{ databaseNow: NOW }]
+    },
     user: { findUnique: async ({ where, select }: any) => {
       assert.equal(where.authProviderUserId, 'list-owner')
       assert.deepEqual(select.memberships.where, { status: 'ACTIVE', organization: { status: 'ACTIVE' } })
@@ -101,10 +132,17 @@ function fixture(rows: Audit[], options: { account?: string; tenants?: ReturnTyp
     },
     tenantHealthSnapshot: {
       findFirst: async ({ where }: any) => {
+        const saved = previous.get(where.customerTenantId) ?? null
         await options.snapshotRead?.()
-        return previous.get(where.customerTenantId) ?? null
+        if (options.visibleSnapshotWrites) await new Promise<void>(resolve => setImmediate(resolve))
+        return saved
       },
-      create: async ({ data }: any) => { writes.push(data); return data },
+      create: async ({ data }: any) => {
+        writes.push(data)
+        if (options.visibleSnapshotWrites) previous.set(data.customerTenantId,
+          { ...data, id: `snapshot-${writes.length}` })
+        return data
+      },
     },
   }
   const service = new TenantsService(prisma, consent as never, {} as never)
@@ -436,4 +474,79 @@ test('tenant list expiry: changed audit evidence creates history despite unchang
   assert.equal(replaced.tenantHealth.security.directoryAuditRead.eligibleEventCount, 3)
   assert.equal(f.writes.length, 3, 'replacement evidence should be retained even when the event count is unchanged')
   assert.deepEqual(auditKeys(f.writes[2].payload), ['audit-auth-first', 'audit-auth-second', 'audit-auth-replacement'])
+})
+
+test('tenant list expiry: simultaneous identical requests serialize snapshot admission', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('first', 60_000, -100)],
+    { snapshotLockMode: 'serialized', visibleSnapshotWrites: true })
+  const [left, right] = await Promise.all([read(f), read(f)])
+  assert.deepEqual(auditKeys(left.tenants[0]!), ['audit-auth-first'])
+  assert.deepEqual(auditKeys(right.tenants[0]!), ['audit-auth-first'])
+  assert.equal(f.writes.length, 1, 'only the first process should save identical evidence')
+})
+
+test('tenant list expiry: same-millisecond changed evidence waits for a later evaluation to enter history', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('first', 60_000, -100)], { visibleSnapshotWrites: true })
+  await read(f)
+  assert.equal(f.writes.length, 1)
+
+  f.rows.push(audit('second', 60_000, -200))
+  const sameMillisecond = await read(f)
+  assert.deepEqual(auditKeys(sameMillisecond.tenants[0]!), ['audit-auth-first', 'audit-auth-second'],
+    'the response still shows the newly read evidence')
+  assert.equal(f.writes.length, 1, 'ambiguous equal-time evidence cannot supersede saved history')
+
+  const later = await f.service.listForIdentity(identity, { now: () => date(1) })
+  assert.deepEqual(auditKeys(later.tenants[0]!), ['audit-auth-first', 'audit-auth-second'])
+  assert.equal(f.writes.length, 2, 'the next evaluation clock records changed evidence')
+  assert.ok(f.writes[1].evaluatedAt > f.writes[0].evaluatedAt)
+  assert.deepEqual(auditKeys(f.writes[1].payload), auditKeys(later.tenants[0]!))
+})
+
+test('tenant list expiry: a fourth eligible audit event changes history after the displayed three', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([
+    audit('first', 60_000, -100), audit('second', 60_000, -200), audit('third', 60_000, -300),
+  ], { visibleSnapshotWrites: true })
+  const first = (await read(f)).tenants[0]!
+  assert.deepEqual(auditKeys(first), ['audit-auth-first', 'audit-auth-second', 'audit-auth-third'])
+  assert.equal(first.tenantHealth.security.directoryAuditRead.eligibleEventCount, 3)
+  assert.equal(f.writes.length, 1)
+
+  f.rows.push(audit('fourth', 60_000, -400))
+  const changed = (await f.service.listForIdentity(identity, { now: () => date(1) })).tenants[0]!
+  assert.deepEqual(auditKeys(changed), auditKeys(first), 'the displayed top three have not changed')
+  assert.equal(changed.tenantHealth.overallStatus, first.tenantHealth.overallStatus)
+  assert.equal(changed.tenantHealth.security.directoryAuditRead.status, 'COMPLETE')
+  assert.equal(changed.tenantHealth.security.directoryAuditRead.eligibleEventCount, 4)
+  assert.equal(f.writes.length, 2, 'eligible evidence count changed inside the polling window')
+  assert.equal(f.writes[1].payload.security.directoryAuditRead.eligibleEventCount, 4)
+
+  f.rows.splice(3, 1, audit('replacement', 60_000, -400))
+  const replaced = (await f.service.listForIdentity(identity, { now: () => date(2) })).tenants[0]!
+  assert.deepEqual(auditKeys(replaced), auditKeys(first), 'replacement remains outside the displayed top three')
+  assert.equal(replaced.tenantHealth.security.directoryAuditRead.eligibleEventCount, 4)
+  assert.equal(f.writes.length, 3, 'same-count replacement outside the displayed top three changes history')
+  assert.equal(f.writes[2].payload.security.directoryAuditRead.eligibleEventCount, 4)
+})
+
+test('tenant list expiry: an older evaluation cannot become the latest health snapshot', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('first', 1, -3000)], { visibleSnapshotWrites: true })
+  await read(f)
+  assert.equal(f.writes.length, 1)
+  f.rows.push(audit('second', 1, -4000))
+  const older = await f.service.listForIdentity(identity, { now: () => date(-1000) })
+  assert.deepEqual(auditKeys(older.tenants[0]!), ['audit-auth-first', 'audit-auth-second'])
+  assert.equal(f.writes.length, 1, 'an older request must not supersede a newer saved evaluation')
+})
+
+test('tenant list expiry: snapshot lock failure keeps the evidence-backed list available', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const f = fixture([audit('first', 1, -100)], { snapshotLockMode: 'fail' })
+  const result = await read(f)
+  assert.deepEqual(auditKeys(result.tenants[0]!), ['audit-auth-first'])
+  assert.equal(f.writes.length, 0)
 })

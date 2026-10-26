@@ -9,6 +9,7 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common'
+import { createHash } from 'node:crypto'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type VerificationPublication } from './connection-verification-store.js'
 import { captureCustomerConnectionVerification, publishCustomerConnectionVerification, CustomerConnectionVerificationSuperseded, type CustomerVerificationPublication } from './customer-connection-verification-store.js'
 import { readDirectoryRoleControl, setDirectoryRoleControl, directoryControlExpectation, removeManagedDirectoryTenant } from './directory-role-receipt-store.js'
@@ -82,9 +83,19 @@ const TENANT_ONBOARDING_ROLES = [
 const MICROSOFT_TENANT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-// Per-request database fanout only. Cross-request snapshot deduplication
-// requires a separate database fence before this HAW-70 candidate can ship.
+// Per-request database fanout only. Tenant-scoped transactions serialize
+// snapshot admission across API processes; fleet-scale latency remains a
+// separate release gate for this HAW-70 candidate.
 const TENANT_HEALTH_SNAPSHOT_WORKERS = 4
+
+function auditWindowSignature(window: { status: DirectoryAuditReadStatus; events: TenantAuditEvent[] } | undefined): string | null {
+  if (window?.status !== 'COMPLETE') return null
+  // A displayed attention list holds only three findings. The complete,
+  // bounded audit window may change outside those three, including a
+  // same-count replacement, so keep a non-reversible evidence fingerprint.
+  const idsAndTimes = window.events.map((event) => [event.microsoftAuditId, event.eventDateTime.toISOString()])
+  return createHash('sha256').update(JSON.stringify(idsAndTimes)).digest('hex')
+}
 
 export const preserveOptionalExchangeConsent = (
   graphPermissions: string[],
@@ -332,7 +343,7 @@ export class TenantsService {
       lastSuccessfulPollAt: Date | null
       lastError: string | null
     }>
-  }, auditEvents: TenantAuditEvent[] = [], directoryAuditReadStatus: DirectoryAuditReadStatus = 'NOT_READ') {
+  }, auditEvents: TenantAuditEvent[] = [], directoryAuditReadStatus: DirectoryAuditReadStatus = 'NOT_READ', now = new Date()) {
     const secureScoreDetails = getMicrosoftSecureScoreDetails(
       tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES),
       tenant.syncStates.find((state) => state.resourceType === SyncResourceType.SECURE_SCORES)?.lastSuccessfulAt,
@@ -404,7 +415,7 @@ export class TenantsService {
     const notApplicableResourceTypes = readinessResourceTypes('NOT_LICENSED')
     const unsupportedResourceTypes = readinessResourceTypes('UNSUPPORTED')
     const syncFreshness = deriveTenantSyncFreshness(
-      tenant.syncStates, new Date(),
+      tenant.syncStates, now,
       [...notApplicableResourceTypes, ...unsupportedResourceTypes],
       { notLicensed: notApplicableResourceTypes, unsupported: unsupportedResourceTypes },
     )
@@ -423,6 +434,7 @@ export class TenantsService {
       directoryAuditReadStatus,
       notApplicableResourceTypes,
       unsupportedResourceTypes,
+      now,
     })
 
     return {
@@ -695,6 +707,10 @@ export class TenantsService {
     const organizationIds = await this.getAccessibleOrganizationIds(identity)
     if (organizationIds.length === 0) return { tenants: [] }
 
+    // Pin the evaluation clock before either tenant or audit evidence is read.
+    // Requests in the same millisecond remain ambiguous and cannot supersede
+    // one another's saved history.
+    const auditReadAt = internals.now?.() ?? new Date()
     const tenants = await this.prisma.customerTenant.findMany({
       where: { organizationId: { in: organizationIds } },
       orderBy: [{ displayName: 'asc' }, { microsoftTenantId: 'asc' }],
@@ -705,7 +721,6 @@ export class TenantsService {
     // Event recency and saved retention are independent eligibility rules.
     // Capture once for this query; HTTP callers never supply the clock. The
     // bounded lateral read has an independent coverage witness per tenant.
-    const auditReadAt = internals.now?.() ?? new Date()
     let auditWindows: Map<string, { events: TenantAuditEvent[]; status: DirectoryAuditReadStatus }>
     try {
       auditWindows = await readTenantDirectoryAuditWindows(
@@ -725,6 +740,7 @@ export class TenantsService {
           tenant,
           auditWindows.get(tenant.id)?.events ?? [],
           auditWindows.get(tenant.id)?.status ?? 'NOT_READ',
+          auditReadAt,
         )
       )
 
@@ -737,7 +753,12 @@ export class TenantsService {
         const tenant = tenants[index]
         const mapped = mappedTenants[index]
         if (!tenant || !mapped) continue
-        await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
+        await this.persistTenantHealthSnapshot(
+          tenant,
+          mapped.tenantHealth,
+          mapped.syncFreshness,
+          auditWindowSignature(auditWindows.get(tenant.id)),
+        )
       }
     }))
 
@@ -748,44 +769,63 @@ export class TenantsService {
     tenant: { id: string; microsoftTenantId: string; organization: { id: string } },
     health: ReturnType<typeof deriveTenantHealth>,
     syncFreshness: TenantSyncFreshness,
+    auditEvidenceSignature: string | null,
   ) {
     try {
-      const previous = await this.prisma.tenantHealthSnapshot.findFirst({
-        where: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
-        orderBy: { evaluatedAt: 'desc' },
-        select: { overallStatus: true, evaluatedAt: true, payload: true },
-      })
       const evaluatedAt = new Date(health.evaluatedAt)
       const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-      const previousPayload = previous?.payload as {
-        syncFreshness?: TenantSyncFreshness
-        attention?: ReturnType<typeof deriveTenantHealth>['attention']
-        security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } }
-      } | null
-      const previousSignature = previousPayload?.syncFreshness
-        ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-        : null
       const currentAuditFindings = JSON.stringify(health.attention.filter((item) => item.key.startsWith('audit-')))
-      const previousAuditFindings = Array.isArray(previousPayload?.attention)
-        ? JSON.stringify(previousPayload.attention.filter((item) => item?.key?.startsWith('audit-')))
-        : null
-      // Keep evidence history without producing a row on every tenant-list poll.
-      if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature &&
-        previousPayload?.security?.directoryAuditRead?.status === health.security.directoryAuditRead.status &&
-        previousAuditFindings === currentAuditFindings &&
-        evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
-      await this.prisma.tenantHealthSnapshot.create({
-        // Preserve the existing health fields for snapshot consumers; freshness
-        // is additive rather than wrapping the prior payload shape.
-        data: { organizationId: tenant.organization.id, customerTenantId: tenant.id, healthModelVersion: health.healthModelVersion, overallStatus: health.overallStatus, payload: { ...health, syncFreshness }, evaluatedAt },
-      })
+      const saved = await this.prisma.$transaction(async (tx) => {
+        // A request may outlive another API process's evaluation. Serialize
+        // this tenant's latest-read/insert, including the absence of a row.
+        await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '750ms'")
+        await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '2500ms'")
+        await tx.$queryRawUnsafe(
+          'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended($1, 0))',
+          `hawkview:tenant-health-snapshot:${tenant.organization.id}:${tenant.id}`,
+        )
+        const previous = await tx.tenantHealthSnapshot.findFirst({
+          where: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
+          orderBy: [{ evaluatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+          select: { overallStatus: true, evaluatedAt: true, payload: true },
+        })
+        // Same-millisecond reads cannot be ordered by evidence freshness.
+        // Keep the first completed evaluation; the next clock tick can record
+        // changed findings without allowing a stale waiter to become latest.
+        if (previous && evaluatedAt.getTime() <= previous.evaluatedAt.getTime()) return null
+        const previousPayload = previous?.payload as {
+          syncFreshness?: TenantSyncFreshness
+          attention?: ReturnType<typeof deriveTenantHealth>['attention']
+          security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } }
+          auditEvidenceSignature?: string | null
+        } | null
+        const previousSignature = previousPayload?.syncFreshness
+          ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
+          : null
+        const previousAuditFindings = Array.isArray(previousPayload?.attention)
+          ? JSON.stringify(previousPayload.attention.filter((item) => item?.key?.startsWith('audit-')))
+          : null
+        // Keep evidence history without producing a row on every tenant-list poll.
+        if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature &&
+          previousPayload?.security?.directoryAuditRead?.status === health.security.directoryAuditRead.status &&
+          previousAuditFindings === currentAuditFindings &&
+          previousPayload?.auditEvidenceSignature === auditEvidenceSignature &&
+          evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return null
+        await tx.tenantHealthSnapshot.create({
+          // Preserve the existing health fields for snapshot consumers; freshness
+          // is additive rather than wrapping the prior payload shape.
+          data: { organizationId: tenant.organization.id, customerTenantId: tenant.id, healthModelVersion: health.healthModelVersion, overallStatus: health.overallStatus, payload: { ...health, syncFreshness, auditEvidenceSignature }, evaluatedAt },
+        })
+        return { previousStatus: previous?.overallStatus ?? null }
+      }, { isolationLevel: 'ReadCommitted', maxWait: 1000, timeout: 3500 })
+      if (!saved) return
       this.logger.debug({
         event: 'tenant_health_evaluated',
         workspaceId: tenant.organization.id,
         customerTenantId: tenant.id,
         microsoftTenantId: tenant.microsoftTenantId,
         healthModelVersion: health.healthModelVersion,
-        previousStatus: previous?.overallStatus ?? null,
+        previousStatus: saved.previousStatus,
         newStatus: health.overallStatus,
         triggeringEvidence: {
           connection: health.connection.status,

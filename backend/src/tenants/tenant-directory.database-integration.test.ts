@@ -273,6 +273,46 @@ test('physical tenant list expiry: positive attention survives expired pre-take 
   await assertPersistedExpiry(prisma.directoryAuditLog, ids, 504, 2)
 })
 
+test('physical tenant list expiry: concurrent clients save one snapshot per evidence state',
+  { skip: !databaseIntegrationEnabled }, async context => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    const secondClient = new PrismaService()
+    context.after(async () => { await secondClient.$disconnect() })
+    await Promise.all([prisma.$connect(), secondClient.$connect()])
+    const mine = await seedExportWorkspace(prisma, 'list-snapshot-race', randomUUID(), track)
+    const scope = { organizationId: mine.organizationId, customerTenantId: mine.tenantId }
+    await prisma.directoryAuditLog.create({ data: listAudit(mine, 'first', 60_000) })
+    const firstClient = tenantListReader(prisma)
+    const otherClient = tenantListReader(secondClient)
+
+    await Promise.all([
+      firstClient.listForIdentity(identityOf(mine), { now: readNow }),
+      otherClient.listForIdentity(identityOf(mine), { now: readNow }),
+    ])
+    assert.equal(await prisma.tenantHealthSnapshot.count({ where: scope }), 1,
+      'identical concurrent requests must not create duplicate history rows')
+
+    await prisma.directoryAuditLog.create({ data: listAudit(mine, 'second', 60_000, -301_000) })
+    await Promise.all([
+      firstClient.listForIdentity(identityOf(mine), { now: () => readDate(1) }),
+      otherClient.listForIdentity(identityOf(mine), { now: () => readDate(1) }),
+    ])
+    const snapshots = await prisma.tenantHealthSnapshot.findMany({
+      where: scope, orderBy: [{ evaluatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+    })
+    assert.equal(snapshots.length, 2, 'one changed evidence state adds exactly one history row')
+    assert.ok(snapshots[0]!.evaluatedAt > snapshots[1]!.evaluatedAt,
+      'changed evidence must have a later evaluation clock')
+    assert.deepEqual(new Set(listAuditKeys(snapshots[0]!.payload as any)),
+      new Set(['audit-auth-first', 'audit-auth-second']))
+
+    await prisma.directoryAuditLog.create({ data: listAudit(mine, 'older-only', 60_000, -302_000) })
+    await otherClient.listForIdentity(identityOf(mine), { now: () => readDate(-1000) })
+    assert.equal(await prisma.tenantHealthSnapshot.count({ where: scope }), 2,
+      'an older evaluation cannot become the latest saved history')
+  })
+
 const bundleReader = (prisma: PrismaService) => new TenantSyncService(
   prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
 )
@@ -1273,9 +1313,19 @@ test(
 
     const overflow = base(noisy, 400, { eventDateTime: readDate(-100) })
     await prisma.directoryAuditLog.create({ data: overflow })
-    const capped = await readTenantDirectoryAuditWindows(prisma, requested, at)
+    let sentinel: Record<string, unknown> | undefined
+    const observed = { $queryRaw: async (query: unknown) => {
+      const rows = await prisma.$queryRaw<Array<Record<string, unknown>>>(query as never)
+      sentinel = rows.find(row => row.customerTenantId === noisy.tenantId && row.overflow === true)
+      return rows
+    } }
+    const capped = await readTenantDirectoryAuditWindows(observed as never, requested, at)
     assert.equal(capped.get(noisy.tenantId)?.status, 'CAPPED')
     assert.equal(capped.get(noisy.tenantId)?.events.length, TENANT_DIRECTORY_AUDIT_LIMIT)
+    assert.ok(sentinel, 'the seventeenth selected row is present only as a cap witness')
+    assert.equal(sentinel?.detailPresent, false)
+    for (const field of ['microsoftAuditId', 'activityDisplayName', 'category', 'operationType',
+      'result', 'initiatedBy', 'targetResources']) assert.equal(sentinel?.[field], null)
     assert.deepEqual(capped.get(noisy.tenantId)?.events.map(row => row.microsoftAuditId),
       [...noisyRows, overflow].sort((a, b) => b.id.localeCompare(a.id))
         .slice(0, TENANT_DIRECTORY_AUDIT_LIMIT).map(row => row.microsoftAuditId))
@@ -1284,3 +1334,45 @@ test(
       [`export-${quiet.tenantId}-300`])
   },
 )
+
+test('physical tenant audit read: oversized JSONB stays on the server and only its tenant fails closed',
+  { skip: !databaseIntegrationEnabled }, async context => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const mine = await seedExportWorkspace(prisma, 'audit-sql-byte-guard', randomUUID(), track)
+    const quietRow = await prisma.customerTenant.create({ data: {
+      organizationId: mine.organizationId, microsoftTenantId: randomUUID(),
+      displayName: 'SQL byte guard quiet tenant', status: 'ACTIVE',
+    } })
+    const quiet = { ...mine, tenantId: quietRow.id }
+    await prisma.directoryAuditLog.createMany({ data: [
+      { ...exportAuditRow(mine, 1), eventDateTime: readDate(-100), expiresAt: readDate(60_000),
+        activityDisplayName: 'Disable conditional access policy' },
+      { ...exportAuditRow(mine, 2), eventDateTime: readDate(-200), expiresAt: readDate(60_000),
+        initiatedBy: { user: { displayName: 'x'.repeat(256 * 1024) } } },
+      { ...exportAuditRow(quiet, 3), eventDateTime: readDate(-100), expiresAt: readDate(60_000),
+        activityDisplayName: 'Disable conditional access policy' },
+    ] })
+    let transferredBytes = 0
+    let oversizedRow: Record<string, unknown> | undefined
+    const observed = { $queryRaw: async (query: unknown) => {
+      const rows = await prisma.$queryRaw<Array<Record<string, unknown>>>(query as never)
+      transferredBytes = Buffer.byteLength(JSON.stringify(rows))
+      oversizedRow = rows.find(row => row.customerTenantId === mine.tenantId && row.payloadTooLarge === true)
+      return rows
+    } }
+    const windows = await readTenantDirectoryAuditWindows(observed as never,
+      [{ id: mine.tenantId, organizationId: mine.organizationId },
+        { id: quiet.tenantId, organizationId: quiet.organizationId }], READ_CLOCK)
+    assert.equal(windows.get(mine.tenantId)?.status, 'NOT_READ')
+    assert.equal(windows.get(mine.tenantId)?.events.length, 1,
+      'a valid critical event preceding the oversized row remains available')
+    assert.equal(windows.get(quiet.tenantId)?.status, 'COMPLETE')
+    assert.equal(windows.get(quiet.tenantId)?.events.length, 1)
+    assert.ok(oversizedRow, 'the database returns an oversized marker rather than the payload')
+    for (const field of ['microsoftAuditId', 'activityDisplayName', 'category', 'operationType',
+      'result', 'initiatedBy', 'targetResources']) assert.equal(oversizedRow?.[field], null)
+    assert.ok(transferredBytes < 16 * 1024,
+      `the oversized JSONB must not cross the database connection (${transferredBytes} bytes)`)
+  })

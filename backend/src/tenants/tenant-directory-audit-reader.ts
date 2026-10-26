@@ -7,14 +7,17 @@ import type { DirectoryAuditReadStatus, TenantAuditEvent } from './tenant-health
  * findings, so this allows non-finding events while bounding transfer. It is
  * not an assertion that every audit event was inspected. A 17th eligible
  * event turns only that tenant's window CAPPED.
- * At 1,000 tenants the SQL may return up to 17,000 rows; measure the actual
- * plan, row widths, and latency in disposable CI before claiming that scale.
+ * At 1,000 tenants the SQL may return up to 17,000 small rows; measure the
+ * actual plan, transfer, and latency in disposable CI before claiming scale.
  */
 export const TENANT_DIRECTORY_AUDIT_LIMIT = 16
-// These limits protect health projection after the database read. They do not
-// bound SQL transfer or duration; the two-phase read is still required before
-// this candidate can be released at MSP scale.
+// SQL omits an over-budget row's JSONB before transfer. The independent Node
+// limits still protect projection depth and aggregate size. SQL duration and
+// tenant-list fanout remain release gates until measured in disposable CI.
 export const TENANT_DIRECTORY_AUDIT_EVENT_BYTES = 16 * 1024
+// Reserve room for UUIDs, timestamps, field names and protocol framing; the
+// SQL test measures the projected scalar/JSON text, not the entire wire row.
+const TENANT_DIRECTORY_AUDIT_SQL_TRANSFER_BYTES = TENANT_DIRECTORY_AUDIT_EVENT_BYTES - 1024
 const TENANT_DIRECTORY_AUDIT_TENANT_BYTES = 64 * 1024
 const TENANT_DIRECTORY_AUDIT_PAYLOAD_NODES = 2_048
 const TENANT_DIRECTORY_AUDIT_PAYLOAD_DEPTH = 24
@@ -29,6 +32,9 @@ type AuditRow = {
   organizationId: string
   customerTenantId: string
   eventId: string | null
+  overflow?: boolean
+  detailPresent?: boolean
+  payloadTooLarge?: boolean
   microsoftAuditId: string | null
   eventDateTime: Date | null
   activityDisplayName: string | null
@@ -92,32 +98,76 @@ export async function readTenantDirectoryAuditWindows(
     organization_id: organizationId,
     customer_tenant_id: id,
   }))
+  if (new Set(pairs.map((pair) => `${pair.organization_id}:${pair.customer_tenant_id}`)).size !== pairs.length) {
+    throw new Error('Directory audit read received a duplicate tenant scope.')
+  }
   const since = new Date(asOf.getTime() - 24 * 60 * 60 * 1000)
   const rows = await prisma.$queryRaw<AuditRow[]>(Prisma.sql`
     /* tenant-directory:audit-fair-window */
+    WITH sampled AS MATERIALIZED (
+      SELECT requested.organization_id, requested.customer_tenant_id,
+             audit.id AS event_id, audit.event_date_time,
+             row_number() OVER (
+               PARTITION BY requested.organization_id, requested.customer_tenant_id
+               ORDER BY audit.event_date_time DESC NULLS LAST, audit.id DESC NULLS LAST
+             ) AS event_rank
+      FROM jsonb_to_recordset(${JSON.stringify(pairs)}::jsonb)
+           AS requested(organization_id uuid, customer_tenant_id uuid)
+      LEFT JOIN LATERAL (
+        SELECT id, event_date_time
+        FROM directory_audit_logs
+        WHERE organization_id = requested.organization_id
+          AND customer_tenant_id = requested.customer_tenant_id
+          AND event_date_time >= ${since}
+          AND expires_at > ${asOf}
+        ORDER BY event_date_time DESC, id DESC
+        LIMIT ${TENANT_DIRECTORY_AUDIT_LIMIT + 1}
+      ) AS audit ON true
+    )
     SELECT requested.organization_id AS "organizationId",
            requested.customer_tenant_id AS "customerTenantId",
-           audit.id AS "eventId",
+           requested.event_id AS "eventId",
+           (requested.event_rank > ${TENANT_DIRECTORY_AUDIT_LIMIT}) AS "overflow",
+           (audit.id IS NOT NULL) AS "detailPresent",
+           COALESCE(audit.payload_too_large, false) AS "payloadTooLarge",
            audit.microsoft_audit_id AS "microsoftAuditId",
-           audit.event_date_time AS "eventDateTime",
+           requested.event_date_time AS "eventDateTime",
            audit.activity_display_name AS "activityDisplayName",
            audit.category,
            audit.operation_type AS "operationType",
            audit.result,
            audit.initiated_by AS "initiatedBy",
            audit.target_resources AS "targetResources"
-    FROM jsonb_to_recordset(${JSON.stringify(pairs)}::jsonb)
-         AS requested(organization_id uuid, customer_tenant_id uuid)
+    FROM sampled AS requested
     LEFT JOIN LATERAL (
-      SELECT id, microsoft_audit_id, event_date_time, activity_display_name,
-             category, operation_type, result, initiated_by, target_resources
-      FROM directory_audit_logs
-      WHERE organization_id = requested.organization_id
-        AND customer_tenant_id = requested.customer_tenant_id
-        AND event_date_time >= ${since}
-        AND expires_at > ${asOf}
-      ORDER BY event_date_time DESC, id DESC
-      LIMIT ${TENANT_DIRECTORY_AUDIT_LIMIT + 1}
+      SELECT detail.id, detail.event_date_time,
+             CASE WHEN allowed.within_budget THEN detail.microsoft_audit_id ELSE NULL END AS microsoft_audit_id,
+             CASE WHEN allowed.within_budget THEN detail.activity_display_name ELSE NULL END AS activity_display_name,
+             CASE WHEN allowed.within_budget THEN detail.category ELSE NULL END AS category,
+             CASE WHEN allowed.within_budget THEN detail.operation_type ELSE NULL END AS operation_type,
+             CASE WHEN allowed.within_budget THEN detail.result ELSE NULL END AS result,
+             CASE WHEN allowed.within_budget
+                  THEN detail.initiated_by ELSE NULL END AS initiated_by,
+             CASE WHEN allowed.within_budget
+                  THEN detail.target_resources ELSE NULL END AS target_resources,
+             NOT allowed.within_budget AS payload_too_large
+      FROM directory_audit_logs AS detail
+      CROSS JOIN LATERAL (
+        SELECT COALESCE(octet_length(detail.microsoft_audit_id), 0)::bigint
+             + COALESCE(octet_length(detail.activity_display_name), 0)
+             + COALESCE(octet_length(detail.category), 0)
+             + COALESCE(octet_length(detail.operation_type), 0)
+             + COALESCE(octet_length(detail.result), 0)
+             + COALESCE(octet_length(detail.initiated_by::text), 0)
+             + COALESCE(octet_length(detail.target_resources::text), 0) AS payload_bytes
+      ) AS measured
+      CROSS JOIN LATERAL (
+        SELECT measured.payload_bytes <= ${TENANT_DIRECTORY_AUDIT_SQL_TRANSFER_BYTES} AS within_budget
+      ) AS allowed
+      WHERE requested.event_rank <= ${TENANT_DIRECTORY_AUDIT_LIMIT}
+        AND detail.id = requested.event_id
+        AND detail.organization_id = requested.organization_id
+        AND detail.customer_tenant_id = requested.customer_tenant_id
     ) AS audit ON true
     ORDER BY requested.organization_id, requested.customer_tenant_id,
              audit.event_date_time DESC NULLS LAST, audit.id DESC NULLS LAST
@@ -136,14 +186,20 @@ export async function readTenantDirectoryAuditWindows(
     seen.add(key)
     if (row.eventId === null) continue
     if (window.status === 'NOT_READ') continue
+    if (row.overflow === true || window.events.length >= TENANT_DIRECTORY_AUDIT_LIMIT) {
+      window.status = 'CAPPED'
+      continue
+    }
+    if (row.detailPresent === false || row.payloadTooLarge === true) {
+      // The selected event was not safely returned; preserve any earlier
+      // findings while refusing a complete or healthy audit verdict.
+      window.status = 'NOT_READ'
+      continue
+    }
     if (typeof row.eventId !== 'string' || typeof row.microsoftAuditId !== 'string' ||
         !(row.eventDateTime instanceof Date) || Number.isNaN(row.eventDateTime.getTime()) ||
         typeof row.activityDisplayName !== 'string') {
       throw new Error('Directory audit read returned an invalid event.')
-    }
-    if (window.events.length >= TENANT_DIRECTORY_AUDIT_LIMIT) {
-      window.status = 'CAPPED'
-      continue
     }
     const eventBytes = boundedPayloadBytes(row)
     const nextBytes = (payloadBytes.get(key) ?? 0) + (eventBytes ?? 0)
