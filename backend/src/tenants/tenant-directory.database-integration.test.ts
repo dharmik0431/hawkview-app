@@ -313,7 +313,7 @@ test('physical tenant list expiry: concurrent clients save one snapshot per evid
       'an older evaluation cannot become the latest saved history')
   })
 
-test('physical tenant health history: a contended tenant lock cannot block another tenant or the list',
+test('physical tenant health history: a contended tenant lock preserves list and another tenant',
   { skip: !databaseIntegrationEnabled, timeout: 15_000 }, async context => {
     assertDisposableTestDatabase()
     const { prisma, track } = physicalContext(context)
@@ -343,6 +343,12 @@ test('physical tenant health history: a contended tenant lock cannot block anoth
       throw new Error('Health snapshot lock holder finished before acquiring its lock')
     })])
     try {
+      const otherLock = await prisma.$transaction(tx => tx.$queryRawUnsafe<Array<{ locked: boolean }>>(
+        'SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS locked',
+        `hawkview:tenant-health-snapshot:${mine.organizationId}:${other.id}`,
+      ))
+      assert.equal(otherLock[0]?.locked, true,
+        'another tenant can acquire its own history lock while the first remains held')
       const list = await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: readNow })
       assert.deepEqual(list.tenants.map(tenant => tenant.id).sort(), [mine.tenantId, other.id].sort(),
         'lock failure must leave the authorized tenant directory available')
