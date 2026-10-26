@@ -165,13 +165,20 @@ class Database {
   tenantWrites = 0
   failAt: 'write' | 'before-commit' | 'after-commit' | 'read' | null = null
   disabled = false
+  role = 'MSP_OWNER'
   memberships = [this.organizationId]
   constructor() { this.authority.credentialReference = `encrypted-secret:${this.authority.configurationRevision}` }
   snapshot() { return copy({ tenant: this.tenant, connection: this.connection, roles: this.roles, observations: this.observations, authority: this.authority }) }
   user = { findUnique: async (args: any) => {
     assert.equal(args.where.authProviderUserId, identity.subject)
-    assert.deepEqual(args.select.memberships.where, { status: 'ACTIVE', organization: { status: 'ACTIVE' } })
-    return { disabledAt: this.disabled ? new Date() : null, memberships: this.memberships.map(organizationId => ({ organizationId })) }
+    assert.deepEqual(args.select.memberships.where, {
+      status: 'ACTIVE', role: { in: ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN'] },
+      organization: { status: 'ACTIVE' },
+    })
+    return { disabledAt: this.disabled ? new Date() : null,
+      memberships: this.role === 'MSP_VIEWER' ? [] : this.memberships.map(organizationId => ({
+        organizationId, organization: { onboardingCompletedAt: new Date() },
+      })) }
   } }
   customerTenant = {
     findUnique: async (_args: any) => copy({ ...this.tenant, connection: { ...this.connection, connectionMode: this.connection.mode, consentedPermissions: this.connection.permissions } }),
@@ -346,6 +353,24 @@ test('wrong organization, tenant, and disabled identity stop before provider/cap
   f.db.disabled = true; await assert.rejects(f.run(), ForbiddenException)
   assert.equal(f.db.providerCalls, 0); assert.deepEqual(f.db.trace, [])
 })
+test('viewer cannot verify a managed connection or change tenant state', async () => {
+  const f = fixture(); f.db.role = 'MSP_VIEWER'
+  const before = f.db.snapshot()
+  await assert.rejects(f.run(), NotFoundException)
+  assert.equal(f.db.providerCalls, 0)
+  assert.equal(f.db.connectionWrites, 0)
+  assert.equal(f.db.tenantWrites, 0)
+  assert.deepEqual(f.db.trace, [])
+  assert.deepEqual(f.db.snapshot(), before)
+})
+for (const role of ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN']) {
+  test(`${role} can verify a managed connection`, async () => {
+    const f = fixture(); f.db.role = role
+    assert.equal((await f.run()).connected, true)
+    assert.equal(f.db.providerCalls, 1)
+    assert.equal(f.db.connection.status, 'CONNECTED')
+  })
+}
 test('disconnected/revoked and mutable or absent managed authority refuse before provider', async () => {
   for (const mutate of [(db: Database) => { db.tenant.status = 'DISCONNECTED' }, (db: Database) => { db.connection.status = 'REVOKED' },
     (db: Database) => { db.authority = null }, (db: Database) => { db.authority.credentialReference = 'legacy-mutable' }]) {

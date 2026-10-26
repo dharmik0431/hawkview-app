@@ -46,13 +46,19 @@ class CustomerDatabase {
   connectionRowCount: number | undefined
   tenantRowCount: number | undefined
   beforeCapture?: () => void
-  disabled = false; memberships = [ORG]
+  disabled = false; role = 'MSP_OWNER'; memberships = [ORG]
   fail(message: string): never { this.injectedError = new Error(message); throw this.injectedError }
   snapshot() { return copy({ tenant: this.tenant, connection: this.connection }) }
   user = { findUnique: async (args: any) => {
     assert.equal(args.where.authProviderUserId, identity.subject)
-    assert.deepEqual(args.select.memberships.where, { status: 'ACTIVE', organization: { status: 'ACTIVE' } })
-    return { disabledAt: this.disabled ? new Date() : null, memberships: this.memberships.map(organizationId => ({ organizationId })) }
+    assert.deepEqual(args.select.memberships.where, {
+      status: 'ACTIVE', role: { in: ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN'] },
+      organization: { status: 'ACTIVE' },
+    })
+    return { disabledAt: this.disabled ? new Date() : null,
+      memberships: this.role === 'MSP_VIEWER' ? [] : this.memberships.map(organizationId => ({
+        organizationId, organization: { onboardingCompletedAt: new Date() },
+      })) }
   } }
   customerTenant = {
     findFirst: async (args: any) => {
@@ -395,6 +401,25 @@ test('authorization refuses wrong organization, unknown tenant and disabled iden
   f.db.disabled = true; await assert.rejects(f.run, ForbiddenException)
   assert.equal(f.db.providerCalls, 0); assert.deepEqual(f.db.events, [])
 })
+test('viewer cannot verify a customer-managed connection or change tenant state', async () => {
+  const f = fixture(); f.db.role = 'MSP_VIEWER'
+  const before = f.db.snapshot()
+  await assert.rejects(f.run, NotFoundException)
+  assert.equal(f.db.providerCalls, 0)
+  assert.equal(f.db.credentialReads, 0)
+  assert.equal(f.db.connectionWrites, 0)
+  assert.equal(f.db.tenantWrites, 0)
+  assert.deepEqual(f.db.events, [])
+  assert.deepEqual(f.db.snapshot(), before)
+})
+for (const role of ['MSP_OWNER', 'MSP_ADMIN', 'MSP_TECHNICIAN']) {
+  test(`${role} can verify a customer-managed connection`, async () => {
+    const f = fixture(); f.db.role = role
+    assert.equal((await f.run()).connected, true)
+    assert.equal(f.db.providerCalls, 1)
+    assert.equal(f.db.connection.status, 'CONNECTED')
+  })
+}
 
 test('shared verifier retains managed credential, incomplete, resolution-error and provider-error behavior', async () => {
   for (const outcome of ['success', 'incomplete', 'resolution-error', 'provider-error'] as const) {

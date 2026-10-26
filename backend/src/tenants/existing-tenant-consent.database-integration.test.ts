@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { randomUUID } from 'node:crypto'
+import { NotFoundException } from '@nestjs/common'
 import pg from 'pg'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
@@ -21,7 +22,7 @@ test('existing tenant public consent route with physical transaction and synthet
   // This suite uses the fully migrated disposable schema, including real FKs.
   // Refuse to overwrite another suite's global connector fixture.
   assert.equal((await observer.query("SELECT count(*)::int AS n FROM platform_microsoft_connectors WHERE id='default'")).rows[0].n,0)
-  const organizationId=randomUUID(),customerTenantId=randomUUID(),microsoftTenantId=randomUUID(),actor=randomUUID()
+  const organizationId=randomUUID(),customerTenantId=randomUUID(),microsoftTenantId=randomUUID(),actor=randomUUID(),actorSubject=randomUUID()
   const foreignOrganizationId=randomUUID(),foreignTenantId=randomUUID(),siblingTenantId=randomUUID(),foreignActor=randomUUID()
   const connectionKey=`tenant:${customerTenantId}:connection`,authorizedKey=`tenant:${customerTenantId}:onboarding-authorized`
   const notificationScope=[organizationId,connectionKey,authorizedKey]
@@ -41,15 +42,13 @@ test('existing tenant public consent route with physical transaction and synthet
   const microsoft = new MicrosoftConsentService(prisma as any,{access:async()=> 'synthetic-credential'} as any)
   ;(microsoft as any).getStateConfiguration=async()=>({stateSecret:'synthetic-consent-state-secret-at-least-32-bytes',redirectUri:'https://callback.invalid/consent'})
   const tenants = new TenantsService(prisma as any,microsoft,{publishIncident(){throw Error('legacy effect')},resolveIncident(){throw Error('legacy effect')}} as any)
-  ;(tenants as any).getAccessibleOrganizationIds=async()=>[organizationId]
-  ;(tenants as any).getTenantOnboardingActor=async()=>actor
   ;(tenants as any).buildFrontendConsentRedirect=(result:string,error:string|null)=>({result,error})
   let providerCalls=0
   const good=async()=>{providerCalls++;return {displayName:'Synthetic tenant',primaryDomain:'fixture.invalid',grantedPermissions:['Directory.Read.All'],missingPermissions:[],missingRequiredPermissions:[],missingNonConnectionPermissions:[]}}
   microsoft.verifyClaimedTenantAfterConsent=good
   const connection=async()=>(await observer.query('SELECT * FROM tenant_connections WHERE customer_tenant_id=$1',[customerTenantId])).rows[0]
   const issue=async()=>{
-    const response=await tenants.createConsentUrlForIdentity({subject:'synthetic',email:'actor@fixture.invalid'} as any,customerTenantId)
+    const response=await tenants.createConsentUrlForIdentity({subject:actorSubject,email:'actor@fixture.invalid'} as any,customerTenantId)
     const state=new URL(response.consentUrl).searchParams.get('state')!
     const parsed=await microsoft.verifyConsentState(state)
     return {state,parsed,key:{operationId:parsed.operationId!,organizationId,customerTenantId,flow:'EXISTING_TENANT' as const,stateHash:microsoft.hashConsentNonce(parsed.nonce)}}
@@ -57,8 +56,9 @@ test('existing tenant public consent route with physical transaction and synthet
   const callback=(state:string,extra:Record<string,unknown>={})=>tenants.completeMicrosoftConsent({state,tenant:microsoftTenantId,admin_consent:'True',...extra})
   const operation=async(id:string)=>(await observer.query('SELECT * FROM microsoft_consent_attempts WHERE id=$1',[id])).rows[0]
   try {
-    await prisma.organization.create({data:{id:organizationId,name:'Synthetic route fixture',slug:organizationId}})
-    await prisma.user.create({data:{id:actor,email:`${actor}@fixture.invalid`}})
+    await prisma.organization.create({data:{id:organizationId,name:'Synthetic route fixture',slug:organizationId,onboardingCompletedAt:new Date()}})
+    await prisma.user.create({data:{id:actor,authProviderUserId:actorSubject,email:`${actor}@fixture.invalid`}})
+    const membership=await prisma.membership.create({data:{userId:actor,organizationId,role:'MSP_OWNER',status:'ACTIVE'}})
     await observer.query("INSERT INTO customer_tenants(id,organization_id,microsoft_tenant_id,status,updated_at) VALUES($1,$2,$3,'ACTIVE',now())",[customerTenantId,organizationId,microsoftTenantId])
     await observer.query("INSERT INTO tenant_connections(id,organization_id,customer_tenant_id,status,consented_permissions,updated_at) VALUES($1,$2,$3,'CONNECTED',ARRAY['Exchange.ManageAsAppV2'],now())",[randomUUID(),organizationId,customerTenantId])
     // Shared CI database deliberately contains unrelated data. A matching dedupe
@@ -77,6 +77,17 @@ test('existing tenant public consent route with physical transaction and synthet
     }
     const foreignBefore=await foreignRows()
     assert.equal((await publishManagedAuthority(prisma,{...publication(revision),expectedRevision:null})).status,'published')
+    await t.test('viewer cannot issue consent or change a connected tenant',async()=>{
+      const before=await connection(),attempts=await prisma.microsoftConsentAttempt.count({where:{organizationId,customerTenantId,flow:'EXISTING_TENANT'}})
+      await prisma.membership.update({where:{id:membership.id},data:{role:'MSP_VIEWER'}})
+      try {
+        await assert.rejects(issue(),NotFoundException)
+        assert.deepEqual(await connection(),before)
+        assert.equal(await prisma.microsoftConsentAttempt.count({where:{organizationId,customerTenantId,flow:'EXISTING_TENANT'}}),attempts)
+      } finally {
+        await prisma.membership.update({where:{id:membership.id},data:{role:'MSP_OWNER'}})
+      }
+    })
     await t.test('actual URL binds committed context and retains actor, optional permission, and replay identity',async()=>{
       const issued=await issue(),op=await operation(issued.key.operationId)
       assert.equal(op.initiated_by_user_id,actor);assert.equal(op.operation_state,'ISSUED')
