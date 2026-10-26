@@ -69,6 +69,15 @@ type ReceiptRow = Readonly<{
 
 type DecisionClockRow = Readonly<{ decided_at_exact: string }>
 
+async function lockedDecisionClock(tx: SqlRunner): Promise<string> {
+  const rows = await tx.query<DecisionClockRow>(
+    `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS decided_at_exact`,
+    [],
+  )
+  return rows.length === 1 ? rows[0]?.decided_at_exact ?? '' : ''
+}
+
 function sourceFromRow(row: SourceRow): IntakeSourceSnapshot {
   return {
     id: row.id, organizationId: row.organization_id,
@@ -150,13 +159,7 @@ export async function commitActiveIntakeReceipt(
     // while waiting cannot enter the active-effects path. This inactive seam
     // refuses historical/untrusted findings until a separate history writer
     // can durably record them without notifications or email.
-    const clockRows = await tx.query<DecisionClockRow>(
-      `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC',
-              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS decided_at_exact`,
-      [],
-    )
-    const decisionClock = clockRows.length === 1 ? clockRows[0]?.decided_at_exact : undefined
-    const mode = classifyLockedIntakeMode(lockedSource, decisionClock ?? '')
+    const mode = classifyLockedIntakeMode(lockedSource, await lockedDecisionClock(tx))
     if (mode.kind !== 'ACTIVE_ELIGIBLE') return { kind: 'REFUSED', reason: mode.kind }
     if (review === 'INACTIVE') return { kind: 'REFUSED', reason: 'INACTIVE' }
 
@@ -189,6 +192,14 @@ export async function commitActiveIntakeReceipt(
     )
     if (claimed !== 1) throw new Error('INTAKE_RECEIPT_CLAIM_LOST')
     await writeEffects(tx)
+    // A database-only callback can cross the observation-age or expiry edge.
+    // Throw rather than returning REFUSED: the transaction must roll back both
+    // its receipt and effects. This is a pre-commit check, not proof of the
+    // exact commit instant or of any external send path.
+    const finalMode = classifyLockedIntakeMode(lockedSource, await lockedDecisionClock(tx))
+    if (finalMode.kind !== 'ACTIVE_ELIGIBLE') {
+      throw new Error('INTAKE_ACTIVE_EFFECT_BOUNDARY_CROSSED')
+    }
     return { kind: 'COMMITTED' }
   })
 }

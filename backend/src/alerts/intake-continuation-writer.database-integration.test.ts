@@ -121,7 +121,9 @@ test('inactive writer samples the DB clock after an active finding expires and c
     const runId = randomUUID()
     const matchedResultId = randomUUID()
     const findingId = randomUUID()
+    const crossingFindingId = randomUUID()
     const incidentKey = `ci-intake-${findingId}`
+    const crossingIncidentKey = `ci-intake-${crossingFindingId}`
     const seed = new pg.Client({ connectionString: URL })
     const pool = new pg.Pool({ connectionString: URL, max: 1,
       connectionTimeoutMillis: INTAKE_RECEIPT_TRANSACTION_LIMITS.maxWaitMs })
@@ -222,6 +224,69 @@ test('inactive writer samples the DB clock after an active finding expires and c
       assert.equal(effectCalls, 0)
       assert.equal(probe.decisionClockSamples.length, 1,
         'a failed finding lock must not sample a second decision clock')
+
+      // A separate finding starts active. Its DB-only effect is written, then
+      // the callback waits until expiry while the bounded transaction remains
+      // open. The second real PostgreSQL clock sample must abort that entire
+      // transaction, not leave a receipt or incident behind.
+      await seed.query(`INSERT INTO identity_risk_findings
+        (id, organization_id, customer_tenant_id, matched_result_id, dedupe_key, rule_id,
+         rule_version, subject_type, subject_id, state, severity, confidence, coverage,
+         observed_at, expires_at, updated_at)
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, 'HV-ID-AUTH-001.v1',
+                'v1', 'USER', 'ci-subject', 'OPEN', 'HIGH', 'HIGH', 'FULL',
+                clock_timestamp() - INTERVAL '1 hour', clock_timestamp() + INTERVAL '2 seconds', now())`,
+      [crossingFindingId, organizationId, customerTenantId, matchedResultId,
+        `intake-${crossingFindingId}`])
+      let crossingProbe: SqlProbe | undefined
+      let crossingSource: SelectedRow | undefined
+      // A heavily loaded CI worker may reach the first clock after a short
+      // expiry. That is a valid historical refusal, not the rollback case
+      // under test. Re-arm the still-unclaimed source at most three times.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await seed.query(`UPDATE identity_risk_findings
+          SET expires_at = clock_timestamp() + INTERVAL '2 seconds',
+              updated_at = clock_timestamp()
+          WHERE id = $1::uuid`, [crossingFindingId])
+        const selectedCrossing = await selectSource(seed, crossingFindingId)
+        if (!selectedCrossing.activeAtSelection) continue
+        const attemptProbe: SqlProbe = { statements: [], decisionClockSamples: [] }
+        try {
+          const result = await commitActiveIntakeReceipt(receiptRunner(pool, attemptProbe),
+            selectedCrossing, 'ci-map-a', 'COMPLETED', async tx => {
+              await tx.execute(`INSERT INTO alert_incidents
+                (id, organization_id, incident_key, alert_type_id, ownership, "condition", investigation,
+                 ownership_at, condition_at, investigation_at, updated_at)
+                VALUES (gen_random_uuid(), $1::uuid, $2, 'security.suspected_credential_attack',
+                        'UNACKNOWLEDGED', 'ACTIVE', 'OPEN', now(), now(), now(), now())`,
+              [organizationId, crossingIncidentKey])
+              await tx.query(`SELECT pg_sleep(GREATEST(0,
+                EXTRACT(EPOCH FROM ($1::timestamptz - clock_timestamp())) + 0.02)::double precision)`,
+              [selectedCrossing.expiresAt])
+            })
+          assert.deepEqual(result, { kind: 'REFUSED', reason: 'HISTORICAL_ONLY' },
+            'only a pre-effect expiry may be retried by this test')
+          assert.equal(attemptProbe.decisionClockSamples.length, 1)
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== 'INTAKE_ACTIVE_EFFECT_BOUNDARY_CROSSED') {
+            throw error
+          }
+          crossingProbe = attemptProbe
+          crossingSource = selectedCrossing
+          break
+        }
+      }
+      assert.ok(crossingProbe && crossingSource, 'a bounded attempt must exercise post-effect rollback')
+      assert.equal(crossingProbe.decisionClockSamples.length, 2)
+      assert.ok(crossingProbe.decisionClockSamples[0]! < crossingSource.expiresAt)
+      assert.ok(crossingProbe.decisionClockSamples[1]! >= crossingSource.expiresAt)
+      const crossingRows = (await seed.query<{ receipts: number; incidents: number }>(
+        `SELECT
+          (SELECT count(*)::int FROM alert_finding_intake_status WHERE finding_id = $1::uuid) AS receipts,
+          (SELECT count(*)::int FROM alert_incidents WHERE organization_id = $2::uuid
+             AND incident_key = $3) AS incidents`,
+        [crossingFindingId, organizationId, crossingIncidentKey])).rows[0]
+      assert.deepEqual(crossingRows, { receipts: 0, incidents: 0 })
     } catch (error) {
       bodyFailed = true
       throw error
@@ -237,6 +302,10 @@ test('inactive writer samples the DB clock after an active finding expires and c
       }
       await attempt(() => pool.end())
       if (seedConnected) {
+        await attempt(() => seed.query('DELETE FROM alert_incidents WHERE organization_id = $1::uuid AND incident_key = $2',
+          [organizationId, crossingIncidentKey]))
+        await attempt(() => seed.query('DELETE FROM alert_finding_intake_status WHERE finding_id = $1::uuid', [crossingFindingId]))
+        await attempt(() => seed.query('DELETE FROM identity_risk_findings WHERE id = $1::uuid', [crossingFindingId]))
         await attempt(() => seed.query('DELETE FROM alert_incidents WHERE organization_id = $1::uuid AND incident_key = $2',
           [organizationId, incidentKey]))
         await attempt(() => seed.query('DELETE FROM alert_finding_intake_status WHERE finding_id = $1::uuid', [findingId]))

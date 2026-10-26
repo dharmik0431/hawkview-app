@@ -40,12 +40,14 @@ function fixture(options: {
   claimed?: number
   receiptLockError?: Error
   decisionClock?: string | null
+  finalClock?: string | null
 } = {}) {
   const attempted: string[] = []
   const committed: string[] = []
   const queries: Array<{ sql: string; params: readonly unknown[] }> = []
   const executes: Array<{ sql: string; params: readonly unknown[] }> = []
   const transactionLimits: IntakeReceiptTransactionLimits[] = []
+  let clockReads = 0
   const transactionRunner: SqlRunner = {
     async query<T>(sql: string, params: readonly unknown[]): Promise<readonly T[]> {
       queries.push({ sql, params })
@@ -66,8 +68,10 @@ function fixture(options: {
         }] as T[]
       }
       if (sql.includes('clock_timestamp()')) {
-        return (options.decisionClock === null ? [] : [{
-          decided_at_exact: options.decisionClock ?? '2026-10-25T12:00:00.000000Z',
+        const value = ++clockReads === 1 ? options.decisionClock :
+          options.finalClock === undefined ? options.decisionClock : options.finalClock
+        return (value === null ? [] : [{
+          decided_at_exact: value ?? '2026-10-25T12:00:00.000000Z',
         }]) as T[]
       }
       throw new Error('UNEXPECTED_QUERY')
@@ -172,6 +176,22 @@ test('a finding aged or expired after selection cannot claim active effects', as
     assert.deepEqual(await commitActiveIntakeReceipt(f.runner, current, 'map-a', 'COMPLETED',
       writeEffect), { kind: 'REFUSED', reason })
     assert.deepEqual(dataWrites(f), [], reason)
+  }
+})
+
+test('a callback crossing the active boundary rolls its receipt and effects back', async () => {
+  for (const [current, decisionClock, finalClock] of [
+    [source, '2026-10-26T10:00:00.123455Z', '2026-10-26T10:00:00.123456Z'],
+    [{ ...source, expiresAt: '2026-10-27T10:00:00.123456Z' },
+      '2026-10-26T10:00:00.123456Z', '2026-10-26T10:00:00.123457Z'],
+    [source, '2026-10-25T12:00:00.000000Z', null],
+  ] as const) {
+    const f = fixture({ current, decisionClock, finalClock })
+    await assert.rejects(commitActiveIntakeReceipt(f.runner, current, 'map-a',
+      'COMPLETED', writeEffect), /INTAKE_ACTIVE_EFFECT_BOUNDARY_CROSSED/)
+    assert.deepEqual(f.attempted, ['receipt', 'effect'])
+    assert.deepEqual(f.committed, [])
+    assert.equal(f.queries.filter(each => each.sql.includes('clock_timestamp()')).length, 2)
   }
 })
 
