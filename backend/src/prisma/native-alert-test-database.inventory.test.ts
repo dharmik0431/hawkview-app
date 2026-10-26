@@ -14,6 +14,7 @@ const expected = [
   "alerts/email-regular-release.database-integration.test.ts",
   "alerts/finding-pipeline.database-integration.test.ts",
   "alerts/in-app-visibility.database-integration.test.ts",
+  "alerts/intake-continuation-writer.database-integration.test.ts",
   "alerts/send-job-withdrawal.database-integration.test.ts",
   "alerts/send-store.database-integration.test.ts",
   "alerts/suppressed-evidence-reader.database-integration.test.ts",
