@@ -313,6 +313,54 @@ test('physical tenant list expiry: concurrent clients save one snapshot per evid
       'an older evaluation cannot become the latest saved history')
   })
 
+test('physical tenant health history: a contended tenant lock cannot block another tenant or the list',
+  { skip: !databaseIntegrationEnabled, timeout: 15_000 }, async context => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    const blocker = new PrismaService()
+    context.after(async () => { await blocker.$disconnect() })
+    await Promise.all([prisma.$connect(), blocker.$connect()])
+    const mine = await seedExportWorkspace(prisma, 'health-lock-timeout', randomUUID(), track)
+    const other = await prisma.customerTenant.create({ data: {
+      organizationId: mine.organizationId, microsoftTenantId: randomUUID(),
+      displayName: 'Independent health history tenant', status: 'ACTIVE',
+    } })
+    const mineScope = { organizationId: mine.organizationId, customerTenantId: mine.tenantId }
+    const otherScope = { organizationId: mine.organizationId, customerTenantId: other.id }
+    let acquired!: () => void
+    const lockAcquired = new Promise<void>(resolve => { acquired = resolve })
+    let release!: () => void
+    const releaseLock = new Promise<void>(resolve => { release = resolve })
+    const held = blocker.$transaction(async tx => {
+      await tx.$queryRawUnsafe(
+        'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtextextended($1, 0))',
+        `hawkview:tenant-health-snapshot:${mine.organizationId}:${mine.tenantId}`,
+      )
+      acquired()
+      await releaseLock
+    }, { timeout: 12_000 })
+    await Promise.race([lockAcquired, held.then(() => {
+      throw new Error('Health snapshot lock holder finished before acquiring its lock')
+    })])
+    try {
+      const list = await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: readNow })
+      assert.deepEqual(list.tenants.map(tenant => tenant.id).sort(), [mine.tenantId, other.id].sort(),
+        'lock failure must leave the authorized tenant directory available')
+      assert.equal(await prisma.tenantHealthSnapshot.count({ where: mineScope }), 0,
+        'a timed-out transaction must leave no partial snapshot for its tenant')
+      assert.equal(await prisma.tenantHealthSnapshot.count({ where: otherScope }), 1,
+        'another tenant must save independently while this tenant is locked')
+    } finally {
+      release()
+      await held
+    }
+    await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: () => readDate(1) })
+    assert.equal(await prisma.tenantHealthSnapshot.count({ where: mineScope }), 1,
+      'the tenant recovers on its next ordinary read after the lock clears')
+    assert.equal(await prisma.tenantHealthSnapshot.count({ where: otherScope }), 1,
+      'an unchanged tenant does not gain a duplicate history row')
+  })
+
 const bundleReader = (prisma: PrismaService) => new TenantSyncService(
   prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
 )
