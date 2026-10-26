@@ -367,6 +367,97 @@ test('physical tenant health history: a contended tenant lock preserves list and
       'an unchanged tenant does not gain a duplicate history row')
   })
 
+test('physical verification: a blocked audit read reaches its DB deadline without undoing publication',
+  { skip: !databaseIntegrationEnabled, timeout: 15_000 }, async context => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    const blocker = new PrismaService()
+    context.after(async () => { await blocker.$disconnect() })
+    await Promise.all([prisma.$connect(), blocker.$connect()])
+    const mine = await seedExportWorkspace(prisma, 'verify-audit-timeout', randomUUID(), track)
+    const before = new Date()
+    await prisma.customerTenant.update({ where: { id: mine.tenantId }, data: { status: 'SUSPENDED' } })
+    await prisma.tenantConnection.create({ data: {
+      organizationId: mine.organizationId, customerTenantId: mine.tenantId,
+      connectionMode: 'CUSTOMER_MANAGED', status: 'ERROR', clientId: randomUUID(),
+      credentialReference: 'synthetic-disposable-verification-reference',
+      collectionIncarnation: randomUUID(), consentedPermissions: [],
+      lastErrorCode: 'before-verification',
+    } })
+    await prisma.directoryAuditLog.create({ data: exportAuditRow(mine, 1, {
+      eventDateTime: new Date(before.getTime() - 5 * 60_000),
+      expiresAt: new Date(before.getTime() + 60 * 60_000),
+    }) })
+    const baseline = await readTenantDirectoryAuditWindows(prisma,
+      [{ id: mine.tenantId, organizationId: mine.organizationId }], before)
+    assert.equal(baseline.get(mine.tenantId)?.status, 'COMPLETE')
+    assert.equal(baseline.get(mine.tenantId)?.events.length, 1,
+      'the blocked query would otherwise return a retained finding')
+
+    let providerCalls = 0
+    let warnings = 0
+    const service = new TenantsService(prisma, {
+      async verifyConnectedTenant(input: { connectionMode: string }) {
+        providerCalls++
+        assert.equal(input.connectionMode, 'CUSTOMER_MANAGED')
+        return { displayName: 'Verified after blocked audit', primaryDomain: 'verified.example',
+          grantedPermissions: [], missingRequiredPermissions: [] }
+      },
+      getRequiredPermissions: () => [],
+      getAccessContract: () => ({ connectionRequiredPermissions: [], capabilities: [] }),
+    } as never, {} as never)
+    ;(service as unknown as { logger: { warn: () => void } }).logger = { warn: () => { warnings++ } }
+
+    let acquired!: () => void
+    const lockAcquired = new Promise<void>(resolve => { acquired = resolve })
+    let release!: () => void
+    const releaseLock = new Promise<void>(resolve => { release = resolve })
+    let lockReleased = false
+    const held = blocker.$transaction(async tx => {
+      await tx.$executeRawUnsafe('LOCK TABLE directory_audit_logs IN ACCESS EXCLUSIVE MODE')
+      acquired()
+      await releaseLock
+      lockReleased = true
+    }, { timeout: 10_000 })
+    await Promise.race([lockAcquired, held.then(() => {
+      throw new Error('Audit table lock holder finished before acquiring its lock')
+    })])
+    const started = process.hrtime.bigint()
+    const verification = service.verifyConnectionForIdentity(identityOf(mine), mine.tenantId)
+    try {
+      let deadline!: ReturnType<typeof setTimeout>
+      const responseLimit = new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => reject(
+          new Error('Verification waited beyond its configured audit DB deadline')), 4000)
+      })
+      const verified = await Promise.race([
+        verification, responseLimit,
+      ]).finally(() => { clearTimeout(deadline) })
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1_000_000
+      assert.equal(lockReleased, false, 'the response must finish while PostgreSQL still holds the blocking lock')
+      assert.ok(elapsedMs >= 100, 'the audit SELECT must actually wait on the physical table lock')
+      assert.ok(elapsedMs < 4000, 'the audit DB deadline must bound the interactive response')
+      assert.equal(providerCalls, 1)
+      assert.equal(warnings, 1, 'the blocked audit statement must fail and be reported internally')
+      assert.equal(verified.connected, true)
+      assert.equal(verified.tenant.tenantHealth.security.directoryAuditRead.status, 'NOT_READ')
+      assert.notEqual(verified.tenant.tenantHealth.overallStatus, 'HEALTHY')
+      const published = await prisma.tenantConnection.findUniqueOrThrow({ where: {
+        customerTenantId_organizationId: { customerTenantId: mine.tenantId, organizationId: mine.organizationId },
+      } })
+      const tenant = await prisma.customerTenant.findUniqueOrThrow({ where: { id: mine.tenantId } })
+      assert.equal(published.status, 'CONNECTED')
+      assert.equal(published.lastErrorCode, null)
+      assert.ok(published.lastVerifiedAt)
+      assert.equal(tenant.status, 'ACTIVE')
+      assert.equal(tenant.displayName, 'Verified after blocked audit')
+    } finally {
+      release()
+      try { await held }
+      finally { await verification.catch(() => {}) }
+    }
+  })
+
 const bundleReader = (prisma: PrismaService) => new TenantSyncService(
   prisma, {} as never, {} as never, {} as never, {} as never, {} as never,
 )
