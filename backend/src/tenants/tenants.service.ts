@@ -107,6 +107,37 @@ function auditWindowSignature(window: TenantDirectoryAuditWindow | undefined): s
   return createHash('sha256').update(JSON.stringify(idsAndTimes)).digest('hex')
 }
 
+function syncFreshnessSnapshotSignature(value: unknown): string | null {
+  // PostgreSQL jsonb may return object keys in a different order than the
+  // in-memory registry. Saved legacy JSON can also be incomplete: treat it
+  // as a missing comparison signature so current evidence creates a new row.
+  const record = (item: unknown): item is Record<string, unknown> =>
+    item !== null && typeof item === 'object' && !Array.isArray(item)
+  if (!record(value) || !record(value.services)) return null
+  const keys = Object.keys(value.services).sort()
+  if (keys.length === 0) return null
+  const services = []
+  for (const key of keys) {
+    const service = value.services[key]
+    if (!record(service) || typeof service.service !== 'string' ||
+        typeof service.status !== 'string' || typeof service.freshnessStatus !== 'string' ||
+        !Array.isArray(service.partialFailures)) return null
+    const failures: Array<{ collector: string; status: string; reasonCode: string | null }> = []
+    for (const failure of service.partialFailures) {
+      if (!record(failure) || typeof failure.collector !== 'string' ||
+          typeof failure.status !== 'string' ||
+          (failure.reasonCode !== null && typeof failure.reasonCode !== 'string')) return null
+      failures.push({ collector: failure.collector, status: failure.status,
+        reasonCode: failure.reasonCode })
+    }
+    failures.sort((left, right) => left.collector < right.collector ? -1 :
+      left.collector > right.collector ? 1 : 0)
+    services.push({ key, service: service.service, status: service.status,
+      freshness: service.freshnessStatus, failures })
+  }
+  return JSON.stringify(services)
+}
+
 export const preserveOptionalExchangeConsent = (
   graphPermissions: string[],
   previouslyRecorded: string[]
@@ -818,7 +849,8 @@ export class TenantsService {
   ) {
     try {
       const evaluatedAt = new Date(health.evaluatedAt)
-      const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
+      const currentSignature = syncFreshnessSnapshotSignature(syncFreshness)
+      if (currentSignature === null) throw new Error('Current tenant sync freshness is invalid')
       const currentAuditFindings = JSON.stringify(health.attention.filter((item) => item.key.startsWith('audit-')))
       const saved = await this.prisma.$transaction(async (tx) => {
         // A request may outlive another API process's evaluation. Serialize
@@ -844,9 +876,7 @@ export class TenantsService {
           security?: { directoryAuditRead?: { status?: DirectoryAuditReadStatus } }
           auditEvidenceSignature?: string | null
         } | null
-        const previousSignature = previousPayload?.syncFreshness
-          ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-          : null
+        const previousSignature = syncFreshnessSnapshotSignature(previousPayload?.syncFreshness)
         const previousAuditFindings = Array.isArray(previousPayload?.attention)
           ? JSON.stringify(previousPayload.attention.filter((item) => item?.key?.startsWith('audit-')))
           : null

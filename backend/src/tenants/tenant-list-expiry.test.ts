@@ -535,6 +535,69 @@ test('tenant list expiry: existing conditional snapshot decision uses eligible h
   assert.deepEqual(auditKeys(f.writes[0].payload), ['audit-auth-eligible'])
 })
 
+test('tenant list expiry: JSONB service-key order does not duplicate unchanged health history', async () => {
+  const f = fixture([])
+  await read(f)
+  assert.equal(f.writes.length, 1)
+  const prior = f.writes[0]
+  const services = prior.payload.syncFreshness.services
+  const reversedServices = Object.fromEntries(Object.entries(services).reverse()
+    .map(([key, service]: [string, any]) => [key, {
+      ...service, partialFailures: [...service.partialFailures].reverse(),
+    }]))
+  assert.notDeepEqual(Object.keys(reversedServices), Object.keys(services))
+  f.previous.set('a', {
+    overallStatus: prior.overallStatus,
+    evaluatedAt: date(-1),
+    payload: {
+      ...prior.payload,
+      syncFreshness: { ...prior.payload.syncFreshness, services: reversedServices },
+    },
+  })
+  f.writes.length = 0
+
+  await read(f)
+  assert.equal(f.writes.length, 0, 'JSONB key and failure ordering must not count as a service transition')
+})
+
+for (const [field, changed] of [['status', 'FAILED'], ['reasonCode', 'synthetic-other-reason']] as const) {
+  test(`tenant list expiry: changed collector ${field} persists despite unchanged service status`, async () => {
+    const f = fixture([])
+    await read(f)
+    const prior = f.writes[0]
+    const savedPayload = JSON.parse(JSON.stringify(prior.payload))
+    const failure = savedPayload.syncFreshness.services.entraId.partialFailures[0]
+    assert.ok(failure)
+    failure[field] = changed
+    assert.equal(savedPayload.syncFreshness.services.entraId.status,
+      prior.payload.syncFreshness.services.entraId.status)
+    f.previous.set('a', { overallStatus: prior.overallStatus,
+      evaluatedAt: date(-1), payload: savedPayload })
+    f.writes.length = 0
+
+    await read(f)
+    assert.equal(f.writes.length, 1, `collector ${field} transition must create health history`)
+    assert.equal(f.writes[0].overallStatus, prior.overallStatus)
+  })
+}
+
+test('tenant list expiry: malformed saved sync freshness creates a fresh snapshot', async () => {
+  const f = fixture([])
+  await read(f)
+  const prior = f.writes[0]
+  f.previous.set('a', { overallStatus: prior.overallStatus,
+    evaluatedAt: date(-1), payload: {
+      ...prior.payload,
+      syncFreshness: { services: { entraId: { partialFailures: null } } },
+    } })
+  f.writes.length = 0
+
+  const result = await read(f)
+  assert.equal(result.tenants.length, 1)
+  assert.equal(f.writes.length, 1, 'malformed legacy JSON must not suppress the current snapshot')
+  assert.equal(f.writes[0].overallStatus, prior.overallStatus)
+})
+
 test('tenant list expiry: changed audit evidence creates history despite unchanged health and coverage', async t => {
   t.mock.timers.enable({ apis: ['Date'], now: NOW })
   const f = fixture([audit('first', 1, -100), audit('second', 1, -200)])
