@@ -49,6 +49,7 @@ import {
   customerCollectionFailureMessage,
   fetchMicrosoftWithRetry,
   MicrosoftRequestError,
+  MicrosoftPartialResponseError,
   type MicrosoftFailureProjection,
 } from '../microsoft/microsoft-request.js'
 import { getMicrosoftSkuName } from '../microsoft/microsoft-sku-names.js'
@@ -1205,11 +1206,62 @@ export function projectMailboxRule(value: unknown) {
   return row
 }
 
-async function readBoundedSingleton(response: Response): Promise<Record<string, any>> {
+function hasGraphContinuation(value: unknown): boolean {
+  // Expanded Graph collections can annotate a property at its parent level
+  // (for example, includeTargets@odata.nextLink) or carry a continuation on
+  // a nested record. Search the already byte-bounded JSON without recursion.
+  const pending: unknown[] = [value]
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (Array.isArray(current)) {
+      for (const nested of current) pending.push(nested)
+    } else if (plainRecord(current)) {
+      for (const [key, nested] of Object.entries(current)) {
+        if (key === '@odata.nextLink' || key.endsWith('@odata.nextLink')) return true
+        if (nested !== null && typeof nested === 'object') pending.push(nested)
+      }
+    }
+  }
+  return false
+}
+
+async function readBoundedSingleton(response: Response, baselineSource?: BaselineSourceResource): Promise<Record<string, any>> {
   const parsed = JSON.parse(await readBoundedResponseText(response, SINGLETON_JSON_MAX_BYTES)) as unknown
   if (!plainRecord(parsed)) throw new Error('Microsoft returned an invalid bounded singleton response.')
+  if (baselineSource && hasGraphContinuation(parsed)) {
+    throw new MicrosoftPartialResponseError(
+      `Microsoft ${baselineSource} returned incomplete expanded evidence; baseline was not advanced.`,
+      response.status,
+    )
+  }
   if (parsed['@odata.nextLink'] !== undefined) throw new Error('Microsoft returned an incomplete bounded singleton response; baseline was not advanced.')
   return parsed
+}
+
+type BaselineSourceResource = 'DOMAINS' | 'SECURITY_DEFAULTS' | 'AUTH_METHOD_POLICIES' | 'SHAREPOINT_SETTINGS'
+
+async function assertCompleteBaselineSourceResponse(response: Response, resourceType: BaselineSourceResource): Promise<void> {
+  // Graph can send 206 with a syntactically valid but incomplete JSON body.
+  // A Warning header can also qualify an otherwise successful response. Only
+  // these baseline evidence collectors require this stricter transport proof.
+  const warning = response.headers.get('warning')
+  if (response.status === 200 && warning === null) return
+  await cancelBoundedStream(() => response.body?.cancel())
+  const partial = response.status === 206 ||
+    (response.status === 200 && warning !== null)
+  // Warning text can include provider details. Carry only the numeric code in
+  // the typed error for the structured failure log; the customer message stays generic.
+  const warningCode = warning?.match(/^\s*(\d{3})(?:\s|$)/)?.[1]
+  const warningDetail = warning !== null ? ` (Warning code ${warningCode ?? 'unclassified'})` : ''
+  const message =
+    `Microsoft ${resourceType} returned an invalid response${warningDetail}; baseline was not advanced.`
+  if (partial) throw new MicrosoftPartialResponseError(message, response.status)
+  throw new MicrosoftRequestError(
+    message,
+    response.status,
+    null,
+    null,
+  )
 }
 
 /**
@@ -2889,6 +2941,9 @@ export class TenantSyncService {
         failureClass: failure.failureClass,
         reasonCode: failure.reasonCode,
         status: failure.status,
+        warningCode: error instanceof MicrosoftPartialResponseError
+          ? error.message.match(/\bWarning code (\d{3}|unclassified)\b/)?.[1] ?? null
+          : null,
       }))
       const state = await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
         where: {
@@ -3016,7 +3071,8 @@ export class TenantSyncService {
         'domain',
         { timeoutMs: 20_000 },
       )
-      const body = await readBoundedSingleton(response)
+      await assertCompleteBaselineSourceResponse(response, 'DOMAINS')
+      const body = await readBoundedSingleton(response, 'DOMAINS')
       if (!Array.isArray(body.value) || body.value.length !== 1 || !plainRecord(body.value[0])) {
         throw new Error('Microsoft returned an incomplete organization response; domain baseline was not advanced.')
       }
@@ -3541,7 +3597,8 @@ export class TenantSyncService {
         accessToken,
         'security defaults',
       )
-      const policy = closedFields(await readBoundedSingleton(response), ['id', 'displayName', 'description', 'isEnabled'])
+      await assertCompleteBaselineSourceResponse(response, 'SECURITY_DEFAULTS')
+      const policy = closedFields(await readBoundedSingleton(response, 'SECURITY_DEFAULTS'), ['id', 'displayName', 'description', 'isEnabled'])
       await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy])
     })
   }
@@ -4101,12 +4158,16 @@ export class TenantSyncService {
         accessToken,
         'authentication-method policy',
       )
-      const policy = await readBoundedSingleton(response) as {
+      await assertCompleteBaselineSourceResponse(response, 'AUTH_METHOD_POLICIES')
+      const policy = await readBoundedSingleton(response, 'AUTH_METHOD_POLICIES') as {
         authenticationMethodConfigurations?: unknown[]
       }
       if (!Array.isArray(policy.authenticationMethodConfigurations) || policy.authenticationMethodConfigurations.length > 100) throw new Error('Microsoft authentication policies exceeded the bounded record limit.')
       const rows = policy.authenticationMethodConfigurations.map((value) => {
         const row = closedFields(value, ['id', 'state'])
+        if (typeof row.id !== 'string' || !row.id.trim()) {
+          throw new Error('Microsoft authentication method policy returned an invalid response: a configuration ID is missing; baseline was not advanced.')
+        }
         for (const key of ['includeTargets', 'excludeTargets']) {
           if (plainRecord(value) && Array.isArray(value[key])) row[key] = value[key].map((target) => closedFields(target, ['id', 'targetType', 'isRegistrationRequired', 'authenticationMode']))
         }
@@ -5584,7 +5645,8 @@ export class TenantSyncService {
         accessToken,
         'SharePoint settings',
       )
-      const body = await readBoundedSingleton(response)
+      await assertCompleteBaselineSourceResponse(response, 'SHAREPOINT_SETTINGS')
+      const body = await readBoundedSingleton(response, 'SHAREPOINT_SETTINGS')
       // Microsoft documentation has shown both the resource directly and a
       // single resource under `value`. A wrapped collection is usable only
       // when it contains exactly one record; silently taking its first row

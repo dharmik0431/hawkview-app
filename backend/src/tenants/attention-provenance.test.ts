@@ -27,6 +27,7 @@ test('403, arbitrary codes and permission-shaped messages never imply customer o
   }
   assert.equal(collectorAttentionProvenance('NEW_RESOURCE','HAWKVIEW_INTERNAL_FAILURE').origin,'UNKNOWN')
   assert.equal(collectorAttentionProvenance('USERS','sign-ins-record-validation-partial').remediationOwner,'UNDETERMINED')
+  assert.equal(collectorAttentionProvenance('DOMAINS','MICROSOFT_PARTIAL_RESPONSE').remediationOwner,'HAWKVIEW_OPERATIONS')
 })
 for(const [activity,type,kind] of [
  ['Disable conditional access policy','conditionalAccessPolicy','CONDITIONAL_ACCESS_CHANGE'],
