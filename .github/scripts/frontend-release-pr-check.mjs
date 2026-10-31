@@ -13,6 +13,8 @@ const nonFrontendFiles = new Set([
   '.github/workflows/quality-gates.yml',
   '.github/scripts/backend-quality-tests.mjs',
   '.github/scripts/backend-quality-tests.test.mjs',
+  '.github/scripts/authenticated-msp-canary.mjs',
+  '.github/scripts/authenticated-msp-canary.test.mjs',
   '.github/scripts/frontend-release-pr-check.mjs',
   '.github/scripts/frontend-release-pr-check.test.mjs',
 ])

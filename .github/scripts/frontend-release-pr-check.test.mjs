@@ -18,6 +18,8 @@ test('backend, documentation, and this gate alone do not require a frontend stam
     'backend/src/tenants/tenant-sync.service.ts',
     '.github/scripts/backend-quality-tests.mjs',
     '.github/scripts/backend-quality-tests.test.mjs',
+    '.github/scripts/authenticated-msp-canary.mjs',
+    '.github/scripts/authenticated-msp-canary.test.mjs',
   ]), false)
   assert.equal(requiresReleaseStamp([
     '.github/workflows/quality-gates.yml',
