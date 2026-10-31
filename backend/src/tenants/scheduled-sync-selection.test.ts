@@ -187,6 +187,39 @@ test('uses stable failure codes and cost-aware retry windows', () => {
   }, now), false)
 })
 
+test('three early Baseline source retries retain their existing fifteen-minute admission', () => {
+  for (const resourceType of ['SECURITY_DEFAULTS', 'AUTH_METHOD_POLICIES', 'SHAREPOINT_SETTINGS']) {
+    const failed = {
+      ...state(resourceType, 'FAILED', new Date('2026-08-16T15:00:00.000Z'),
+        new Date(now.getTime() - 15 * 60 * 1000)),
+      lastErrorCode: 'MICROSOFT_PARTIAL_RESPONSE',
+      lastErrorMessage: 'Microsoft returned incomplete data. HawkView will retry automatically.',
+      consecutiveFailures: 1,
+    }
+    assert.equal(targetedTransientRetryDelayMs(failed), 15 * 60 * 1000, resourceType)
+    assert.equal(shouldRunTargetedTransientRetry(failed, now), true, resourceType)
+    assert.equal(shouldRunTargetedTransientRetry({
+      ...failed, lastAttemptAt: new Date(now.getTime() - 15 * 60 * 1000 + 1),
+    }, now), false, resourceType)
+    assert.equal(targetedTransientRetryDelayMs({ ...failed, consecutiveFailures: 3 }), 60 * 60 * 1000, resourceType)
+    assert.equal(shouldRunTargetedTransientRetry({ ...failed, consecutiveFailures: 3 }, now), false, resourceType)
+    const otherStates = [
+      ...dailyCoverage().filter((row) => row.resourceType !== resourceType),
+      state('USERS', 'SUCCEEDED', now, now),
+      state('LICENSES', 'SUCCEEDED', now, now),
+      state('DOMAINS', 'SUCCEEDED', now, now),
+    ]
+    const tenant = (attempt: Date) => ({
+      id: `partial-${resourceType.toLowerCase()}`,
+      syncStates: [...otherStates, { ...failed, lastAttemptAt: attempt }],
+    })
+    assert.deepEqual(selectScheduledTenantWork([tenant(failed.lastAttemptAt!)], now, 1).map((work) => work.tenantId),
+      [`partial-${resourceType.toLowerCase()}`], resourceType)
+    assert.deepEqual(selectScheduledTenantWork([tenant(new Date(now.getTime() - 15 * 60 * 1000 + 1))], now, 1), [],
+      resourceType)
+  }
+})
+
 test('selects a tenant for an eligible Named Locations retry without forcing full inventory', () => {
   const selected = selectScheduledTenantWork([{
     id: 'named-locations-retry',
@@ -632,6 +665,45 @@ function failedCandidacyBranches(at: Date) {
     }>
   return failed
 }
+
+test('partial Domains retains strict thirty-minute database candidacy', () => {
+  const failed = {
+    ...state('DOMAINS', 'FAILED', ago(25 * HOUR), ago(15 * 60 * 1000)),
+    lastErrorCode: 'MICROSOFT_PARTIAL_RESPONSE',
+    lastErrorMessage: 'Microsoft returned incomplete domains data. HawkView will retry automatically.',
+    consecutiveFailures: 1,
+  }
+  // The pure per-resource predicate is due at 15 minutes, but the existing
+  // database candidate query admits Domains only through the broad branch.
+  // Preserve that outer admission gate instead of adding Domains to the seven.
+  assert.equal(targetedTransientRetryDelayMs(failed), 15 * 60 * 1000)
+  assert.equal(shouldRunTargetedTransientRetry(failed, now), true)
+  const branches = failedCandidacyBranches(now)
+  const early = branches.find((branch) => branch.lastAttemptAt.lte)
+  const broad = branches.find((branch) => branch.lastAttemptAt.lt)
+  assert.ok(early)
+  assert.ok(broad)
+  assert.equal(early.resourceType.in.includes('DOMAINS'), false)
+  assert.equal(broad.resourceType.in.includes('DOMAINS'), true)
+  assert.equal(broad.lastErrorCode.notIn.includes('MICROSOFT_PARTIAL_RESPONSE'), false)
+  assert.equal(broad.lastAttemptAt.lt?.getTime(), now.getTime() - 30 * 60 * 1000)
+  const domainsFailedBranchAdmits = (attempt: Date) => branches.some((branch) =>
+    branch.resourceType.in.includes('DOMAINS') &&
+    (branch.lastAttemptAt.lt === undefined || attempt < branch.lastAttemptAt.lt) &&
+    (branch.lastAttemptAt.lte === undefined || attempt <= branch.lastAttemptAt.lte),
+  )
+  assert.equal(domainsFailedBranchAdmits(ago(15 * 60 * 1000)), false)
+  assert.equal(domainsFailedBranchAdmits(ago(30 * 60 * 1000)), false)
+  assert.equal(domainsFailedBranchAdmits(ago(30 * 60 * 1000 + 1)), true)
+  const due = { ...failed, lastAttemptAt: ago(30 * 60 * 1000 + 1) }
+  const work = selectScheduledTenantWork([{
+    id: 'partial-domains-after-candidacy',
+    syncStates: [...dailyCoverage(), state('USERS', 'SUCCEEDED', now, now),
+      state('LICENSES', 'SUCCEEDED', now, now), due,
+    ],
+  }], now, 1)
+  assert.equal(work.length, 1, 'the existing pure dispatch predicate is already due once admitted')
+})
 
 test('the selected resources become candidates at their own first-retry delay', () => {
   // The defect this replaces: candidacy waited for the 30-minute base while

@@ -201,6 +201,24 @@ test('detail and tenant choices restrict every read to the same workspace and bo
   assert.equal(tenantQueries[1].skip, 25)
 })
 
+test('legacy empty saved baseline exposes its unavailable check in library detail', async () => {
+  const saved = { id: baselineId, name: 'Legacy empty', checkIds: [], checkSettings: {},
+    revision: 1, createdAt: new Date(), updatedAt: new Date(), _count: { assignments: 0 } }
+  const prisma = {
+    user: { findUnique: async () => ({ id: 'owner', disabledAt: null, memberships: [{ organizationId: org }] }) },
+    securityBaseline: { findFirst: async () => saved },
+    tenantSecurityBaselineAssignment: { count: async () => 0, findMany: async () => [] },
+    securityBaselineRevision: { findMany: async () => [] },
+    $transaction: async (operations: Promise<unknown>[]) => Promise.all(operations),
+  }
+  const detail = await new SecurityRequirementsService(prisma as unknown as PrismaService)
+    .getLibraryDetail(identity, org, baselineId, '1', '')
+  assert.deepEqual(detail.baseline.checkIds, [])
+  assert.equal(detail.checks.length, 1)
+  assert.equal(detail.checks[0].id, 'baseline-has-no-saved-checks')
+  assert.match(detail.checks[0].guidance, /select at least one current check/i)
+})
+
 test('baseline impact counts observed gaps separately from missing evidence and filters tenant rows', async () => {
   const metTenant = '44444444-4444-4444-8444-444444444444'
   const gapTenant = '55555555-5555-4555-8555-555555555555'
@@ -218,7 +236,8 @@ test('baseline impact counts observed gaps separately from missing evidence and 
     tenantSecurityBaselineAssignment: { findMany: async ({ where }: { where: { organizationId: string; baselineId: string } }) => {
       assert.deepEqual(where, { organizationId: org, baselineId })
       return tenantIds.map((id, index) => ({ customerTenantId: id, assignedAt: new Date(now - 60_000),
-        customerTenant: { displayName: ['Met', 'Gap', 'Unknown'][index], primaryDomain: `${index}.example.test` } }))
+        customerTenant: { displayName: ['Met', 'Gap', 'Unknown'][index], primaryDomain: `${index}.example.test`,
+          status: 'ACTIVE', connection: { status: 'CONNECTED' } } }))
     } },
     customerTenant: { count: async ({ where }: { where: { organizationId: string } }) => {
       assert.deepEqual(where, { organizationId: org })
@@ -257,6 +276,54 @@ test('baseline impact counts observed gaps separately from missing evidence and 
   const all = await service.baselineCoverage(identity, org, baselineId, '1', '', 'ALL')
   assert.deepEqual(all.items.map((item) => item.outcome),
     ['NEEDS_ACTION', 'UNABLE_TO_ASSESS', 'MET'])
+})
+
+test('optional site-creation impact reads only assigned tenants in the selected workspace', async () => {
+  const enabledTenant = '55555555-5555-4555-8555-555555555555'
+  const foreignTenant = '77777777-7777-4777-8777-777777777777'
+  const tenantIds = [tenantId, enabledTenant]
+  const now = Date.now()
+  const evidenceRows = tenantIds.map((id) => ({ customerTenantId: id, resourceType: 'SHAREPOINT_SETTINGS',
+    status: 'SUCCEEDED', lastErrorCode: null, lastAttemptAt: new Date(now - 120_000),
+    lastSuccessfulAt: new Date(now - 30_000) }))
+  const snapshotRows = [...tenantIds, foreignTenant].map((id) => ({ customerTenantId: id, resourceType: 'SHAREPOINT_SETTINGS',
+    observedAt: new Date(now - 60_000), payload: [{ isSiteCreationEnabled: id !== tenantId }] }))
+  const scope = (where: { organizationId: string; customerTenantId: { in: string[] }; resourceType: { in: string[] } }) => {
+    assert.equal(where.organizationId, org)
+    assert.deepEqual(where.customerTenantId, { in: tenantIds })
+    assert.deepEqual(where.resourceType, { in: ['SHAREPOINT_SETTINGS'] })
+  }
+  const prisma = {
+    user: { findUnique: async () => ({ id: 'owner', disabledAt: null, memberships: [{ organizationId: org }] }) },
+    securityBaseline: { findFirst: async ({ where }: { where: { id: string; organizationId: string } }) => {
+      assert.deepEqual(where, { id: baselineId, organizationId: org })
+      return { id: baselineId, revision: 1, checkIds: ['sharepoint-direct-site-creation-disabled-v1'], checkSettings: {} }
+    } },
+    tenantSecurityBaselineAssignment: { findMany: async ({ where }: { where: { organizationId: string; baselineId: string } }) => {
+      assert.deepEqual(where, { organizationId: org, baselineId })
+      return tenantIds.map((id) => ({ customerTenantId: id, assignedAt: new Date(now - 60_000),
+        customerTenant: { displayName: id, primaryDomain: `${id}.example.test`, status: 'ACTIVE', connection: { status: 'CONNECTED' } } }))
+    } },
+    customerTenant: { count: async ({ where }: { where: { organizationId: string } }) => {
+      assert.deepEqual(where, { organizationId: org })
+      return tenantIds.length
+    } },
+    syncState: { findMany: async ({ where }: { where: Parameters<typeof scope>[0] }) => {
+      scope(where)
+      return evidenceRows
+    } },
+    tenantEntraSnapshot: { findMany: async ({ where }: { where: Parameters<typeof scope>[0] }) => {
+      scope(where)
+      return snapshotRows.filter((row) => where.customerTenantId.in.includes(row.customerTenantId))
+    } },
+    $transaction: async (action: (tx: unknown) => Promise<unknown>) => action(prisma),
+  }
+  const result = await new SecurityRequirementsService(prisma as unknown as PrismaService)
+    .baselineCoverage(identity, org, baselineId, '1', '', 'ALL')
+  assert.deepEqual(result.counts, { assigned: 2, met: 1, needsAction: 1, unableToAssess: 0, notApplied: 0 })
+  assert.deepEqual(result.checkImpact.map((check) => ({ id: check.id, met: check.met, needsAction: check.needsAction })),
+    [{ id: 'sharepoint-direct-site-creation-disabled-v1', met: 1, needsAction: 1 }])
+  assert.equal(result.items.some((item) => item.tenantId === foreignTenant), false)
 })
 
 test('baseline impact reads large assigned sets in bounded evidence batches, not one query per tenant', async () => {

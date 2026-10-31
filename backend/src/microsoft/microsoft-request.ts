@@ -9,6 +9,7 @@ export type MicrosoftFailureClass =
   | 'NETWORK_TIMEOUT'
   | 'DELTA_RESET_REQUIRED'
   | 'CAPACITY_GUARD'
+  | 'PARTIAL_MICROSOFT_RESPONSE'
   | 'INVALID_MICROSOFT_RESPONSE'
   | 'HAWKVIEW_INTERNAL'
 
@@ -121,6 +122,14 @@ export class MicrosoftRequestError extends Error {
   }
 }
 
+/** A Baseline evidence collector received a response that Graph marked partial. */
+export class MicrosoftPartialResponseError extends MicrosoftRequestError {
+  constructor(message: string, status: number) {
+    super(message, status, null, null)
+    this.name = 'MicrosoftPartialResponseError'
+  }
+}
+
 export function classifyMicrosoftFailure(
   error: unknown,
   safeMessage = error instanceof Error ? error.message : '',
@@ -133,6 +142,15 @@ export function classifyMicrosoftFailure(
     : codeFromMessage(safeMessage)
   const requestId = error instanceof MicrosoftRequestError ? error.requestId : null
   const normalizedCode = microsoftCode?.toLowerCase() ?? ''
+
+  // Only the strict Baseline response guard creates this type. Do not infer
+  // retryability from an arbitrary Graph Warning value or generic HTTP 206.
+  if (error instanceof MicrosoftPartialResponseError) {
+    return {
+      failureClass: 'PARTIAL_MICROSOFT_RESPONSE', reasonCode: 'MICROSOFT_PARTIAL_RESPONSE',
+      status, microsoftCode: null, requestId: null, retryable: true, customerAction: 'NONE',
+    }
+  }
 
   if (
     status === 410 ||
@@ -215,6 +233,9 @@ export function customerCollectionFailureMessage(
   }
   if (failure.failureClass === 'MICROSOFT_TRANSIENT' || failure.failureClass === 'NETWORK_TIMEOUT') {
     return `Microsoft temporarily could not provide ${resourceLabel} data.${retained} HawkView will retry automatically.`
+  }
+  if (failure.failureClass === 'PARTIAL_MICROSOFT_RESPONSE') {
+    return `Microsoft returned incomplete ${resourceLabel} data.${retained} HawkView will retry automatically.`
   }
   if (failure.failureClass === 'AUTHENTICATION_REQUIRED') {
     return `Microsoft rejected the tenant authorization required for ${resourceLabel}. Reconnect the Microsoft tenant.`

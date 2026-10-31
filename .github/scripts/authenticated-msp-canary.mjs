@@ -724,6 +724,188 @@ async function verifyIdentityRiskRoutes(
   }
 }
 
+function assertBaselineCatalog(value, label) {
+  assert(Array.isArray(value) && value.length > 0 && value.length <= 200, `${label} catalog was invalid`)
+  const ids = new Set()
+  for (const candidate of value) {
+    const check = record(candidate)
+    assert(check, `${label} catalog row was invalid`)
+    boundedString(check.id, 120, `${label} check ID`, /^[a-z0-9]+(?:-[a-z0-9]+)*$/)
+    boundedString(check.title, 200, `${label} check title`)
+    boundedString(check.service, 80, `${label} check service`)
+    boundedString(check.recommendation, 80, `${label} check recommendation`)
+    boundedString(check.source, 200, `${label} check source`)
+    boundedString(check.resourceType, 80, `${label} check resource`)
+    boundedString(check.expected, 1_000, `${label} check expectation`)
+    boundedString(check.guidance, 1_000, `${label} check guidance`)
+    assert(
+      check.choiceGroup === null ||
+        (typeof check.choiceGroup === 'string' && check.choiceGroup.length <= 120),
+      `${label} check choice group was invalid`,
+    )
+    if (check.parameterKind !== undefined) {
+      boundedString(check.parameterKind, 80, `${label} check parameter`)
+    }
+    assert(!ids.has(check.id), `${label} catalog IDs were duplicated`)
+    ids.add(check.id)
+  }
+  return ids
+}
+
+function assertBaselineStarter(value, catalogIds, label) {
+  const starter = record(value)
+  assert(starter, `${label} starter was invalid`)
+  boundedString(starter.id, 100, `${label} starter ID`)
+  boundedString(starter.name, 100, `${label} starter name`)
+  boundedString(starter.description, 1_000, `${label} starter description`)
+  boundedString(starter.boundary, 1_000, `${label} starter boundary`)
+  assert(
+    Array.isArray(starter.checkIds) && starter.checkIds.length > 0 &&
+      starter.checkIds.length <= catalogIds.size &&
+      starter.checkIds.every(id => catalogIds.has(id)) &&
+      new Set(starter.checkIds).size === starter.checkIds.length,
+    `${label} starter checks were invalid`,
+  )
+  return starter
+}
+
+function assertBaselineList(body) {
+  const list = record(body)
+  assert(list && list.page === 1 && list.pageSize === 25, 'Baseline library pagination was invalid')
+  assert(
+    Number.isSafeInteger(list.total) && list.total >= 0 &&
+      Array.isArray(list.items) && list.items.length <= 25 &&
+      list.items.length <= list.total,
+    'Baseline library list was invalid',
+  )
+  const catalogIds = assertBaselineCatalog(list.catalog, 'Baseline library')
+  const starter = assertBaselineStarter(list.starter, catalogIds, 'Baseline library')
+  const ids = new Set()
+  for (const candidate of list.items) {
+    const baseline = record(candidate)
+    assert(baseline && UUID_PATTERN.test(baseline.id ?? ''), 'Baseline library row was invalid')
+    boundedString(baseline.name, 100, 'Baseline library name')
+    assert(
+      Array.isArray(baseline.checkIds) && baseline.checkIds.length <= catalogIds.size &&
+        baseline.checkIds.every(id =>
+          typeof id === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) && id.length <= 120) &&
+        new Set(baseline.checkIds).size === baseline.checkIds.length &&
+        Number.isSafeInteger(baseline.revision) && baseline.revision >= 1 &&
+        baseline.assignedTenantCount === 0 &&
+        canonicalTimestamp(baseline.updatedAt) !== null,
+      'Baseline library row contract was invalid',
+    )
+    assert(!ids.has(baseline.id), 'Baseline library IDs were duplicated')
+    ids.add(baseline.id)
+  }
+  return { catalogIds, starter }
+}
+
+function assertBaselineTenantChoices(body, session) {
+  const choices = record(body)
+  assert(
+    choices && choices.page === 1 && choices.pageSize === 25 &&
+      choices.total === 1 && Array.isArray(choices.items) &&
+      choices.items.length === 1,
+    'Baseline tenant choices were not isolated',
+  )
+  const tenant = record(choices.items[0])
+  assert(
+    tenant?.id === session.expectedTenantId && tenant.baselineId === null &&
+      (tenant.displayName === null ||
+        (typeof tenant.displayName === 'string' && tenant.displayName.length <= 200)) &&
+      (tenant.primaryDomain === null ||
+        (typeof tenant.primaryDomain === 'string' && tenant.primaryDomain.length <= 255)),
+    'Baseline tenant choice was invalid',
+  )
+}
+
+function assertBaselineAssessment(body, session, library) {
+  const assessment = record(body)
+  assert(
+    assessment && assessment.tenantId === session.expectedTenantId &&
+      assessment.canManage === true && assessment.assignment === null,
+    'Baseline tenant assessment scope was invalid',
+  )
+  boundedString(assessment.tenantName, 200, 'Baseline tenant name')
+  assert(
+    assessment.tenantDomain === null ||
+      (typeof assessment.tenantDomain === 'string' && assessment.tenantDomain.length <= 255),
+    'Baseline tenant domain was invalid',
+  )
+  assert(canonicalTimestamp(assessment.assessedAt) !== null, 'Baseline assessment time was invalid')
+  boundedString(assessment.evidenceNote, 500, 'Baseline evidence note')
+  const catalogIds = assertBaselineCatalog(assessment.catalog, 'Baseline assessment')
+  const starter = assertBaselineStarter(assessment.starter, catalogIds, 'Baseline assessment')
+  assert(
+    catalogIds.size === library.catalogIds.size &&
+      [...catalogIds].every(id => library.catalogIds.has(id)) &&
+      starter.id === library.starter.id &&
+      starter.checkIds.length === library.starter.checkIds.length &&
+      starter.checkIds.every((id, index) => id === library.starter.checkIds[index]),
+    'Baseline catalog differed between library and assessment',
+  )
+  assert(Array.isArray(assessment.baselines), 'Baseline assessment library was invalid')
+  const baselineIds = new Set()
+  for (const candidate of assessment.baselines) {
+    const baseline = record(candidate)
+    assert(baseline && UUID_PATTERN.test(baseline.id ?? ''), 'Baseline assessment library row was invalid')
+    boundedString(baseline.name, 100, 'Baseline assessment library name')
+    assert(
+      Number.isSafeInteger(baseline.revision) && baseline.revision >= 1 &&
+        Array.isArray(baseline.checkIds) && baseline.checkIds.length <= catalogIds.size &&
+        baseline.checkIds.every(id =>
+          typeof id === 'string' && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id) && id.length <= 120) &&
+        new Set(baseline.checkIds).size === baseline.checkIds.length &&
+        canonicalTimestamp(baseline.updatedAt) !== null,
+      'Baseline assessment library row contract was invalid',
+    )
+    assert(!baselineIds.has(baseline.id), 'Baseline assessment library IDs were duplicated')
+    baselineIds.add(baseline.id)
+  }
+  assert(Array.isArray(assessment.results) && assessment.results.length === 0, 'Unassigned canary tenant had baseline results')
+  const summary = record(assessment.summary)
+  assert(
+    summary && summary.selected === 0 && summary.met === 0 &&
+      summary.needsAction === 0 && summary.unableToAssess === 0,
+    'Unassigned canary tenant had baseline counts',
+  )
+}
+
+async function verifyBaselineRoutes(fetchImpl, session, foreignSession, verifyUnauthenticated) {
+  const ownLibrary = `/api/policies/workspaces/${encodeURIComponent(session.expectedOrganizationId)}/baselines`
+  const foreignLibrary = `/api/policies/workspaces/${encodeURIComponent(foreignSession.expectedOrganizationId)}/baselines`
+  const ownAssessment = `/api/tenants/${encodeURIComponent(session.expectedTenantId)}/security-requirements`
+  const foreignAssessment = `/api/tenants/${encodeURIComponent(foreignSession.expectedTenantId)}/security-requirements`
+  const library = assertBaselineList((await authenticatedJson(
+    fetchImpl, session.accessToken, `${ownLibrary}?page=1`, [200], 'Baseline own library',
+  )).body)
+  assertBaselineTenantChoices((await authenticatedJson(
+    fetchImpl, session.accessToken, `${ownLibrary}/tenant-choices?page=1`, [200], 'Baseline own tenant choices',
+  )).body, session)
+  assertBaselineAssessment((await authenticatedJson(
+    fetchImpl, session.accessToken, ownAssessment, [200], 'Baseline own tenant assessment',
+  )).body, session, library)
+  await authenticatedJson(
+    fetchImpl, session.accessToken, `${foreignLibrary}?page=1`, [403, 404], 'Baseline foreign workspace denial',
+  )
+  await authenticatedJson(
+    fetchImpl, session.accessToken, `${foreignLibrary}/tenant-choices?page=1`, [403, 404],
+    'Baseline foreign tenant choices denial',
+  )
+  await authenticatedJson(
+    fetchImpl, session.accessToken, foreignAssessment, [403, 404], 'Baseline foreign tenant denial',
+  )
+  if (verifyUnauthenticated) {
+    for (const [path, label] of [
+      [`${ownLibrary}?page=1`, 'Baseline unauthenticated library denial'],
+      [ownAssessment, 'Baseline unauthenticated assessment denial'],
+    ]) {
+      await requestJson(fetchImpl, `${API_ORIGIN}${path}`, { cache: 'no-store' }, [401], label)
+    }
+  }
+}
+
 async function verifyIdentityBoundary(fetchImpl, session, foreignSession) {
   const bootstrap = (
     await requestJson(fetchImpl, `${API_ORIGIN}/auth/bootstrap`, {
@@ -859,7 +1041,9 @@ export async function runAuthenticatedCanary({
   await verifyIdentityBoundary(fetchImpl, sessionB, sessionA)
   await verifyIdentityRiskRoutes(fetchImpl, sessionA, sessionB, true, now)
   await verifyIdentityRiskRoutes(fetchImpl, sessionB, sessionA, false, now)
-  console.log('Authenticated two-MSP canary and identity-risk route checks passed.')
+  await verifyBaselineRoutes(fetchImpl, sessionA, sessionB, true)
+  await verifyBaselineRoutes(fetchImpl, sessionB, sessionA, false)
+  console.log('Authenticated two-MSP canary, identity-risk, and Baseline route checks passed.')
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

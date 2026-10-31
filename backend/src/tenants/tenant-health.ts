@@ -61,7 +61,7 @@ function freshnessWindow(resourceType: string) {
 function mfaCoverage(payload: unknown) { if (!Array.isArray(payload)) return null; const rows = payload.filter((row): row is { isMfaRegistered: boolean } => typeof row === 'object' && row !== null && typeof (row as { isMfaRegistered?: unknown }).isMfaRegistered === 'boolean'); return rows.length ? Math.round((rows.filter((row) => row.isMfaRegistered).length / rows.length) * 100) : null }
 function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => Boolean(d)).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
 function securityUrl(tenantId: string, view: string) { return `/tenants/${encodeURIComponent(tenantId)}?entraTab=security&securityView=${view}` }
-function retryableSyncState(state: SyncState | undefined) { return Boolean(state && ['MICROSOFT_TRANSIENT', 'MICROSOFT_THROTTLED', 'MICROSOFT_NETWORK_TIMEOUT', 'MICROSOFT_DELTA_RESET_REQUIRED'].includes(state.lastErrorCode ?? '')) }
+function retryableSyncState(state: SyncState | undefined) { return Boolean(state && ['MICROSOFT_TRANSIENT', 'MICROSOFT_THROTTLED', 'MICROSOFT_NETWORK_TIMEOUT', 'MICROSOFT_DELTA_RESET_REQUIRED', 'MICROSOFT_PARTIAL_RESPONSE'].includes(state.lastErrorCode ?? '')) }
 function isSignInFallback(state: SyncState | undefined) { return Boolean(state?.resourceType === 'SIGN_INS' && /sign-ins-.*fallback-active/.test(state.lastErrorCode ?? '')) }
 function currentLimitedFallback(state: SyncState | undefined, now: Date) {
   return Boolean(

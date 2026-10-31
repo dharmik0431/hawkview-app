@@ -42,8 +42,8 @@ export const CHECKS = [
     choiceGroup: null,
     source: 'Microsoft SharePoint settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'External sharing is disabled, or the tenant uses an Allow list with at least one external email domain.',
-    guidance: 'Review the actual allowed domains and Entra B2B restrictions; this setting alone does not verify every partner or site-specific access.',
+    expected: 'External sharing is disabled, or Anyone links are disabled and the tenant uses an Allow list with at least one external email domain.',
+    guidance: 'Review the sharing level, actual allowed domains, and Entra B2B restrictions; a domain Allow list does not restrict Anyone links or prove every partner or site-specific access.',
   },
   {
     id: 'sharepoint-approved-partner-domains-v1',
@@ -54,8 +54,8 @@ export const CHECKS = [
     parameterKind: 'approvedDomains',
     source: 'Microsoft SharePoint settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'External sharing is disabled, or the tenant allow list contains only the partner domains selected by the MSP.',
-    guidance: 'Review the allowed domains and site-specific sharing rules. This tenant setting does not prove that invitations or site access work.',
+    expected: 'External sharing is disabled, or Anyone links are disabled and the tenant allow list contains only the partner domains selected by the MSP.',
+    guidance: 'Review the sharing level, allowed domains, and site-specific sharing rules. A domain Allow list does not restrict Anyone links or prove that invitations or site access work.',
   },
   {
     id: 'sharepoint-legacy-auth-disabled',
@@ -70,14 +70,25 @@ export const CHECKS = [
   },
   {
     id: 'sharepoint-guest-resharing-disabled',
-    title: 'Guest resharing is disabled',
+    title: 'Guest resharing of others’ items requires Full Control',
     service: 'SharePoint',
     recommendation: 'HAWKVIEW_STARTER',
     choiceGroup: null,
     source: 'Microsoft SharePoint settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'External users cannot reshare content they do not own.',
-    guidance: 'Review the external-user resharing setting in SharePoint admin settings.',
+    expected: 'The tenant guest-resharing setting is off. Guests with Full Control may still share items.',
+    guidance: 'Review the external-user resharing setting and site permissions in SharePoint admin settings. This setting does not revoke a guest’s Full Control sharing permission.',
+  },
+  {
+    id: 'sharepoint-direct-site-creation-disabled-v1',
+    title: 'Direct SharePoint site creation by users is disabled',
+    service: 'SharePoint',
+    recommendation: 'OPTIONAL',
+    choiceGroup: null,
+    source: 'Microsoft SharePoint settings',
+    resourceType: 'SHAREPOINT_SETTINGS',
+    expected: 'The collected isSiteCreationEnabled setting is false for direct user site creation. Users may still create Microsoft 365 Groups or Teams and their connected SharePoint sites.',
+    guidance: 'Review Settings > Site creation in the SharePoint admin center before restricting legitimate collaboration. Check satellite geos separately where applicable. This setting does not stop users from creating Microsoft 365 groups or Teams and their connected SharePoint sites; manage group creation separately if needed.',
   },
   {
     id: 'sharepoint-invitation-account-match-enabled',
@@ -92,41 +103,41 @@ export const CHECKS = [
   },
   {
     id: 'sharepoint-idle-session-signout-enabled',
-    title: 'SharePoint idle session sign-out is enabled',
+    title: 'SharePoint idle session sign-out is configured',
     service: 'SharePoint',
     recommendation: 'OPTIONAL',
     choiceGroup: null,
     source: 'Microsoft SharePoint settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'The tenant-level idle session sign-out setting is enabled.',
-    guidance: 'Review the idle session sign-out policy and its timeouts; this does not prove a user session was terminated.',
+    expected: 'The tenant setting is enabled with a positive warning time and a later sign-out time. Microsoft Entra P1/P2 licensing and actual session enforcement are not verified.',
+    guidance: 'Review the warning and sign-out times, Microsoft Entra licensing, device scope and Conditional Access. The setting does not affect existing sessions or prove a user was signed out.',
   },
   {
     id: 'onedrive-sync-approved-domains-configured-v1',
-    title: 'OneDrive sync is restricted to approved domains',
+    title: 'AD-domain PC sync restriction is configured',
     service: 'OneDrive',
     recommendation: 'STRICT_OPTION',
     choiceGroup: null,
     source: 'Microsoft SharePoint and OneDrive tenant settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'Domain-joined-PC sync restriction is enabled and at least one approved domain GUID is configured.',
-    guidance: 'Review the approved-domain identities and device strategy; this is not a general unmanaged-device access policy.',
+    expected: 'The collected SharePoint setting enables AD-domain PC sync restriction and lists at least one domain GUID.',
+    guidance: 'Check each geo separately. This setting does not cover Entra-only joined PCs, Mac or mobile sync by default, or files already synced.',
   },
   {
     id: 'onedrive-sync-approved-domain-guids-v1',
-    title: 'OneDrive sync is limited to MSP-approved domain identities',
+    title: 'Configured AD-domain PC sync GUIDs match the MSP-approved list',
     service: 'OneDrive',
     recommendation: 'OPTIONAL',
     choiceGroup: null,
     parameterKind: 'approvedDomainGuids',
     source: 'Microsoft SharePoint and OneDrive tenant settings',
     resourceType: 'SHAREPOINT_SETTINGS',
-    expected: 'Domain-joined-PC sync restriction is enabled and its configured domain GUIDs are within the MSP-approved set.',
-    guidance: 'This checks the configured sync domain list, not general device compliance or Conditional Access coverage.',
+    expected: 'The collected SharePoint AD-domain PC sync setting is enabled and its configured domain GUIDs are within the MSP-approved set.',
+    guidance: 'Check each geo separately. This setting does not cover Entra-only joined PCs, Mac or mobile sync by default, or files already synced.',
   },
   {
     id: 'onedrive-deleted-user-retention-minimum-v1',
-    title: 'Deleted-user OneDrive retention meets the MSP minimum',
+    title: 'Deleted-user OneDrive tenant retention setting meets the MSP minimum',
     service: 'OneDrive',
     recommendation: 'OPTIONAL',
     choiceGroup: null,
@@ -156,19 +167,30 @@ export const CHECKS = [
     source: 'Microsoft Entra authentication method policy',
     resourceType: 'AUTH_METHOD_POLICIES',
     expected: 'The Fido2 method is enabled, targets all_users, and has no excluded targets.',
-    guidance: 'This permits passkey registration/use for the targeted population. It does not require passkeys at sign-in, prove enrollment, or replace Conditional Access coverage.',
+    guidance: 'This checks method-policy availability and targeting only. It does not prove new registrations are allowed, users enrolled, or Conditional Access requires passkeys.',
+  },
+  {
+    id: 'entra-authenticator-push-all-users-enabled-v1',
+    title: 'Microsoft Authenticator push is enabled for all users in the methods policy',
+    service: 'Entra',
+    recommendation: 'OPTIONAL',
+    choiceGroup: null,
+    source: 'Microsoft Entra authentication method policy',
+    resourceType: 'AUTH_METHOD_POLICIES',
+    expected: 'The Microsoft Authenticator methods policy is enabled with one all_users target in push or any mode and no excluded targets.',
+    guidance: 'This checks the Authentication methods policy for sign-in. It does not prove user registration, SSPR coverage, MFA enforcement, or Conditional Access coverage. Legacy policies can also permit the method. Passwordless-only deviceBasedPush does not satisfy it.',
   },
   {
     id: 'm365-required-verified-domains-v1',
-    title: 'MSP-required domains appear in Microsoft verified domains',
+    title: 'MSP-required domains appear in the Microsoft organization inventory',
     service: 'Microsoft 365',
     recommendation: 'OPTIONAL',
     choiceGroup: null,
     parameterKind: 'requiredDomains',
     source: 'Microsoft Graph organization verifiedDomains',
     resourceType: 'DOMAINS',
-    expected: 'Every domain selected by the MSP appears in the tenant-associated Microsoft verified-domain inventory.',
-    guidance: 'This verifies inventory presence, not DNS mail authentication, Exchange accepted-domain type, or service health.',
+    expected: 'Every domain selected by the MSP appears in the tenant-associated organization.verifiedDomains inventory.',
+    guidance: 'This checks stored organization-inventory membership, not the /domains isVerified field, DNS mail authentication, Exchange accepted-domain type, or service health.',
   },
 ] as const
 
@@ -293,19 +315,50 @@ export function evaluateCheck(
     recommendation: check.recommendation,
     choiceGroup: check.choiceGroup,
   }
-  if (checkId === 'entra-fido2-method-all-users-enabled-v1') {
+  if (checkId === 'entra-fido2-method-all-users-enabled-v1' || checkId === 'entra-authenticator-push-all-users-enabled-v1') {
+    const authenticator = checkId === 'entra-authenticator-push-all-users-enabled-v1'
+    const methodId = authenticator ? 'MicrosoftAuthenticator' : 'Fido2'
     const usable = usableRows(evidenceByResource.AUTH_METHOD_POLICIES, now, 'authentication method policy', 100)
     if ('reason' in usable) return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: null, reason: usable.reason }
-    const matching = usable.rows.filter((row) => row.id === 'Fido2')
+    if (usable.rows.some((row) => typeof row.id !== 'string' || !row.id.trim())) {
+      return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
+        reason: 'The stored authentication method collection contains an unidentified configuration.' }
+    }
+    const matching = usable.rows.filter((row) => row.id === methodId)
     if (matching.length !== 1) return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
-      reason: 'The Fido2 method configuration is absent or duplicated in the stored collection.' }
+      reason: `The ${methodId} method configuration is absent or duplicated in the stored collection.` }
     const method = matching[0]
     if (method.state !== 'enabled' && method.state !== 'disabled') return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
-      reason: 'The Fido2 method state is absent or unrecognized.' }
+      reason: `The ${methodId} method state is absent or unrecognized.` }
     if (!Array.isArray(method.includeTargets) || !Array.isArray(method.excludeTargets)) return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
-      reason: 'The Fido2 include or exclude targets are absent.' }
+      reason: `The ${methodId} include or exclude targets are absent.` }
+    // A projected malformed target becomes {}. If one target is unreadable, an
+    // all_users row cannot establish the complete policy scope or exclusions.
+    const validTarget = (target: unknown) => target !== null && typeof target === 'object' && !Array.isArray(target) &&
+      typeof (target as Record<string, unknown>).id === 'string' && Boolean(((target as Record<string, unknown>).id as string).trim()) &&
+      ['group', 'user'].includes(String((target as Record<string, unknown>).targetType))
+    if (method.includeTargets.length + method.excludeTargets.length > 1_000 ||
+        !method.includeTargets.every(validTarget) || !method.excludeTargets.every(validTarget)) {
+      return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
+        reason: `The ${methodId} policy targets are malformed, unrecognized, or exceed the supported bound.` }
+    }
     const allUsers = method.includeTargets.some((target) => target && typeof target === 'object' && !Array.isArray(target) &&
       (target as Record<string, unknown>).id === 'all_users' && (target as Record<string, unknown>).targetType === 'group')
+    if (authenticator) {
+      // Other included groups can carry a different authenticationMode. Avoid
+      // inferring effective all-user push availability from overlapping targets.
+      if (allUsers && method.includeTargets.length > 1) return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
+        reason: 'Microsoft Authenticator has overlapping include targets whose effective mode is not established.' }
+      const mode = allUsers ? (method.includeTargets[0] as Record<string, unknown>).authenticationMode : undefined
+      if (allUsers && mode !== 'any' && mode !== 'push' && mode !== 'deviceBasedPush') {
+        return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
+          reason: 'The all-user Microsoft Authenticator mode is absent or unrecognized.' }
+      }
+      const met = method.state === 'enabled' && allUsers && (mode === 'any' || mode === 'push') && method.excludeTargets.length === 0
+      return { ...base, outcome: met ? 'MET' : 'NEEDS_ACTION',
+        observed: `${method.state}; ${allUsers ? `all users targeted in ${mode} mode` : 'all users not targeted'}; ${method.excludeTargets.length} excluded target${method.excludeTargets.length === 1 ? '' : 's'}`,
+        observedAt: usable.observedAt, reason: null }
+    }
     const met = method.state === 'enabled' && allUsers && method.excludeTargets.length === 0
     return { ...base, outcome: met ? 'MET' : 'NEEDS_ACTION',
       observed: `${method.state}; ${allUsers ? 'all users targeted' : 'all users not targeted'}; ${method.excludeTargets.length} excluded target${method.excludeTargets.length === 1 ? '' : 's'}`,
@@ -315,22 +368,44 @@ export function evaluateCheck(
     const configured = settings[checkId]?.requiredDomains
     const required = Array.isArray(configured) && configured.length > 0 &&
       configured.every((domain) => normalizeDomain(domain) === domain) ? configured : undefined
-    const usable = usableRows(evidenceByResource.DOMAINS, now, 'verified-domain inventory', 1000)
-    const expected = required?.length ? `Microsoft verified-domain inventory includes: ${required.join(', ')}.` : base.expected
+    const usable = usableRows(evidenceByResource.DOMAINS, now, 'organization-domain inventory', 1000)
+    const expected = required?.length ? `Microsoft organization-domain inventory includes: ${required.join(', ')}.` : base.expected
     if ('reason' in usable) return { ...base, expected, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: null, reason: usable.reason }
     if (!required?.length || usable.rows.length === 0) return { ...base, expected, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
-      reason: !required?.length ? 'The saved required-domain choice is missing or malformed.' : 'The verified-domain inventory is empty.' }
+      reason: !required?.length ? 'The saved required-domain choice is missing or malformed.' : 'The organization-domain inventory is empty.' }
     const domains = usable.rows.map((row) => normalizeDomain(row.name))
     if (domains.some((domain) => !domain)) return { ...base, expected, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
-      reason: 'The stored verified-domain inventory contains an invalid domain.' }
+      reason: 'The stored organization-domain inventory contains an invalid domain.' }
     const missing = required.filter((domain) => !domains.includes(domain))
     return { ...base, expected, outcome: missing.length ? 'NEEDS_ACTION' : 'MET',
-      observed: `${domains.length} Microsoft verified domain${domains.length === 1 ? '' : 's'}; ${missing.length} required domain${missing.length === 1 ? '' : 's'} absent`,
+      observed: `${domains.length} organization domain${domains.length === 1 ? '' : 's'}; ${missing.length} required domain${missing.length === 1 ? '' : 's'} absent`,
       observedAt: usable.observedAt, reason: null }
   }
   const usable = usableRecord(evidenceByResource[check.resourceType], now)
   if ('reason' in usable) {
     return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: null, reason: usable.reason }
+  }
+
+  if (checkId === 'sharepoint-idle-session-signout-enabled') {
+    const idle = usable.record.idleSessionSignOut
+    const setting = idle && typeof idle === 'object' && !Array.isArray(idle)
+      ? idle as Record<string, unknown> : null
+    if (!setting || typeof setting.isEnabled !== 'boolean') {
+      return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
+        reason: 'The tenant idle session sign-out setting is absent or unrecognized.' }
+    }
+    if (!setting.isEnabled) {
+      return { ...base, outcome: 'NEEDS_ACTION', observed: 'Disabled', observedAt: usable.observedAt, reason: null }
+    }
+    const warn = setting.warnAfterInSeconds
+    const signOut = setting.signOutAfterInSeconds
+    if (typeof warn !== 'number' || !Number.isSafeInteger(warn) || warn <= 0 ||
+        typeof signOut !== 'number' || !Number.isSafeInteger(signOut) || signOut <= warn) {
+      return { ...base, outcome: 'UNABLE_TO_ASSESS', observed: 'Enabled; timeouts unavailable', observedAt: usable.observedAt,
+        reason: 'The required warning and sign-out times are absent, invalid, or out of order.' }
+    }
+    return { ...base, outcome: 'MET', observed: `Enabled; warning after ${warn} seconds; sign-out after ${signOut} seconds`,
+      observedAt: usable.observedAt, reason: null }
   }
 
   if (checkId === 'sharepoint-approved-partner-domains-v1') {
@@ -340,7 +415,7 @@ export function evaluateCheck(
     const sharing = usable.record.sharingCapability
     const mode = usable.record.sharingDomainRestrictionMode
     const rawDomains = usable.record.sharingAllowedDomainList
-    const expected = approved?.length ? `External sharing disabled, or an Allow list containing only: ${approved.join(', ')}.` : base.expected
+    const expected = approved?.length ? `External sharing disabled, or Anyone links disabled with an Allow list containing only: ${approved.join(', ')}.` : base.expected
     const outcome = (met: boolean | null, observed: string, reason: string | null = null): CheckResult => ({
       ...base, expected, observed, observedAt: usable.observedAt,
       outcome: met === null ? 'UNABLE_TO_ASSESS' : met ? 'MET' : 'NEEDS_ACTION', reason,
@@ -349,6 +424,9 @@ export function evaluateCheck(
     if (sharing === 'disabled') return outcome(true, 'External sharing disabled')
     if (!['externalUserSharingOnly', 'existingExternalUserSharingOnly', 'externalUserAndGuestSharing'].includes(String(sharing))) {
       return outcome(null, 'Unavailable', 'The external sharing level is absent or unrecognized.')
+    }
+    if (sharing === 'externalUserAndGuestSharing') {
+      return outcome(false, 'Anyone links permitted; the partner-domain Allow list does not restrict anonymous links')
     }
     if (mode === 'none' || mode === 'blockList') return outcome(false, `External sharing domain mode: ${mode}`)
     if (mode !== 'allowList' || !Array.isArray(rawDomains) || !rawDomains.length) {
@@ -365,23 +443,25 @@ export function evaluateCheck(
       configured.every((guid) => normalizeGuid(guid) === guid) ? configured : undefined
     const enabled = usable.record.isUnmanagedSyncAppForTenantRestricted
     const rawGuids = usable.record.allowedDomainGuidsForSyncApp
-    const expected = approved?.length ? `Sync restriction enabled; configured domain GUIDs limited to ${approved.length} MSP-approved ${approved.length === 1 ? 'identity' : 'identities'}.` : base.expected
+    const expected = approved?.length ? `Collected AD-domain PC sync setting enabled; configured domain GUIDs limited to ${approved.length} MSP-approved ${approved.length === 1 ? 'identity' : 'identities'}.` : base.expected
     const outcome = (met: boolean | null, observed: string, reason: string | null = null): CheckResult => ({
       ...base, expected, observed, observedAt: usable.observedAt,
       outcome: met === null ? 'UNABLE_TO_ASSESS' : met ? 'MET' : 'NEEDS_ACTION', reason,
     })
     if (!approved?.length) return outcome(null, 'Unavailable', 'The saved approved-domain identity choice is missing or malformed.')
-    if (enabled === false) return outcome(false, 'Sync restriction disabled')
+    if (enabled === false) return outcome(false, 'AD-domain PC sync setting disabled')
     if (enabled !== true || !Array.isArray(rawGuids)) return outcome(null, 'Unavailable', 'The sync restriction or configured domain list is absent.')
     const guids = rawGuids.map(normalizeGuid)
     if (guids.some((guid) => !guid)) return outcome(null, 'Unavailable', 'The stored sync domain list contains an invalid GUID.')
     const unexpected = (guids as string[]).filter((guid) => !approved.includes(guid))
-    return outcome(guids.length > 0 && unexpected.length === 0, `Restriction enabled; ${guids.length} configured domain${guids.length === 1 ? '' : 's'}${unexpected.length ? `; ${unexpected.length} outside the approved set` : ''}`)
+    return outcome(guids.length > 0 && unexpected.length === 0, `AD-domain PC sync setting enabled; ${guids.length} configured domain GUID${guids.length === 1 ? '' : 's'}${unexpected.length ? `; ${unexpected.length} outside the approved set` : ''}`)
   }
   if (checkId === 'onedrive-deleted-user-retention-minimum-v1') {
     const minimumDays = settings[checkId]?.minimumDays
     const days = usable.record.deletedUserPersonalSiteRetentionPeriodInDays
-    const expected = Number.isInteger(minimumDays) ? `At least ${minimumDays} days of deleted-user OneDrive retention.` : base.expected
+    const expected = Number.isInteger(minimumDays)
+      ? `At least ${minimumDays} days in the deleted-user OneDrive tenant retention setting; effective content retention is not assessed.`
+      : base.expected
     if (!Number.isInteger(minimumDays) || (minimumDays as number) < 30 || (minimumDays as number) > 3650 ||
         !Number.isInteger(days) || (days as number) < 30 || (days as number) > 3650) {
       return { ...base, expected, outcome: 'UNABLE_TO_ASSESS', observed: 'Unavailable', observedAt: usable.observedAt,
@@ -405,16 +485,12 @@ export function evaluateCheck(
     case 'sharepoint-guest-resharing-disabled':
       value = usable.record.isResharingByExternalUsersEnabled
       break
+    case 'sharepoint-direct-site-creation-disabled-v1':
+      value = usable.record.isSiteCreationEnabled
+      break
     case 'sharepoint-invitation-account-match-enabled':
       value = usable.record.isRequireAcceptingUserToMatchInvitedUserEnabled
       break
-    case 'sharepoint-idle-session-signout-enabled': {
-      const idle = usable.record.idleSessionSignOut
-      value = idle && typeof idle === 'object' && !Array.isArray(idle)
-        ? (idle as Record<string, unknown>).isEnabled
-        : undefined
-      break
-    }
     case 'onedrive-sync-approved-domains-configured-v1':
       value = usable.record.isUnmanagedSyncAppForTenantRestricted
       break
@@ -430,7 +506,11 @@ export function evaluateCheck(
     const domains = usable.record.sharingAllowedDomainList
     observed = value === 'disabled' ? 'External sharing disabled' : typeof mode === 'string' ? `External sharing domain mode: ${mode}` : 'Unavailable'
     if (value === 'disabled') met = true
-    if (value === 'externalUserSharingOnly' || value === 'existingExternalUserSharingOnly' || value === 'externalUserAndGuestSharing') {
+    if (value === 'externalUserAndGuestSharing') {
+      met = false
+      observed = 'Anyone links permitted; the domain Allow list does not restrict anonymous links'
+    }
+    if (value === 'externalUserSharingOnly' || value === 'existingExternalUserSharingOnly') {
       if (mode === 'none' || mode === 'blockList') met = false
       if (mode === 'allowList' && Array.isArray(domains) && domains.every((domain) => normalizeDomain(domain) !== null)) {
         met = domains.length > 0
@@ -457,12 +537,16 @@ export function evaluateCheck(
     }
   } else if (checkId === 'onedrive-sync-approved-domains-configured-v1') {
     const domains = usable.record.allowedDomainGuidsForSyncApp
-    observed = value === true ? 'Restriction enabled' : value === false ? 'Restriction disabled' : 'Unavailable'
+    observed = value === true ? 'AD-domain PC sync setting enabled' : value === false ? 'AD-domain PC sync setting disabled' : 'Unavailable'
     if (value === false) met = false
     if (value === true && Array.isArray(domains) && domains.every((domain) => typeof domain === 'string' && GUID.test(domain))) {
       met = domains.length > 0
-      observed = `Restriction enabled; ${domains.length} approved domain${domains.length === 1 ? '' : 's'}`
+      observed = `AD-domain PC sync setting enabled; ${domains.length} configured domain GUID${domains.length === 1 ? '' : 's'}`
     }
+  } else if (checkId === 'sharepoint-direct-site-creation-disabled-v1') {
+    observed = value === true ? 'Direct SharePoint site creation by users enabled' :
+      value === false ? 'Direct SharePoint site creation by users disabled' : 'Unavailable'
+    if (typeof value === 'boolean') met = !value
   } else {
     observed = typeof value === 'boolean' ? (value ? 'Enabled' : 'Disabled') : 'Unavailable'
     if (typeof value === 'boolean') {

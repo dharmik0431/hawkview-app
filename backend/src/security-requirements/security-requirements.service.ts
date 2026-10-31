@@ -7,6 +7,13 @@ import { parseCheckSettings, type CheckSettings } from './security-requirements-
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CHECK_IDS = new Set<string>(CHECKS.map((check) => check.id))
+const EMPTY_SAVED_BASELINE_CHECK_ID = 'baseline-has-no-saved-checks'
+const EMPTY_SAVED_BASELINE_CHECK = {
+  id: EMPTY_SAVED_BASELINE_CHECK_ID, title: 'No baseline checks selected', service: 'Unsupported',
+  recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library',
+  expected: 'At least one supported baseline check',
+  guidance: 'Edit this baseline and select at least one current check.', resourceType: null,
+} as const
 const RESOURCES: ResourceType[] = ['SHAREPOINT_SETTINGS', 'SECURITY_DEFAULTS', 'AUTH_METHOD_POLICIES', 'DOMAINS']
 
 function validUuid(value: string): string {
@@ -67,8 +74,14 @@ function expectedRevision(body: unknown): number {
 export class SecurityRequirementsService {
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
-  private evaluateSelected(checkIds: string[], checkSettings: unknown, evidence: Partial<Record<ResourceType, EvidenceInput>>, now: Date) {
-    return checkIds.map((id) => CHECK_IDS.has(id)
+  private evaluateSelected(checkIds: string[], checkSettings: unknown, evidence: Partial<Record<ResourceType, EvidenceInput>>, now: Date, tenantAvailable = true) {
+    const results = checkIds.map((id) => id === EMPTY_SAVED_BASELINE_CHECK_ID
+      ? {
+          ...EMPTY_SAVED_BASELINE_CHECK,
+          outcome: 'UNABLE_TO_ASSESS' as const, observed: 'Unavailable', observedAt: null,
+          reason: 'This saved baseline has no checks and cannot be assessed.',
+        }
+      : CHECK_IDS.has(id)
       ? evaluateCheck(id as CheckId, evidence, now, checkSettings as CheckSettings ?? {})
       : {
           id, title: 'Unsupported saved check', service: 'Unsupported', recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library', expected: 'A supported check definition',
@@ -76,6 +89,9 @@ export class SecurityRequirementsService {
           outcome: 'UNABLE_TO_ASSESS' as const, observed: 'Unavailable', observedAt: null,
           reason: 'This saved check is no longer available in the current catalog.',
         })
+    if (tenantAvailable) return results
+    return results.map((result) => ({ ...result, outcome: 'UNABLE_TO_ASSESS' as const,
+      observed: 'Unavailable', reason: 'This tenant is not active and connected to Microsoft.' }))
   }
 
   private async workspace(identity: AuthenticatedIdentity, organizationId: string) {
@@ -136,7 +152,9 @@ export class SecurityRequirementsService {
       baseline: { id: baseline.id, name: baseline.name, checkIds: baseline.checkIds, checkSettings: baseline.checkSettings, revision: baseline.revision, createdAt: baseline.createdAt, updatedAt: baseline.updatedAt, assignedTenantCount: baseline._count.assignments },
       catalog: CHECKS,
       starter: HAWKVIEW_STARTER,
-      checks: baseline.checkIds.map((id) => CHECKS.find((check) => check.id === id) ?? { id, title: 'Unsupported saved check', service: 'Unsupported', recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library', expected: 'A supported check definition', guidance: 'Edit this baseline to choose a current check.', resourceType: null }),
+      checks: baseline.checkIds.length
+        ? baseline.checkIds.map((id) => CHECKS.find((check) => check.id === id) ?? { id, title: 'Unsupported saved check', service: 'Unsupported', recommendation: 'OPTIONAL', choiceGroup: null, source: 'HawkView baseline library', expected: 'A supported check definition', guidance: 'Edit this baseline to choose a current check.', resourceType: null })
+        : [EMPTY_SAVED_BASELINE_CHECK],
       assignments: assignments.map((row) => ({ tenantId: row.customerTenantId, assignedAt: row.assignedAt, name: row.customerTenant.displayName || row.customerTenant.primaryDomain || 'Unnamed tenant', domain: row.customerTenant.primaryDomain, microsoftTenantId: row.customerTenant.microsoftTenantId })),
       matchingTenants, page, pageSize: 25, revisions,
     }
@@ -157,20 +175,22 @@ export class SecurityRequirementsService {
         select: { id: true, revision: true, checkIds: true, checkSettings: true },
       })
       if (!baseline) throw new ForbiddenException('Baseline is not in this MSP workspace.')
+      const selectedCheckIds = baseline.checkIds.length ? baseline.checkIds : [EMPTY_SAVED_BASELINE_CHECK_ID]
       const [assignments, workspaceTenantCount] = await Promise.all([
         transaction.tenantSecurityBaselineAssignment.findMany({
           where: { organizationId, baselineId },
           orderBy: { customerTenantId: 'asc' },
-          select: { customerTenantId: true, assignedAt: true, customerTenant: { select: { displayName: true, primaryDomain: true } } },
+          select: { customerTenantId: true, assignedAt: true, customerTenant: { select: { displayName: true, primaryDomain: true,
+            status: true, connection: { select: { status: true } } } } },
         }),
         transaction.customerTenant.count({ where: { organizationId } }),
       ])
-      const resources = Array.from(new Set(baseline.checkIds
+      const resources = Array.from(new Set(selectedCheckIds
         .map((id) => CHECKS.find((check) => check.id === id)?.resourceType)
         .filter((resource): resource is ResourceType => Boolean(resource))))
       const assessedAt = new Date()
-      const checkImpact = new Map(baseline.checkIds.map((id) => [id, {
-        id, title: CHECKS.find((check) => check.id === id)?.title ?? 'Unsupported saved check',
+      const checkImpact = new Map(selectedCheckIds.map((id) => [id, {
+        id, title: id === EMPTY_SAVED_BASELINE_CHECK_ID ? 'No baseline checks selected' : CHECKS.find((check) => check.id === id)?.title ?? 'Unsupported saved check',
         met: 0, needsAction: 0, unableToAssess: 0,
       }]))
       const items: Array<{
@@ -205,8 +225,9 @@ export class SecurityRequirementsService {
           evidenceByTenant.set(state.customerTenantId, tenantEvidence)
         }
         for (const assignment of batch) {
-          const results = this.evaluateSelected(baseline.checkIds, baseline.checkSettings,
-            evidenceByTenant.get(assignment.customerTenantId) ?? {}, assessedAt)
+          const results = this.evaluateSelected(selectedCheckIds, baseline.checkSettings,
+            evidenceByTenant.get(assignment.customerTenantId) ?? {}, assessedAt,
+            assignment.customerTenant.status === 'ACTIVE' && assignment.customerTenant.connection?.status === 'CONNECTED')
           const needsAction = results.filter((result) => result.outcome === 'NEEDS_ACTION')
           const unable = results.filter((result) => result.outcome === 'UNABLE_TO_ASSESS')
           for (const result of results) {
@@ -349,13 +370,15 @@ export class SecurityRequirementsService {
   async get(identity: AuthenticatedIdentity, tenantId: string) {
     const { tenant, canManage } = await this.scope(identity, tenantId, true)
     const snapshot = await this.prisma.$transaction(async (transaction) => {
-      const [baselines, assignment, states, snapshots] = await Promise.all([
+      const [assessmentTenant, baselines, assignment, states, snapshots] = await Promise.all([
+        transaction.customerTenant.findFirst({ where: { id: tenant.id, organizationId: tenant.organizationId },
+          select: { status: true, connection: { select: { status: true } } } }),
         transaction.securityBaseline.findMany({ where: { organizationId: tenant.organizationId }, orderBy: { name: 'asc' }, select: { id: true, name: true, checkIds: true, checkSettings: true, revision: true, updatedAt: true } }),
         transaction.tenantSecurityBaselineAssignment.findUnique({ where: { customerTenantId: tenant.id }, select: { baselineId: true, assignedAt: true } }),
         transaction.syncState.findMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: { in: RESOURCES } }, select: { resourceType: true, status: true, lastErrorCode: true, lastAttemptAt: true, lastSuccessfulAt: true } }),
         transaction.tenantEntraSnapshot.findMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: { in: RESOURCES } }, select: { resourceType: true, observedAt: true, payload: true } }),
       ])
-      return { baselines, assignment, states, snapshots }
+      return { assessmentTenant, baselines, assignment, states, snapshots }
     }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead })
     const selected = snapshot.baselines.find((baseline) => baseline.id === snapshot.assignment?.baselineId) ?? null
     const evidence: Partial<Record<ResourceType, EvidenceInput>> = {}
@@ -372,7 +395,9 @@ export class SecurityRequirementsService {
       }
     }
     const now = new Date()
-    const results = this.evaluateSelected(selected?.checkIds ?? [], selected?.checkSettings, evidence, now)
+    const selectedCheckIds = selected ? selected.checkIds.length ? selected.checkIds : [EMPTY_SAVED_BASELINE_CHECK_ID] : []
+    const results = this.evaluateSelected(selectedCheckIds, selected?.checkSettings, evidence, now,
+      snapshot.assessmentTenant?.status === 'ACTIVE' && snapshot.assessmentTenant.connection?.status === 'CONNECTED')
     const summary = {
       selected: results.length,
       met: results.filter((result) => result.outcome === 'MET').length,

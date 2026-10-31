@@ -87,6 +87,53 @@ function riskFixture(route) {
   }
 }
 
+const baselineCatalog = [
+  { id: 'sharepoint-anonymous-links-disabled', title: 'Anonymous links disabled', service: 'SharePoint' },
+  { id: 'sharepoint-legacy-auth-disabled', title: 'Legacy auth disabled', service: 'SharePoint' },
+  { id: 'sharepoint-guest-resharing-disabled', title: 'Guest resharing disabled', service: 'SharePoint' },
+].map(check => ({
+  ...check,
+  recommendation: 'HAWKVIEW_STARTER',
+  choiceGroup: null,
+  source: 'Microsoft SharePoint settings',
+  resourceType: 'SHAREPOINT_SETTINGS',
+  expected: 'The control is enabled.',
+  guidance: 'Review the tenant setting.',
+}))
+const baselineStarter = {
+  id: 'hawkview-starter-v1',
+  name: 'HawkView Essentials',
+  description: 'A conservative starting template.',
+  boundary: 'Only current stored evidence is assessed.',
+  checkIds: baselineCatalog.map(check => check.id),
+}
+
+function baselineFixture(route, own) {
+  if (route === 'library') {
+    return { items: [], total: 0, page: 1, pageSize: 25, catalog: baselineCatalog, starter: baselineStarter }
+  }
+  if (route === 'choices') {
+    return {
+      items: [{ id: own.tenant, displayName: 'Canary tenant', primaryDomain: 'canary.example.test', baselineId: null }],
+      total: 1, page: 1, pageSize: 25,
+    }
+  }
+  return {
+    tenantId: own.tenant,
+    tenantName: 'Canary tenant',
+    tenantDomain: 'canary.example.test',
+    catalog: baselineCatalog,
+    starter: baselineStarter,
+    baselines: [],
+    assignment: null,
+    results: [],
+    summary: { selected: 0, met: 0, needsAction: 0, unableToAssess: 0 },
+    assessedAt: '2026-09-02T13:00:00.000Z',
+    canManage: true,
+    evidenceNote: 'Stored Microsoft configuration only.',
+  }
+}
+
 function completedUnavailableFixture(route) {
   const meta = {
     ...hawkViewUnavailable,
@@ -234,7 +281,7 @@ function jsonResponse(body, status = 200) {
   })
 }
 
-function successfulFetch({ riskResponseOverride } = {}) {
+function successfulFetch({ riskResponseOverride, baselineResponseOverride } = {}) {
   const calls = []
   const fetchImpl = async (input, init = {}) => {
     const url = new URL(String(input))
@@ -266,7 +313,16 @@ function successfulFetch({ riskResponseOverride } = {}) {
         : url.pathname.endsWith('/microsoft-entra-risky-users')
           ? 'microsoft'
           : null
-    if (riskRoute && !authorization) {
+    const baselineRoute = url.pathname.startsWith('/api/policies/workspaces/') &&
+      url.pathname.endsWith('/baselines/tenant-choices')
+      ? 'choices'
+      : url.pathname.startsWith('/api/policies/workspaces/') &&
+          url.pathname.endsWith('/baselines')
+        ? 'library'
+        : url.pathname.endsWith('/security-requirements')
+          ? 'assessment'
+          : null
+    if ((riskRoute || baselineRoute) && !authorization) {
       return jsonResponse({ message: 'Unauthorized' }, 401)
     }
     const own = authorization === `Bearer ${tokenA}`
@@ -286,6 +342,17 @@ function successfulFetch({ riskResponseOverride } = {}) {
       if (overridden) return overridden
       if (relationship === 'foreign') return jsonResponse({ message: 'Not found' }, 404)
       if (relationship === 'own') return jsonResponse(riskFixture(riskRoute))
+    }
+    if (baselineRoute) {
+      const relationship = baselineRoute === 'assessment'
+        ? url.pathname.includes(`/api/tenants/${own.tenant}/`)
+          ? 'own' : url.pathname.includes(`/api/tenants/${own.foreign}/`) ? 'foreign' : 'unknown'
+        : url.pathname.includes(`/workspaces/${own.org}/`)
+          ? 'own' : 'foreign'
+      const overridden = baselineResponseOverride?.({ authorization, relationship, route: baselineRoute })
+      if (overridden) return overridden
+      if (relationship === 'foreign') return jsonResponse({ message: 'Not found' }, 404)
+      if (relationship === 'own') return jsonResponse(baselineFixture(baselineRoute, own))
     }
     if (url.pathname === '/auth/bootstrap') {
       return jsonResponse({ user: { email: own.email, memberships: [{ organization: { id: own.org } }] } }, 201)
@@ -442,7 +509,118 @@ test('accepts truthful no-source and unavailable v1 risk envelopes for two isola
     !call.init.headers?.Authorization &&
     (call.url.pathname.includes('/identity-signals/') ||
       call.url.pathname.endsWith('/microsoft-entra-risky-users'))).length, 3)
+  assert.equal(calls.filter(call =>
+    call.url.pathname.includes('/api/policies/workspaces/') ||
+    call.url.pathname.endsWith('/security-requirements')).length, 14)
+  assert.ok(calls.filter(call =>
+    call.url.pathname.includes('/api/policies/workspaces/') ||
+    call.url.pathname.endsWith('/security-requirements')).every(call =>
+      (call.init.method ?? 'GET') === 'GET' && call.init.body === undefined))
   assert.ok(calls.every(call => call.url.origin === API_ORIGIN || call.url.origin === 'https://oidc.example.test'))
+})
+
+test('rejects a malformed own-workspace Baseline library without exposing organization IDs', async () => {
+  const { fetchImpl } = successfulFetch({
+    baselineResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'library'
+        ? jsonResponse({ ...baselineFixture('library', { tenant: ids.tenantA }), pageSize: 1000 })
+        : null,
+  })
+  await assert.rejects(runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment }), error => {
+    assert.match(error.message, /Baseline library pagination was invalid/)
+    assert.doesNotMatch(error.message, new RegExp(ids.orgA, 'i'))
+    return true
+  })
+})
+
+test('allows a saved but unassigned Baseline in the canary workspace', async () => {
+  const saved = {
+    id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    name: 'Custom baseline',
+    checkIds: [baselineCatalog[0].id],
+    revision: 1,
+    updatedAt: completedAt,
+    assignedTenantCount: 0,
+  }
+  const { fetchImpl } = successfulFetch({
+    baselineResponseOverride: ({ authorization, relationship, route }) => {
+      if (authorization !== `Bearer ${tokenA}` || relationship !== 'own') return null
+      if (route === 'library') {
+        return jsonResponse({
+          ...baselineFixture('library', { tenant: ids.tenantA }),
+          items: [saved], total: 1,
+        })
+      }
+      if (route === 'assessment') {
+        return jsonResponse({
+          ...baselineFixture('assessment', { tenant: ids.tenantA }),
+          baselines: [saved],
+        })
+      }
+      return null
+    },
+  })
+  await runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment })
+})
+
+test('rejects a foreign tenant in the own Baseline tenant-choice list', async () => {
+  const { fetchImpl } = successfulFetch({
+    baselineResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'choices'
+        ? jsonResponse(baselineFixture('choices', { tenant: ids.tenantB }))
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment }),
+    /Baseline tenant choice was invalid/,
+  )
+})
+
+test('rejects a forged MET result on an unassigned canary tenant', async () => {
+  const { fetchImpl } = successfulFetch({
+    baselineResponseOverride: ({ authorization, relationship, route }) =>
+      authorization === `Bearer ${tokenA}` && relationship === 'own' && route === 'assessment'
+        ? jsonResponse({
+            ...baselineFixture('assessment', { tenant: ids.tenantA }),
+            results: [{ id: baselineCatalog[0].id, outcome: 'MET' }],
+          })
+        : null,
+  })
+  await assert.rejects(
+    runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment }),
+    /Unassigned canary tenant had baseline results/,
+  )
+})
+
+test('rejects a 200 from a foreign Baseline workspace, choice list, or tenant', async () => {
+  for (const route of ['library', 'choices', 'assessment']) {
+    const { fetchImpl } = successfulFetch({
+      baselineResponseOverride: ({ authorization, relationship, route: requestedRoute }) =>
+        authorization === `Bearer ${tokenA}` && relationship === 'foreign' && requestedRoute === route
+          ? jsonResponse(baselineFixture(requestedRoute, { tenant: ids.tenantB }))
+          : null,
+    })
+    await assert.rejects(
+      runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment }),
+      /Baseline foreign (workspace|tenant choices|tenant) denial returned an unexpected status/,
+    )
+  }
+})
+
+test('rejects an unauthenticated Baseline library exposure', async () => {
+  const { fetchImpl: baseFetch } = successfulFetch()
+  const fetchImpl = (input, init) => {
+    const url = new URL(String(input))
+    if (url.pathname === `/api/policies/workspaces/${ids.orgA}/baselines` &&
+        !init.headers?.Authorization) {
+      return Promise.resolve(jsonResponse(baselineFixture('library', { tenant: ids.tenantA })))
+    }
+    return baseFetch(input, init)
+  }
+  await assert.rejects(
+    runAuthenticatedCanary({ fetchImpl, environment: readinessEnvironment }),
+    /Baseline unauthenticated library denial returned an unexpected status/,
+  )
 })
 
 test('accepts a completed HawkView evaluation with unavailable source evidence', async () => {

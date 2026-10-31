@@ -181,6 +181,7 @@ function retryableFailure(state: DailyInventoryState) {
       'MICROSOFT_THROTTLED',
       'MICROSOFT_NETWORK_TIMEOUT',
       'MICROSOFT_DELTA_RESET_REQUIRED',
+      'MICROSOFT_PARTIAL_RESPONSE',
     ].includes(state.lastErrorCode)
   }
   return true
@@ -559,7 +560,8 @@ export function scheduledSyncTenantWhere(
       },
       {
         // Unchanged: every other targeted resource keeps its existing
-        // 30-minute candidacy and admission behaviour.
+        // strict >30-minute candidacy, including DOMAINS. Its pure 15-minute
+        // retry predicate cannot advance this outer database admission gate.
         syncStates: {
           some: {
             resourceType: { in: [...TARGETED_TRANSIENT_RETRY_RESOURCES] },

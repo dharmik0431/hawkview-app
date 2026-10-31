@@ -33,7 +33,7 @@ test('observed MSFT SharePoint values produce distinct outcomes', () => {
   assert.equal(evaluateCheck('sharepoint-guest-resharing-disabled', evidence, now).outcome, 'NEEDS_ACTION')
 })
 
-test('all fifteen selected checks classify a tenant-shaped stored snapshot without treating missing fields as gaps', () => {
+test('all seventeen selected checks classify a tenant-shaped stored snapshot without treating missing fields as gaps', () => {
   const evidence = {
     SHAREPOINT_SETTINGS: { ...collected, payload: [{
       sharingCapability: 'externalUserAndGuestSharing',
@@ -41,6 +41,7 @@ test('all fifteen selected checks classify a tenant-shaped stored snapshot witho
       sharingAllowedDomainList: [],
       isLegacyAuthProtocolsEnabled: true,
       isResharingByExternalUsersEnabled: true,
+      isSiteCreationEnabled: true,
       isRequireAcceptingUserToMatchInvitedUserEnabled: null,
       idleSessionSignOut: { isEnabled: false },
       isUnmanagedSyncAppForTenantRestricted: false,
@@ -51,6 +52,9 @@ test('all fifteen selected checks classify a tenant-shaped stored snapshot witho
     AUTH_METHOD_POLICIES: { ...collected, payload: [{
       id: 'Fido2', state: 'disabled',
       includeTargets: [{ id: 'all_users', targetType: 'group' }], excludeTargets: [],
+    }, {
+      id: 'MicrosoftAuthenticator', state: 'disabled',
+      includeTargets: [{ id: 'all_users', targetType: 'group', authenticationMode: 'any' }], excludeTargets: [],
     }] },
     DOMAINS: { ...collected, payload: [{ name: 'other.example' }] },
   }
@@ -61,8 +65,8 @@ test('all fifteen selected checks classify a tenant-shaped stored snapshot witho
     'm365-required-verified-domains-v1': { requiredDomains: ['required.example'] },
   }
   const results = CHECKS.map((check) => evaluateCheck(check.id, evidence, now, settings))
-  assert.equal(results.length, 15)
-  assert.equal(results.filter((result) => result.outcome === 'NEEDS_ACTION').length, 14)
+  assert.equal(results.length, 17)
+  assert.equal(results.filter((result) => result.outcome === 'NEEDS_ACTION').length, 16)
   const unavailable = results.filter((result) => result.outcome === 'UNABLE_TO_ASSESS')
   assert.deepEqual(unavailable.map((result) => result.id), ['sharepoint-invitation-account-match-enabled'])
   assert.match(unavailable[0].reason ?? '', /absent or has an unrecognized value/)
@@ -82,7 +86,67 @@ test('additional stored SharePoint and OneDrive predicates are exact and opt-in'
   const sync = evaluateCheck('onedrive-sync-approved-domains-configured-v1', evidence, now)
   assert.equal(sync.outcome, 'MET')
   assert.equal(sync.service, 'OneDrive')
-  assert.equal(sync.observed, 'Restriction enabled; 1 approved domain')
+  assert.equal(sync.observed, 'AD-domain PC sync setting enabled; 1 configured domain GUID')
+  assert.match(sync.guidance, /Check each geo separately/)
+})
+
+test('idle sign-out needs ordered positive timeouts before its tenant setting can pass', () => {
+  const id = 'sharepoint-idle-session-signout-enabled'
+  const evaluate = (idleSessionSignOut: unknown) => evaluateCheck(id, {
+    SHAREPOINT_SETTINGS: { ...collected, payload: [{ idleSessionSignOut }] },
+  }, now)
+  const configured = evaluate({ isEnabled: true, warnAfterInSeconds: 2700, signOutAfterInSeconds: 3600 })
+  assert.equal(configured.outcome, 'MET')
+  assert.match(configured.observed, /warning after 2700 seconds; sign-out after 3600 seconds/)
+  assert.match(configured.expected, /licensing and actual session enforcement are not verified/)
+  assert.equal(evaluate({ isEnabled: false }).outcome, 'NEEDS_ACTION')
+  for (const idle of [
+    { isEnabled: true },
+    { isEnabled: true, warnAfterInSeconds: 2700, signOutAfterInSeconds: 2700 },
+    { isEnabled: true, warnAfterInSeconds: 3600, signOutAfterInSeconds: 2700 },
+    { isEnabled: true, warnAfterInSeconds: 0, signOutAfterInSeconds: 3600 },
+    { isEnabled: true, warnAfterInSeconds: '2700', signOutAfterInSeconds: 3600 },
+    { isEnabled: true, warnAfterInSeconds: 2700, signOutAfterInSeconds: Number.POSITIVE_INFINITY },
+    { isEnabled: 'true', warnAfterInSeconds: 2700, signOutAfterInSeconds: 3600 },
+  ]) {
+    assert.equal(evaluate(idle).outcome, 'UNABLE_TO_ASSESS')
+  }
+})
+
+test('direct SharePoint site creation is an opt-in check with explicit group and Teams scope', () => {
+  const id = 'sharepoint-direct-site-creation-disabled-v1'
+  const check = CHECKS.find((candidate) => candidate.id === id)
+  assert.equal(check?.recommendation, 'OPTIONAL')
+  assert.equal(check?.resourceType, 'SHAREPOINT_SETTINGS')
+  assert.equal(CHECKS.filter((candidate) => candidate.id === id).length, 1)
+  assert.equal(HAWKVIEW_STARTER.checkIds.includes(id), false)
+  assert.match(check?.guidance ?? '', /does not stop users from creating Microsoft 365 groups or Teams/)
+
+  const evaluate = (field: unknown) => evaluateCheck(id, {
+    SHAREPOINT_SETTINGS: { ...collected, payload: [{ isSiteCreationEnabled: field }] },
+  }, now)
+  const disabled = evaluate(false)
+  assert.equal(disabled.outcome, 'MET')
+  assert.equal(disabled.observed, 'Direct SharePoint site creation by users disabled')
+  assert.equal(disabled.observedAt, collected.observedAt.toISOString())
+  const enabled = evaluate(true)
+  assert.equal(enabled.outcome, 'NEEDS_ACTION')
+  assert.equal(enabled.observed, 'Direct SharePoint site creation by users enabled')
+  for (const field of [undefined, null, 'false', 0, {}]) {
+    const result = evaluate(field)
+    assert.equal(result.outcome, 'UNABLE_TO_ASSESS')
+    assert.equal(result.observed, 'Unavailable')
+  }
+  for (const variant of [
+    undefined,
+    { ...collected, status: 'FAILED', payload: [{ isSiteCreationEnabled: false }] },
+    { ...collected, observedAt: new Date('2026-10-14T00:00:00Z'), payload: [{ isSiteCreationEnabled: false }] },
+    { ...collected, lastSuccessfulAt: new Date('2026-10-14T00:00:00Z'), payload: [{ isSiteCreationEnabled: false }] },
+    { ...collected, payload: [] },
+    { ...collected, payload: [{ isSiteCreationEnabled: false }, { isSiteCreationEnabled: false }] },
+  ]) {
+    assert.equal(evaluateCheck(id, { SHAREPOINT_SETTINGS: variant }, now).outcome, 'UNABLE_TO_ASSESS')
+  }
 })
 
 test('strict sharing level does not treat new guest access as a pass', () => {
@@ -109,6 +173,22 @@ test('external sharing domain restriction requires a usable allow list', () => {
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: [''] }).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: ['not a domain'] }).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate({ sharingDomainRestrictionMode: 'allowList', sharingAllowedDomainList: ['example.org', 'bad domain'] }).outcome, 'UNABLE_TO_ASSESS')
+})
+
+test('domain Allow lists cannot make Anyone links satisfy SharePoint restrictions', () => {
+  const evidence = { SHAREPOINT_SETTINGS: { ...collected, payload: [{
+    sharingCapability: 'externalUserAndGuestSharing',
+    sharingDomainRestrictionMode: 'allowList',
+    sharingAllowedDomainList: ['partner.example'],
+  }] } }
+  const configured = evaluateCheck('sharepoint-sharing-domains-allowlisted-v1', evidence, now)
+  const approved = evaluateCheck('sharepoint-approved-partner-domains-v1', evidence, now,
+    { 'sharepoint-approved-partner-domains-v1': { approvedDomains: ['partner.example'] } })
+  for (const result of [configured, approved]) {
+    assert.equal(result.outcome, 'NEEDS_ACTION')
+    assert.match(result.observed, /Anyone links permitted/)
+    assert.match(result.observed, /does not restrict anonymous links/)
+  }
 })
 
 test('OneDrive sync needs a valid nonempty domain list before it can pass', () => {
@@ -147,7 +227,11 @@ test('MSP sync GUID and retention choices compare only their exact tenant settin
     deletedUserPersonalSiteRetentionPeriodInDays: 93,
   }] } }
   assert.equal(evaluateCheck('onedrive-sync-approved-domain-guids-v1', evidence, now, settings).outcome, 'MET')
+  assert.equal(evaluateCheck('onedrive-sync-approved-domain-guids-v1', evidence, now, settings).observed,
+    'AD-domain PC sync setting enabled; 1 configured domain GUID')
   assert.equal(evaluateCheck('onedrive-deleted-user-retention-minimum-v1', evidence, now, settings).outcome, 'NEEDS_ACTION')
+  assert.match(evaluateCheck('onedrive-deleted-user-retention-minimum-v1', evidence, now, settings).expected,
+    /tenant retention setting; effective content retention is not assessed/)
   const expanded = { SHAREPOINT_SETTINGS: { ...collected, payload: [{
     isUnmanagedSyncAppForTenantRestricted: true,
     allowedDomainGuidsForSyncApp: [guid, '22222222-2222-4222-8222-222222222222'],
@@ -164,20 +248,61 @@ test('Entra Fido2 availability requires an enabled all-user method with no exclu
     AUTH_METHOD_POLICIES: { ...collected, status: state, payload: rows },
   }, now)
   assert.equal(evaluate([method]).outcome, 'MET')
+  assert.equal(evaluate([method, { id: 'MicrosoftAuthenticator', state: 'disabled' }]).outcome, 'MET')
+  for (const malformed of [{ state: 'disabled' }, { id: null, state: 'disabled' }, { id: '  ', state: 'disabled' }]) {
+    assert.equal(evaluate([method, malformed]).outcome, 'UNABLE_TO_ASSESS')
+    assert.equal(evaluate([malformed, method]).outcome, 'UNABLE_TO_ASSESS')
+  }
   assert.equal(evaluate([{ ...method, state: 'disabled' }]).outcome, 'NEEDS_ACTION')
   assert.equal(evaluate([{ ...method, includeTargets: [{ id: 'team-id', targetType: 'group' }] }]).outcome, 'NEEDS_ACTION')
-  assert.equal(evaluate([{ ...method, excludeTargets: [{ id: 'excluded-group' }] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, excludeTargets: [{ id: 'excluded-group', targetType: 'group' }] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, excludeTargets: undefined }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [...method.includeTargets, {}] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [...method.includeTargets, null] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [...method.includeTargets, { id: 'team-id', targetType: 'unknownFutureValue' }] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, excludeTargets: [{ id: 'excluded-group' }] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: Array.from({ length: 1001 }, () => method.includeTargets[0]) }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([method], 'FAILED').outcome, 'UNABLE_TO_ASSESS')
+})
+
+test('Microsoft Authenticator push availability requires a single readable all-user mode with no exclusions', () => {
+  const method = { id: 'MicrosoftAuthenticator', state: 'enabled', includeTargets: [
+    { id: 'all_users', targetType: 'group', authenticationMode: 'push' },
+  ], excludeTargets: [] }
+  const evaluate = (rows: unknown[], state = 'SUCCEEDED') => evaluateCheck('entra-authenticator-push-all-users-enabled-v1', {
+    AUTH_METHOD_POLICIES: { ...collected, status: state, payload: rows },
+  }, now)
+  assert.equal(evaluate([method]).outcome, 'MET')
+  assert.equal(evaluate([{ ...method, includeTargets: [{ ...method.includeTargets[0], authenticationMode: 'any' }] }]).outcome, 'MET')
+  for (const malformed of [{ state: 'disabled' }, { id: null, state: 'disabled' }, { id: '  ', state: 'disabled' }]) {
+    assert.equal(evaluate([method, malformed]).outcome, 'UNABLE_TO_ASSESS')
+    assert.equal(evaluate([malformed, method]).outcome, 'UNABLE_TO_ASSESS')
+  }
+  assert.equal(evaluate([{ ...method, state: 'disabled' }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, includeTargets: [{ ...method.includeTargets[0], authenticationMode: 'deviceBasedPush' }] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, includeTargets: [{ id: 'team-id', targetType: 'group', authenticationMode: 'push' }] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, includeTargets: [
+    { id: 'team-a', targetType: 'group', authenticationMode: 'push' },
+    { id: 'team-b', targetType: 'group', authenticationMode: 'any' },
+  ] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, excludeTargets: [{ id: 'team-id', targetType: 'group' }] }]).outcome, 'NEEDS_ACTION')
+  assert.equal(evaluate([{ ...method, includeTargets: [...method.includeTargets, { id: 'team-id', targetType: 'group', authenticationMode: 'deviceBasedPush' }] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [{ ...method.includeTargets[0], authenticationMode: undefined }] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [{ ...method.includeTargets[0], authenticationMode: 'future' }] }]).outcome, 'UNABLE_TO_ASSESS')
+  assert.equal(evaluate([{ ...method, includeTargets: [...method.includeTargets, {}] }]).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate([{ ...method, excludeTargets: undefined }]).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate([]).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate([method], 'FAILED').outcome, 'UNABLE_TO_ASSESS')
 })
 
-test('required Microsoft verified domains are checked against only the selected tenant inventory', () => {
+test('required domains are checked against only the selected tenant organization inventory without claiming /domains verification', () => {
   const settings = { 'm365-required-verified-domains-v1': { requiredDomains: ['brand.example', 'customer.example'] } }
   const evaluate = (rows: unknown[], state = 'SUCCEEDED') => evaluateCheck('m365-required-verified-domains-v1', {
     DOMAINS: { ...collected, status: state, payload: rows },
   }, now, settings)
   assert.equal(evaluate([{ name: 'brand.example' }, { name: 'customer.example' }]).outcome, 'MET')
+  assert.match(evaluate([{ name: 'brand.example' }, { name: 'customer.example' }]).guidance, /not the \/domains isVerified field/)
   assert.equal(evaluate([{ name: 'brand.example' }]).outcome, 'NEEDS_ACTION')
   assert.equal(evaluate([{ name: 'brand.example' }, { name: 'invalid domain' }]).outcome, 'UNABLE_TO_ASSESS')
   assert.equal(evaluate([]).outcome, 'UNABLE_TO_ASSESS')

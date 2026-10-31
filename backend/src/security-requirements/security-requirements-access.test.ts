@@ -13,6 +13,7 @@ function service(role: 'MSP_VIEWER' | 'MSP_ADMIN', organizationId = 'admin-org')
     customerTenant: { findFirst: async ({ where }: { where: { organizationId: { in: string[] } } }) =>
       where.organizationId.in.includes('admin-org') ? { id: tenantId, organizationId: 'admin-org', displayName: 'MSFT trial', primaryDomain: 'example.test' } : null },
     $transaction: async (callback: (transaction: unknown) => unknown) => callback({
+      customerTenant: { findFirst: async () => ({ status: 'ACTIVE', connection: { status: 'CONNECTED' } }) },
       securityBaseline: { findMany: async () => [] },
       tenantSecurityBaselineAssignment: { findUnique: async () => null },
       syncState: { findMany: async () => [] },
@@ -33,6 +34,8 @@ test('baseline assessment is limited to a matching MSP admin workspace', async (
   assert.equal(result.tenantId, tenantId)
   assert.equal(result.tenantName, 'MSFT trial')
   assert.equal(result.tenantDomain, 'example.test')
+  assert.deepEqual(result.results, [])
+  assert.deepEqual(result.summary, { selected: 0, met: 0, needsAction: 0, unableToAssess: 0 })
 })
 
 test('a saved flag-only OneDrive requirement is not silently reinterpreted', async () => {
@@ -40,6 +43,7 @@ test('a saved flag-only OneDrive requirement is not silently reinterpreted', asy
     user: { findUnique: async () => ({ id: 'local-user', disabledAt: null, memberships: [{ organizationId: 'admin-org', role: 'MSP_ADMIN' }] }) },
     customerTenant: { findFirst: async () => ({ id: tenantId, organizationId: 'admin-org' }) },
     $transaction: async (callback: (transaction: unknown) => unknown) => callback({
+      customerTenant: { findFirst: async () => ({ status: 'ACTIVE', connection: { status: 'CONNECTED' } }) },
       securityBaseline: { findMany: async () => [{ id: 'baseline', name: 'Older trial', checkIds: ['onedrive-sync-restricted-to-specified-domains'] }] },
       tenantSecurityBaselineAssignment: { findUnique: async () => ({ baselineId: 'baseline', assignedAt: new Date() }) },
       syncState: { findMany: async () => [] },

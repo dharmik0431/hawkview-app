@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
+import { evaluateCheck } from '../security-requirements/security-requirements-evaluator.js'
 import {
   assertGraphCollectionBounds,
   ENTRA_COLLECTION_LIMITS,
@@ -271,6 +272,323 @@ test('singletons and accepted domains reject oversized streaming bodies before s
     await assert.rejects(() => (service as any)[method](boundedTenant, 'token'), /bounded response-size limit/, method)
     assert.equal(cancelled, true, method); assert.equal(saved, 0, method)
   }
+})
+
+test('Baseline source collectors reject partial and warning-qualified Graph responses before publishing snapshots', async () => {
+  const collectors = [
+    'syncDomains', 'syncSecurityDefaults', 'syncAuthenticationMethodPolicy', 'syncSharePointSettings',
+  ] as const
+  for (const method of collectors) {
+    for (const [status, headers] of [
+      [206, {}],
+      [200, { Warning: '199 Microsoft "partial provider evidence"' }],
+      [201, {}],
+    ] as const) {
+      let saves = 0
+      let cancellations = 0
+      const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+      ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+      ;(service as any).saveSnapshot = async () => { saves += 1 }
+      ;(service as any).fetchGraphPage = async () => new Response(new ReadableStream({
+        cancel() { cancellations += 1; throw new Error('private-provider-body') },
+      }), { status, headers })
+
+      await assert.rejects(
+        () => (service as any)[method](boundedTenant, 'token'),
+        (error: Error) => error.message.includes('baseline was not advanced') && !error.message.includes('private-provider-body') &&
+          (!('Warning' in headers) || (error.message.includes('Warning code 199') && !error.message.includes('partial provider evidence'))),
+        `${method}: HTTP ${status} ${JSON.stringify(headers)}`,
+      )
+      assert.equal(cancellations, 1, method)
+      assert.equal(saves, 0, method)
+    }
+  }
+})
+
+test('Baseline source collectors still publish valid HTTP 200 responses without Warning', async () => {
+  const cases = [
+    ['syncDomains', { value: [{ id: boundedTenant.microsoftTenantId, verifiedDomains: [{ name: 'example.invalid', isDefault: true, isInitial: false }] }] }],
+    ['syncSecurityDefaults', { id: 'security-defaults', isEnabled: true }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [{ id: 'Fido2', state: 'enabled' }] }],
+    ['syncSharePointSettings', { sharingCapability: 'disabled' }],
+  ] as const
+  for (const [method, body] of cases) {
+    const saved: unknown[] = []
+    const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: string, snapshot: unknown) => { saved.push(snapshot) }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify(body), { status: 200 })
+    await (service as any)[method](boundedTenant, 'token')
+    assert.equal(saved.length, 1, method)
+  }
+})
+
+test('Baseline singleton collectors reject nested Graph continuations before publishing evidence', async () => {
+  const continuation = 'https://graph.microsoft.com/v1.0/next'
+  const method = { id: 'Fido2', state: 'enabled', includeTargets: [{ id: 'all_users', targetType: 'group' }], excludeTargets: [] }
+  const cases = [
+    ['syncDomains', { value: [{ id: boundedTenant.microsoftTenantId, verifiedDomains: [], 'verifiedDomains@odata.nextLink': continuation }] }],
+    ['syncSecurityDefaults', { id: 'security-defaults', isEnabled: true, expanded: { '@odata.nextLink': continuation } }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [method], 'authenticationMethodConfigurations@odata.nextLink': continuation }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [{ ...method, 'includeTargets@odata.nextLink': continuation }] }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [{ ...method, 'excludeTargets@odata.nextLink': continuation }] }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [{ ...method, includeTargets: [{ ...method.includeTargets[0], '@odata.nextLink': continuation }] }] }],
+    ['syncSharePointSettings', { value: [{ sharingCapability: 'disabled', '@odata.nextLink': continuation }] }],
+  ] as const
+
+  for (const [methodName, body] of cases) {
+    const updates: Array<Record<string, unknown>> = []
+    const previousSuccess = new Date('2026-10-20T00:00:00Z')
+    let snapshots = 0
+    let requests = 0
+    let incidents = 0
+    const service = new TenantSyncService({
+      syncState: {
+        upsert: async () => ({ lastSuccessfulAt: previousSuccess }),
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          updates.push(data)
+          return { consecutiveFailures: 1 }
+        },
+      },
+    } as any, {} as any, {} as any, {
+      publishIncident: async () => { incidents += 1 },
+    } as any, {} as any, {} as any)
+    ;(service as any).logger = { warn: () => undefined }
+    ;(service as any).saveSnapshot = async () => { snapshots += 1 }
+    ;(service as any).fetchGraphPage = async () => {
+      requests += 1
+      return new Response(JSON.stringify(body), { status: 200 })
+    }
+
+    await assert.rejects(() => (service as any)[methodName](boundedTenant, 'token'))
+    assert.equal(requests, 1, methodName)
+    assert.equal(snapshots, 0, methodName)
+    assert.equal(incidents, 0, methodName)
+    assert.equal(updates.length, 1, methodName)
+    assert.equal(updates[0]?.status, 'FAILED', methodName)
+    assert.equal(updates[0]?.lastErrorCode, 'MICROSOFT_PARTIAL_RESPONSE', methodName)
+    assert.equal(Object.hasOwn(updates[0]!, 'lastSuccessfulAt'), false, methodName)
+  }
+})
+
+test('authentication-method policy rejects an unidentified sibling before publishing evidence', async () => {
+  const valid = { id: 'Fido2', state: 'enabled', includeTargets: [{ id: 'all_users', targetType: 'group' }], excludeTargets: [] }
+  for (const rows of [[valid, { state: 'disabled' }], [{ id: null, state: 'disabled' }, valid], [{ id: '  ', state: 'disabled' }, valid]]) {
+    const updates: Array<Record<string, unknown>> = []
+    const previousSuccess = new Date('2026-10-20T00:00:00Z')
+    let snapshots = 0
+    let incidents = 0
+    const service = new TenantSyncService({
+      syncState: {
+        upsert: async () => ({ lastSuccessfulAt: previousSuccess }),
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          updates.push(data)
+          return { consecutiveFailures: 1 }
+        },
+      },
+    } as any, {} as any, {} as any, {
+      publishIncident: async () => { incidents += 1 },
+    } as any, {} as any, {} as any)
+    ;(service as any).logger = { warn: () => undefined }
+    ;(service as any).saveSnapshot = async () => { snapshots += 1 }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({ authenticationMethodConfigurations: rows }), { status: 200 })
+
+    await assert.rejects(() => (service as any).syncAuthenticationMethodPolicy(boundedTenant, 'token'))
+    assert.equal(snapshots, 0)
+    assert.equal(incidents, 1)
+    assert.equal(updates.length, 1)
+    assert.equal(updates[0]?.status, 'FAILED')
+    assert.equal(updates[0]?.lastErrorCode, 'MICROSOFT_INVALID_RESPONSE')
+    assert.equal(Object.hasOwn(updates[0]!, 'lastSuccessfulAt'), false)
+  }
+})
+
+test('Baseline singleton collectors treat top-level Graph continuations as retryable partial evidence', async () => {
+  const continuation = 'https://graph.microsoft.com/v1.0/next'
+  const cases = [
+    ['syncDomains', { value: [{ id: boundedTenant.microsoftTenantId, verifiedDomains: [] }], '@odata.nextLink': continuation }],
+    ['syncSecurityDefaults', { id: 'security-defaults', isEnabled: true, '@odata.nextLink': continuation }],
+    ['syncAuthenticationMethodPolicy', { authenticationMethodConfigurations: [{ id: 'Fido2', state: 'enabled' }], '@odata.nextLink': continuation }],
+    ['syncSharePointSettings', { sharingCapability: 'disabled', '@odata.nextLink': continuation }],
+  ] as const
+
+  for (const [method, body] of cases) {
+    const updates: Array<Record<string, unknown>> = []
+    const incidents: Array<{ metadata?: Record<string, unknown> }> = []
+    const previousSuccess = new Date('2026-10-20T00:00:00Z')
+    let snapshots = 0
+    let requests = 0
+    const service = new TenantSyncService({
+      syncState: {
+        upsert: async () => ({ lastSuccessfulAt: previousSuccess }),
+        update: async ({ data }: { data: Record<string, unknown> }) => {
+          updates.push(data)
+          return { consecutiveFailures: updates.length }
+        },
+      },
+    } as any, {} as any, {} as any, {
+      publishIncident: async (incident: { metadata?: Record<string, unknown> }) => { incidents.push(incident) },
+    } as any, {} as any, {} as any)
+    ;(service as any).logger = { warn: () => undefined }
+    ;(service as any).saveSnapshot = async () => { snapshots += 1 }
+    ;(service as any).fetchGraphPage = async () => {
+      requests += 1
+      return new Response(JSON.stringify(body), { status: 200 })
+    }
+
+    for (const failureCount of [1, 2, 3]) {
+      await assert.rejects(() => (service as any)[method](boundedTenant, 'token'))
+      assert.equal(incidents.length, failureCount >= 3 ? 1 : 0, `${method}: failure ${failureCount}`)
+    }
+    assert.equal(requests, 3, method)
+    assert.equal(snapshots, 0, method)
+    assert.equal(updates.length, 3, method)
+    for (const update of updates) {
+      assert.equal(update.status, 'FAILED', method)
+      assert.equal(update.lastErrorCode, 'MICROSOFT_PARTIAL_RESPONSE', method)
+      assert.equal(Object.hasOwn(update, 'lastSuccessfulAt'), false, method)
+    }
+    assert.equal(incidents[0]?.metadata?.failureClass, 'PARTIAL_MICROSOFT_RESPONSE', method)
+    assert.equal(incidents[0]?.metadata?.consecutiveFailures, 3, method)
+  }
+})
+
+test('authentication-method policy accepts Graph context annotations without a continuation', async () => {
+  const saved: unknown[] = []
+  const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+  ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+  ;(service as any).saveSnapshot = async (_tenant: unknown, _resource: string, snapshot: unknown) => { saved.push(snapshot) }
+  ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({
+    '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#policies/authenticationMethodsPolicy',
+    'authenticationMethodConfigurations@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#policies/authenticationMethodsPolicy/authenticationMethodConfigurations',
+    authenticationMethodConfigurations: [{
+      id: 'Fido2', state: 'enabled',
+      'includeTargets@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#includeTargets',
+      includeTargets: [{ id: 'all_users', targetType: 'group', '@odata.context': 'https://graph.microsoft.com/v1.0/$metadata#target' }],
+      excludeTargets: [],
+    }],
+  }), { status: 200 })
+
+  await (service as any).syncAuthenticationMethodPolicy(boundedTenant, 'token')
+  assert.equal(saved.length, 1)
+})
+
+test('Authenticator push can pass only after a complete policy response is projected and saved', async () => {
+  const policy = {
+    authenticationMethodConfigurations: [{
+      id: 'MicrosoftAuthenticator', state: 'enabled',
+      includeTargets: [{ id: 'all_users', targetType: 'group', authenticationMode: 'push' }],
+      excludeTargets: [],
+    }],
+  }
+  const now = new Date('2026-10-16T05:00:00.000Z')
+  const attempt = new Date('2026-10-16T04:00:00.000Z')
+  const observed = new Date('2026-10-16T04:01:00.000Z')
+  const success = new Date('2026-10-16T04:02:00.000Z')
+  const checkId = 'entra-authenticator-push-all-users-enabled-v1'
+  for (const [status, headers, expectedSaves] of [
+    [200, {}, 1],
+    [206, {}, 0],
+    [200, { Warning: '199 Microsoft "partial provider evidence"' }, 0],
+  ] as const) {
+    const saved: Array<{ rows: unknown[]; completeness: string }> = []
+    const service = new TenantSyncService({} as any, {} as any, {} as any, {} as any, {} as any, {} as any)
+    ;(service as any).runSnapshotSync = async (_tenant: unknown, _resource: string, work: () => Promise<void>) => work()
+    ;(service as any).saveSnapshot = async (_tenant: unknown, resource: string, snapshot: { rows: unknown[]; completeness: string }) => {
+      assert.equal(resource, 'AUTH_METHOD_POLICIES')
+      saved.push(snapshot)
+    }
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify(policy), { status, headers })
+
+    if (expectedSaves) await (service as any).syncAuthenticationMethodPolicy(boundedTenant, 'token')
+    else await assert.rejects(() => (service as any).syncAuthenticationMethodPolicy(boundedTenant, 'token'), /baseline was not advanced/)
+    assert.equal(saved.length, expectedSaves, `HTTP ${status} ${JSON.stringify(headers)}`)
+    if (expectedSaves) {
+      assert.equal(saved[0].completeness, 'authoritative_complete')
+      assert.deepEqual(saved[0].rows, policy.authenticationMethodConfigurations)
+      assert.equal(evaluateCheck(checkId, { AUTH_METHOD_POLICIES: {
+        status: 'SUCCEEDED', lastAttemptAt: attempt, observedAt: observed,
+        lastSuccessfulAt: success, payload: saved[0].rows,
+      } }, now).outcome, 'MET')
+    } else {
+      // Even an older valid snapshot cannot pass while this resource reports a
+      // failed partial collection; the rejected response itself is never saved.
+      assert.equal(evaluateCheck(checkId, { AUTH_METHOD_POLICIES: {
+        status: 'FAILED', lastErrorCode: 'MICROSOFT_PARTIAL_RESPONSE',
+        lastAttemptAt: attempt, observedAt: observed, lastSuccessfulAt: success,
+        payload: policy.authenticationMethodConfigurations,
+      } }, now).outcome, 'UNABLE_TO_ASSESS')
+    }
+  }
+})
+
+test('partial Baseline source responses retain success, retry, and notify only after three failures', async () => {
+  for (const method of ['syncDomains', 'syncSecurityDefaults', 'syncAuthenticationMethodPolicy', 'syncSharePointSettings']) {
+    for (const [status, headers] of [[206, {}], [200, { Warning: 'private-provider-warning' }],
+      [200, { Warning: '199 Microsoft "private-provider-warning"' }]] as const) {
+      const updates: Array<Record<string, unknown>> = []
+      const incidents: Array<{ metadata?: Record<string, unknown> }> = []
+      const failureLogs: Array<Record<string, unknown>> = []
+      let snapshots = 0
+      let attempts = 0
+      const previousSuccess = new Date('2026-10-20T00:00:00Z')
+      const service = new TenantSyncService({
+        syncState: {
+          upsert: async () => ({ lastSuccessfulAt: previousSuccess }),
+          update: async ({ data }: { data: Record<string, unknown> }) => {
+            updates.push(data)
+            return { consecutiveFailures: ++attempts }
+          },
+        },
+      } as any, {} as any, {} as any, { publishIncident: async (incident: { metadata?: Record<string, unknown> }) => { incidents.push(incident) } } as any, {} as any, {} as any)
+      ;(service as any).logger = { warn: (line: string) => { failureLogs.push(JSON.parse(line) as Record<string, unknown>) } }
+      ;(service as any).saveSnapshot = async () => { snapshots += 1 }
+      ;(service as any).fetchGraphPage = async () => new Response('{}', { status, headers })
+
+      for (const failureCount of [1, 2, 3]) {
+        await assert.rejects(() => (service as any)[method](boundedTenant, 'token'))
+        assert.equal(incidents.length, failureCount >= 3 ? 1 : 0, `${method}: failure ${failureCount}`)
+      }
+      assert.equal(snapshots, 0, method)
+      assert.equal(updates.length, 3, method)
+      for (const update of updates) {
+        assert.equal(update.status, 'FAILED', method)
+        assert.equal(update.lastErrorCode, 'MICROSOFT_PARTIAL_RESPONSE', method)
+        assert.equal(Object.hasOwn(update, 'lastSuccessfulAt'), false, method)
+      }
+      const collectionFailures = failureLogs.filter((entry) => entry.event === 'microsoft_collection_failed')
+      assert.equal(collectionFailures.length, 3, method)
+      if ('Warning' in headers) {
+        const code = headers.Warning.startsWith('199 ') ? '199' : 'unclassified'
+        assert.deepEqual(collectionFailures.map((entry) => entry.warningCode), [code, code, code], method)
+      }
+      assert.equal(incidents[0]?.metadata?.failureClass, 'PARTIAL_MICROSOFT_RESPONSE', method)
+      assert.equal(incidents[0]?.metadata?.reasonCode, 'MICROSOFT_PARTIAL_RESPONSE', method)
+      assert.equal(incidents[0]?.metadata?.consecutiveFailures, 3, method)
+      assert.equal(JSON.stringify({ updates, incidents, failureLogs }).includes('private-provider-warning'), false, method)
+    }
+  }
+})
+
+test('unexpected non-partial Baseline transport response remains a first-attempt invalid-response failure', async () => {
+  const updates: Array<Record<string, unknown>> = []
+  const incidents: unknown[] = []
+  const service = new TenantSyncService({
+    syncState: {
+      upsert: async () => ({ lastSuccessfulAt: null }),
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        updates.push(data)
+        return { consecutiveFailures: 1 }
+      },
+    },
+  } as any, {} as any, {} as any, {
+    publishIncident: async (incident: unknown) => { incidents.push(incident) },
+  } as any, {} as any, {} as any)
+  ;(service as any).logger = { warn: () => undefined }
+  ;(service as any).fetchGraphPage = async () => new Response('{}', { status: 201 })
+  await assert.rejects(() => (service as any).syncSecurityDefaults(boundedTenant, 'token'))
+  assert.equal(updates[0]?.lastErrorCode, 'MICROSOFT_INVALID_RESPONSE')
+  assert.equal(incidents.length, 1)
 })
 
 test('domain collection rejects incomplete verified-domain inventories before replacing stored domains', async () => {

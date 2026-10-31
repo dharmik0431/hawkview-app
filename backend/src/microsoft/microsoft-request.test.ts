@@ -6,6 +6,7 @@ import {
   fetchMicrosoftWithRetry,
   microsoftErrorMetadata,
   MicrosoftRequestError,
+  MicrosoftPartialResponseError,
   retryAfterMilliseconds,
 } from './microsoft-request.js'
 
@@ -90,6 +91,26 @@ test('classifies customer action independently from human-readable messages', ()
   assert.doesNotMatch(resourceMessage, /reconnect|permission/i)
   assert.equal(classifyMicrosoftFailure(new Error('HTTP 410 syncStateNotFound')).failureClass, 'DELTA_RESET_REQUIRED')
   assert.equal(classifyMicrosoftFailure(new Error('fetch failed')).failureClass, 'NETWORK_TIMEOUT')
+})
+
+test('only the Baseline partial-response guard opts into retryable incomplete evidence', () => {
+  const partial = classifyMicrosoftFailure(
+    new MicrosoftPartialResponseError('safe Baseline response marker', 206),
+  )
+  assert.deepEqual(partial, {
+    failureClass: 'PARTIAL_MICROSOFT_RESPONSE', reasonCode: 'MICROSOFT_PARTIAL_RESPONSE',
+    status: 206, microsoftCode: null, requestId: null,
+    retryable: true, customerAction: 'NONE',
+  })
+  assert.equal(
+    customerCollectionFailureMessage('domains', partial, true),
+    'Microsoft returned incomplete domains data. HawkView retained the last successful data. HawkView will retry automatically.',
+  )
+  const generic = classifyMicrosoftFailure(
+    new MicrosoftRequestError('Microsoft returned an invalid response.', 206, null, null),
+  )
+  assert.equal(generic.reasonCode, 'MICROSOFT_INVALID_RESPONSE')
+  assert.equal(generic.retryable, false)
 })
 
 test('customer transient copy retains baseline and never blames tenant configuration', () => {

@@ -513,6 +513,24 @@ test('temporary Microsoft failures stay in automatic-retry state before becoming
   assert.doesNotMatch(issue?.label ?? '', /review policies|permission/i)
 })
 
+test('incomplete Baseline evidence stays pending until the existing third-failure threshold', () => {
+  const now = new Date('2026-08-13T12:00:00.000Z')
+  const states = (failures: number) => completeCurrentStates(now).map((state) => state.resourceType === 'DOMAINS'
+    ? {
+        ...state, status: 'FAILED', lastErrorCode: 'MICROSOFT_PARTIAL_RESPONSE',
+        lastErrorMessage: 'Microsoft returned incomplete domains data. HawkView will retry automatically.',
+        consecutiveFailures: failures,
+      }
+    : state)
+  const first = deriveTenantHealth({ ...baseInput(), now, syncStates: states(1) })
+  assert.equal(first.resourceHealth.find((item) => item.resourceType === 'DOMAINS')?.classification, 'PENDING')
+  assert.equal(first.attention.some((item) => item.key === 'sync-domains'), false)
+  const third = deriveTenantHealth({ ...baseInput(), now, syncStates: states(3) })
+  const issue = third.attention.find((item) => item.key === 'sync-domains')
+  assert.equal(issue?.actionLabel, 'View synchronization')
+  assert.equal(issue?.provenance.remediationOwner, 'HAWKVIEW_OPERATIONS')
+})
+
 test('a retired historical Exchange Admin API failure no longer degrades tenant health', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const states = [

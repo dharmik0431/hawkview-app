@@ -23,7 +23,7 @@ export function accessProvenance(kind: 'CONNECTION_UNAVAILABLE' | 'AUTHORIZATION
   return { version: 1, origin: 'ACCESS_CONFIGURATION', kind, remediationOwner: customerActionSupported ? 'CUSTOMER_ADMIN' : 'UNDETERMINED' }
 }
 const operatorCodes = new Set(['MICROSOFT_TRANSIENT', 'MICROSOFT_THROTTLED', 'MICROSOFT_NETWORK_TIMEOUT',
-  'MICROSOFT_DELTA_RESET_REQUIRED', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_INVALID_RESPONSE',
+  'MICROSOFT_DELTA_RESET_REQUIRED', 'MICROSOFT_PARTIAL_RESPONSE', 'HAWKVIEW_CAPACITY_GUARD', 'MICROSOFT_INVALID_RESPONSE',
   'HAWKVIEW_INTERNAL_FAILURE', 'sign-ins-record-validation-partial'])
 export function collectorAttentionProvenance(resource: string, reasonCode: string | null): AttentionProvenance {
   if (!(ATTENTION_COLLECTOR_RESOURCES as readonly string[]).includes(resource)) return unknownAttentionProvenance()
