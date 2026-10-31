@@ -1,3 +1,5 @@
+import { isRecognizedLimitedSignInCode } from './authentication-collection-outcome.js'
+
 /** Read-only explanation of stored outcomes, never a live execution signal. */
 export type SyncOutcomeProjection = {
   version: 1
@@ -21,14 +23,6 @@ type OutcomeState = {
   lastErrorCode?: string | null
 }
 
-const limitedSignInCodes = new Set([
-  'sign-ins-premium-graph-fallback-active',
-  'sign-ins-non-premium-fallback-active',
-  'sign-ins-entitlement-unverified-fallback-active',
-  'sign-ins-premium-graph-fallback-active-geolocation-partial',
-  'sign-ins-non-premium-fallback-active-geolocation-partial',
-  'sign-ins-entitlement-unverified-fallback-active-geolocation-partial',
-])
 const initializingCode = 'sign-ins-audit-subscription-initializing'
 const deferredCodes = new Set(['m365-audit-backlog', 'm365-audit-budget-exhausted'])
 
@@ -43,7 +37,7 @@ export function projectSyncOutcome(
   const attempt = validClock(state?.lastAttemptAt, now)
   const success = validClock(state?.lastSuccessfulAt, now)
   const code = state?.lastErrorCode
-  const limited = resourceType === 'SIGN_INS' && typeof code === 'string' && limitedSignInCodes.has(code)
+  const limited = isRecognizedLimitedSignInCode(resourceType, code)
   const initializing = resourceType === 'SIGN_INS' && code === initializingCode
   const deferred = resourceType === 'M365_AUDIT' && typeof code === 'string' && deferredCodes.has(code)
   const outcome: SyncOutcomeProjection['recordedOutcome'] = {
