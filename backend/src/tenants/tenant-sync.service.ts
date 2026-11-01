@@ -14,7 +14,11 @@ import { projectSyncOutcome } from './sync-outcome-projection.js'
 import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type CapturedConnectionVerification } from './connection-verification-store.js'
 import { validatedLicenseRows } from './license-validation.js'
-import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
+import {
+  CORE_AUTHENTICATION_PARTIAL,
+  isCoreAuthenticationPartial,
+  isRecognizedLimitedSignInCode,
+} from './authentication-collection-outcome.js'
 import {
   BadRequestException,
   BadGatewayException,
@@ -2898,7 +2902,9 @@ export class TenantSyncService {
       }
       const corePartial = error instanceof CollectionPartialError &&
         isCoreAuthenticationPartial(resourceType, error.code)
-      if (error instanceof CollectionPartialError && !corePartial) {
+      const acceptedPartial = error instanceof CollectionPartialError &&
+        (resourceType !== 'SIGN_INS' || isRecognizedLimitedSignInCode(resourceType, error.code))
+      if (acceptedPartial) {
         await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {

@@ -421,6 +421,31 @@ test('records successful bounded fallback evidence as partial without publishing
   assert.deepEqual(resolved, ['tenant:tenant-1:sync:SIGN_INS'])
 })
 
+test('unknown SIGN_INS partial reasons fail closed without advancing selected-source success', async () => {
+  for (const code of ['sign-ins-new-partial', 'sign-ins-non-premium-fallback-active-extra']) {
+    const updates: Array<Record<string, unknown>> = []
+    const resolved: string[] = []
+    const service = serviceWithState(updates, resolved)
+
+    await assert.rejects(
+      (service as any).runSnapshotSync(
+        { id: 'tenant-1', organizationId: 'org-1' },
+        'SIGN_INS',
+        async () => {
+          throw new CollectionPartialError(code, 'Synthetic unrecognized partial collection.')
+        },
+      ),
+      BadGatewayException,
+    )
+
+    const terminal = updates.at(-1)
+    assert.equal(terminal?.status, 'FAILED', code)
+    assert.equal(Object.hasOwn(terminal ?? {}, 'lastSuccessfulAt'), false, code)
+    assert.deepEqual(terminal?.consecutiveFailures, { increment: 1 }, code)
+    assert.deepEqual(resolved, [], code)
+  }
+})
+
 function signInCollectorFixture(servicePlans: unknown) {
   const updates: Array<Record<string, unknown>> = []
   const scopes: Array<Record<string, unknown>> = []
