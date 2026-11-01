@@ -37,17 +37,23 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
     },
   })
   const today = m365AuditUsageDate()
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000)
   const limits = m365AuditUsageLimits()
-  assert.ok(limits.tenantRecords < limits.tenantMonthlyRecords)
+  const monthlySeed = today.getUTCMonth() === tomorrow.getUTCMonth()
+    ? 2 * limits.tenantRecords
+    : limits.tenantRecords
+  assert.ok(monthlySeed < limits.tenantMonthlyRecords)
   assert.ok(limits.tenantRecords < limits.deploymentRecords)
-  assert.ok(limits.tenantRecords < limits.deploymentMonthlyRecords)
-  await prisma.m365AuditDailyUsage.create({
-    data: {
+  assert.ok(monthlySeed < limits.deploymentMonthlyRecords)
+  // The processor samples its own clock twice. Seed both adjacent UTC days so
+  // a hosted run spanning midnight still reaches the record-budget refusal.
+  await prisma.m365AuditDailyUsage.createMany({
+    data: [today, tomorrow].map(usageDate => ({
       organizationId: organization.id,
       customerTenantId: tenant.id,
-      usageDate: today,
+      usageDate,
       recordsStored: limits.tenantRecords,
-    },
+    })),
   })
   const content = await prisma.m365ActivityContent.create({
     data: {
@@ -96,12 +102,12 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
   assert.equal(requests, 1)
   assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
   assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
-  const usage = await prisma.m365AuditDailyUsage.findUniqueOrThrow({
-    where: { customerTenantId_usageDate: { customerTenantId: tenant.id, usageDate: today } },
+  const usage = await prisma.m365AuditDailyUsage.findMany({
+    where: { customerTenantId: tenant.id, usageDate: { in: [today, tomorrow] } },
   })
-  assert.equal(usage.recordsStored, limits.tenantRecords)
-  assert.equal(usage.blobsProcessed, 0)
-  assert.equal(usage.downloadedBytes, BigInt(Buffer.byteLength(body)))
+  assert.equal(usage.length, 2)
+  assert.ok(usage.every(row => row.recordsStored === limits.tenantRecords && row.blobsProcessed === 0))
+  assert.equal(usage.reduce((sum, row) => sum + row.downloadedBytes, 0n), BigInt(Buffer.byteLength(body)))
   const savedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
   assert.equal(savedContent.status, 'RETRY')
   assert.equal(savedContent.attemptCount, 1)
