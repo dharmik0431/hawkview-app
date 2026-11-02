@@ -5,6 +5,7 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   M365ManagementActivityService,
+  M365AuditBudgetError,
   m365AuditUsageDate,
   m365AuditUsageLimits,
 } from './m365-management-activity.service.js'
@@ -116,4 +117,71 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
   const nextDay = (value: Date) => new Date(m365AuditUsageDate(value).getTime() + 24 * 60 * 60 * 1000).getTime()
   assert.ok(savedContent.nextRetryAt)
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
+})
+
+test('two clients cannot both reserve the last deployment audit record', {
+  skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+}, async (context) => {
+  assertDisposableTestDatabase()
+  const firstClient = new PrismaService()
+  const secondClient = new PrismaService()
+  let organization: { id: string } | undefined
+  context.after(async () => {
+    try {
+      if (organization) await firstClient.organization.delete({ where: { id: organization.id } })
+    } finally {
+      await Promise.all([firstClient.$disconnect(), secondClient.$disconnect()])
+    }
+  })
+  await Promise.all([firstClient.$connect(), secondClient.$connect()])
+  organization = await firstClient.organization.create({
+    data: { name: 'M365 audit reservation race', slug: `m365-budget-race-${randomUUID()}` },
+  })
+  const tenants = await Promise.all(Array.from({ length: 4 }, (_, index) =>
+    firstClient.customerTenant.create({
+      data: {
+        organizationId: organization!.id,
+        microsoftTenantId: randomUUID(),
+        displayName: `Budget race tenant ${index}`,
+      },
+    }),
+  ))
+  const limits = m365AuditUsageLimits()
+  assert.equal(limits.deploymentRecords, 2 * limits.tenantRecords)
+  assert.ok(limits.deploymentRecords < limits.deploymentMonthlyRecords)
+  assert.ok(limits.tenantRecords < limits.tenantMonthlyRecords)
+  const now = new Date('2098-03-17T12:00:00.000Z')
+  const usageDate = m365AuditUsageDate(now)
+  await firstClient.m365AuditDailyUsage.createMany({
+    data: [limits.tenantRecords, limits.tenantRecords - 1].map((recordsStored, index) => ({
+      organizationId: organization!.id,
+      customerTenantId: tenants[index]!.id,
+      usageDate,
+      recordsStored,
+    })),
+  })
+  const serviceA = new M365ManagementActivityService(firstClient, {} as never)
+  const serviceB = new M365ManagementActivityService(secondClient, {} as never)
+  const target = (tenant: (typeof tenants)[number]) => ({
+    id: tenant.id,
+    organizationId: organization!.id,
+    microsoftTenantId: tenant.microsoftTenantId,
+    connection: null,
+  })
+  const outcomes = await Promise.allSettled([
+    (serviceA as any).reserveDailyUsage(target(tenants[2]!), { records: 1 }, now),
+    (serviceB as any).reserveDailyUsage(target(tenants[3]!), { records: 1 }, now),
+  ])
+  assert.equal(outcomes.filter((result) => result.status === 'fulfilled').length, 1)
+  for (const result of outcomes) {
+    if (result.status === 'rejected') {
+      assert.ok(result.reason instanceof M365AuditBudgetError)
+      assert.match(result.reason.message, /daily cost budget is exhausted/)
+    }
+  }
+  const usage = await firstClient.m365AuditDailyUsage.findMany({
+    where: { organizationId: organization.id, usageDate },
+  })
+  assert.equal(usage.reduce((total, row) => total + row.recordsStored, 0), limits.deploymentRecords)
+  assert.equal(usage.filter((row) => [tenants[2]!.id, tenants[3]!.id].includes(row.customerTenantId)).length, 1)
 })
