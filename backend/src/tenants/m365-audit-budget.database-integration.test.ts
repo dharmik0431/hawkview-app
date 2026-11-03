@@ -119,6 +119,85 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
 })
 
+test('a valid whole blob above the empty-day tenant record cap cannot complete', {
+  skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+  timeout: 60000,
+}, async (context) => {
+  assertDisposableTestDatabase()
+  const prisma = new PrismaService()
+  await prisma.$connect()
+  const organization = await prisma.organization.create({
+    data: { name: 'M365 audit whole-blob budget', slug: `m365-whole-blob-${randomUUID()}` },
+  })
+  context.after(async () => {
+    try {
+      await prisma.organization.delete({ where: { id: organization.id } })
+    } finally {
+      await prisma.$disconnect()
+    }
+  })
+  const tenant = await prisma.customerTenant.create({
+    data: {
+      organizationId: organization.id,
+      microsoftTenantId: randomUUID(),
+      displayName: 'Whole-blob budget test tenant',
+    },
+  })
+  const limits = m365AuditUsageLimits()
+  assert.equal(limits.tenantRecords, 1000)
+  const content = await prisma.m365ActivityContent.create({
+    data: {
+      organizationId: organization.id,
+      customerTenantId: tenant.id,
+      contentType: 'Audit.Exchange',
+      microsoftContentId: randomUUID(),
+      contentUri: `https://manage.office.com/api/v1.0/${tenant.microsoftTenantId}/activity/feed/audit/content`,
+      ledgerExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    },
+  })
+  const creationTime = new Date().toISOString()
+  const body = JSON.stringify(Array.from({ length: limits.tenantRecords + 1 }, (_, index) => ({
+    Id: `whole-blob-${index}-${randomUUID()}`,
+    OrganizationId: tenant.microsoftTenantId,
+    CreationTime: creationTime,
+    Operation: 'Set-Mailbox',
+    Workload: 'Exchange',
+    ResultStatus: 'Succeeded',
+    UserId: 'admin@example.test',
+    ObjectId: `mailbox-${index}@example.test`,
+  })))
+  assert.ok(Buffer.byteLength(body) < 1024 * 1024)
+  const service = new M365ManagementActivityService(prisma, {} as never)
+  let requests = 0
+  ;(service as any).request = async () => {
+    requests += 1
+    return new Response(body)
+  }
+  const before = new Date()
+  const changes = await (service as any).processContent(
+    { id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId, connection: null },
+    'test-token', randomUUID(), { remainingBytes: 1024 * 1024 }, content, Date.now() + 45_000,
+  )
+  const after = new Date()
+
+  assert.deepEqual(changes, [])
+  assert.equal(requests, 1)
+  assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
+  assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
+  const usage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  assert.equal(usage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
+  assert.equal(usage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
+  assert.equal(usage.reduce((sum, row) => sum + row.downloadedBytes, 0n), BigInt(Buffer.byteLength(body)))
+  const savedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
+  assert.equal(savedContent.status, 'RETRY')
+  assert.equal(savedContent.attemptCount, 1)
+  assert.equal(savedContent.processedAt, null)
+  assert.match(savedContent.lastError ?? '', /daily cost budget is exhausted/)
+  const nextDay = (value: Date) => new Date(m365AuditUsageDate(value).getTime() + 24 * 60 * 60 * 1000).getTime()
+  assert.ok(savedContent.nextRetryAt)
+  assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
+})
+
 test('two clients cannot both reserve the last deployment audit record', {
   skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
 }, async (context) => {
