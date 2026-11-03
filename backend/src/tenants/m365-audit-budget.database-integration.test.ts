@@ -119,7 +119,7 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
 })
 
-test('a valid whole blob above the empty-day tenant record cap cannot complete', {
+test('a valid over-cap whole blob recharges bytes on a second eligible processor attempt', {
   skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
   timeout: 60000,
 }, async (context) => {
@@ -196,6 +196,35 @@ test('a valid whole blob above the empty-day tenant record cap cannot complete',
   const nextDay = (value: Date) => new Date(m365AuditUsageDate(value).getTime() + 24 * 60 * 60 * 1000).getTime()
   assert.ok(savedContent.nextRetryAt)
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
+
+  // Exercise a second processor attempt after the persisted retry time. The
+  // scheduler's due-row selection is a separate behavior and is not asserted.
+  const secondAttemptAt = new Date(savedContent.nextRetryAt.getTime() + 12 * 60 * 60 * 1000)
+  context.mock.timers.enable({ apis: ['Date'], now: secondAttemptAt })
+  let secondChanges: unknown
+  try {
+    secondChanges = await (service as any).processContent(
+      { id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId, connection: null },
+      'test-token', randomUUID(), { remainingBytes: 1024 * 1024 }, savedContent, Date.now() + 45_000,
+    )
+  } finally {
+    context.mock.timers.reset()
+  }
+  assert.deepEqual(secondChanges, [])
+  assert.equal(requests, 2)
+  assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
+  assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
+  const twoDayUsage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.downloadedBytes, 0n),
+    2n * BigInt(Buffer.byteLength(body)))
+  const retriedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
+  assert.equal(retriedContent.status, 'RETRY')
+  assert.equal(retriedContent.attemptCount, 2)
+  assert.equal(retriedContent.processedAt, null)
+  assert.ok(retriedContent.nextRetryAt)
+  assert.equal(retriedContent.nextRetryAt.getTime(), nextDay(secondAttemptAt))
 })
 
 test('two clients cannot both reserve the last deployment audit record', {
