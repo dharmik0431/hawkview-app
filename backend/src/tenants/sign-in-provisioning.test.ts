@@ -238,6 +238,26 @@ test('actual sign-in collection rejects malformed continuation before any persis
   }
 })
 
+test('partial Graph sign-in transport never becomes a completed full-source collection', async () => {
+  // A valid-looking body does not prove full Graph coverage when the transport
+  // itself qualifies the response. It may be retained only as incomplete data.
+  for (const [status, headers] of [
+    [206, {}],
+    [200, { Warning: '199 Microsoft "partial sign-in evidence"' }],
+  ] as const) {
+    const { service, observations } = locationFixture(0)
+    delete (service as any).fetchGraphCollection
+    ;(service as any).fetchGraphPage = async () => new Response(JSON.stringify({
+      value: [{ id: 'synthetic-event', createdDateTime: new Date().toISOString() }],
+    }), { status, headers })
+
+    await assert.rejects(() => (service as any).syncSignInLogs(signInTenant, 'token'), BadGatewayException)
+    assert.equal(observations.states.at(-1)?.status, 'FAILED', `HTTP ${status}: collection must fail`)
+    assert.equal(Object.hasOwn(observations.states.at(-1), 'lastSuccessfulAt'), false)
+    assert.equal(observations.resolved, 0)
+  }
+})
+
 test('failed primary sign-in persistence cannot become optional success or launch historical enrichment', async () => {
   const { service, observations } = locationFixture(3)
   ;(service as any).prisma.signInLog.createMany = async () => { throw new Error('private@example.invalid database password secret') }
