@@ -1,4 +1,4 @@
-import { MAX_FINDINGS_PER_TICK } from './finding-pipeline.js'
+import { FINDING_NOTICE_KEY_PREFIX, MAX_FINDINGS_PER_TICK } from './finding-pipeline.js'
 import {
   asAlertTypeId, asDisposition, dispositionKey, scopedNoticeKey,
   type DispositionKey, type Dispositions, type ExistingIncident, type FindingRow,
@@ -48,9 +48,21 @@ export function pipelineStore(runner: SqlRunner): PipelineStore {
       }>(
         `SELECT id, organization_id, customer_tenant_id, rule_id, dedupe_key, subject_type,
                 subject_id, state, observed_at
-           FROM identity_risk_findings
+           FROM identity_risk_findings AS finding
           WHERE state = 'OPEN' AND observed_at >= $1::timestamptz
             AND expires_at > $2::timestamptz
+            -- Exclude durable decisions BEFORE the cap. Incidents alone are not decisions:
+            -- fresh evidence for an existing incident must still be considered.
+            AND NOT EXISTS (
+              SELECT 1 FROM notifications AS notice
+              WHERE notice.organization_id = finding.organization_id
+                AND notice.dedupe_key = '${FINDING_NOTICE_KEY_PREFIX}' || finding.dedupe_key
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM alert_withheld_notices AS withheld
+              WHERE withheld.organization_id = finding.organization_id
+                AND withheld.dedupe_key = '${FINDING_NOTICE_KEY_PREFIX}' || finding.dedupe_key
+            )
           ORDER BY observed_at, id
           -- ONE PAST THE CAP, so the tick can say whether it was TRUNCATED without a second
           -- COUNT on every run. runIntake slices back to the cap; the extra row exists only

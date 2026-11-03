@@ -344,7 +344,9 @@ if (TIER_BY_SEVERITY.size !== Object.keys(NOTIFICATION_TONE).length) {
  * A finding in either is decided. "Both" is a redundant record rather than a wrong decision — and
  * one tick still decides once, atomically. Three R004 tests hold this, one of which drives that
  * race rather than reasoning about it. */
-export const noticeKeyFor = (finding: FindingRow): string => `identity-risk:${finding.dedupeKey}`
+/** Shared with the SQL selector so durable history uses the exact write identity. */
+export const FINDING_NOTICE_KEY_PREFIX = 'identity-risk:'
+export const noticeKeyFor = (finding: FindingRow): string => `${FINDING_NOTICE_KEY_PREFIX}${finding.dedupeKey}`
 
 /** The same key, scoped to its organisation. Case 6 — one organisation cannot suppress or expose
  * another's evidence — is then true by the key rather than by a WHERE clause somebody remembers. */

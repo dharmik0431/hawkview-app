@@ -950,6 +950,73 @@ const noticeState = async (client: pg.Client) => (await client.query(
   `SELECT dedupe_key, occurrence_count, resolved_at IS NULL AS unresolved
      FROM notifications WHERE source = 'identity-risk' ORDER BY dedupe_key`)).rows
 
+// HAW-19: authored for the guarded disposable fixture. Offline discovery only skips these;
+// it does not establish SQL correctness, durability, concurrency or performance acceptance.
+for (const withheld of [false, true]) test(
+  `HAW19 — tail behind 5000 ${withheld ? 'withheld' : 'resolved notified'} OPEN findings progresses after reconnect`,
+  { skip: !RUN || !URL }, async () => {
+    const first = new pg.Client({ connectionString: URL })
+    await first.connect()
+    let tailId: string
+    try {
+      await freshWithRecipient(first)
+      if (withheld) await silence(first)
+      await seed(first)
+      await first.query('DELETE FROM identity_risk_findings')
+      await first.query(`INSERT INTO identity_risk_findings
+        (id, organization_id, customer_tenant_id, matched_result_id, dedupe_key, rule_id, rule_version,
+         subject_type, subject_id, state, severity, confidence, coverage, observed_at, expires_at, updated_at)
+        SELECT ('55555555-5555-5555-5555-' || lpad(i::text, 12, '0'))::uuid,
+          $1, $2, '44444444-4444-4444-4444-444444444444'::uuid, 'fairness-' || i,
+          'HV-ID-AUTH-001.v1', 'v1', 'USER', 'fairness-user-' || i,
+          'OPEN', 'HIGH', 'HIGH', 'FULL', $3::timestamptz, $3::timestamptz + interval '1 day', now()
+        FROM generate_series(1, 5001) AS i`, [ORG, TENANT, T0])
+      tailId = '55555555-5555-5555-5555-000000005001'
+      const report = await ranIntake(storeFor(first), WATERMARK, T0, Date.now() + 300_000, OLD)
+      assert.equal(report.findingsRead, 5000)
+      assert.equal(report.truncated, true)
+      assert.equal(report.notificationsWritten + report.noticesWithheld, 5000)
+      if (withheld) await unsilence(first)
+      else await first.query("UPDATE notifications SET resolved_at = now() WHERE source = 'identity-risk'")
+    } finally { await first.end() }
+    const next = new pg.Client({ connectionString: URL })
+    await next.connect()
+    try {
+      const selected = await storeFor(next).findOpenFindings(OLD, T0)
+      assert.deepEqual(selected.map(r => r.id), [tailId!])
+      const report = await ranIntake(storeFor(next), WATERMARK, T0, Date.now() + 60_000, OLD)
+      assert.equal(report.notificationsWritten, 1, 'eligible tail actually committed')
+      assert.equal(report.jobsWritten, 1)
+      assert.equal((await next.query(`SELECT count(*)::int AS n FROM identity_risk_findings
+        WHERE state = 'OPEN' AND expires_at > $1::timestamptz`, [T0])).rows[0].n, 5001)
+      assert.deepEqual(await storeFor(next).findOpenFindings(OLD, T0), [])
+    } finally { await next.end() }
+  })
+
+test('HAW19 — a rolled-back durable decision remains selectable from a second connection',
+  { skip: !RUN || !URL }, async () => {
+    const writer = new pg.Client({ connectionString: URL })
+    const reader = new pg.Client({ connectionString: URL })
+    await writer.connect()
+    await reader.connect()
+    try {
+      await freshWithRecipient(writer)
+      await seed(writer)
+      const runner = runnerFor(writer)
+      const failing = pipelineStore({ ...runner, transaction: run => runner.transaction(async tx => {
+        await run(tx)
+        throw new Error('HAW19 injected failure after writes, before commit')
+      }) })
+      const failed = await runIntake(failing, WATERMARK, T0, Date.now() + 60_000, OLD)
+      assert.equal(failed.kind, 'FAILED')
+      assert.equal((await storeFor(reader).findOpenFindings(OLD, T0)).length, 1)
+      assert.equal((await reader.query('SELECT count(*)::int AS n FROM notifications')).rows[0].n, 0)
+      assert.equal((await reader.query('SELECT count(*)::int AS n FROM alert_send_jobs')).rows[0].n, 0)
+      assert.equal((await tick(reader)).notificationsWritten, 1)
+      assert.equal((await tick(writer)).findingsRead, 0)
+    } finally { await reader.end(); await writer.end() }
+  })
+
 test('CASE 1 — reprocessing a finding neither duplicates it nor reopens what somebody dismissed',
   { skip: !RUN || !URL }, async () => {
     // **THE SECOND CONFIRMED DEFECT, AND IT IS OLDER THAN THE RECORD_ONLY WORK.** The review
