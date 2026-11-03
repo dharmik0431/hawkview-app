@@ -3,6 +3,9 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { initializePrismaUtcSession } from '../prisma/prisma-utc-session.js'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../generated/prisma/client.js'
 import { ChangesService } from '../changes/changes.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantsService } from './tenants.service.js'
@@ -10,6 +13,32 @@ import { TenantSyncService } from './tenant-sync.service.js'
 
 const databaseIntegrationEnabled =
   process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
+// This fail-first source-order race runs only in the bounded child of the
+// registered disposable-PostgreSQL job. Ordinary test discovery skips it.
+const sourceOrderPhysicalFailFirst = databaseIntegrationEnabled &&
+  process.env.HAWKVIEW_HAW70_SOURCE_ORDER_PHYSICAL_FAIL_FIRST === '1' &&
+  process.env.HAWKVIEW_HAW70_BOUNDED_SOURCE_ORDER_CHILD === '1' &&
+  process.env.CI === 'true' &&
+  process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1' &&
+  process.env.GITHUB_ACTIONS === 'true' &&
+  process.env.RUNNER_ENVIRONMENT === 'github-hosted' &&
+  process.env.GITHUB_WORKFLOW === 'Required quality gates' &&
+  process.env.GITHUB_JOB === 'backend-quality'
+
+function boundedSourceOrderClient(): PrismaService {
+  const connectionString = process.env.DATABASE_URL
+  if (!connectionString) throw new Error('HAW70_PHYSICAL_WITNESS_NOT_REGISTERED')
+  return new PrismaClient({ adapter: new PrismaPg({
+    connectionString,
+    max: 3,
+    connectionTimeoutMillis: 5_000,
+    statement_timeout: 8_000,
+    query_timeout: 8_000,
+    lock_timeout: 8_000,
+    idle_in_transaction_session_timeout: 8_000,
+    onConnect: initializePrismaUtcSession,
+  }) }) as unknown as PrismaService
+}
 
 // Physical deletion is distinct from read-side invisibility. Each case owns
 // fresh workspaces; no earlier prune or teardown can satisfy its assertions.
@@ -208,6 +237,98 @@ function listAudit(workspace: ExportWorkspace, id: string, expiry: number, event
     activityDisplayName: 'Update authentication method',
     targetResources: [{ type: 'authenticationMethod', displayName: id }] }
 }
+
+test('physical tenant health history: committed evidence outranks an earlier request clock',
+  { skip: !sourceOrderPhysicalFailFirst }, async () => {
+    assertDisposableTestDatabase()
+    // The bounded launcher owns the child process deadline. Keep fixture
+    // cleanup here only after every started request settles; a killed child
+    // leaves disposal to its dedicated CI database rather than racing writes.
+    const prisma = boundedSourceOrderClient()
+    const secondClient = boundedSourceOrderClient()
+    const track = { organizationIds: [] as string[], userIds: [] as string[] }
+    const started: Promise<unknown>[] = []
+    let releaseOldRead: () => void = () => {}
+    try {
+      await prisma.$connect()
+      await secondClient.$connect()
+      const mine = await seedExportWorkspace(prisma, 'health-source-order-main', randomUUID(), track)
+      const scope = { organizationId: mine.organizationId, customerTenantId: mine.tenantId }
+      const readAt = new Date()
+      let reachedOldRead!: () => void
+      const oldReadReached = new Promise<void>(resolve => { reachedOldRead = resolve })
+      const holdOldRead = new Promise<void>(resolve => { releaseOldRead = resolve })
+      let heldReads = 0
+      // Capture the real old SQL result, then hold its return to the service.
+      // The second API process can commit a new event and save its history
+      // before this first process evaluates the stale result.
+      const delayedClient = new Proxy(prisma, {
+        get(target, property) {
+          if (property === 'directoryAuditLog') return new Proxy(target.directoryAuditLog, {
+            get(delegate, method) {
+              if (method === 'findMany') return async (...args: unknown[]) => {
+                const rows = await Reflect.apply(delegate.findMany, delegate, args)
+                heldReads += 1
+                reachedOldRead()
+                await holdOldRead
+                return rows
+              }
+              const value: unknown = Reflect.get(delegate, method, delegate)
+              return typeof value === 'function' ? value.bind(delegate) : value
+            },
+          })
+          const value: unknown = Reflect.get(target, property, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+      const earlierRequest = tenantListReader(delayedClient).listForIdentity(
+        identityOf(mine), { now: () => readAt })
+      started.push(earlierRequest)
+      try {
+        await Promise.race([oldReadReached, earlierRequest.then(() => {
+          throw new Error('Earlier request completed before the audit read was held')
+        })])
+        const event = { ...listAudit(mine, 'new-source', 1), eventDateTime: readAt,
+          ingestedAt: readAt, expiresAt: new Date(readAt.getTime() + 30 * 24 * 60 * 60 * 1000) }
+        await secondClient.directoryAuditLog.create({ data: event })
+        const newerEvidence = await tenantListReader(secondClient).listForIdentity(
+          identityOf(mine), { now: () => readAt })
+        assert.deepEqual(listAuditKeys(newerEvidence.tenants[0]!), ['audit-auth-new-source'])
+        assert.equal(await prisma.tenantHealthSnapshot.count({ where: scope }), 1)
+      } finally {
+        releaseOldRead()
+      }
+      const staleEvidence = await earlierRequest
+      assert.equal(heldReads, 1, 'the held result must be the real directory-audit read')
+      assert.deepEqual(listAuditKeys(staleEvidence.tenants[0]!), [])
+      assert.equal(await prisma.tenantHealthSnapshot.count({ where: scope }), 2,
+        'the stale evaluation must reach history admission to prove the race')
+      const latest = await prisma.tenantHealthSnapshot.findFirstOrThrow({
+        where: scope, orderBy: [{ evaluatedAt: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+      })
+      assert.deepEqual(listAuditKeys(latest.payload as any), ['audit-auth-new-source'],
+        'a later evaluation of old evidence must not supersede committed new evidence')
+    } finally {
+      releaseOldRead()
+      await Promise.allSettled(started)
+      try {
+        if (track.organizationIds.length > 0) {
+          await prisma.organization.deleteMany({ where: { id: { in: track.organizationIds } } })
+        }
+      } finally {
+        try {
+          if (track.userIds.length > 0) {
+            await prisma.user.deleteMany({ where: { id: { in: track.userIds } } })
+          }
+        } finally {
+          const disconnects = await Promise.allSettled([prisma.$disconnect(), secondClient.$disconnect()])
+          for (const outcome of disconnects) {
+            if (outcome.status === 'rejected') throw outcome.reason
+          }
+        }
+      }
+    }
+  })
 
 // These are defensive saved-expiry states. Correctly ordered event <= ingestion
 // with six-month expiry cannot be expired and inside a recent24h window. This

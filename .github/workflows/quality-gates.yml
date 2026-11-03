@@ -96,6 +96,11 @@ jobs:
           test "${#tests[@]}" -gt 0
           node --test ../.github/scripts/backend-quality-tests.test.mjs
           node ../.github/scripts/backend-quality-tests.mjs "${tests[@]}"
+      - name: HAW-70 source-order race witness (fail first)
+        timeout-minutes: 2
+        env:
+          HAWKVIEW_HAW70_SOURCE_ORDER_PHYSICAL_FAIL_FIRST: '1'
+        run: node scripts/haw70-source-order-witness.mjs
       - run: npm run build
       - name: Backend standalone script tests
         run: node --test scripts/*.test.mjs
