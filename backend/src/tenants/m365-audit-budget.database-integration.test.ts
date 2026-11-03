@@ -6,6 +6,7 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import {
   M365ManagementActivityService,
   M365AuditBudgetError,
+  M365_ACTIVITY_CONTENT_TYPES,
   m365AuditUsageDate,
   m365AuditUsageLimits,
 } from './m365-management-activity.service.js'
@@ -119,7 +120,7 @@ test('a record-budget refusal rolls back the content write and leaves the downlo
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
 })
 
-test('a valid over-cap whole blob recharges bytes on a second eligible processor attempt', {
+test('a valid over-cap whole blob is selected and recharged on its second eligible day', {
   skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
   timeout: 60000,
 }, async (context) => {
@@ -167,7 +168,11 @@ test('a valid over-cap whole blob recharges bytes on a second eligible processor
     ObjectId: `mailbox-${index}@example.test`,
   })))
   assert.ok(Buffer.byteLength(body) < 1024 * 1024)
-  const service = new M365ManagementActivityService(prisma, {} as never)
+  const service = new M365ManagementActivityService(prisma, {
+    getTenantManagementActivityContext: async () => ({
+      accessToken: 'test-token', publisherIdentifier: 'test-publisher',
+    }),
+  } as never)
   let requests = 0
   ;(service as any).request = async () => {
     requests += 1
@@ -197,16 +202,19 @@ test('a valid over-cap whole blob recharges bytes on a second eligible processor
   assert.ok(savedContent.nextRetryAt)
   assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
 
-  // Exercise a second processor attempt after the persisted retry time. The
-  // scheduler's due-row selection is a separate behavior and is not asserted.
+  // The second attempt enters through the scheduler's due-row query. Avoid
+  // external subscription/discovery calls while retaining its real content
+  // selection, processing, accounting and final SyncState publication.
+  ;(service as any).ensureSubscriptions = async () => new Set<string>(M365_ACTIVITY_CONTENT_TYPES)
+  ;(service as any).discoverContent = async () => false
   const secondAttemptAt = new Date(savedContent.nextRetryAt.getTime() + 12 * 60 * 60 * 1000)
   context.mock.timers.enable({ apis: ['Date'], now: secondAttemptAt })
   let secondChanges: unknown
   try {
-    secondChanges = await (service as any).processContent(
-      { id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId, connection: null },
-      'test-token', randomUUID(), { remainingBytes: 1024 * 1024 }, savedContent, Date.now() + 45_000,
-    )
+    secondChanges = await service.syncTenant({
+      id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId,
+      connection: { connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null },
+    } as any)
   } finally {
     context.mock.timers.reset()
   }
@@ -225,6 +233,11 @@ test('a valid over-cap whole blob recharges bytes on a second eligible processor
   assert.equal(retriedContent.processedAt, null)
   assert.ok(retriedContent.nextRetryAt)
   assert.equal(retriedContent.nextRetryAt.getTime(), nextDay(secondAttemptAt))
+  const retryState = await prisma.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' } },
+  })
+  assert.equal(retryState.status, 'RUNNING')
+  assert.equal(retryState.lastErrorCode, 'm365-audit-backlog')
 })
 
 test('two clients cannot both reserve the last deployment audit record', {
