@@ -242,19 +242,21 @@ test('a valid over-cap whole blob is selected and recharged on its second eligib
 
 test('two clients cannot both reserve the last deployment audit record', {
   skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+  timeout: 60_000,
 }, async (context) => {
   assertDisposableTestDatabase()
   const firstClient = new PrismaService()
   const secondClient = new PrismaService()
+  const observer = new PrismaService()
   let organization: { id: string } | undefined
   context.after(async () => {
     try {
       if (organization) await firstClient.organization.delete({ where: { id: organization.id } })
     } finally {
-      await Promise.all([firstClient.$disconnect(), secondClient.$disconnect()])
+      await Promise.all([firstClient.$disconnect(), secondClient.$disconnect(), observer.$disconnect()])
     }
   })
-  await Promise.all([firstClient.$connect(), secondClient.$connect()])
+  await Promise.all([firstClient.$connect(), secondClient.$connect(), observer.$connect()])
   organization = await firstClient.organization.create({
     data: { name: 'M365 audit reservation race', slug: `m365-budget-race-${randomUUID()}` },
   })
@@ -289,10 +291,86 @@ test('two clients cannot both reserve the last deployment audit record', {
     microsoftTenantId: tenant.microsoftTenantId,
     connection: null,
   })
-  const outcomes = await Promise.allSettled([
-    (serviceA as any).reserveDailyUsage(target(tenants[2]!), { records: 1 }, now),
-    (serviceB as any).reserveDailyUsage(target(tenants[3]!), { records: 1 }, now),
-  ])
+  const within = <T>(promise: Promise<T>, ms: number, stage: string): Promise<T> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`M365 audit reservation ${stage} timed out`)), ms)
+      promise.then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (error) => { clearTimeout(timer); reject(error) },
+      )
+    })
+  let releaseFirst!: () => void
+  const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let firstRead!: () => void
+  const firstReadReached = new Promise<void>((resolve) => { firstRead = resolve })
+  const monthStart = new Date(Date.UTC(usageDate.getUTCFullYear(), usageDate.getUTCMonth(), 1))
+  const firstReservation = firstClient.$transaction(async (transaction) => {
+    // Hold A after a real aggregate read while it owns the deployment/month
+    // lock. Its actual reservation then runs in this same transaction.
+    await transaction.$executeRawUnsafe(
+      'SELECT pg_advisory_xact_lock(hashtext($1))',
+      `hawkview:m365-monthly-budget:${monthStart.toISOString()}`,
+    )
+    const before = await transaction.m365AuditDailyUsage.aggregate({
+      where: { usageDate }, _sum: { recordsStored: true },
+    })
+    assert.equal(before._sum.recordsStored, limits.deploymentRecords - 1)
+    firstRead()
+    await holdFirst
+    await (serviceA as any).reserveUsageInTransaction(
+      transaction, target(tenants[2]!), { records: 1 }, now,
+    )
+  }, { maxWait: 5_000, timeout: 30_000 })
+  let secondReservation: Promise<void> | undefined
+  let outcomes: PromiseSettledResult<void>[] = []
+  try {
+    await within(Promise.race([
+      firstReadReached,
+      firstReservation.then(() => { throw new Error('First reservation ended before its hold point') }),
+    ]), 8_000, 'first aggregate')
+
+    let secondPid!: (pid: number) => void
+    const secondEntered = new Promise<number>((resolve) => { secondPid = resolve })
+    secondReservation = secondClient.$transaction(async (transaction) => {
+      const rows = await transaction.$queryRawUnsafe<Array<{ pid: number }>>(
+        'SELECT pg_backend_pid() AS pid',
+      )
+      assert.ok(rows[0]?.pid)
+      secondPid(rows[0]!.pid)
+      await transaction.$executeRawUnsafe("SET LOCAL lock_timeout = '15000ms'")
+      await (serviceB as any).reserveUsageInTransaction(
+        transaction, target(tenants[3]!), { records: 1 }, now,
+      )
+    }, { maxWait: 5_000, timeout: 30_000 })
+    const pid = await within(Promise.race([
+      secondEntered,
+      secondReservation.then(() => { throw new Error('Second reservation ended before lock observation') }),
+    ]), 8_000, 'second client startup')
+
+    // An outcome-only assertion also passes when two calls run serially.
+    // Inspect the second database session while A is deliberately paused;
+    // removing the shared monthly lock must make this witness fail.
+    const lockDeadline = Date.now() + 8_000
+    let blocked = false
+    while (Date.now() < lockDeadline) {
+      const rows = await observer.$queryRawUnsafe<Array<{
+        wait_event_type: string | null; wait_event: string | null
+      }>>('SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1', pid)
+      if (rows[0]?.wait_event_type === 'Lock' && rows[0].wait_event === 'advisory') {
+        blocked = true
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    }
+    assert.equal(blocked, true, 'second client must wait on the deployment advisory lock')
+  } finally {
+    releaseFirst()
+    outcomes = await within(Promise.allSettled([
+      firstReservation,
+      ...(secondReservation ? [secondReservation] : []),
+    ]), 35_000, 'transaction cleanup')
+  }
+  assert.equal(outcomes.length, 2)
   assert.equal(outcomes.filter((result) => result.status === 'fulfilled').length, 1)
   for (const result of outcomes) {
     if (result.status === 'rejected') {
