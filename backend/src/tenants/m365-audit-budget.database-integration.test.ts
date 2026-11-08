@@ -1,0 +1,396 @@
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import test from 'node:test'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
+import { PrismaService } from '../prisma/prisma.service.js'
+import {
+  M365ManagementActivityService,
+  M365AuditBudgetError,
+  M365_ACTIVITY_CONTENT_TYPES,
+  m365AuditUsageDate,
+  m365AuditUsageLimits,
+} from './m365-management-activity.service.js'
+
+test('a record-budget refusal rolls back the content write and leaves the downloaded-byte charge', {
+  skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+}, async (context) => {
+  assertDisposableTestDatabase()
+  const prisma = new PrismaService()
+  await prisma.$connect()
+  const organization = await prisma.organization.create({
+    data: {
+      name: 'M365 audit budget integration',
+      slug: `m365-budget-${randomUUID()}`,
+    },
+  })
+  context.after(async () => {
+    try {
+      await prisma.organization.delete({ where: { id: organization.id } })
+    } finally {
+      await prisma.$disconnect()
+    }
+  })
+
+  const tenant = await prisma.customerTenant.create({
+    data: {
+      organizationId: organization.id,
+      microsoftTenantId: randomUUID(),
+      displayName: 'Budget test tenant',
+    },
+  })
+  const today = m365AuditUsageDate()
+  const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000)
+  const limits = m365AuditUsageLimits()
+  const monthlySeed = today.getUTCMonth() === tomorrow.getUTCMonth()
+    ? 2 * limits.tenantRecords
+    : limits.tenantRecords
+  assert.ok(monthlySeed < limits.tenantMonthlyRecords)
+  assert.ok(limits.tenantRecords < limits.deploymentRecords)
+  assert.ok(monthlySeed < limits.deploymentMonthlyRecords)
+  // The processor samples its own clock twice. Seed both adjacent UTC days so
+  // a hosted run spanning midnight still reaches the record-budget refusal.
+  await prisma.m365AuditDailyUsage.createMany({
+    data: [today, tomorrow].map(usageDate => ({
+      organizationId: organization.id,
+      customerTenantId: tenant.id,
+      usageDate,
+      recordsStored: limits.tenantRecords,
+    })),
+  })
+  const content = await prisma.m365ActivityContent.create({
+    data: {
+      organizationId: organization.id,
+      customerTenantId: tenant.id,
+      contentType: 'Audit.Exchange',
+      microsoftContentId: randomUUID(),
+      contentUri: `https://manage.office.com/api/v1.0/${tenant.microsoftTenantId}/activity/feed/audit/content`,
+      ledgerExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    },
+  })
+  const sourceEventId = randomUUID()
+  const body = JSON.stringify([{
+    Id: sourceEventId,
+    OrganizationId: tenant.microsoftTenantId,
+    CreationTime: new Date().toISOString(),
+    Operation: 'Set-Mailbox',
+    Workload: 'Exchange',
+    ResultStatus: 'Succeeded',
+    UserId: 'admin@example.test',
+    ObjectId: 'mailbox@example.test',
+  }])
+  const service = new M365ManagementActivityService(prisma, {} as never)
+  let requests = 0
+  ;(service as any).request = async () => {
+    requests += 1
+    return new Response(body)
+  }
+  const before = new Date()
+  const changes = await (service as any).processContent(
+    {
+      id: tenant.id,
+      organizationId: organization.id,
+      microsoftTenantId: tenant.microsoftTenantId,
+      connection: null,
+    },
+    'test-token',
+    randomUUID(),
+    { remainingBytes: 1024 * 1024 },
+    content,
+    Date.now() + 45_000,
+  )
+  const after = new Date()
+
+  assert.deepEqual(changes, [])
+  assert.equal(requests, 1)
+  assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
+  assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
+  const usage = await prisma.m365AuditDailyUsage.findMany({
+    where: { customerTenantId: tenant.id, usageDate: { in: [today, tomorrow] } },
+  })
+  assert.equal(usage.length, 2)
+  assert.ok(usage.every(row => row.recordsStored === limits.tenantRecords && row.blobsProcessed === 0))
+  assert.equal(usage.reduce((sum, row) => sum + row.downloadedBytes, 0n), BigInt(Buffer.byteLength(body)))
+  const savedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
+  assert.equal(savedContent.status, 'RETRY')
+  assert.equal(savedContent.attemptCount, 1)
+  assert.equal(savedContent.processedAt, null)
+  assert.match(savedContent.lastError ?? '', /daily cost budget is exhausted/)
+  const nextDay = (value: Date) => new Date(m365AuditUsageDate(value).getTime() + 24 * 60 * 60 * 1000).getTime()
+  assert.ok(savedContent.nextRetryAt)
+  assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
+})
+
+test('a valid over-cap whole blob is selected and recharged on its second eligible day', {
+  skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+  timeout: 60000,
+}, async (context) => {
+  assertDisposableTestDatabase()
+  const prisma = new PrismaService()
+  await prisma.$connect()
+  const organization = await prisma.organization.create({
+    data: { name: 'M365 audit whole-blob budget', slug: `m365-whole-blob-${randomUUID()}` },
+  })
+  context.after(async () => {
+    try {
+      await prisma.organization.delete({ where: { id: organization.id } })
+    } finally {
+      await prisma.$disconnect()
+    }
+  })
+  const tenant = await prisma.customerTenant.create({
+    data: {
+      organizationId: organization.id,
+      microsoftTenantId: randomUUID(),
+      displayName: 'Whole-blob budget test tenant',
+    },
+  })
+  const limits = m365AuditUsageLimits()
+  assert.equal(limits.tenantRecords, 1000)
+  const content = await prisma.m365ActivityContent.create({
+    data: {
+      organizationId: organization.id,
+      customerTenantId: tenant.id,
+      contentType: 'Audit.Exchange',
+      microsoftContentId: randomUUID(),
+      contentUri: `https://manage.office.com/api/v1.0/${tenant.microsoftTenantId}/activity/feed/audit/content`,
+      ledgerExpiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    },
+  })
+  const creationTime = new Date().toISOString()
+  const body = JSON.stringify(Array.from({ length: limits.tenantRecords + 1 }, (_, index) => ({
+    Id: `whole-blob-${index}-${randomUUID()}`,
+    OrganizationId: tenant.microsoftTenantId,
+    CreationTime: creationTime,
+    Operation: 'Set-Mailbox',
+    Workload: 'Exchange',
+    ResultStatus: 'Succeeded',
+    UserId: 'admin@example.test',
+    ObjectId: `mailbox-${index}@example.test`,
+  })))
+  assert.ok(Buffer.byteLength(body) < 1024 * 1024)
+  const service = new M365ManagementActivityService(prisma, {
+    getTenantManagementActivityContext: async () => ({
+      accessToken: 'test-token', publisherIdentifier: 'test-publisher',
+    }),
+  } as never)
+  let requests = 0
+  ;(service as any).request = async () => {
+    requests += 1
+    return new Response(body)
+  }
+  const before = new Date()
+  const changes = await (service as any).processContent(
+    { id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId, connection: null },
+    'test-token', randomUUID(), { remainingBytes: 1024 * 1024 }, content, Date.now() + 45_000,
+  )
+  const after = new Date()
+
+  assert.deepEqual(changes, [])
+  assert.equal(requests, 1)
+  assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
+  assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
+  const usage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  assert.equal(usage.length, 1)
+  assert.equal(usage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
+  assert.equal(usage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
+  assert.equal(usage.reduce((sum, row) => sum + row.downloadedBytes, 0n), BigInt(Buffer.byteLength(body)))
+  const firstUsageDate = m365AuditUsageDate(usage[0]!.usageDate).getTime()
+  const savedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
+  assert.equal(savedContent.status, 'RETRY')
+  assert.equal(savedContent.attemptCount, 1)
+  assert.equal(savedContent.processedAt, null)
+  assert.match(savedContent.lastError ?? '', /daily cost budget is exhausted/)
+  const nextDay = (value: Date) => new Date(m365AuditUsageDate(value).getTime() + 24 * 60 * 60 * 1000).getTime()
+  assert.ok(savedContent.nextRetryAt)
+  assert.ok([nextDay(before), nextDay(after)].includes(savedContent.nextRetryAt.getTime()))
+
+  // The second attempt enters through the scheduler's due-row query. Avoid
+  // external subscription/discovery calls while retaining its real content
+  // selection, processing, accounting and final SyncState publication.
+  ;(service as any).ensureSubscriptions = async () => new Set<string>(M365_ACTIVITY_CONTENT_TYPES)
+  ;(service as any).discoverContent = async () => false
+  const secondAttemptAt = new Date(savedContent.nextRetryAt.getTime() + 12 * 60 * 60 * 1000)
+  context.mock.timers.enable({ apis: ['Date'], now: secondAttemptAt })
+  let secondChanges: unknown
+  try {
+    secondChanges = await service.syncTenant({
+      id: tenant.id, organizationId: organization.id, microsoftTenantId: tenant.microsoftTenantId,
+      connection: { connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null },
+    } as any)
+  } finally {
+    context.mock.timers.reset()
+  }
+  assert.deepEqual(secondChanges, [])
+  assert.equal(requests, 2)
+  assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
+  assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
+  const twoDayUsage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  const secondUsageDate = m365AuditUsageDate(secondAttemptAt).getTime()
+  assert.notEqual(secondUsageDate, firstUsageDate)
+  assert.equal(twoDayUsage.length, 2)
+  const bytesByDay = new Map(twoDayUsage.map((row) => [
+    m365AuditUsageDate(row.usageDate).getTime(), row.downloadedBytes,
+  ]))
+  assert.equal(bytesByDay.get(firstUsageDate), BigInt(Buffer.byteLength(body)))
+  assert.equal(bytesByDay.get(secondUsageDate), BigInt(Buffer.byteLength(body)))
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
+  assert.equal(twoDayUsage.reduce((sum, row) => sum + row.downloadedBytes, 0n),
+    2n * BigInt(Buffer.byteLength(body)))
+  const retriedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
+  assert.equal(retriedContent.status, 'RETRY')
+  assert.equal(retriedContent.attemptCount, 2)
+  assert.equal(retriedContent.processedAt, null)
+  assert.ok(retriedContent.nextRetryAt)
+  assert.equal(retriedContent.nextRetryAt.getTime(), nextDay(secondAttemptAt))
+  const retryState = await prisma.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' } },
+  })
+  assert.equal(retryState.status, 'RUNNING')
+  assert.equal(retryState.lastErrorCode, 'm365-audit-backlog')
+})
+
+test('two clients cannot both reserve the last deployment audit record', {
+  skip: process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1',
+  timeout: 60_000,
+}, async (context) => {
+  assertDisposableTestDatabase()
+  const firstClient = new PrismaService()
+  const secondClient = new PrismaService()
+  const observer = new PrismaService()
+  let organization: { id: string } | undefined
+  context.after(async () => {
+    try {
+      if (organization) await firstClient.organization.delete({ where: { id: organization.id } })
+    } finally {
+      await Promise.all([firstClient.$disconnect(), secondClient.$disconnect(), observer.$disconnect()])
+    }
+  })
+  await Promise.all([firstClient.$connect(), secondClient.$connect(), observer.$connect()])
+  organization = await firstClient.organization.create({
+    data: { name: 'M365 audit reservation race', slug: `m365-budget-race-${randomUUID()}` },
+  })
+  const tenants = await Promise.all(Array.from({ length: 4 }, (_, index) =>
+    firstClient.customerTenant.create({
+      data: {
+        organizationId: organization!.id,
+        microsoftTenantId: randomUUID(),
+        displayName: `Budget race tenant ${index}`,
+      },
+    }),
+  ))
+  const limits = m365AuditUsageLimits()
+  assert.equal(limits.deploymentRecords, 2 * limits.tenantRecords)
+  assert.ok(limits.deploymentRecords < limits.deploymentMonthlyRecords)
+  assert.ok(limits.tenantRecords < limits.tenantMonthlyRecords)
+  const now = new Date('2098-03-17T12:00:00.000Z')
+  const usageDate = m365AuditUsageDate(now)
+  await firstClient.m365AuditDailyUsage.createMany({
+    data: [limits.tenantRecords, limits.tenantRecords - 1].map((recordsStored, index) => ({
+      organizationId: organization!.id,
+      customerTenantId: tenants[index]!.id,
+      usageDate,
+      recordsStored,
+    })),
+  })
+  const serviceA = new M365ManagementActivityService(firstClient, {} as never)
+  const serviceB = new M365ManagementActivityService(secondClient, {} as never)
+  const target = (tenant: (typeof tenants)[number]) => ({
+    id: tenant.id,
+    organizationId: organization!.id,
+    microsoftTenantId: tenant.microsoftTenantId,
+    connection: null,
+  })
+  const within = <T>(promise: Promise<T>, ms: number, stage: string): Promise<T> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`M365 audit reservation ${stage} timed out`)), ms)
+      promise.then(
+        (value) => { clearTimeout(timer); resolve(value) },
+        (error) => { clearTimeout(timer); reject(error) },
+      )
+    })
+  let releaseFirst!: () => void
+  const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve })
+  let firstRead!: () => void
+  const firstReadReached = new Promise<void>((resolve) => { firstRead = resolve })
+  const monthStart = new Date(Date.UTC(usageDate.getUTCFullYear(), usageDate.getUTCMonth(), 1))
+  const firstReservation = firstClient.$transaction(async (transaction) => {
+    // Hold A after a real aggregate read while it owns the deployment/month
+    // lock. Its actual reservation then runs in this same transaction.
+    await transaction.$executeRawUnsafe(
+      'SELECT pg_advisory_xact_lock(hashtext($1))',
+      `hawkview:m365-monthly-budget:${monthStart.toISOString()}`,
+    )
+    const before = await transaction.m365AuditDailyUsage.aggregate({
+      where: { usageDate }, _sum: { recordsStored: true },
+    })
+    assert.equal(before._sum.recordsStored, limits.deploymentRecords - 1)
+    firstRead()
+    await holdFirst
+    await (serviceA as any).reserveUsageInTransaction(
+      transaction, target(tenants[2]!), { records: 1 }, now,
+    )
+  }, { maxWait: 5_000, timeout: 30_000 })
+  let secondReservation: Promise<void> | undefined
+  let outcomes: PromiseSettledResult<void>[] = []
+  try {
+    await within(Promise.race([
+      firstReadReached,
+      firstReservation.then(() => { throw new Error('First reservation ended before its hold point') }),
+    ]), 8_000, 'first aggregate')
+
+    let secondPid!: (pid: number) => void
+    const secondEntered = new Promise<number>((resolve) => { secondPid = resolve })
+    secondReservation = secondClient.$transaction(async (transaction) => {
+      const rows = await transaction.$queryRawUnsafe<Array<{ pid: number }>>(
+        'SELECT pg_backend_pid() AS pid',
+      )
+      assert.ok(rows[0]?.pid)
+      secondPid(rows[0]!.pid)
+      await transaction.$executeRawUnsafe("SET LOCAL lock_timeout = '15000ms'")
+      await (serviceB as any).reserveUsageInTransaction(
+        transaction, target(tenants[3]!), { records: 1 }, now,
+      )
+    }, { maxWait: 5_000, timeout: 30_000 })
+    const pid = await within(Promise.race([
+      secondEntered,
+      secondReservation.then(() => { throw new Error('Second reservation ended before lock observation') }),
+    ]), 8_000, 'second client startup')
+
+    // An outcome-only assertion also passes when two calls run serially.
+    // Inspect the second database session while A is deliberately paused;
+    // removing the shared monthly lock must make this witness fail.
+    const lockDeadline = Date.now() + 8_000
+    let blocked = false
+    while (Date.now() < lockDeadline) {
+      const rows = await observer.$queryRawUnsafe<Array<{
+        wait_event_type: string | null; wait_event: string | null
+      }>>('SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1', pid)
+      if (rows[0]?.wait_event_type === 'Lock' && rows[0].wait_event === 'advisory') {
+        blocked = true
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 40))
+    }
+    assert.equal(blocked, true, 'second client must wait on the deployment advisory lock')
+  } finally {
+    releaseFirst()
+    outcomes = await within(Promise.allSettled([
+      firstReservation,
+      ...(secondReservation ? [secondReservation] : []),
+    ]), 35_000, 'transaction cleanup')
+  }
+  assert.equal(outcomes.length, 2)
+  assert.equal(outcomes.filter((result) => result.status === 'fulfilled').length, 1)
+  for (const result of outcomes) {
+    if (result.status === 'rejected') {
+      assert.ok(result.reason instanceof M365AuditBudgetError)
+      assert.match(result.reason.message, /daily cost budget is exhausted/)
+    }
+  }
+  const usage = await firstClient.m365AuditDailyUsage.findMany({
+    where: { organizationId: organization.id, usageDate },
+  })
+  assert.equal(usage.reduce((total, row) => total + row.recordsStored, 0), limits.deploymentRecords)
+  assert.equal(usage.filter((row) => [tenants[2]!.id, tenants[3]!.id].includes(row.customerTenantId)).length, 1)
+})
