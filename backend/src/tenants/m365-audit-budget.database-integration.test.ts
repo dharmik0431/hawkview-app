@@ -190,9 +190,11 @@ test('a valid over-cap whole blob is selected and recharged on its second eligib
   assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
   assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
   const usage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  assert.equal(usage.length, 1)
   assert.equal(usage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
   assert.equal(usage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
   assert.equal(usage.reduce((sum, row) => sum + row.downloadedBytes, 0n), BigInt(Buffer.byteLength(body)))
+  const firstUsageDate = m365AuditUsageDate(usage[0]!.usageDate).getTime()
   const savedContent = await prisma.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } })
   assert.equal(savedContent.status, 'RETRY')
   assert.equal(savedContent.attemptCount, 1)
@@ -223,6 +225,14 @@ test('a valid over-cap whole blob is selected and recharged on its second eligib
   assert.equal(await prisma.m365AuditRecord.count({ where: { customerTenantId: tenant.id } }), 0)
   assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: tenant.id } }), 0)
   const twoDayUsage = await prisma.m365AuditDailyUsage.findMany({ where: { customerTenantId: tenant.id } })
+  const secondUsageDate = m365AuditUsageDate(secondAttemptAt).getTime()
+  assert.notEqual(secondUsageDate, firstUsageDate)
+  assert.equal(twoDayUsage.length, 2)
+  const bytesByDay = new Map(twoDayUsage.map((row) => [
+    m365AuditUsageDate(row.usageDate).getTime(), row.downloadedBytes,
+  ]))
+  assert.equal(bytesByDay.get(firstUsageDate), BigInt(Buffer.byteLength(body)))
+  assert.equal(bytesByDay.get(secondUsageDate), BigInt(Buffer.byteLength(body)))
   assert.equal(twoDayUsage.reduce((sum, row) => sum + row.recordsStored, 0), 0)
   assert.equal(twoDayUsage.reduce((sum, row) => sum + row.blobsProcessed, 0), 0)
   assert.equal(twoDayUsage.reduce((sum, row) => sum + row.downloadedBytes, 0n),
