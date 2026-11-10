@@ -77,6 +77,7 @@ import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreR
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
   deriveInitialSyncStatus,
+  INITIAL_SYNC_RESOURCE_TYPES,
   initialSyncStateHasInitializingSignIns,
   initialSyncStateHasLimitedSignIns,
   initialSyncStateRequiresAction,
@@ -2647,6 +2648,30 @@ export class TenantSyncService {
           actionRequiredResources,
         },
       })
+    }
+    // The first pass may have published an incomplete initial-sync incident
+    // before USERS established its successful baseline. A later full pass must
+    // close that warning only when every required source proves completion.
+    if (
+      !capturedManaged &&
+      !initialSync &&
+      !incrementalOnly &&
+      failedResources.length === 0 &&
+      INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
+        attemptedStates.some((state) =>
+          state.resourceType === resourceType && state.status === 'SUCCEEDED')) &&
+      deriveInitialSyncStatus({
+        startedAt:
+          tenant.connection.onboardingCompletedAt ??
+          tenant.connection.consentedAt,
+        syncStates: attemptedStates,
+      }).status === 'COMPLETE'
+    ) {
+      await this.notifications.resolveIncidentIfEventType(
+        tenant.organizationId,
+        `tenant:${tenant.id}:initial-sync`,
+        ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required'],
+      )
     }
     return {
       bundle: includeBundle ? await this.buildBundle(tenant) : null,

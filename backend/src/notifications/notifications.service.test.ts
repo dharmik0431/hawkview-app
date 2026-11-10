@@ -51,6 +51,33 @@ test('notification operational logs never include hostile caller event types on 
   }
 })
 
+test('typed incident resolution only closes an unresolved matching warning', async () => {
+  const rows = new Map([
+    ['warning', { eventType: 'tenant.initial_sync_in_progress', resolvedAt: null as Date | null }],
+    ['success', { eventType: 'tenant.initial_sync_completed', resolvedAt: null as Date | null }],
+  ])
+  const service = new NotificationsService({
+    notification: {
+      updateMany: async ({ where, data }: any) => {
+        assert.equal(where.organizationId, 'org')
+        assert.equal(where.resolvedAt, null)
+        const row = rows.get(where.dedupeKey)
+        if (!row || row.resolvedAt || !where.eventType.in.includes(row.eventType)) return { count: 0 }
+        row.resolvedAt = data.resolvedAt
+        return { count: 1 }
+      },
+    },
+  } as any)
+  ;(service as any).logger = { log: () => undefined, error: () => undefined }
+  const allowed = ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required']
+
+  assert.equal(await service.resolveIncidentIfEventType('org', 'success', allowed), false)
+  assert.equal(rows.get('success')?.resolvedAt, null)
+  assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), true)
+  assert.ok(rows.get('warning')?.resolvedAt instanceof Date)
+  assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), false)
+})
+
 const preferenceOrg = '00000000-0000-4000-8000-000000000041'
 const preferenceOtherOrg = '00000000-0000-4000-8000-000000000042'
 const preferenceUser = '00000000-0000-4000-8000-000000000043'

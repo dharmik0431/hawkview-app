@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
+import { INITIAL_SYNC_RESOURCE_TYPES } from './initial-sync-status.js'
 import { evaluateCheck } from '../security-requirements/security-requirements-evaluator.js'
 import {
   assertGraphCollectionBounds,
@@ -1126,23 +1127,36 @@ function aggregateSyncFixture(options: {
   persistedFailures?: Array<{ resourceType: string; lastErrorCode?: string }>
   persistedSignInReasonCode?: string
   initial?: boolean
+  completedInitialSyncResources?: boolean
 } = {}) {
   const tenant = {
     ...boundedTenant,
-    connection: { ...boundedTenant.connection, connectionMode: 'CUSTOMER_MANAGED', exchangeReadOnlyEnabledAt: null },
+    connection: {
+      ...boundedTenant.connection,
+      connectionMode: 'CUSTOMER_MANAGED',
+      exchangeReadOnlyEnabledAt: null,
+      onboardingCompletedAt: new Date('2026-01-01T00:00:00.000Z'),
+    },
   }
   const calls: string[] = []
   const messages: string[] = []
   const incidents: any[] = []
+  const openIncidents = new Map<string, string>()
+  const resolvedIncidents: string[] = []
   const stateWrites: string[] = []
+  let usersLastSuccessfulAt = options.initial ? null : new Date()
+  let persistedFailures = options.persistedFailures ?? []
+  let persistedSignInReasonCode = options.persistedSignInReasonCode
+  let runningResources: string[] = []
   const prisma = utcTestDatabase({
     syncState: {
-      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: options.initial ? null : new Date(), deltaLink: 'previous-delta' }),
+      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: usersLastSuccessfulAt, deltaLink: 'previous-delta' }),
       updateMany: async () => { stateWrites.push('USERS:RUNNING'); return { count: 1 } },
       update: async ({ where, data }: any) => {
         assert.equal(where.customerTenantId_resourceType.resourceType, 'USERS')
         assert.equal(data.deltaLink, 'next-delta')
         stateWrites.push(`USERS:${data.status}`)
+        if (data.status === 'SUCCEEDED') usersLastSuccessfulAt = data.lastSuccessfulAt
         return {}
       },
       findMany: async ({ where }: any) => {
@@ -1150,21 +1164,45 @@ function aggregateSyncFixture(options: {
         assert.equal(where.customerTenantId, tenant.id)
         if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
         assert.ok(where.lastAttemptAt.gte instanceof Date)
-        return [
-          ...(options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null })),
-          ...(options.persistedSignInReasonCode ? [{
-            resourceType: 'SIGN_INS', status: 'RUNNING',
-            lastErrorCode: options.persistedSignInReasonCode, lastErrorMessage: 'Incomplete source',
+        const states = new Map<string, any>()
+        if (options.completedInitialSyncResources) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
+          states.set(resourceType, {
+            resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
             lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
-          }] : []),
-        ]
+          })
+        }
+        for (const state of persistedFailures) states.set(state.resourceType, {
+          ...state, status: 'FAILED', lastErrorMessage: null,
+          lastSuccessfulAt: null, lastAttemptAt: new Date(),
+        })
+        for (const resourceType of runningResources) states.set(resourceType, {
+          resourceType, status: 'RUNNING', lastErrorCode: null, lastErrorMessage: null,
+          lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+        })
+        if (persistedSignInReasonCode) states.set('SIGN_INS', {
+            resourceType: 'SIGN_INS', status: 'RUNNING',
+            lastErrorCode: persistedSignInReasonCode, lastErrorMessage: 'Incomplete source',
+            lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+          })
+        return [...states.values()]
       },
     },
     tenantConnection: { update: async () => ({}) },
   })
   const service = new TenantSyncService(prisma as any,
     { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
-    { publishIncident: async (incident: any) => { incidents.push(incident) } } as any, {} as any, {} as any)
+    {
+      publishIncident: async (incident: any) => {
+        incidents.push(incident)
+        if (!openIncidents.has(incident.dedupeKey)) openIncidents.set(incident.dedupeKey, incident.eventType)
+      },
+      resolveIncidentIfEventType: async (_organizationId: string, dedupeKey: string, eventTypes: string[]) => {
+        if (eventTypes.includes(openIncidents.get(dedupeKey) ?? '')) {
+          resolvedIncidents.push(dedupeKey)
+          openIncidents.delete(dedupeKey)
+        }
+      },
+    } as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async (_tenant: unknown, _token: string, delta: string) => {
     assert.equal(delta, 'previous-delta')
     return { deltaLink: 'next-delta' }
@@ -1187,7 +1225,11 @@ function aggregateSyncFixture(options: {
   ;(service as any).syncEntraCollection = (_tenant: unknown, _token: string, resource: string) => collect(resource)
   ;(service as any).refreshCollectionFieldStates = async () => undefined
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
-  return { calls, messages, incidents, stateWrites,
+  return { calls, messages, incidents, stateWrites, resolvedIncidents,
+    isIncidentOpen: (key: string) => openIncidents.has(key),
+    setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
+    setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
+    setRunningResources: (resources: string[]) => { runningResources = resources },
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
@@ -1265,6 +1307,51 @@ test('first limited sign-in fallback cannot publish initial-sync completion', as
   assert.deepEqual(incident.metadata.limitedResources, ['SIGN_INS'])
   assert.deepEqual(incident.metadata.retryingResources, [])
   assert.deepEqual(incident.metadata.unclassifiedResources, [])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('initial sign-in warning closes only after a later complete source pass', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  const key = 'tenant:tenant:initial-sync'
+
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedSignInReasonCode(undefined)
+  fixture.setPersistedFailures([{ resourceType: 'GROUPS', lastErrorCode: 'HTTP_503' }])
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedFailures([])
+  fixture.setRunningResources(['GROUPS'])
+  await fixture.run()
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setRunningResources([])
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), false)
+  assert.deepEqual(fixture.resolvedIncidents, [key])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a completed initial-sync notice stays open after a later clean full pass', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+  const key = 'tenant:tenant:initial-sync'
+
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_completed')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
   assert.equal(network.mock.callCount(), 0)
 })
 

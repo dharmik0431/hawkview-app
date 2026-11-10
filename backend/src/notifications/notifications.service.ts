@@ -425,4 +425,18 @@ export class NotificationsService {
       return null
     }
   }
+
+  async resolveIncidentIfEventType(organizationId: string, dedupeKey: string, eventTypes: readonly string[]) {
+    try {
+      const result = await this.prisma.notification.updateMany({
+        where: { organizationId, dedupeKey, eventType: { in: [...eventTypes] }, resolvedAt: null },
+        data: { resolvedAt: new Date() },
+      })
+      if (result.count > 0) this.logger.log(JSON.stringify({ event: 'notification.resolved', outcome: 'COMPLETED' }))
+      return result.count > 0
+    } catch (error) {
+      this.logger.error(JSON.stringify({ event: 'notification.resolve_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
+      return false
+    }
+  }
 }
