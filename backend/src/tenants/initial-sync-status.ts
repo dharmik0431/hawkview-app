@@ -31,12 +31,14 @@ export type InitialSyncStatus = {
   status:
     | 'IN_PROGRESS'
     | 'DELAYED'
+    | 'LIMITED'
     | 'COMPLETE'
     | 'ACTION_REQUIRED'
     | 'UNKNOWN'
   startedAt: string | null
   pendingResources: string[]
   retryingResources: string[]
+  limitedResources: string[]
   actionRequiredResources: string[]
   completedResources: string[]
 }
@@ -84,6 +86,7 @@ export function deriveInitialSyncStatus(input: {
       startedAt: null,
       pendingResources: [],
       retryingResources: [],
+      limitedResources: [],
       actionRequiredResources: [],
       completedResources: [],
     }
@@ -94,14 +97,32 @@ export function deriveInitialSyncStatus(input: {
   )
   const pendingResources: string[] = []
   const retryingResources: string[] = []
+  const limitedResources: string[] = []
   const actionRequiredResources: string[] = []
   const completedResources: string[] = []
 
   for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
     const state = states.get(resourceType)
-    // Limited audit-source freshness and an initializing subscription do not
-    // prove full Graph sign-in collection completed in this connection cycle.
-    if (state && (initialSyncStateHasLimitedSignIns(state) || initialSyncStateHasInitializingSignIns(state))) {
+    // A successfully persisted fallback is limited coverage, not a transient
+    // collection failure or proof of full Graph sign-in coverage.
+    if (state && initialSyncStateHasLimitedSignIns(state)) {
+      if (!attemptedAfter(state, startedAt)) {
+        pendingResources.push(resourceType)
+      } else if (
+        state.status === 'RUNNING' &&
+        succeededAfter(state, startedAt) &&
+        state.lastSuccessfulAt &&
+        state.lastAttemptAt &&
+        state.lastSuccessfulAt.getTime() >= state.lastAttemptAt.getTime()
+      ) {
+        limitedResources.push(resourceType)
+      } else {
+        retryingResources.push(resourceType)
+      }
+      continue
+    }
+    // An initializing subscription has not provided fallback evidence yet.
+    if (state && initialSyncStateHasInitializingSignIns(state)) {
       if (attemptedAfter(state, startedAt)) retryingResources.push(resourceType)
       else pendingResources.push(resourceType)
       continue
@@ -124,15 +145,15 @@ export function deriveInitialSyncStatus(input: {
   let status: InitialSyncStatus['status']
   if (actionRequiredResources.length > 0) {
     status = 'ACTION_REQUIRED'
-  } else if (pendingResources.length === 0 && retryingResources.length === 0) {
-    status = 'COMPLETE'
-  } else if (
-    (input.now ?? new Date()).getTime() - startedAt.getTime() >
-    INITIAL_SYNC_GRACE_MS
-  ) {
-    status = 'DELAYED'
+  } else if (pendingResources.length > 0 || retryingResources.length > 0) {
+    status = (input.now ?? new Date()).getTime() - startedAt.getTime() >
+      INITIAL_SYNC_GRACE_MS
+      ? 'DELAYED'
+      : 'IN_PROGRESS'
+  } else if (limitedResources.length > 0) {
+    status = 'LIMITED'
   } else {
-    status = 'IN_PROGRESS'
+    status = 'COMPLETE'
   }
 
   return {
@@ -140,6 +161,7 @@ export function deriveInitialSyncStatus(input: {
     startedAt: startedAt.toISOString(),
     pendingResources,
     retryingResources,
+    limitedResources,
     actionRequiredResources,
     completedResources,
   }
