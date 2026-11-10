@@ -394,7 +394,7 @@ test('records expected sign-in dependency provisioning as initializing without a
       'Microsoft is activating the audit subscription used for limited-license sign-in collection.',
     consecutiveFailures: 0,
   })
-  assert.deepEqual(resolved, ['tenant:tenant-1:sync:SIGN_INS'])
+  assert.deepEqual(resolved, [])
 })
 
 test('does not hide a genuine sign-in collector failure as provisioning', async () => {
@@ -440,6 +440,37 @@ test('records successful bounded fallback evidence as partial without publishing
     'sign-ins-premium-graph-fallback-active',
   )
   assert.equal(updates.at(-1)?.consecutiveFailures, 0)
+  assert.deepEqual(resolved, [])
+})
+
+test('does not resolve a sign-in incident through limited and initializing passes until full collection succeeds', async () => {
+  const updates: Array<Record<string, unknown>> = []
+  const resolved: string[] = []
+  const service = serviceWithState(updates, resolved)
+  const tenant = { id: 'tenant-1', organizationId: 'org-1' }
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    await (service as any).runSnapshotSync(tenant, 'SIGN_INS', async () => {
+      throw new CollectionPartialError(
+        'sign-ins-premium-graph-fallback-active',
+        'Only limited sign-in evidence was collected.',
+      )
+    })
+    assert.equal(updates.at(-1)?.status, 'RUNNING')
+    assert.deepEqual(resolved, [])
+  }
+
+  await (service as any).runSnapshotSync(tenant, 'SIGN_INS', async () => {
+    throw new CollectionInitializingError(
+      'sign-ins-audit-subscription-initializing',
+      'Microsoft is activating the audit subscription.',
+    )
+  })
+  assert.equal(updates.at(-1)?.status, 'RUNNING')
+  assert.deepEqual(resolved, [])
+
+  await (service as any).runSnapshotSync(tenant, 'SIGN_INS', async () => undefined)
+  assert.equal(updates.at(-1)?.status, 'SUCCEEDED')
   assert.deepEqual(resolved, ['tenant:tenant-1:sync:SIGN_INS'])
 })
 

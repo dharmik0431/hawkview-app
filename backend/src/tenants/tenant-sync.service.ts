@@ -2926,13 +2926,14 @@ export class TenantSyncService {
             consecutiveFailures: 0,
           },
         }))
-        // A previous deployment could have published an incident for this
-        // normal provisioning state. Retire it without claiming collection
-        // success; readiness will continue to report INITIALIZING.
-        await this.notifications.resolveIncident(
-          tenant.organizationId,
-          `tenant:${tenant.id}:sync:${resourceType}`,
-        )
+        // SIGN_INS initialization does not prove recovery from an earlier
+        // collection failure. Keep that incident open until a full success.
+        if (resourceType !== 'SIGN_INS') {
+          await this.notifications.resolveIncident(
+            tenant.organizationId,
+            `tenant:${tenant.id}:sync:${resourceType}`,
+          )
+        }
         return
       }
       const corePartial = error instanceof CollectionPartialError &&
@@ -2955,10 +2956,13 @@ export class TenantSyncService {
             consecutiveFailures: 0,
           },
         }))
-        await this.notifications.resolveIncident(
-          tenant.organizationId,
-          `tenant:${tenant.id}:sync:${resourceType}`,
-        )
+        // Limited sign-in evidence does not restore the selected Graph source.
+        if (resourceType !== 'SIGN_INS') {
+          await this.notifications.resolveIncident(
+            tenant.organizationId,
+            `tenant:${tenant.id}:sync:${resourceType}`,
+          )
+        }
         return
       }
       // Core evidence loss follows the existing failure/incident lifecycle.
