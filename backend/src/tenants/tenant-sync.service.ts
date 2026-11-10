@@ -1138,6 +1138,20 @@ export async function parseBoundedGraphCollectionPage(
   response: Response,
   resourceLabel: string,
 ) {
+  // A valid JSON body does not establish complete collection coverage when
+  // Graph marks the transport as partial. Reject it before parsing or writing
+  // any rows; never include provider Warning text in the error.
+  const warning = response.headers.get('warning')
+  if (response.status !== 200 || warning !== null) {
+    await cancelBoundedStream(() => response.body?.cancel())
+    const warningCode = warning?.match(/^\s*(\d{3})(?:\s|$)/)?.[1]
+    const detail = warning !== null ? ` (Warning code ${warningCode ?? 'unclassified'})` : ''
+    const message = `Microsoft ${resourceLabel} returned an invalid response${detail}; collection was not advanced.`
+    if (response.status === 206 || (response.status === 200 && warning !== null)) {
+      throw new MicrosoftPartialResponseError(message, response.status)
+    }
+    throw new MicrosoftRequestError(message, response.status, null, null)
+  }
   try {
     const parsed = JSON.parse(
       await readBoundedResponseText(response, GRAPH_LOG_PAGE_MAX_BYTES),

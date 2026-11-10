@@ -122,7 +122,7 @@ export class MicrosoftRequestError extends Error {
   }
 }
 
-/** A Baseline evidence collector received a response that Graph marked partial. */
+/** A Microsoft evidence collector received a response that Graph marked partial. */
 export class MicrosoftPartialResponseError extends MicrosoftRequestError {
   constructor(message: string, status: number) {
     super(message, status, null, null)
