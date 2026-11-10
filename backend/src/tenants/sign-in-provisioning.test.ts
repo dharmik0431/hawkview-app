@@ -62,7 +62,7 @@ function locationFixture(count = 6) {
   const service = new TenantSyncService(prisma, {} as any, { ensureReady: async () => ({ ready: true }), lookupReady: () => {
     observations.lookups++; observations.lookupActive++; observations.maximumLookups = Math.max(observations.maximumLookups, observations.lookupActive)
     observations.lookupActive--; return { kind: 'FOUND', location: inferredLocation }
-  } } as any, { resolveIncident: async () => { observations.resolved++ }, publishIncident: async () => { observations.incidents++ } } as any, { pruneExpired: async () => undefined } as any, {} as any)
+  } } as any, { resolveIncident: async () => { observations.resolved++ }, refreshOpenSignInIncident: async () => false, publishIncident: async () => { observations.incidents++ } } as any, { pruneExpired: async () => undefined } as any, {} as any)
   ;(service as any).logger = { log: (line: string) => observations.logs.push(line), warn: (line: string) => observations.logs.push(line) }
   ;(service as any).signInEntitlement = async () => 'NON_PREMIUM'
   ;(service as any).fetchGraphCollection = async () => { throw new Error('Authentication_RequestFromNonPremiumTenantOrB2CTenant') }
@@ -341,7 +341,11 @@ test('PostgreSQL enrichment pages are isolated, resumable and cancelled by trans
     assert.deepEqual(await (service as any).backfillLimitedSignInLocations(own, locations, limits), { partial: false, updatedRows: 1 })
   })
 
-function serviceWithState(updates: Array<Record<string, unknown>>, resolved: string[]) {
+function serviceWithState(
+  updates: Array<Record<string, unknown>>,
+  resolved: string[],
+  refreshed: Array<{ organizationId: string; tenantId: string; phase: string }> = [],
+) {
   const prisma: any = {
     syncState: {
       upsert: async () => undefined,
@@ -358,6 +362,9 @@ function serviceWithState(updates: Array<Record<string, unknown>>, resolved: str
   const notifications: any = {
     resolveIncident: async (_organizationId: string, dedupeKey: string) => {
       resolved.push(dedupeKey)
+    },
+    refreshOpenSignInIncident: async (organizationId: string, tenantId: string, phase: string) => {
+      refreshed.push({ organizationId, tenantId, phase })
     },
     publishIncident: async () => undefined,
   }
@@ -446,7 +453,8 @@ test('records successful bounded fallback evidence as partial without publishing
 test('does not resolve a sign-in incident through limited and initializing passes until full collection succeeds', async () => {
   const updates: Array<Record<string, unknown>> = []
   const resolved: string[] = []
-  const service = serviceWithState(updates, resolved)
+  const refreshed: Array<{ organizationId: string; tenantId: string; phase: string }> = []
+  const service = serviceWithState(updates, resolved, refreshed)
   const tenant = { id: 'tenant-1', organizationId: 'org-1' }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -468,10 +476,16 @@ test('does not resolve a sign-in incident through limited and initializing passe
   })
   assert.equal(updates.at(-1)?.status, 'RUNNING')
   assert.deepEqual(resolved, [])
+  assert.deepEqual(refreshed, [
+    { organizationId: 'org-1', tenantId: 'tenant-1', phase: 'LIMITED' },
+    { organizationId: 'org-1', tenantId: 'tenant-1', phase: 'LIMITED' },
+    { organizationId: 'org-1', tenantId: 'tenant-1', phase: 'INITIALIZING' },
+  ])
 
   await (service as any).runSnapshotSync(tenant, 'SIGN_INS', async () => undefined)
   assert.equal(updates.at(-1)?.status, 'SUCCEEDED')
   assert.deepEqual(resolved, ['tenant:tenant-1:sync:SIGN_INS'])
+  assert.equal(refreshed.length, 3)
 })
 
 test('unknown SIGN_INS partial reasons fail closed without advancing selected-source success', async () => {
@@ -533,6 +547,7 @@ function signInCollectorFixture(servicePlans: unknown) {
     { ensureReady: async () => ({ ready: true }), lookupReady: () => ({ kind: 'NO_MATCH' }) } as never,
     {
       resolveIncident: async () => undefined,
+      refreshOpenSignInIncident: async () => false,
       publishIncident: async () => undefined,
     } as never,
     {

@@ -439,4 +439,38 @@ export class NotificationsService {
       return false
     }
   }
+
+  async refreshOpenSignInIncident(
+    organizationId: string,
+    customerTenantId: string,
+    phase: 'INITIALIZING' | 'LIMITED',
+  ) {
+    const initializing = phase === 'INITIALIZING'
+    try {
+      const result = await this.prisma.notification.updateMany({
+        where: {
+          organizationId,
+          customerTenantId,
+          dedupeKey: `tenant:${customerTenantId}:sync:SIGN_INS`,
+          eventType: 'tenant.sync_failed',
+          resolvedAt: null,
+        },
+        data: {
+          category: 'warning',
+          severity: 'medium',
+          title: initializing ? 'Sign in collection initializing' : 'Sign in coverage limited',
+          description: initializing
+            ? 'Microsoft is preparing the sign in source. Full sign in coverage is not yet verified; HawkView will retry automatically.'
+            : 'Only limited sign in evidence is available. Full Microsoft Graph sign in coverage is not yet verified; HawkView will retry automatically.',
+          actionUrl: `/tenants/${customerTenantId}`,
+          actionLabel: 'View synchronization',
+          metadata: { resourceType: 'SIGN_INS', coverageState: phase, consecutiveFailures: 0 },
+        },
+      })
+      return result.count > 0
+    } catch {
+      this.logger.error(JSON.stringify({ event: 'notification.refresh_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
+      return false
+    }
+  }
 }

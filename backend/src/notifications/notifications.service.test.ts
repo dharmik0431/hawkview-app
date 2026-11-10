@@ -78,6 +78,48 @@ test('typed incident resolution only closes an unresolved matching warning', asy
   assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), false)
 })
 
+test('limited sign-in passes replace stale incident reason and action without republishing or resolving it', async () => {
+  const oldAction = '/tenants/tenant-1/settings'
+  const rows = [
+    { organizationId: 'org-1', customerTenantId: 'tenant-1', dedupeKey: 'tenant:tenant-1:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: null as Date | null, title: 'Sign ins require attention', description: 'Review Microsoft permissions.', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: { reasonCode: 'MICROSOFT_PERMISSION_DENIED' }, occurrenceCount: 3 },
+    { organizationId: 'other-org', customerTenantId: 'tenant-1', dedupeKey: 'tenant:tenant-1:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: null as Date | null, title: 'Foreign incident', description: 'Foreign', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: {}, occurrenceCount: 1 },
+    { organizationId: 'org-1', customerTenantId: 'tenant-2', dedupeKey: 'tenant:tenant-2:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: new Date(), title: 'Resolved incident', description: 'Old', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: {}, occurrenceCount: 1 },
+    { organizationId: 'org-1', customerTenantId: 'tenant-3', dedupeKey: 'tenant:tenant-3:sync:SIGN_INS', eventType: 'tenant.sync_recovered', resolvedAt: null as Date | null, title: 'Recovery notice', description: 'Recovered', actionUrl: oldAction, actionLabel: 'View tenant', severity: 'info', metadata: {}, occurrenceCount: 1 },
+  ]
+  const service = new NotificationsService({
+    notification: {
+      updateMany: async ({ where, data }: any) => {
+        const matching = rows.filter(row => row.organizationId === where.organizationId && row.customerTenantId === where.customerTenantId && row.dedupeKey === where.dedupeKey && row.eventType === where.eventType && row.resolvedAt === where.resolvedAt)
+        matching.forEach(row => Object.assign(row, data))
+        return { count: matching.length }
+      },
+      upsert: async () => { throw new Error('Refreshing must not republish') },
+    },
+    notificationUserState: { deleteMany: async () => { throw new Error('Refreshing must retain user state') } },
+  } as any)
+  ;(service as any).logger = { error: () => undefined }
+
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-1', 'LIMITED'), true)
+  assert.equal(rows[0]?.title, 'Sign in coverage limited')
+  assert.match(rows[0]?.description ?? '', /full Microsoft Graph sign in coverage is not yet verified/i)
+  assert.equal(rows[0]?.actionUrl, '/tenants/tenant-1')
+  assert.equal(rows[0]?.actionLabel, 'View synchronization')
+  assert.equal(rows[0]?.severity, 'medium')
+  assert.deepEqual(rows[0]?.metadata, { resourceType: 'SIGN_INS', coverageState: 'LIMITED', consecutiveFailures: 0 })
+  assert.equal(rows[0]?.occurrenceCount, 3)
+  assert.equal(rows[0]?.resolvedAt, null)
+
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-1', 'INITIALIZING'), true)
+  assert.equal(rows[0]?.title, 'Sign in collection initializing')
+  assert.match(rows[0]?.description ?? '', /Microsoft is preparing the sign in source/i)
+  assert.deepEqual(rows[0]?.metadata, { resourceType: 'SIGN_INS', coverageState: 'INITIALIZING', consecutiveFailures: 0 })
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-2', 'LIMITED'), false)
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-3', 'LIMITED'), false)
+  assert.equal(rows[1]?.title, 'Foreign incident')
+  assert.equal(rows[2]?.title, 'Resolved incident')
+  assert.equal(rows[3]?.title, 'Recovery notice')
+})
+
 const preferenceOrg = '00000000-0000-4000-8000-000000000041'
 const preferenceOtherOrg = '00000000-0000-4000-8000-000000000042'
 const preferenceUser = '00000000-0000-4000-8000-000000000043'

@@ -321,7 +321,7 @@ const nonpremiumService = new TenantSyncService(nonpremiumPrisma, {} as any, { e
   locationLookups++; activeLocationLookups++; maximumLocationLookups = Math.max(maximumLocationLookups, activeLocationLookups)
   activeLocationLookups--
   return { kind: 'FOUND', location: { city: 'Synthetic', countryOrRegion: 'ZZ', geoCoordinates: { latitude: 1, longitude: 2 }, source: 'MAXMIND_GEOLITE2' } }
-} } as any, { resolveIncident: async () => undefined } as any, { pruneExpired: async () => undefined } as any, {} as any)
+} } as any, { resolveIncident: async () => undefined, refreshOpenSignInIncident: async () => false } as any, { pruneExpired: async () => undefined } as any, {} as any)
 ;(nonpremiumService as any).signInEntitlement = async () => 'NON_PREMIUM'
 ;(nonpremiumService as any).fetchGraphCollection = async () => { throw new Error('Authentication_RequestFromNonPremiumTenantOrB2CTenant') }
 ;(nonpremiumService as any).fetchLimitedLoginActivity = async () => Array.from({ length: nonpremiumCurrentRows }, (_, index) => ({ id: `current-${index}`, createdDateTime: '2026-09-03T10:00:00Z', ipAddress: `10.1.${Math.floor(index / 250)}.${index % 250 + 1}`, status: { errorCode: 0 } }))

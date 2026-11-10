@@ -2953,7 +2953,9 @@ export class TenantSyncService {
         }))
         // SIGN_INS initialization does not prove recovery from an earlier
         // collection failure. Keep that incident open until a full success.
-        if (resourceType !== 'SIGN_INS') {
+        if (resourceType === 'SIGN_INS') {
+          await this.notifications.refreshOpenSignInIncident(tenant.organizationId, tenant.id, 'INITIALIZING')
+        } else {
           await this.notifications.resolveIncident(
             tenant.organizationId,
             `tenant:${tenant.id}:sync:${resourceType}`,
@@ -2982,7 +2984,9 @@ export class TenantSyncService {
           },
         }))
         // Limited sign-in evidence does not restore the selected Graph source.
-        if (resourceType !== 'SIGN_INS') {
+        if (resourceType === 'SIGN_INS') {
+          await this.notifications.refreshOpenSignInIncident(tenant.organizationId, tenant.id, 'LIMITED')
+        } else {
           await this.notifications.resolveIncident(
             tenant.organizationId,
             `tenant:${tenant.id}:sync:${resourceType}`,
