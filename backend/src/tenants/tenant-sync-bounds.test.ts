@@ -1124,6 +1124,7 @@ test('actual full sync continues from a failed sign-in collector to audit withou
 function aggregateSyncFixture(options: {
   rejected?: string[]
   persistedFailures?: Array<{ resourceType: string; lastErrorCode?: string }>
+  persistedSignInReasonCode?: string
   initial?: boolean
 } = {}) {
   const tenant = {
@@ -1149,7 +1150,14 @@ function aggregateSyncFixture(options: {
         assert.equal(where.customerTenantId, tenant.id)
         if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
         assert.ok(where.lastAttemptAt.gte instanceof Date)
-        return (options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null }))
+        return [
+          ...(options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null })),
+          ...(options.persistedSignInReasonCode ? [{
+            resourceType: 'SIGN_INS', status: 'RUNNING',
+            lastErrorCode: options.persistedSignInReasonCode, lastErrorMessage: 'Incomplete source',
+            lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+          }] : []),
+        ]
       },
     },
     tenantConnection: { update: async () => ({}) },
@@ -1237,6 +1245,71 @@ test('initial sync notifications distinguish unclassified rejections from persis
       : known === 'HTTP_503' ? 'tenant.initial_sync_in_progress' : 'tenant.initial_sync_completed')
     assert.deepEqual(fixture.incidents[0].metadata.unclassifiedResources, [])
   })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('first limited sign-in fallback cannot publish initial-sync completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  const result = await fixture.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['SIGN_INS'])
+  assert.equal(fixture.incidents.length, 1)
+  const incident = fixture.incidents[0]
+  assert.equal(incident.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(incident.title, 'Initial tenant sync has limited coverage')
+  assert.doesNotMatch(incident.description, /will automatically retry|No action is required/)
+  assert.deepEqual(incident.metadata.limitedResources, ['SIGN_INS'])
+  assert.deepEqual(incident.metadata.retryingResources, [])
+  assert.deepEqual(incident.metadata.unclassifiedResources, [])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('initializing audit subscription cannot publish initial-sync completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true,
+    persistedSignInReasonCode: 'sign-ins-audit-subscription-initializing' })
+  const result = await fixture.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['SIGN_INS'])
+  assert.equal(fixture.incidents[0].eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.incidents[0].title, 'Initial tenant sync in progress')
+  assert.deepEqual(fixture.incidents[0].metadata.initializingResources, ['SIGN_INS'])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('incremental limited or initializing sign-in state remains partial', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const code of [
+    'sign-ins-non-premium-fallback-active',
+    'sign-ins-audit-subscription-initializing',
+  ]) await t.test(code, async () => {
+    const fixture = aggregateSyncFixture({ persistedSignInReasonCode: code })
+    const result = await fixture.run(true)
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, ['SIGN_INS'])
+    assert.equal(fixture.incidents.length, 0)
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a rejected sign-in collector cannot hide behind a retained limited code', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    rejected: ['SIGN_INS'],
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.incidents.length, 1)
+  const incident = fixture.incidents[0]
+  assert.equal(incident.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(incident.title, 'Initial tenant sync incomplete')
+  assert.deepEqual(incident.metadata.unclassifiedResources, ['SIGN_INS'])
+  assert.deepEqual(incident.metadata.retryingResources, [])
   assert.equal(network.mock.callCount(), 0)
 })
 

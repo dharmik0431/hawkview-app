@@ -1,3 +1,5 @@
+import { isRecognizedLimitedSignInCode } from './authentication-collection-outcome.js'
+
 export const INITIAL_SYNC_GRACE_MS = 30 * 60 * 1000
 
 export const INITIAL_SYNC_RESOURCE_TYPES = [
@@ -48,6 +50,15 @@ export function initialSyncStateRequiresAction(state: InitialSyncState) {
   return CUSTOMER_ACTION_ERROR.test(evidence)
 }
 
+export function initialSyncStateHasLimitedSignIns(state: Pick<InitialSyncState, 'resourceType' | 'lastErrorCode'>) {
+  return isRecognizedLimitedSignInCode(state.resourceType, state.lastErrorCode)
+}
+
+export function initialSyncStateHasInitializingSignIns(state: Pick<InitialSyncState, 'resourceType' | 'lastErrorCode'>) {
+  return state.resourceType === 'SIGN_INS' &&
+    state.lastErrorCode === 'sign-ins-audit-subscription-initializing'
+}
+
 function succeededAfter(state: InitialSyncState | undefined, startedAt: Date) {
   return Boolean(
     state?.lastSuccessfulAt &&
@@ -88,6 +99,13 @@ export function deriveInitialSyncStatus(input: {
 
   for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
     const state = states.get(resourceType)
+    // Limited audit-source freshness and an initializing subscription do not
+    // prove full Graph sign-in collection completed in this connection cycle.
+    if (state && (initialSyncStateHasLimitedSignIns(state) || initialSyncStateHasInitializingSignIns(state))) {
+      if (attemptedAfter(state, startedAt)) retryingResources.push(resourceType)
+      else pendingResources.push(resourceType)
+      continue
+    }
     if (succeededAfter(state, startedAt)) {
       completedResources.push(resourceType)
       continue

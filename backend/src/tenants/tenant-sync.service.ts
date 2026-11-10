@@ -77,6 +77,8 @@ import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreR
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
   deriveInitialSyncStatus,
+  initialSyncStateHasInitializingSignIns,
+  initialSyncStateHasLimitedSignIns,
   initialSyncStateRequiresAction,
 } from './initial-sync-status.js'
 import {
@@ -2361,12 +2363,15 @@ export class TenantSyncService {
           customerTenantId: tenant.id,
           lastAttemptAt: { gte: now },
         },
-        select: { resourceType: true, status: true },
+        select: { resourceType: true, status: true, lastErrorCode: true },
       })
       const persistedFailedResources = attemptedStates
         .filter((state) => state.status === 'FAILED')
         .map((state) => state.resourceType)
-      const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
+      const incompleteSignIns = attemptedStates
+        .filter((state) => initialSyncStateHasLimitedSignIns(state) || initialSyncStateHasInitializingSignIns(state))
+        .map((state) => state.resourceType)
+      const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...incompleteSignIns])].sort()
       return {
         bundle: includeBundle ? await this.buildBundle(tenant) : null,
         status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
@@ -2576,34 +2581,46 @@ export class TenantSyncService {
       (state) => state.status === 'FAILED',
     )
     const persistedFailedResources = new Set<string>(failedStates.map((state) => state.resourceType))
-    const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
-    const unclassifiedResources = failedResources.filter((resource) => !persistedFailedResources.has(resource))
+    const limitedResources = new Set<string>(attemptedStates
+      .filter(initialSyncStateHasLimitedSignIns)
+      .map((state) => state.resourceType))
+    const initializingResources = new Set<string>(attemptedStates
+      .filter(initialSyncStateHasInitializingSignIns)
+      .map((state) => state.resourceType))
+    const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...limitedResources, ...initializingResources])].sort()
+    const unclassifiedResources = failedResources.filter((resource) =>
+      !persistedFailedResources.has(resource) &&
+      (rejectedResources.has(resource) || (!limitedResources.has(resource) && !initializingResources.has(resource))))
     const actionRequiredResources = failedStates
       .filter(initialSyncStateRequiresAction)
       .map((state) => state.resourceType)
-    const retryingResources = failedStates
+    const retryingResources = [...new Set([...failedStates
       .filter((state) => !initialSyncStateRequiresAction(state))
-      .map((state) => state.resourceType)
+      .map((state) => state.resourceType),
+    ...[...initializingResources].filter((resource) => !rejectedResources.has(resource))])].sort()
     const initialSync = !existingState?.lastSuccessfulAt
     if (initialSync) {
       const unclassified = unclassifiedResources.length > 0
       const actionRequired = actionRequiredResources.length > 0
+      const limited = limitedResources.size > 0
       const retrying = !actionRequired && retryingResources.length > 0
       if (!capturedManaged) await this.notifications.publishIncident({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         eventType: actionRequired
           ? 'tenant.initial_sync_action_required'
-          : retrying || unclassified
+          : retrying || unclassified || limited
             ? 'tenant.initial_sync_in_progress'
             : 'tenant.initial_sync_completed',
-        category: unclassified || actionRequired ? 'warning' : retrying ? 'info' : 'success',
+        category: unclassified || actionRequired || limited ? 'warning' : retrying ? 'info' : 'success',
         severity: actionRequired ? 'medium' : 'info',
         title:
           unclassified
             ? 'Initial tenant sync incomplete'
             : actionRequired
               ? 'Initial tenant sync needs attention'
+              : limited
+                ? 'Initial tenant sync has limited coverage'
               : retrying
                 ? 'Initial tenant sync in progress'
                 : 'Initial tenant sync completed',
@@ -2612,6 +2629,8 @@ export class TenantSyncService {
             ? 'Some data sources did not finish collection. Review their sync status for available details.'
             : actionRequired
               ? `${actionRequiredResources.length} data source${actionRequiredResources.length === 1 ? '' : 's'} requires administrator action before collection can finish.`
+              : limited
+                ? 'Limited sign-in evidence is available, but full Microsoft Graph sign-in coverage is unconfirmed. Review the tenant sync status for the reason and next step.'
               : retrying
                 ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
                 : 'HawkView finished collecting the tenant data required for monitoring.',
@@ -2623,6 +2642,8 @@ export class TenantSyncService {
           failedResources,
           unclassifiedResources,
           retryingResources,
+          limitedResources: [...limitedResources].sort(),
+          initializingResources: [...initializingResources].sort(),
           actionRequiredResources,
         },
       })

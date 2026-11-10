@@ -148,6 +148,29 @@ test('reports completion only after every baseline collector succeeds in this cy
   assert.equal(result.completedResources.length, INITIAL_SYNC_RESOURCE_TYPES.length)
 })
 
+test('limited or initializing sign-ins cannot complete initial sync until full Graph recovery', () => {
+  const completed = INITIAL_SYNC_RESOURCE_TYPES.map((resourceType) => state(resourceType))
+  for (const code of [
+    'sign-ins-premium-graph-fallback-active',
+    'sign-ins-non-premium-fallback-active-geolocation-partial',
+    'sign-ins-audit-subscription-initializing',
+  ]) {
+    const incomplete = completed.map((item) => item.resourceType === 'SIGN_INS'
+      ? { ...item, status: 'RUNNING', lastErrorCode: code }
+      : item)
+    const result = deriveInitialSyncStatus({ startedAt, now, syncStates: incomplete })
+    assert.equal(result.status, 'IN_PROGRESS')
+    assert.deepEqual(result.retryingResources, ['SIGN_INS'])
+    assert.equal(result.completedResources.includes('SIGN_INS'), false)
+    assert.equal(deriveInitialSyncStatus({
+      startedAt,
+      now: new Date(startedAt.getTime() + INITIAL_SYNC_GRACE_MS + 1),
+      syncStates: incomplete,
+    }).status, 'DELAYED')
+  }
+  assert.equal(deriveInitialSyncStatus({ startedAt, now, syncStates: completed }).status, 'COMPLETE')
+})
+
 test('reports a long-running initial collection as delayed without fabricating errors', () => {
   const result = deriveInitialSyncStatus({
     startedAt,
