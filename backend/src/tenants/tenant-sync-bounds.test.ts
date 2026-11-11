@@ -1130,6 +1130,10 @@ function aggregateSyncFixture(options: {
   initial?: boolean
   completedInitialSyncResources?: boolean
   missingRequiredResource?: string
+  staleRequiredResource?: string
+  futureRequiredResource?: string
+  invertedRequiredResource?: string
+  replaceCurrentSignInProof?: boolean
 } = {}) {
   const tenant = {
     ...boundedTenant,
@@ -1146,7 +1150,11 @@ function aggregateSyncFixture(options: {
   const openIncidents = new Map<string, string>()
   const resolvedIncidents: string[] = []
   const stateWrites: string[] = []
+  let baselineReads = 0
+  const persistedBaselineAt = new Date(Date.now() - 60_000)
+  let currentSignInProof: { lastAttemptAt: Date; lastSuccessfulAt: Date } | null = null
   let usersLastSuccessfulAt = options.initial ? null : new Date()
+  let rejected = options.rejected ?? []
   let persistedFailures = options.persistedFailures ?? []
   let persistedSignInReasonCode = options.persistedSignInReasonCode
   let auditBacklogCode: string | undefined
@@ -1162,17 +1170,32 @@ function aggregateSyncFixture(options: {
         if (data.status === 'SUCCEEDED') usersLastSuccessfulAt = data.lastSuccessfulAt
         return {}
       },
-      findMany: async ({ where }: any) => {
+      findMany: async ({ where, select }: any) => {
         assert.equal(where.organizationId, tenant.organizationId)
         assert.equal(where.customerTenantId, tenant.id)
-        if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
-        assert.ok(where.lastAttemptAt.gte instanceof Date)
+        if (where.resourceType?.in && select?.consecutiveFailures) return [] // No hourly/retry work due.
+        const baselineRead = Boolean(where.resourceType?.in)
+        if (baselineRead) {
+          baselineReads += 1
+          assert.deepEqual([...where.resourceType.in].sort(), [...INITIAL_SYNC_RESOURCE_TYPES].sort())
+        } else assert.ok(where.lastAttemptAt.gte instanceof Date)
         const states = new Map<string, any>()
         if (options.completedInitialSyncResources !== false) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
           if (resourceType === options.missingRequiredResource) continue
+          const completedAt = resourceType === options.staleRequiredResource
+            ? new Date('2025-01-01T00:00:00.000Z')
+            : resourceType === options.futureRequiredResource
+              ? new Date(Date.now() + 60 * 60_000)
+              : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
+                ? currentSignInProof.lastSuccessfulAt
+              : baselineRead ? persistedBaselineAt : new Date()
           states.set(resourceType, {
             resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
-            lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+            lastSuccessfulAt: completedAt,
+            lastAttemptAt: baselineRead && resourceType === options.invertedRequiredResource
+              ? new Date(completedAt.getTime() + 1000)
+              : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
+                ? currentSignInProof.lastAttemptAt : completedAt,
           })
         }
         for (const state of persistedFailures) states.set(state.resourceType, {
@@ -1192,7 +1215,13 @@ function aggregateSyncFixture(options: {
             lastErrorCode: persistedSignInReasonCode, lastErrorMessage: 'Incomplete source',
             lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
           })
-        return [...states.values()]
+        if (!baselineRead && states.get('SIGN_INS')?.status === 'SUCCEEDED') {
+          const signIn = states.get('SIGN_INS')
+          currentSignInProof = { lastAttemptAt: signIn.lastAttemptAt, lastSuccessfulAt: signIn.lastSuccessfulAt }
+        }
+        return [...states.values()].filter((state) =>
+          (!where.resourceType?.in || where.resourceType.in.includes(state.resourceType)) &&
+          (!where.lastAttemptAt?.gte || state.lastAttemptAt >= where.lastAttemptAt.gte))
       },
     },
     tenantConnection: { update: async () => ({}) },
@@ -1217,7 +1246,7 @@ function aggregateSyncFixture(options: {
   }
   const collect = async (resource: string) => {
     calls.push(resource)
-    if (options.rejected?.includes(resource)) throw new Error('access_token=secret private@example.invalid')
+    if (rejected.includes(resource)) throw new Error('access_token=secret private@example.invalid')
   }
   for (const [method, resource] of Object.entries({
     syncLicenses: 'LICENSES', syncOrganizationConfiguration: 'ORGANIZATION_CONFIGURATION',
@@ -1234,8 +1263,10 @@ function aggregateSyncFixture(options: {
   ;(service as any).refreshCollectionFieldStates = async () => undefined
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
   return { calls, messages, incidents, stateWrites, resolvedIncidents,
+    baselineReadCount: () => baselineReads,
     isIncidentOpen: (key: string) => openIncidents.has(key),
     setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
+    setRejected: (resources: string[]) => { rejected = resources },
     setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
     setRunningResources: (resources: string[]) => { runningResources = resources },
     setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
@@ -1402,6 +1433,54 @@ test('initial sign-in warning closes only after a later complete source pass', a
   assert.equal(network.mock.callCount(), 0)
 })
 
+test('incremental Graph sign-in recovery closes an initial warning only with complete baseline evidence', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const key = 'tenant:tenant:initial-sync'
+  const complete = aggregateSyncFixture({
+    initial: true, completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  assert.equal((await complete.run()).status, 'PARTIAL')
+  assert.equal(complete.isIncidentOpen(key), true)
+  complete.setPersistedSignInReasonCode(undefined)
+  assert.equal((await complete.run(true)).status, 'SUCCEEDED')
+  assert.equal(complete.isIncidentOpen(key), false)
+  assert.deepEqual(complete.resolvedIncidents, [key])
+  assert.equal(complete.baselineReadCount(), 1)
+
+  for (const scenario of [
+    { name: 'missing audit row', missingRequiredResource: 'M365_AUDIT' },
+    { name: 'failed group', persistedFailures: [{ resourceType: 'GROUPS', lastErrorCode: 'HTTP_503' }] },
+    { name: 'running audit backlog', auditBacklog: 'm365-audit-backlog' },
+    { name: 'stale group success', staleRequiredResource: 'GROUPS' },
+    { name: 'future group success', futureRequiredResource: 'GROUPS' },
+    { name: 'future sign-in success', futureRequiredResource: 'SIGN_INS' },
+    { name: 'inverted group timestamps', invertedRequiredResource: 'GROUPS' },
+    { name: 'sign-in proof changed between reads', replaceCurrentSignInProof: true },
+    { name: 'rejected current sign-ins', rejectedSignIns: true },
+  ]) await t.test(scenario.name, async () => {
+    const fixture = aggregateSyncFixture({
+      initial: true, completedInitialSyncResources: true,
+      persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+      missingRequiredResource: scenario.missingRequiredResource,
+      staleRequiredResource: scenario.staleRequiredResource,
+      futureRequiredResource: scenario.futureRequiredResource,
+      invertedRequiredResource: scenario.invertedRequiredResource,
+      replaceCurrentSignInProof: scenario.replaceCurrentSignInProof,
+      persistedFailures: scenario.persistedFailures,
+    })
+    if (scenario.auditBacklog) fixture.setAuditBacklog(scenario.auditBacklog)
+    await fixture.run()
+    assert.equal(fixture.isIncidentOpen(key), true)
+    fixture.setPersistedSignInReasonCode(undefined)
+    if (scenario.rejectedSignIns) fixture.setRejected(['SIGN_INS'])
+    await fixture.run(true)
+    assert.equal(fixture.isIncidentOpen(key), true)
+    assert.deepEqual(fixture.resolvedIncidents, [])
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
 test('a completed initial-sync notice stays open after a later clean full pass', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
   const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
@@ -1412,6 +1491,9 @@ test('a completed initial-sync notice stays open after a later clean full pass',
   assert.equal(fixture.isIncidentOpen(key), true)
 
   assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
   assert.equal(fixture.isIncidentOpen(key), true)
   assert.deepEqual(fixture.resolvedIncidents, [])
   assert.equal(network.mock.callCount(), 0)

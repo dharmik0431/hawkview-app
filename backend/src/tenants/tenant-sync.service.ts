@@ -2364,7 +2364,7 @@ export class TenantSyncService {
           customerTenantId: tenant.id,
           lastAttemptAt: { gte: now },
         },
-        select: { resourceType: true, status: true, lastErrorCode: true },
+        select: { resourceType: true, status: true, lastErrorCode: true, lastAttemptAt: true, lastSuccessfulAt: true },
       })
       const persistedFailedResources = attemptedStates
         .filter((state) => state.status === 'FAILED')
@@ -2375,6 +2375,54 @@ export class TenantSyncService {
       const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...incompleteSignIns])].sort()
       const hasNonterminalAttempt = attemptedStates.some((state) =>
         state.status !== 'SUCCEEDED' && state.status !== 'FAILED')
+      const proofReadAt = new Date()
+      // A later incremental Graph pass can finish an earlier incomplete first
+      // pass. Close its warning only after this visit proves SIGN_INS success
+      // and the persisted baseline still proves every required source.
+      const currentGraphSignIn = attemptedStates.find((state) =>
+        state.resourceType === 'SIGN_INS' && state.status === 'SUCCEEDED' &&
+        !state.lastErrorCode && Boolean(state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() >= now.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime()))
+      if (!capturedManaged && failedResources.length === 0 && !hasNonterminalAttempt && currentGraphSignIn) {
+        const baselineStates = await this.prisma.syncState.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType: { in: [...INITIAL_SYNC_RESOURCE_TYPES] },
+          },
+          select: {
+            resourceType: true,
+            status: true,
+            lastAttemptAt: true,
+            lastSuccessfulAt: true,
+            lastErrorCode: true,
+            lastErrorMessage: true,
+          },
+        })
+        // Future or inverted timestamps cannot be evidence of a completed
+        // baseline, even if the status row says SUCCEEDED.
+        const baselineTimesValid = baselineStates.every((state) => Boolean(
+          state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime()))
+        const persistedGraphSignIn = baselineStates.find((state) => state.resourceType === 'SIGN_INS')
+        const sameGraphSignInProof = persistedGraphSignIn?.status === 'SUCCEEDED' &&
+          !persistedGraphSignIn.lastErrorCode &&
+          persistedGraphSignIn.lastAttemptAt?.getTime() === currentGraphSignIn.lastAttemptAt?.getTime() &&
+          persistedGraphSignIn.lastSuccessfulAt?.getTime() === currentGraphSignIn.lastSuccessfulAt?.getTime()
+        if (sameGraphSignInProof && baselineTimesValid && deriveInitialSyncStatus({
+          startedAt: tenant.connection.onboardingCompletedAt ?? tenant.connection.consentedAt,
+          syncStates: baselineStates,
+        }).status === 'COMPLETE') {
+          await this.notifications.resolveIncidentIfEventType(
+            tenant.organizationId,
+            `tenant:${tenant.id}:initial-sync`,
+            ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required'],
+          )
+        }
+      }
       return {
         bundle: includeBundle ? await this.buildBundle(tenant) : null,
         status: failedResources.length > 0 || hasNonterminalAttempt ? 'PARTIAL' : 'SUCCEEDED',
