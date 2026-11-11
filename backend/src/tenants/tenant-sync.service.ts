@@ -2659,9 +2659,17 @@ export class TenantSyncService {
     const startedAt = initialSyncEpochStart(tenant.connection)
     // A collector may return without persisting a state row. A full pass has
     // not proved coverage unless every required source completed this attempt.
+    // Future or inverted timestamps cannot prove either the aggregate result
+    // or the initial-sync notice, even if the persisted status says SUCCEEDED.
+    const proofReadAt = new Date()
     const requiredResourcesComplete = INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
       attemptedStates.some((state) =>
-        state.resourceType === resourceType && state.status === 'SUCCEEDED' && Boolean(state.lastSuccessfulAt)))
+        state.resourceType === resourceType && state.status === 'SUCCEEDED' && Boolean(
+          state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() >= now.getTime() &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime(),
+        )))
     const baselineComplete = failedResources.length === 0 &&
       requiredResourcesComplete &&
       deriveInitialSyncStatus({ startedAt, syncStates: attemptedStates }).status === 'COMPLETE'

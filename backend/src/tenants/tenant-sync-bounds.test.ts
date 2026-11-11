@@ -1132,6 +1132,7 @@ function aggregateSyncFixture(options: {
   missingRequiredResource?: string
   staleRequiredResource?: string
   futureRequiredResource?: string
+  futureSuccessOnlyResource?: string
   invertedRequiredResource?: string
   replaceCurrentSignInProof?: boolean
   reconsentedAt?: Date
@@ -1187,7 +1188,7 @@ function aggregateSyncFixture(options: {
           if (resourceType === options.missingRequiredResource) continue
           const completedAt = resourceType === options.staleRequiredResource
             ? new Date('2025-01-01T00:00:00.000Z')
-            : resourceType === options.futureRequiredResource
+            : resourceType === options.futureRequiredResource || resourceType === options.futureSuccessOnlyResource
               ? new Date(Date.now() + 60 * 60_000)
               : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
                 ? currentSignInProof.lastSuccessfulAt
@@ -1195,10 +1196,12 @@ function aggregateSyncFixture(options: {
           states.set(resourceType, {
             resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
             lastSuccessfulAt: completedAt,
-            lastAttemptAt: baselineRead && resourceType === options.invertedRequiredResource
-              ? new Date(completedAt.getTime() + 1000)
-              : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
-                ? currentSignInProof.lastAttemptAt : completedAt,
+            lastAttemptAt: resourceType === options.futureSuccessOnlyResource
+              ? new Date()
+              : resourceType === options.invertedRequiredResource
+                ? new Date(completedAt.getTime() + 1000)
+                : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
+                  ? currentSignInProof.lastAttemptAt : completedAt,
           })
         }
         for (const state of persistedFailures) states.set(state.resourceType, {
@@ -1314,6 +1317,22 @@ test('a full pass with a missing required baseline row cannot report aggregate s
     assert.deepEqual(result.failedResources, [])
     assert.equal(fixture.incidents[0]?.eventType, initial ? 'tenant.initial_sync_in_progress' : undefined)
     assert.equal(fixture.stateWrites.join(','), 'USERS:RUNNING,USERS:SUCCEEDED')
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a full pass cannot count future or inverted required success timestamps as completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const [name, option] of [
+    ['future attempt and success', { futureRequiredResource: 'GROUPS' }],
+    ['current attempt with future success', { futureSuccessOnlyResource: 'GROUPS' }],
+    ['inverted success', { invertedRequiredResource: 'GROUPS' }],
+  ] as const) for (const initial of [true, false]) await t.test(`${name}, ${initial ? 'initial' : 'later'} pass`, async () => {
+    const fixture = aggregateSyncFixture({ initial, completedInitialSyncResources: true, ...option })
+    const result = await fixture.run()
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, [])
+    if (initial) assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
   })
   assert.equal(network.mock.callCount(), 0)
 })
