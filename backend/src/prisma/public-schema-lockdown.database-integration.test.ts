@@ -134,3 +134,75 @@ test(
     }
   },
 )
+
+const searchPathMigrationUrl = new URL(
+  '../../prisma/migrations/20260910040000_pin_function_search_path/migration.sql',
+  import.meta.url,
+)
+
+test('the search_path migration pins every function it defines', async () => {
+  const file = await readFile(searchPathMigrationUrl, 'utf8')
+  const sql = file.replaceAll(/--.*/g, '')
+
+  const defined = [...sql.matchAll(/CREATE\s+OR\s+REPLACE\s+FUNCTION\s+([a-z_.]+)\(/gi)]
+  assert.equal(defined.length, 3, 'expected exactly the three guard functions')
+
+  const pinned = [...sql.matchAll(/SET\s+search_path\s*=\s*''/gi)]
+  assert.equal(
+    pinned.length,
+    defined.length,
+    'every redefined function must pin search_path',
+  )
+
+  // With search_path = '' nothing resolves implicitly, so any table the bodies
+  // touch has to be schema-qualified or the guard breaks at runtime.
+  assert.doesNotMatch(
+    sql,
+    /(FROM|UPDATE|INTO|DECLARE\s+\w+)\s+identity_risk_pseudonym_key_versions\b/i,
+    'unqualified table reference under an empty search_path',
+  )
+  assert.doesNotMatch(sql, /\bGRANT\b/i, 'the migration only revokes')
+})
+
+test(
+  'public functions pin search_path and are closed to PUBLIC',
+  { skip: !databaseIntegrationEnabled },
+  async () => {
+    const client = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    await client.connect()
+
+    try {
+      const unpinned = await client.query(`
+        SELECT p.proname
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND COALESCE(array_to_string(p.proconfig, ','), '') NOT LIKE '%search_path=%'
+        ORDER BY p.proname
+      `)
+      assert.deepEqual(
+        unpinned.rows.map((row) => row.proname),
+        [],
+        'a function with a role-mutable search_path can be redirected by its caller',
+      )
+
+      // A PUBLIC grant covers anon and authenticated no matter what was revoked
+      // from them by name, so this is what actually closes the function surface.
+      const publicExecute = await client.query(`
+        SELECT p.proname
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND EXISTS (SELECT 1 FROM unnest(p.proacl) a WHERE a::text LIKE '=%')
+        ORDER BY p.proname
+      `)
+      assert.deepEqual(
+        publicExecute.rows.map((row) => row.proname),
+        [],
+        'no function in public may grant EXECUTE to PUBLIC',
+      )
+    } finally {
+      await client.end()
+    }
+  },
+)
