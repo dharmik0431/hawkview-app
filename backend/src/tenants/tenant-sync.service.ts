@@ -2373,9 +2373,11 @@ export class TenantSyncService {
         .filter((state) => initialSyncStateHasLimitedSignIns(state) || initialSyncStateHasInitializingSignIns(state))
         .map((state) => state.resourceType)
       const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...incompleteSignIns])].sort()
+      const hasNonterminalAttempt = attemptedStates.some((state) =>
+        state.status !== 'SUCCEEDED' && state.status !== 'FAILED')
       return {
         bundle: includeBundle ? await this.buildBundle(tenant) : null,
-        status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+        status: failedResources.length > 0 || hasNonterminalAttempt ? 'PARTIAL' : 'SUCCEEDED',
         failedResources,
       }
     }
@@ -2589,6 +2591,11 @@ export class TenantSyncService {
       .filter(initialSyncStateHasInitializingSignIns)
       .map((state) => state.resourceType))
     const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...limitedResources, ...initializingResources])].sort()
+    // A collector can retain RUNNING to signal bounded backlog without
+    // rejecting or persisting FAILED. It did not complete this pass, so the
+    // aggregate run must not count as succeeded in scheduler results.
+    const hasNonterminalAttempt = attemptedStates.some((state) =>
+      state.status !== 'SUCCEEDED' && state.status !== 'FAILED')
     const unclassifiedResources = failedResources.filter((resource) =>
       !persistedFailedResources.has(resource) &&
       (rejectedResources.has(resource) || (!limitedResources.has(resource) && !initializingResources.has(resource))))
@@ -2676,7 +2683,7 @@ export class TenantSyncService {
     }
     return {
       bundle: includeBundle ? await this.buildBundle(tenant) : null,
-      status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+      status: failedResources.length > 0 || hasNonterminalAttempt ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
   }

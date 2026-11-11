@@ -1303,14 +1303,26 @@ test('first-pass audit backlog or budget cannot publish a completed initial-sync
     const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
     const key = 'tenant:tenant:initial-sync'
     fixture.setAuditBacklog(code)
-    await fixture.run()
+    const incomplete = await fixture.run()
+    assert.equal(incomplete.status, 'PARTIAL')
+    assert.deepEqual(incomplete.failedResources, [])
     assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
     assert.equal(fixture.isIncidentOpen(key), true)
     fixture.setAuditBacklog(undefined)
-    await fixture.run()
+    assert.equal((await fixture.run()).status, 'SUCCEEDED')
     assert.equal(fixture.isIncidentOpen(key), false)
     assert.deepEqual(fixture.resolvedIncidents, [key])
   })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('incremental audit backlog is not counted as a succeeded scheduler result', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ completedInitialSyncResources: true })
+  fixture.setAuditBacklog('m365-audit-backlog')
+  const result = await fixture.run(true)
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, [])
   assert.equal(network.mock.callCount(), 0)
 })
 
