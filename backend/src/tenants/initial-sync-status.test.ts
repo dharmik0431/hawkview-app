@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   deriveInitialSyncStatus,
+  initialSyncEpochStart,
   INITIAL_SYNC_GRACE_MS,
   INITIAL_SYNC_RESOURCE_TYPES,
   type InitialSyncState,
@@ -9,6 +10,24 @@ import {
 
 const startedAt = new Date('2026-08-26T17:00:00.000Z')
 const now = new Date('2026-08-26T17:05:00.000Z')
+
+test('a later consent starts a new baseline and an older in-flight attempt cannot complete it', () => {
+  const consentedAt = new Date('2026-08-26T17:02:00.000Z')
+  const epoch = initialSyncEpochStart({
+    onboardingCompletedAt: startedAt,
+    consentedAt,
+  })
+  assert.equal(epoch?.getTime(), consentedAt.getTime())
+  const rows = INITIAL_SYNC_RESOURCE_TYPES.map((resourceType) => state(resourceType, {
+    lastAttemptAt: new Date('2026-08-26T17:01:00.000Z'),
+    lastSuccessfulAt: new Date('2026-08-26T17:03:00.000Z'),
+  }))
+  assert.equal(deriveInitialSyncStatus({ startedAt: epoch, now, syncStates: rows }).status, 'IN_PROGRESS')
+  const currentRows = rows.map((row) => ({ ...row, lastAttemptAt: new Date('2026-08-26T17:03:00.000Z') }))
+  assert.equal(deriveInitialSyncStatus({ startedAt: epoch, now, syncStates: currentRows }).status, 'COMPLETE')
+  assert.equal(initialSyncEpochStart({ onboardingCompletedAt: startedAt })?.getTime(), startedAt.getTime())
+  assert.equal(initialSyncEpochStart(null), null)
+})
 
 function state(
   resourceType: string,

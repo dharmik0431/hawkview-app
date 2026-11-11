@@ -77,6 +77,7 @@ import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreR
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
   deriveInitialSyncStatus,
+  initialSyncEpochStart,
   INITIAL_SYNC_RESOURCE_TYPES,
   initialSyncStateHasInitializingSignIns,
   initialSyncStateHasLimitedSignIns,
@@ -2413,7 +2414,7 @@ export class TenantSyncService {
           persistedGraphSignIn.lastAttemptAt?.getTime() === currentGraphSignIn.lastAttemptAt?.getTime() &&
           persistedGraphSignIn.lastSuccessfulAt?.getTime() === currentGraphSignIn.lastSuccessfulAt?.getTime()
         if (sameGraphSignInProof && baselineTimesValid && deriveInitialSyncStatus({
-          startedAt: tenant.connection.onboardingCompletedAt ?? tenant.connection.consentedAt,
+          startedAt: initialSyncEpochStart(tenant.connection),
           syncStates: baselineStates,
         }).status === 'COMPLETE') {
           await this.notifications.resolveIncidentIfEventType(
@@ -2655,7 +2656,7 @@ export class TenantSyncService {
       .map((state) => state.resourceType),
     ...[...initializingResources].filter((resource) => !rejectedResources.has(resource))])].sort()
     const initialSync = !existingState?.lastSuccessfulAt
-    const startedAt = tenant.connection.onboardingCompletedAt ?? tenant.connection.consentedAt
+    const startedAt = initialSyncEpochStart(tenant.connection)
     // A collector may return without persisting a state row. A full pass has
     // not proved coverage unless every required source completed this attempt.
     const requiredResourcesComplete = INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
@@ -6742,10 +6743,7 @@ export class TenantSyncService {
         : null
     const syncFreshness = deriveTenantSyncFreshness(syncStates)
     const initialSync = deriveInitialSyncStatus({
-      startedAt:
-        tenant.connection?.onboardingCompletedAt ??
-        tenant.connection?.consentedAt ??
-        null,
+      startedAt: initialSyncEpochStart(tenant.connection),
       syncStates,
     })
 

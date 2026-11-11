@@ -27,6 +27,17 @@ export type InitialSyncState = {
   lastErrorMessage: string | null
 }
 
+export function initialSyncEpochStart(connection: {
+  onboardingCompletedAt?: Date | null
+  consentedAt?: Date | null
+} | null | undefined): Date | null {
+  const onboarding = connection?.onboardingCompletedAt ?? null
+  const consent = connection?.consentedAt ?? null
+  if (!onboarding) return consent
+  if (!consent) return onboarding
+  return consent.getTime() > onboarding.getTime() ? consent : onboarding
+}
+
 export type InitialSyncStatus = {
   status:
     | 'IN_PROGRESS'
@@ -68,8 +79,9 @@ export function initialSyncStateHasInitializingSignIns(state: Pick<InitialSyncSt
 
 function succeededAfter(state: InitialSyncState | undefined, startedAt: Date) {
   return Boolean(
-    state?.lastSuccessfulAt &&
-      state.lastSuccessfulAt.getTime() >= startedAt.getTime(),
+    state?.lastAttemptAt && state.lastSuccessfulAt &&
+      state.lastAttemptAt.getTime() >= startedAt.getTime() &&
+      state.lastSuccessfulAt.getTime() >= state.lastAttemptAt.getTime(),
   )
 }
 

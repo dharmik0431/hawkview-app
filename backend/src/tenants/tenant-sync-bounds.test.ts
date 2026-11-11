@@ -1134,6 +1134,8 @@ function aggregateSyncFixture(options: {
   futureRequiredResource?: string
   invertedRequiredResource?: string
   replaceCurrentSignInProof?: boolean
+  reconsentedAt?: Date
+  baselineSucceededAt?: Date
 } = {}) {
   const tenant = {
     ...boundedTenant,
@@ -1142,6 +1144,7 @@ function aggregateSyncFixture(options: {
       connectionMode: 'CUSTOMER_MANAGED',
       exchangeReadOnlyEnabledAt: null,
       onboardingCompletedAt: new Date('2026-01-01T00:00:00.000Z'),
+      consentedAt: options.reconsentedAt ?? null,
     },
   }
   const calls: string[] = []
@@ -1151,7 +1154,7 @@ function aggregateSyncFixture(options: {
   const resolvedIncidents: string[] = []
   const stateWrites: string[] = []
   let baselineReads = 0
-  const persistedBaselineAt = new Date(Date.now() - 60_000)
+  let persistedBaselineAt = options.baselineSucceededAt ?? new Date(Date.now() - 60_000)
   let currentSignInProof: { lastAttemptAt: Date; lastSuccessfulAt: Date } | null = null
   let usersLastSuccessfulAt = options.initial ? null : new Date()
   let rejected = options.rejected ?? []
@@ -1270,6 +1273,7 @@ function aggregateSyncFixture(options: {
     setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
     setRunningResources: (resources: string[]) => { runningResources = resources },
     setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
+    setPersistedBaselineAt: (value: Date) => { persistedBaselineAt = value },
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
@@ -1478,6 +1482,32 @@ test('incremental Graph sign-in recovery closes an initial warning only with com
     assert.equal(fixture.isIncidentOpen(key), true)
     assert.deepEqual(fixture.resolvedIncidents, [])
   })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('reconsent keeps the initial warning open until every baseline source succeeds in the new consent cycle', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const reconsentedAt = new Date(Date.now() - 30_000)
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+    reconsentedAt,
+    baselineSucceededAt: new Date(reconsentedAt.getTime() - 60_000),
+  })
+  const key = 'tenant:tenant:initial-sync'
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedSignInReasonCode(undefined)
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
+
+  fixture.setPersistedBaselineAt(new Date())
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), false)
+  assert.deepEqual(fixture.resolvedIncidents, [key])
   assert.equal(network.mock.callCount(), 0)
 })
 
