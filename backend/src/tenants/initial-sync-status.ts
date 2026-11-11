@@ -46,6 +46,11 @@ export type InitialSyncStatus = {
 const CUSTOMER_ACTION_ERROR =
   /(?:^|_)(?:401|403)(?:$|_)|permission|required|consent|unauthori[sz]ed|forbidden|authentication|credential|reconnect|revoked/i
 
+const EXPECTED_NON_PREMIUM_SIGN_IN_CODES = new Set([
+  'sign-ins-non-premium-fallback-active',
+  'sign-ins-non-premium-fallback-active-geolocation-partial',
+])
+
 export function initialSyncStateRequiresAction(state: InitialSyncState) {
   if (state.status !== 'FAILED') return false
   const evidence = `${state.lastErrorCode ?? ''} ${state.lastErrorMessage ?? ''}`
@@ -103,6 +108,16 @@ export function deriveInitialSyncStatus(input: {
 
   for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
     const state = states.get(resourceType)
+    // A newer failed attempt is the current outcome even when an earlier
+    // collection in this connection cycle left a successful timestamp.
+    if (state?.status === 'FAILED' && attemptedAfter(state, startedAt)) {
+      if (initialSyncStateRequiresAction(state)) {
+        actionRequiredResources.push(resourceType)
+      } else {
+        retryingResources.push(resourceType)
+      }
+      continue
+    }
     // A successfully persisted fallback is limited coverage, not a transient
     // collection failure or proof of full Graph sign-in coverage.
     if (state && initialSyncStateHasLimitedSignIns(state)) {
@@ -116,6 +131,11 @@ export function deriveInitialSyncStatus(input: {
         state.lastSuccessfulAt.getTime() >= state.lastAttemptAt.getTime()
       ) {
         limitedResources.push(resourceType)
+        // Non-premium coverage is an expected limit. Premium Graph rejection
+        // and unknown entitlement still require full-source retry.
+        if (!EXPECTED_NON_PREMIUM_SIGN_IN_CODES.has(state.lastErrorCode ?? '')) {
+          retryingResources.push(resourceType)
+        }
       } else {
         retryingResources.push(resourceType)
       }
@@ -129,14 +149,6 @@ export function deriveInitialSyncStatus(input: {
     }
     if (succeededAfter(state, startedAt)) {
       completedResources.push(resourceType)
-      continue
-    }
-    if (state?.status === 'FAILED' && attemptedAfter(state, startedAt)) {
-      if (initialSyncStateRequiresAction(state)) {
-        actionRequiredResources.push(resourceType)
-      } else {
-        retryingResources.push(resourceType)
-      }
       continue
     }
     pendingResources.push(resourceType)
