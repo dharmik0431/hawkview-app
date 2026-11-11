@@ -148,6 +148,21 @@ test('reports completion only after every baseline collector succeeds in this cy
   assert.equal(result.completedResources.length, INITIAL_SYNC_RESOURCE_TYPES.length)
 })
 
+test('a running audit backlog cannot inherit completion from an earlier successful attempt', () => {
+  const states = INITIAL_SYNC_RESOURCE_TYPES.map((resourceType) =>
+    resourceType === 'M365_AUDIT'
+      ? state(resourceType, {
+          status: 'RUNNING',
+          lastAttemptAt: new Date('2026-08-26T17:03:00.000Z'),
+          lastErrorCode: 'm365-audit-backlog',
+        })
+      : state(resourceType))
+  const result = deriveInitialSyncStatus({ startedAt, now, syncStates: states })
+  assert.equal(result.status, 'IN_PROGRESS')
+  assert.deepEqual(result.retryingResources, ['M365_AUDIT'])
+  assert.equal(result.completedResources.includes('M365_AUDIT'), false)
+})
+
 test('a later failed attempt overrides earlier success in this connection cycle', () => {
   const completed = INITIAL_SYNC_RESOURCE_TYPES.map((resourceType) => state(resourceType))
   for (const [errorCode, expectedStatus] of [

@@ -2600,20 +2600,26 @@ export class TenantSyncService {
       .map((state) => state.resourceType),
     ...[...initializingResources].filter((resource) => !rejectedResources.has(resource))])].sort()
     const initialSync = !existingState?.lastSuccessfulAt
+    const startedAt = tenant.connection.onboardingCompletedAt ?? tenant.connection.consentedAt
+    const baselineComplete = failedResources.length === 0 &&
+      INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
+        attemptedStates.some((state) => state.resourceType === resourceType && state.status === 'SUCCEEDED')) &&
+      deriveInitialSyncStatus({ startedAt, syncStates: attemptedStates }).status === 'COMPLETE'
     if (initialSync) {
       const unclassified = unclassifiedResources.length > 0
       const actionRequired = actionRequiredResources.length > 0
       const limited = limitedResources.size > 0
       const retrying = !actionRequired && retryingResources.length > 0
+      const unproven = !baselineComplete && failedResources.length === 0
       if (!capturedManaged) await this.notifications.publishIncident({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         eventType: actionRequired
           ? 'tenant.initial_sync_action_required'
-          : retrying || unclassified || limited
+          : retrying || unclassified || limited || unproven
             ? 'tenant.initial_sync_in_progress'
             : 'tenant.initial_sync_completed',
-        category: unclassified || actionRequired || limited ? 'warning' : retrying ? 'info' : 'success',
+        category: unclassified || actionRequired || limited ? 'warning' : retrying || unproven ? 'info' : 'success',
         severity: actionRequired ? 'medium' : 'info',
         title:
           unclassified
@@ -2624,6 +2630,8 @@ export class TenantSyncService {
                 ? 'Initial tenant sync has limited coverage'
               : retrying
                 ? 'Initial tenant sync in progress'
+                : unproven
+                  ? 'Initial tenant sync in progress'
                 : 'Initial tenant sync completed',
         description:
           unclassified
@@ -2634,6 +2642,8 @@ export class TenantSyncService {
                 ? 'Limited sign-in evidence is available, but full Microsoft Graph sign-in coverage is unconfirmed. Review the tenant sync status for the reason and next step.'
               : retrying
                 ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
+                : unproven
+                  ? 'Required data sources have not all confirmed completion. Review the tenant sync status for current progress.'
                 : 'HawkView finished collecting the tenant data required for monitoring.',
         dedupeKey: `tenant:${tenant.id}:initial-sync`,
         source: 'tenant-sync',
@@ -2656,16 +2666,7 @@ export class TenantSyncService {
       !capturedManaged &&
       !initialSync &&
       !incrementalOnly &&
-      failedResources.length === 0 &&
-      INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
-        attemptedStates.some((state) =>
-          state.resourceType === resourceType && state.status === 'SUCCEEDED')) &&
-      deriveInitialSyncStatus({
-        startedAt:
-          tenant.connection.onboardingCompletedAt ??
-          tenant.connection.consentedAt,
-        syncStates: attemptedStates,
-      }).status === 'COMPLETE'
+      baselineComplete
     ) {
       await this.notifications.resolveIncidentIfEventType(
         tenant.organizationId,

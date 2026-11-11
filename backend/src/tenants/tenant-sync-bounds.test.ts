@@ -1147,6 +1147,7 @@ function aggregateSyncFixture(options: {
   let usersLastSuccessfulAt = options.initial ? null : new Date()
   let persistedFailures = options.persistedFailures ?? []
   let persistedSignInReasonCode = options.persistedSignInReasonCode
+  let auditBacklogCode: string | undefined
   let runningResources: string[] = []
   const prisma = utcTestDatabase({
     syncState: {
@@ -1178,6 +1179,10 @@ function aggregateSyncFixture(options: {
         for (const resourceType of runningResources) states.set(resourceType, {
           resourceType, status: 'RUNNING', lastErrorCode: null, lastErrorMessage: null,
           lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+        })
+        if (auditBacklogCode) states.set('M365_AUDIT', {
+          resourceType: 'M365_AUDIT', status: 'RUNNING', lastErrorCode: auditBacklogCode,
+          lastErrorMessage: 'Synthetic audit backlog', lastSuccessfulAt: null, lastAttemptAt: new Date(),
         })
         if (persistedSignInReasonCode) states.set('SIGN_INS', {
             resourceType: 'SIGN_INS', status: 'RUNNING',
@@ -1230,6 +1235,7 @@ function aggregateSyncFixture(options: {
     setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
     setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
     setRunningResources: (resources: string[]) => { runningResources = resources },
+    setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
@@ -1280,6 +1286,7 @@ test('initial sync notifications distinguish unclassified rejections from persis
   })
   for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`persisted-only disposition ${known ?? 'clean success'}`, async () => {
     const fixture = aggregateSyncFixture({ initial: true,
+      completedInitialSyncResources: !known,
       persistedFailures: known ? [{ resourceType: 'GROUPS', lastErrorCode: known }] : [] })
     await fixture.run()
     assert.equal(fixture.incidents.length, 1)
@@ -1287,6 +1294,33 @@ test('initial sync notifications distinguish unclassified rejections from persis
       : known === 'HTTP_503' ? 'tenant.initial_sync_in_progress' : 'tenant.initial_sync_completed')
     assert.deepEqual(fixture.incidents[0].metadata.unclassifiedResources, [])
   })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('first-pass audit backlog or budget cannot publish a completed initial-sync notice', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const code of ['m365-audit-backlog', 'm365-audit-budget-exhausted']) await t.test(code, async () => {
+    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+    const key = 'tenant:tenant:initial-sync'
+    fixture.setAuditBacklog(code)
+    await fixture.run()
+    assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+    assert.equal(fixture.isIncidentOpen(key), true)
+    fixture.setAuditBacklog(undefined)
+    await fixture.run()
+    assert.equal(fixture.isIncidentOpen(key), false)
+    assert.deepEqual(fixture.resolvedIncidents, [key])
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a first pass without persisted baseline evidence stays in progress', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true })
+  await fixture.run()
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.incidents[0]?.category, 'info')
+  assert.equal(fixture.isIncidentOpen('tenant:tenant:initial-sync'), true)
   assert.equal(network.mock.callCount(), 0)
 })
 

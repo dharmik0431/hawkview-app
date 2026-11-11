@@ -147,7 +147,13 @@ export function deriveInitialSyncStatus(input: {
       else pendingResources.push(resourceType)
       continue
     }
-    if (succeededAfter(state, startedAt)) {
+    // A retained success time does not complete a source whose newer attempt
+    // is still working (for example a bounded M365 audit backlog).
+    if (state?.status === 'RUNNING' && attemptedAfter(state, startedAt)) {
+      retryingResources.push(resourceType)
+      continue
+    }
+    if (state?.status === 'SUCCEEDED' && succeededAfter(state, startedAt)) {
       completedResources.push(resourceType)
       continue
     }
