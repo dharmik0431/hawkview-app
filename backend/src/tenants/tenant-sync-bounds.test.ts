@@ -1042,7 +1042,8 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
     safeStartedDuringSignIn = signInActive
   }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
-  assert.equal(result.status, 'SUCCEEDED')
+  // This scheduling harness does not persist required resource states.
+  assert.equal(result.status, 'PARTIAL')
   assert.equal(safeStartedDuringSignIn, false)
   assert.equal(maximumGeneric, 1)
   assert.deepEqual(persistedResources, [
@@ -1128,6 +1129,7 @@ function aggregateSyncFixture(options: {
   persistedSignInReasonCode?: string
   initial?: boolean
   completedInitialSyncResources?: boolean
+  missingRequiredResource?: string
 } = {}) {
   const tenant = {
     ...boundedTenant,
@@ -1166,7 +1168,8 @@ function aggregateSyncFixture(options: {
         if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
         assert.ok(where.lastAttemptAt.gte instanceof Date)
         const states = new Map<string, any>()
-        if (options.completedInitialSyncResources) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
+        if (options.completedInitialSyncResources !== false) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
+          if (resourceType === options.missingRequiredResource) continue
           states.set(resourceType, {
             resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
             lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
@@ -1267,6 +1270,19 @@ test('actual sync aggregates rejected collectors with current persisted failures
   assert.equal(network.mock.callCount(), 0)
 })
 
+test('a full pass with a missing required baseline row cannot report aggregate success', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const initial of [true, false]) await t.test(initial ? 'initial pass' : 'later full pass', async () => {
+    const fixture = aggregateSyncFixture({ initial, missingRequiredResource: 'SIGN_INS' })
+    const result = await fixture.run()
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, [])
+    assert.equal(fixture.incidents[0]?.eventType, initial ? 'tenant.initial_sync_in_progress' : undefined)
+    assert.equal(fixture.stateWrites.join(','), 'USERS:RUNNING,USERS:SUCCEEDED')
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
 test('initial sync notifications distinguish unclassified rejections from persisted dispositions', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
   for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`unclassified rejection with ${known ?? 'no persisted failure'}`, async () => {
@@ -1328,7 +1344,7 @@ test('incremental audit backlog is not counted as a succeeded scheduler result',
 
 test('a first pass without persisted baseline evidence stays in progress', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
-  const fixture = aggregateSyncFixture({ initial: true })
+  const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: false })
   await fixture.run()
   assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
   assert.equal(fixture.incidents[0]?.category, 'info')

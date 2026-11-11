@@ -2608,9 +2608,13 @@ export class TenantSyncService {
     ...[...initializingResources].filter((resource) => !rejectedResources.has(resource))])].sort()
     const initialSync = !existingState?.lastSuccessfulAt
     const startedAt = tenant.connection.onboardingCompletedAt ?? tenant.connection.consentedAt
+    // A collector may return without persisting a state row. A full pass has
+    // not proved coverage unless every required source completed this attempt.
+    const requiredResourcesComplete = INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
+      attemptedStates.some((state) =>
+        state.resourceType === resourceType && state.status === 'SUCCEEDED' && Boolean(state.lastSuccessfulAt)))
     const baselineComplete = failedResources.length === 0 &&
-      INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
-        attemptedStates.some((state) => state.resourceType === resourceType && state.status === 'SUCCEEDED')) &&
+      requiredResourcesComplete &&
       deriveInitialSyncStatus({ startedAt, syncStates: attemptedStates }).status === 'COMPLETE'
     if (initialSync) {
       const unclassified = unclassifiedResources.length > 0
@@ -2683,7 +2687,7 @@ export class TenantSyncService {
     }
     return {
       bundle: includeBundle ? await this.buildBundle(tenant) : null,
-      status: failedResources.length > 0 || hasNonterminalAttempt ? 'PARTIAL' : 'SUCCEEDED',
+      status: failedResources.length > 0 || hasNonterminalAttempt || !requiredResourcesComplete ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
   }
