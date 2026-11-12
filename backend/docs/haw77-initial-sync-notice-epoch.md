@@ -36,8 +36,9 @@ snapshot loaded before consent changed. No notice fix is active in this branch.
    from the current connection. This includes customer-managed reconsent and
    onboarding completion: `initialSyncEpochStart` uses the later of those two
    timestamps. Otherwise the completed notice remains visible after the
-   advance. The generic upsert does not update `eventType` on an existing
-   dedupe row, so republishing an in-progress title alone is insufficient.
+   advance. The generic upsert now updates `eventType` on an existing dedupe
+   row, but it neither binds that row to an epoch nor makes the consent advance
+   and notice replacement one atomic operation.
 5. A stale epoch or owner is a superseded result, not a successful notice
    publication or clearance. The aggregate status must not claim the old
    epoch's coverage as current. Existing coverage proof reads also need a
@@ -51,6 +52,33 @@ snapshot loaded before consent changed. No notice fix is active in this branch.
    current-epoch in-progress notice or prove that the derived readiness and
    reader path truthfully show the new incomplete epoch without one. Do not
    assume the next full visit will repair it automatically.
+
+## Reader and history contract
+
+The current notification list returns resolved rows and still sends their
+original title with `resolved: true`. Marking an old
+`tenant.initial_sync_completed` row resolved during reconsent therefore does
+not remove its old success title from the API. This is a separate gap from the
+old visit publishing after reconsent. A scoped consent-side replacement of the
+deduped initial-sync row with a current-epoch in-progress state is one possible
+repair; an epoch-aware reader is another. Either repair must make the **current
+tenant state** unambiguous without hiding unrelated resolved history. A blanket
+`resolvedAt: null` list filter would silently change all notification history
+and is not an acceptable shortcut.
+
+If the reader filters or labels a stale initial-sync notice, it must compare a
+persisted notice epoch with the current tenant connection's epoch from one
+coherent database view. An exclusion must use the same current-epoch predicate
+for items, `total`, `unreadCount`, and pagination; `unreadCount()` delegates to
+this list. The current list's batched transaction alone does not establish a
+shared snapshot for a future multi-query epoch comparison. If history remains
+visible with an explicit stale label, the counts must agree with that visible
+set and the row must not claim current completion.
+Legacy notices with no epoch must not be treated as current completions after
+an epoch advance. A consent-side replacement must also reset recipient read
+state in the same transaction so the new incomplete state is visible to every
+eligible recipient. These rules apply to every epoch writer, including
+customer-managed reconsent, onboarding, and Exchange consent.
 
 ## Lock order and falsifiers
 
@@ -71,8 +99,13 @@ ordinary persistence failure propagation, both dedupe-row event-type
 transitions, unchanged-epoch positive cases,
 and all three full/incremental notice paths. Verify the actual reader cannot
 show a completed old-epoch notice after reconsent or onboarding completion,
-and that a new incomplete epoch has a truthful visible state. No local or live physical
-database is permitted for this proof.
+and that a new incomplete epoch has a truthful visible state. For the reader,
+also verify unrelated resolved history remains available; initial-sync item,
+total, unread count and page boundaries agree after either commit order; and
+a same-millisecond or legacy-null epoch cannot resurrect the old completion.
+Mocked reader rows cannot establish query filtering or count/pagination truth:
+these cases require the registered disposable-PostgreSQL path. No local or live
+physical database is permitted for this proof.
 
 This is a design checkpoint only. The held synthetic witness remains red,
 there is no registered physical result on this exact head, and HAW-77 is not
