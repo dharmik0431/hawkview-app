@@ -1158,6 +1158,16 @@ function aggregateSyncFixture(options: {
   let persistedBaselineAt = options.baselineSucceededAt ?? new Date(Date.now() - 60_000)
   let currentSignInProof: { lastAttemptAt: Date; lastSuccessfulAt: Date } | null = null
   let usersLastSuccessfulAt = options.initial ? null : new Date()
+  let persistedConsentAt = tenant.connection.consentedAt
+  let advanceConsentOnNextNotice = false
+  const advanceConsentAtNoticeBoundary = () => {
+    if (advanceConsentOnNextNotice) {
+      // The database changes after the loaded connection was used for the
+      // coverage decision, immediately before the separate notice write.
+      persistedConsentAt = new Date()
+      advanceConsentOnNextNotice = false
+    }
+  }
   let rejected = options.rejected ?? []
   let persistedFailures = options.persistedFailures ?? []
   let persistedSignInReasonCode = options.persistedSignInReasonCode
@@ -1230,16 +1240,24 @@ function aggregateSyncFixture(options: {
           (!where.lastAttemptAt?.gte || state.lastAttemptAt >= where.lastAttemptAt.gte))
       },
     },
-    tenantConnection: { update: async () => ({}) },
+    tenantConnection: {
+      update: async () => ({}),
+      findUnique: async () => ({
+        consentedAt: persistedConsentAt,
+        onboardingCompletedAt: tenant.connection.onboardingCompletedAt,
+      }),
+    },
   })
   const service = new TenantSyncService(prisma as any,
     { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
     {
       publishIncident: async (incident: any) => {
+        advanceConsentAtNoticeBoundary()
         incidents.push(incident)
         if (!openIncidents.has(incident.dedupeKey)) openIncidents.set(incident.dedupeKey, incident.eventType)
       },
       resolveIncidentIfEventType: async (_organizationId: string, dedupeKey: string, eventTypes: string[]) => {
+        advanceConsentAtNoticeBoundary()
         if (eventTypes.includes(openIncidents.get(dedupeKey) ?? '')) {
           resolvedIncidents.push(dedupeKey)
           openIncidents.delete(dedupeKey)
@@ -1277,9 +1295,45 @@ function aggregateSyncFixture(options: {
     setRunningResources: (resources: string[]) => { runningResources = resources },
     setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
     setPersistedBaselineAt: (value: Date) => { persistedBaselineAt = value },
+    advanceConsentBeforeNextNotice: () => { advanceConsentOnNextNotice = true },
+    persistedConsentAt: () => persistedConsentAt,
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
+
+test('a reconsent at the notice-write boundary cannot publish or clear an old-epoch initial result', {
+  skip: process.env.HAWKVIEW_HAW77_RECONSENT_NOTICE_RACE_WITNESS === '1'
+    ? false : 'held pending an atomic connection-epoch and notice write',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+
+  await t.test('initial completion notice', async () => {
+    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+    fixture.advanceConsentBeforeNextNotice()
+    await fixture.run()
+    assert.ok(fixture.persistedConsentAt() instanceof Date)
+    assert.notEqual(fixture.incidents[0]?.eventType, 'tenant.initial_sync_completed')
+  })
+
+  for (const incremental of [false, true]) await t.test(
+    `${incremental ? 'incremental' : 'full'} warning clearance`, async () => {
+      const fixture = aggregateSyncFixture({
+        initial: true, completedInitialSyncResources: true,
+        persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+      })
+      const key = 'tenant:tenant:initial-sync'
+      await fixture.run()
+      assert.equal(fixture.isIncidentOpen(key), true)
+      fixture.setPersistedSignInReasonCode(undefined)
+      fixture.advanceConsentBeforeNextNotice()
+      await fixture.run(incremental)
+      assert.ok(fixture.persistedConsentAt() instanceof Date)
+      assert.equal(fixture.isIncidentOpen(key), true)
+      assert.deepEqual(fixture.resolvedIncidents, [])
+    },
+  )
+  assert.equal(network.mock.callCount(), 0)
+})
 
 test('actual sync aggregates rejected collectors with current persisted failures', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
