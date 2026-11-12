@@ -53,6 +53,59 @@ snapshot loaded before consent changed. No notice fix is active in this branch.
    reader path truthfully show the new incomplete epoch without one. Do not
    assume the next full visit will repair it automatically.
 
+## Source audit: choose a separate, non-reusable initial-sync epoch
+
+The notice/coverage epoch should be a dedicated UUID on the tenant connection,
+not `collectionIncarnation`. The latter is nullable for legacy connections and
+is already an authority fence for managed consent, connection verification and
+directory-role receipts. Those paths can rotate it without a new initial-sync
+consent epoch; a repeated managed Exchange grant advances `consentedAt` without
+rotating it. Customer-managed reconsent and onboarding can also advance
+`initialSyncEpochStart` without rotating it. Reusing it would either miss a
+real restart or invalidate unrelated collection receipts. The dedicated value
+is still only a **candidate field**: no migration or runtime guard exists yet.
+
+The current source has these writes that can advance or affect the epoch. Each needs an atomic
+decision about UUID rotation and old-notice invalidation under the existing
+authority lock order, not a later cleanup call:
+
+| Current writer | Existing boundary | Required proof before activation |
+| --- | --- | --- |
+| New customer-managed connection and suspended-tenant reconsent (`tenants.service.ts`, `createForIdentity`) | Creates or advances `consentedAt`; reconsent now replaces an owned old completion inside its transaction | Seed or rotate the dedicated UUID in the same write; reject stale publisher after reconsent, including an absent notice |
+| Customer-managed Exchange grant (`tenants.service.ts`, Exchange callback) | Advances `consentedAt` in a standalone connection update | Determine whether this is an initial-sync restart; if it is, rotate and invalidate atomically; otherwise stop treating this timestamp as an initial-sync boundary |
+| Onboarding completion (`tenants.service.ts`, `completeTenantOnboardingForIdentity`) | Sets `onboardingCompletedAt` only when its conditional update wins; it affects the current timestamp boundary when later than consent | Rotate and invalidate only when it creates a new initial-sync boundary; preserve audit rollback and prove completion-before/after-notice ordering |
+| Managed consent terminalization (`microsoft/consent-operation-store.ts`, `finishConsentOperation`) | Rotates `collectionIncarnation`; on success advances `consentedAt` under managed authority | Rotate the separate epoch on the successful consent transition and invalidate old completion in that transaction; a failed/replayed terminal result must not invent a new epoch |
+| Managed verification or Exchange refresh (`tenants/connection-verification-store.ts`) | Verified consent can advance `consentedAt`; Exchange refresh advances it on every grant, but rotates `collectionIncarnation` only if the permission was absent | Distinguish consent from routine verification and repeat grants; rotate/invalidate exactly for a real initial-sync restart, without reusing a routine collection-incarnation change |
+
+Managed consent issuance can also move a connection to `PENDING_CONSENT`
+without advancing either timestamp. The current-state reader must not present
+an old completion as current while consent is pending or the connection is in
+error, even before a new successful grant establishes the next epoch.
+
+`TenantSyncTarget` and both tenant loaders currently carry the two timestamps
+but no non-reusable epoch. Capture the dedicated value before provider work and
+compare it while holding tenant then connection locks in every notice writer.
+The three current mutation sites are the initial publish, full-pass warning
+clear, and incremental warning clear. An epoch mismatch must supersede the
+old result even when no notification row existed at capture time.
+
+This UUID alone does not prove *coverage*. `SyncState` stores attempt and
+success times but no initial-sync epoch; `deriveInitialSyncStatus` accepts a
+success whose attempt equals the epoch-start millisecond. Thus a prior success
+can satisfy a same-millisecond reconsent unless each required resource's
+durable success is bound to the captured epoch (or an equivalent fenced
+receipt). The HAW-21 visit-owner work is separate; use its receipt only after
+its exact authority and recovery semantics are proven. Until then, a guarded
+notice row must not be promoted to “completed” from timestamp-only evidence.
+
+For legacy NULL epochs, refuse a current completion claim. An upgrade must
+establish a new epoch and incomplete state under the tenant/connection lock,
+then collect new bound resource proofs. Do not backfill a UUID onto an old
+completed row and silently treat historical successes as current. A nullable
+additive migration, writer rotations, visit capture, proof binding, guarded
+notice writes and reader truth should be reviewed as one inactive package;
+no schema-only step authorizes activation.
+
 ## Reader and history contract
 
 The current notification list returns resolved rows and still sends their
