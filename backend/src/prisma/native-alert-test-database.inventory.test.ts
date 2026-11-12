@@ -43,6 +43,7 @@ const expected = [
   "secrets/secret-store.database-integration.test.ts",
   "security-requirements/baseline-coverage-scale.database-integration.test.ts",
   "tenants/customer-connection-verification.database-integration.test.ts",
+  "tenants/customer-reconsent-initial-notice.database-integration.test.ts",
   "tenants/directory-role-receipt-store.database-integration.test.ts",
   "tenants/existing-tenant-consent.database-integration.test.ts",
   "tenants/scheduled-sync-cursor.database-integration.test.ts",
