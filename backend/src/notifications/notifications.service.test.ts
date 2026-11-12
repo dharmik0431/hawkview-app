@@ -78,6 +78,49 @@ test('typed incident resolution only closes an unresolved matching warning', asy
   assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), false)
 })
 
+test('republished initial-sync notice changes event type with its deduped status', async () => {
+  const key = 'tenant:tenant-1:initial-sync'
+  const row = {
+    id: 'notice-1', organizationId: 'org-1', dedupeKey: key,
+    eventType: 'tenant.initial_sync_in_progress', resolvedAt: null as Date | null,
+    occurrenceCount: 1,
+  }
+  const service = new NotificationsService({
+    notification: {
+      upsert: async ({ where, update }: any) => {
+        assert.deepEqual(where.organizationId_dedupeKey, { organizationId: 'org-1', dedupeKey: key })
+        Object.assign(row, update, { occurrenceCount: row.occurrenceCount + 1 })
+        return row
+      },
+      updateMany: async ({ where, data }: any) => {
+        assert.equal(where.organizationId, row.organizationId)
+        assert.equal(where.dedupeKey, row.dedupeKey)
+        if (row.resolvedAt || !where.eventType.in.includes(row.eventType)) return { count: 0 }
+        row.resolvedAt = data.resolvedAt
+        return { count: 1 }
+      },
+    },
+    notificationUserState: { deleteMany: async () => ({ count: 0 }) },
+  } as any)
+  ;(service as any).logger = { log: () => undefined, error: () => undefined }
+  const publish = (eventType: string) => service.publishIncident({
+    organizationId: 'org-1', customerTenantId: 'tenant-1', eventType,
+    category: 'info', title: eventType, description: 'Current status',
+    dedupeKey: key, source: 'tenant-sync',
+  })
+  const warningTypes = ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required']
+
+  await publish('tenant.initial_sync_completed')
+  assert.equal(row.eventType, 'tenant.initial_sync_completed')
+  assert.equal(await service.resolveIncidentIfEventType('org-1', key, warningTypes), false)
+  assert.equal(row.resolvedAt, null)
+
+  await publish('tenant.initial_sync_in_progress')
+  assert.equal(row.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(await service.resolveIncidentIfEventType('org-1', key, warningTypes), true)
+  assert.ok((row.resolvedAt as Date | null) instanceof Date)
+})
+
 test('limited sign-in passes replace stale incident reason and action without republishing or resolving it', async () => {
   const oldAction = '/tenants/tenant-1/settings'
   const rows = [

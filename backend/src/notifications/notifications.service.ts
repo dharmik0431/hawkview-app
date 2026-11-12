@@ -390,6 +390,7 @@ export class NotificationsService {
           lastOccurredAt: now,
         },
         update: {
+          eventType: input.eventType,
           category: input.category,
           severity: input.severity ?? 'info',
           title: input.title,
