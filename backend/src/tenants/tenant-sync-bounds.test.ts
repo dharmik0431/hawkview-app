@@ -1295,6 +1295,7 @@ function aggregateSyncFixture(options: {
   return { calls, messages, incidents, stateWrites, resolvedIncidents,
     baselineReadCount: () => baselineReads,
     isIncidentOpen: (key: string) => openIncidents.has(key),
+    openIncidentType: (key: string) => openIncidents.get(key),
     setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
     setRejected: (resources: string[]) => { rejected = resources },
     setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
@@ -1302,6 +1303,7 @@ function aggregateSyncFixture(options: {
     setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
     setPersistedBaselineAt: (value: Date) => { persistedBaselineAt = value },
     advanceConsentBeforeNextNotice: () => { advanceConsentOnNextNotice = true },
+    advanceConsentAfterNotice: () => { persistedConsentAt = new Date() },
     persistedConsentAt: () => persistedConsentAt,
     noticeBoundaryStartedAtMs: () => noticeBoundaryStartedAtMs,
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
@@ -1344,6 +1346,29 @@ test('a reconsent at the notice-write boundary cannot publish or clear an old-ep
       assert.deepEqual(fixture.resolvedIncidents, [])
     },
   )
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a reconsent after the initial completion notice cannot leave that notice current', {
+  skip: process.env.HAWKVIEW_HAW77_RECONSENT_AFTER_NOTICE_WITNESS === '1'
+    ? false : 'held pending epoch-bound notice invalidation',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const oldConsent = new Date(Date.now() - 60_000)
+  const fixture = aggregateSyncFixture({
+    initial: true, completedInitialSyncResources: true, reconsentedAt: oldConsent,
+  })
+  const key = 'tenant:tenant:initial-sync'
+
+  // The real sync orchestrator publishes the old-epoch completion to a mock
+  // notice sink. The fixture then models a later consent write. This only
+  // exposes the stale-notice symptom; it cannot prove consent-side invalidation
+  // or physical transaction ordering before the fix is activated.
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.openIncidentType(key), 'tenant.initial_sync_completed')
+  fixture.advanceConsentAfterNotice()
+  assert.ok(fixture.persistedConsentAt()!.getTime() > oldConsent.getTime())
+  assert.notEqual(fixture.openIncidentType(key), 'tenant.initial_sync_completed')
   assert.equal(network.mock.callCount(), 0)
 })
 
