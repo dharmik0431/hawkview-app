@@ -1160,10 +1160,16 @@ function aggregateSyncFixture(options: {
   let usersLastSuccessfulAt = options.initial ? null : new Date()
   let persistedConsentAt = tenant.connection.consentedAt
   let advanceConsentOnNextNotice = false
-  const advanceConsentAtNoticeBoundary = () => {
+  let noticeBoundaryStartedAtMs: number | null = null
+  const advanceConsentAtNoticeBoundary = async () => {
     if (advanceConsentOnNextNotice) {
       // The database changes after the loaded connection was used for the
       // coverage decision, immediately before the separate notice write.
+      noticeBoundaryStartedAtMs = Date.now()
+      for (let tick = 0; tick < 20 && Date.now() <= noticeBoundaryStartedAtMs; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1))
+      }
+      assert.ok(Date.now() > noticeBoundaryStartedAtMs)
       persistedConsentAt = new Date()
       advanceConsentOnNextNotice = false
     }
@@ -1252,12 +1258,12 @@ function aggregateSyncFixture(options: {
     { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
     {
       publishIncident: async (incident: any) => {
-        advanceConsentAtNoticeBoundary()
+        await advanceConsentAtNoticeBoundary()
         incidents.push(incident)
         if (!openIncidents.has(incident.dedupeKey)) openIncidents.set(incident.dedupeKey, incident.eventType)
       },
       resolveIncidentIfEventType: async (_organizationId: string, dedupeKey: string, eventTypes: string[]) => {
-        advanceConsentAtNoticeBoundary()
+        await advanceConsentAtNoticeBoundary()
         if (eventTypes.includes(openIncidents.get(dedupeKey) ?? '')) {
           resolvedIncidents.push(dedupeKey)
           openIncidents.delete(dedupeKey)
@@ -1297,6 +1303,7 @@ function aggregateSyncFixture(options: {
     setPersistedBaselineAt: (value: Date) => { persistedBaselineAt = value },
     advanceConsentBeforeNextNotice: () => { advanceConsentOnNextNotice = true },
     persistedConsentAt: () => persistedConsentAt,
+    noticeBoundaryStartedAtMs: () => noticeBoundaryStartedAtMs,
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
@@ -1306,12 +1313,15 @@ test('a reconsent at the notice-write boundary cannot publish or clear an old-ep
     ? false : 'held pending an atomic connection-epoch and notice write',
 }, async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const oldConsent = new Date(Date.now() - 60_000)
 
   await t.test('initial completion notice', async () => {
-    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true,
+      reconsentedAt: oldConsent })
     fixture.advanceConsentBeforeNextNotice()
     await fixture.run()
     assert.ok(fixture.persistedConsentAt() instanceof Date)
+    assert.ok(fixture.persistedConsentAt()!.getTime() > fixture.noticeBoundaryStartedAtMs()!)
     assert.notEqual(fixture.incidents[0]?.eventType, 'tenant.initial_sync_completed')
   })
 
@@ -1320,6 +1330,7 @@ test('a reconsent at the notice-write boundary cannot publish or clear an old-ep
       const fixture = aggregateSyncFixture({
         initial: true, completedInitialSyncResources: true,
         persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+        reconsentedAt: oldConsent,
       })
       const key = 'tenant:tenant:initial-sync'
       await fixture.run()
@@ -1328,6 +1339,7 @@ test('a reconsent at the notice-write boundary cannot publish or clear an old-ep
       fixture.advanceConsentBeforeNextNotice()
       await fixture.run(incremental)
       assert.ok(fixture.persistedConsentAt() instanceof Date)
+      assert.ok(fixture.persistedConsentAt()!.getTime() > fixture.noticeBoundaryStartedAtMs()!)
       assert.equal(fixture.isIncidentOpen(key), true)
       assert.deepEqual(fixture.resolvedIncidents, [])
     },
