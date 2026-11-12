@@ -104,6 +104,13 @@ test('customer-managed reconsent cannot leave an old initial-sync completion cla
       } })
       assert.ok(initialSyncEpochStart(current)!.getTime() > users.lastSuccessfulAt!.getTime(),
         'the prior USERS success belongs to the old consent epoch')
+      const notice = await prisma.notification.findUniqueOrThrow({ where: { id: f.notice.id } })
+      assert.equal(notice.customerTenantId, f.tenant.id)
+      assert.equal(notice.eventType, 'tenant.initial_sync_in_progress')
+      assert.equal(notice.title, 'Initial tenant sync in progress')
+      assert.equal(await prisma.notificationUserState.count({
+        where: { notificationId: f.notice.id },
+      }), 0, 'recipient read state must reset atomically with the new consent epoch')
       const after = await f.reader.list(f.identity)
       assert.equal(after.items.some(item => item.title === 'Initial tenant sync completed'), false,
       'the actual notification API still presents old coverage as a completed current sync')
