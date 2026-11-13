@@ -277,6 +277,158 @@ for (const overflowStage of ['current-authority', 'orphan-tombstone'] as const) 
     })
 }
 
+test('HAW-70 precommit database session loss rolls back repair and permits a fresh attempt',
+  { skip: !RUN, timeout: 60_000 }, async () => {
+    // This destructive fixture is hosted-CI-only; the shared parser validates
+    // the exact provisioning workflow, job, database and role on this port.
+    assert.equal(assertDisposableTestDatabase().port, '5432', 'Session termination is registered-CI-only')
+    const observer = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+    const prisma = new PrismaService()
+    const recovery = new PrismaService()
+    const [org, tenant, snapshot] = Array.from({ length: 3 }, () => randomUUID())
+    const application = `haw70-loss-${randomUUID()}`
+    const tables = ['organizations', 'customer_tenants', 'directory_audit_logs',
+      'tenant_health_snapshots', 'tenant_health_source_authorities', 'tenant_health_reconciliation_generations']
+    type Transaction = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
+    const readAuthority = async () => (await observer.query(
+      `SELECT incarnation::text, source_revision::text, live, current_snapshot_id::text,
+              current_observation_sequence::text FROM public.tenant_health_source_authorities
+        WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])).rows
+    const readSnapshots = async () => (await observer.query(
+      `SELECT id::text, source_incarnation::text, source_revision::text,
+              observation_sequence::text, payload, evaluated_at::text
+         FROM public.tenant_health_snapshots WHERE organization_id = $1 ORDER BY id`, [org])).rows
+    const readReceipt = async () => (await observer.query(
+      `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+        WHERE generation = $1`, [repairGeneration])).rows
+    const readMigrationHistory = async () => (await observer.query(
+      `SELECT id, migration_name, checksum, started_at::text, finished_at::text,
+              rolled_back_at::text, applied_steps_count, md5(COALESCE(logs, '')) AS log_digest
+         FROM public._prisma_migrations ORDER BY id`)).rows
+    const assertLocksFree = async () => {
+      await observer.query('BEGIN')
+      try {
+        await observer.query(`LOCK TABLE public.organizations, public.customer_tenants,
+          public.directory_audit_logs, public.tenant_health_snapshots,
+          public.tenant_health_source_authorities, public.tenant_health_reconciliation_generations
+          IN EXCLUSIVE MODE NOWAIT`)
+      } finally { await observer.query('ROLLBACK') }
+    }
+    await observer.connect()
+    try {
+      await Promise.all([prisma.$connect(), recovery.$connect()])
+      assert.deepEqual(await readReceipt(), [], 'Session-loss witness precedes committed generation success')
+      await observer.query('BEGIN')
+      await observer.query(`INSERT INTO organizations (id, name, slug, updated_at)
+        VALUES ($1, 'HAW-70 session-loss fixture', $2, now())`, [org, `haw70-${org}`])
+      await observer.query(`INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+        VALUES ($1, $2, $3, now())`, [tenant, org, randomUUID()])
+      await observer.query(`INSERT INTO tenant_health_snapshots
+        (id, organization_id, customer_tenant_id, health_model_version, overall_status, payload,
+         evaluated_at, source_incarnation, source_revision, observation_sequence)
+        SELECT $1, organization_id, customer_tenant_id, 1, 'UNKNOWN', '{}'::jsonb,
+               now(), incarnation, source_revision, 1 FROM tenant_health_source_authorities
+         WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, tenant])
+      await observer.query(`UPDATE tenant_health_source_authorities
+        SET current_snapshot_id = $1, current_observation_sequence = 1
+        WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, tenant])
+      await observer.query('COMMIT')
+      const before = await readAuthority()
+      assert.equal(before.length, 1)
+      assert.equal(before[0].current_snapshot_id, snapshot)
+      const snapshotsBefore = await readSnapshots()
+      const historyBefore = await readMigrationHistory()
+      const assertUncommittedRepair = async (tx: Transaction) => {
+        const [changed] = await tx.$queryRawUnsafe<Array<{
+          incarnation: string; source_revision: bigint; current_snapshot_id: string | null
+        }>>(`SELECT incarnation::text, source_revision, current_snapshot_id::text
+             FROM public.tenant_health_source_authorities
+            WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid`, org, tenant)
+        assert.notEqual(changed.incarnation, before[0].incarnation)
+        assert.equal(changed.source_revision, BigInt(before[0].source_revision) + 1n)
+        assert.equal(changed.current_snapshot_id, null)
+        assert.deepEqual(await tx.$queryRawUnsafe(
+          `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+            WHERE generation = $1`, repairGeneration),
+        [{ generation: repairGeneration, protocol_fingerprint: repairFingerprint }])
+        assert.deepEqual(await readAuthority(), before)
+        assert.deepEqual(await readReceipt(), [])
+      }
+      let reachedRealCommitAfterLoss = false
+      const disconnected = {
+        $transaction: (callback: (tx: Transaction) => Promise<unknown>,
+          options: Parameters<typeof prisma.$transaction>[1]) => prisma.$transaction(async tx => {
+          await tx.$queryRawUnsafe("SELECT set_config('application_name', $1, true)", application)
+          const result = await callback(tx)
+          assert.deepEqual(result, { outcome: 'completed', generation: repairGeneration, fingerprint: repairFingerprint })
+          await assertUncommittedRepair(tx)
+          const [identity] = await tx.$queryRawUnsafe<Array<{ pid: number; started: string }>>(
+            `SELECT pid, backend_start::text AS started FROM pg_catalog.pg_stat_activity
+              WHERE pid = pg_backend_pid()`)
+          assert.ok(Number.isInteger(identity.pid) && identity.pid > 0)
+          // Exactly this test's transaction must still hold every repair lock.
+          const held = await observer.query<{ relname: string }>(
+            `SELECT c.relname FROM pg_catalog.pg_locks l
+               JOIN pg_catalog.pg_class c ON c.oid = l.relation
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid
+              WHERE a.pid = $1 AND a.backend_start = $2::timestamptz
+                AND a.application_name = $3 AND a.datname = current_database() AND a.usename = current_user
+                AND a.pid <> pg_backend_pid() AND n.nspname = 'public'
+                AND c.relname = ANY($4::text[]) AND l.mode = 'ExclusiveLock' AND l.granted`,
+            [identity.pid, identity.started, application, tables])
+          assert.deepEqual(held.rows.map(row => row.relname).sort(), [...tables].sort())
+          // Positive timeout waits for confirmed termination on PostgreSQL 16.
+          // No other backend is selected; no synthetic error replaces loss.
+          const terminated = await observer.query(
+            `SELECT pg_terminate_backend(a.pid, 1000) AS terminated FROM pg_catalog.pg_stat_activity a
+              WHERE a.pid = $1 AND a.backend_start = $2::timestamptz AND a.application_name = $3
+                AND a.datname = current_database() AND a.usename = current_user AND a.pid <> pg_backend_pid()`,
+            [identity.pid, identity.started, application])
+          assert.deepEqual(terminated.rows, [{ terminated: true }])
+          await observer.query('SELECT pg_stat_clear_snapshot()')
+          assert.deepEqual((await observer.query(
+            `SELECT pid FROM pg_catalog.pg_stat_activity WHERE pid = $1 AND backend_start = $2::timestamptz`,
+            [identity.pid, identity.started])).rows, [])
+          reachedRealCommitAfterLoss = true
+          return result // Real Prisma commit must now reject on the lost session.
+        }, options),
+      } as unknown as Pick<PrismaService, '$transaction'>
+      await assert.rejects(reconcile(disconnected))
+      assert.equal(reachedRealCommitAfterLoss, true, 'A prerequisite or observer assertion must not count as session loss')
+      await assertLocksFree()
+      assert.deepEqual(await readAuthority(), before)
+      assert.deepEqual(await readSnapshots(), snapshotsBefore)
+      assert.deepEqual(await readReceipt(), [])
+      assert.deepEqual(await readMigrationHistory(), historyBefore)
+
+      // A new service can reach a complete repair. Deliberately roll it back to
+      // preserve the immutable generation for the later committed-success case.
+      const interrupted = new Error('rollback fresh recovery fixture before commit')
+      const recovering = {
+        $transaction: (callback: (tx: Transaction) => Promise<unknown>,
+          options: Parameters<typeof recovery.$transaction>[1]) => recovery.$transaction(async tx => {
+          assert.equal((await callback(tx) as { outcome: string }).outcome, 'completed')
+          await assertUncommittedRepair(tx)
+          throw interrupted
+        }, options),
+      } as unknown as Pick<PrismaService, '$transaction'>
+      await assert.rejects(reconcile(recovering), error => error === interrupted)
+      await assertLocksFree()
+      assert.deepEqual(await readAuthority(), before)
+      assert.deepEqual(await readSnapshots(), snapshotsBefore)
+      assert.deepEqual(await readReceipt(), [])
+      assert.deepEqual(await readMigrationHistory(), historyBefore)
+    } finally {
+      try {
+        await observer.query('ROLLBACK')
+        await observer.query('DELETE FROM organizations WHERE id = $1', [org])
+      } finally {
+        try { await Promise.all([prisma.$disconnect(), recovery.$disconnect()]) } finally { await observer.end() }
+      }
+    }
+  })
+
 test('HAW-70 competing reconciliation runners recover after rollback and do not repeat a committed repair',
   { skip: !RUN, timeout: 60_000 }, async () => {
     const client = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
