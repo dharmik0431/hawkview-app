@@ -277,10 +277,11 @@ for (const overflowStage of ['current-authority', 'orphan-tombstone'] as const) 
     })
 }
 
-test('HAW-70 experimental reconciliation repairs history atomically and exact retry does not rotate again',
+test('HAW-70 competing reconciliation runners recover after rollback and do not repeat a committed repair',
   { skip: !RUN, timeout: 60_000 }, async () => {
-    const client = new pg.Client({ connectionString: URL! })
+    const client = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
     const prisma = new PrismaService()
+    const contender = new PrismaService()
     const [org, missing, current, deadCurrent, orphan, deadAbsent, snapshot] =
       Array.from({ length: 7 }, () => randomUUID())
     type Authority = { customer_tenant_id: string; incarnation: string; source_revision: string;
@@ -295,6 +296,7 @@ test('HAW-70 experimental reconciliation repairs history atomically and exact re
         WHERE generation = $1`, [repairGeneration])).rows
     await client.connect()
     try {
+      await Promise.all([prisma.$connect(), contender.$connect()])
       assert.deepEqual(await readReceipt(), [], 'Each registered job needs a fresh disposable database')
       await client.query('BEGIN')
       await client.query(`INSERT INTO organizations (id, name, slug, updated_at)
@@ -322,22 +324,78 @@ test('HAW-70 experimental reconciliation repairs history atomically and exact re
         WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, current])
       await client.query('COMMIT')
       const before = await readAuthorities()
-      const interrupted = new Error('synthetic interruption before commit')
+      const readSnapshots = async () => (await client.query(
+        `SELECT id::text, source_incarnation::text, source_revision::text,
+                observation_sequence::text, payload, evaluated_at::text
+           FROM public.tenant_health_snapshots WHERE organization_id = $1 ORDER BY id`, [org])).rows
+      const readMigrationHistory = async () => (await client.query(
+        `SELECT id, migration_name, checksum, started_at::text, finished_at::text,
+                rolled_back_at::text, applied_steps_count, md5(COALESCE(logs, '')) AS log_digest
+           FROM public._prisma_migrations ORDER BY id`)).rows
+      const snapshotsBefore = await readSnapshots()
+      const historyBefore = await readMigrationHistory()
+      type Transaction = Parameters<Parameters<typeof prisma.$transaction>[0]>[0]
+      const assertOpponentDefers = async (holder: Transaction, opponent: PrismaService) => {
+        const [owner] = await holder.$queryRawUnsafe<Array<{ pid: number }>>('SELECT pg_backend_pid() AS pid')
+        const observing = {
+          $transaction: (callback: (tx: Transaction) => Promise<unknown>,
+            options: Parameters<typeof prisma.$transaction>[1]) => opponent.$transaction(async tx => {
+            const [other] = await tx.$queryRawUnsafe<Array<{ pid: number }>>('SELECT pg_backend_pid() AS pid')
+            assert.notEqual(other.pid, owner.pid, 'Contending attempts must use distinct database sessions')
+            return callback(tx)
+          }, options),
+        } as unknown as Pick<PrismaService, '$transaction'>
+        // The real NOWAIT source lock must reject the opponent. No fabricated
+        // lock error or timing sleep is used to make the contender defer.
+        assert.deepEqual(await reconcile(observing), { outcome: 'deferred', reason: 'source_lock_unavailable' })
+        assert.deepEqual(await readAuthorities(), before, 'No uncommitted repair becomes externally visible')
+        assert.deepEqual(await readReceipt(), [], 'No uncommitted receipt becomes externally visible')
+      }
+      const interrupted = new Error('injected rollback before commit')
       const aborting = {
         $transaction: (callback: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0]) => Promise<unknown>,
           options: Parameters<typeof prisma.$transaction>[1]) => prisma.$transaction(async tx => {
           assert.equal((await callback(tx) as { outcome: string }).outcome, 'completed')
-          assert.deepEqual(await readAuthorities(), before, 'Other connection sees only committed authority')
-          assert.deepEqual(await readReceipt(), [], 'Other connection cannot see an uncommitted receipt')
+          await assertOpponentDefers(tx, contender)
           throw interrupted
         }, options),
       } as unknown as Pick<PrismaService, '$transaction'>
       await assert.rejects(reconcile(aborting), error => error === interrupted)
       assert.deepEqual(await readAuthorities(), before)
       assert.deepEqual(await readReceipt(), [], 'An interrupted transaction records no completion')
+      assert.deepEqual(await readSnapshots(), snapshotsBefore)
+      assert.deepEqual(await readMigrationHistory(), historyBefore)
+      await client.query('BEGIN')
+      try {
+        await client.query(`LOCK TABLE public.organizations, public.customer_tenants,
+          public.directory_audit_logs, public.tenant_health_snapshots,
+          public.tenant_health_source_authorities, public.tenant_health_reconciliation_generations
+          IN EXCLUSIVE MODE NOWAIT`)
+      } finally { await client.query('ROLLBACK') }
 
-      assert.deepEqual(await reconcile(prisma), { outcome: 'completed',
-        generation: repairGeneration, fingerprint: repairFingerprint })
+      const lostResult = new Error('injected loss of success result after confirmed commit')
+      let committed = false
+      const recovering = {
+        $transaction: async (callback: (tx: Transaction) => Promise<unknown>,
+          options: Parameters<typeof contender.$transaction>[1]) => {
+          const result = await contender.$transaction(async tx => {
+            const repaired = await callback(tx)
+            assert.deepEqual(repaired, { outcome: 'completed',
+              generation: repairGeneration, fingerprint: repairFingerprint })
+            // B now owns the repair boundary; A must defer until B commits.
+            await assertOpponentDefers(tx, prisma)
+            return repaired
+          }, options)
+          assert.deepEqual(result, { outcome: 'completed',
+            generation: repairGeneration, fingerprint: repairFingerprint })
+          committed = true
+          // This models a lost caller-visible result, not a real process crash,
+          // lost network acknowledgment or uncertain database commit outcome.
+          throw lostResult
+        },
+      } as unknown as Pick<PrismaService, '$transaction'>
+      await assert.rejects(reconcile(recovering), error => error === lostResult)
+      assert.equal(committed, true, 'The injected result loss must occur after successful real commit')
       const after = await readAuthorities()
       const byId = new Map(after.map(row => [row.customer_tenant_id, row]))
       assert.equal(after.length, 5)
@@ -363,12 +421,17 @@ test('HAW-70 experimental reconciliation repairs history atomically and exact re
       assert.deepEqual(await reconcile(prisma), { outcome: 'already_completed',
         generation: repairGeneration, fingerprint: repairFingerprint })
       assert.deepEqual(await readAuthorities(), after, 'A retry after commit must not rotate authority again')
+      assert.deepEqual(await readReceipt(), [{ generation: repairGeneration, protocol_fingerprint: repairFingerprint }])
+      assert.deepEqual(await readSnapshots(), snapshotsBefore)
+      assert.deepEqual(await readMigrationHistory(), historyBefore)
     } finally {
       try {
         await client.query('ROLLBACK')
         await client.query('DELETE FROM organizations WHERE id = $1', [org])
         // Keep the immutable experimental receipt only in this disposable job.
-      } finally { await prisma.$disconnect(); await client.end() }
+      } finally {
+        try { await Promise.all([prisma.$disconnect(), contender.$disconnect()]) } finally { await client.end() }
+      }
     }
   })
 
