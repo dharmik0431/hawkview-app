@@ -25,6 +25,151 @@ function sqlState(expected: string) {
     typeof error === 'object' && error !== null && 'code' in error && error.code === expected
 }
 
+test('HAW-70 private reconciliation receipts reject malformed identity and ordinary mutation',
+  { skip: !RUN, timeout: 30_000 }, async () => {
+    const client = new pg.Client({ connectionString: URL! })
+    const generation = `ci-${randomUUID()}`
+    const fingerprint = '1'.repeat(64)
+    await client.connect()
+    try {
+      const migration = await client.query(
+        `SELECT migration_name FROM _prisma_migrations
+          WHERE migration_name = '20261113170000_tenant_health_reconciliation_marker'
+            AND finished_at IS NOT NULL AND rolled_back_at IS NULL`)
+      assert.equal(migration.rowCount, 1, 'The registered job must apply the marker migration')
+      const privacy = await client.query<{ relrowsecurity: boolean; exposed: boolean }>(
+        `SELECT relrowsecurity,
+                EXISTS (SELECT 1 FROM aclexplode(COALESCE(relacl, acldefault('r', relowner))) a
+                         LEFT JOIN pg_roles r ON r.oid = a.grantee
+                         WHERE a.grantee = 0 OR r.rolname IN ('anon', 'authenticated')) AS exposed
+           FROM pg_class WHERE oid = 'public.tenant_health_reconciliation_generations'::regclass`)
+      assert.deepEqual(privacy.rows, [{ relrowsecurity: true, exposed: false }])
+
+      await client.query('BEGIN')
+      const inserted = await client.query<{ completed_at: Date }>(
+        `INSERT INTO public.tenant_health_reconciliation_generations
+           (generation, protocol_fingerprint) VALUES ($1, $2) RETURNING completed_at`,
+        [generation, fingerprint])
+      assert.ok(Number.isFinite(inserted.rows[0].completed_at.getTime()))
+
+      const rejected = async (sql: string, values: string[], code: string) => {
+        await client.query('SAVEPOINT rejected_marker_change')
+        await assert.rejects(client.query(sql, values), sqlState(code))
+        await client.query('ROLLBACK TO SAVEPOINT rejected_marker_change')
+        await client.query('RELEASE SAVEPOINT rejected_marker_change')
+      }
+      for (const [invalidGeneration, invalidFingerprint] of [
+        ['', fingerprint], ['Bad generation', fingerprint],
+        [`ci-${randomUUID()}`, 'a'.repeat(63)], [`ci-${randomUUID()}`, 'G'.repeat(64)],
+      ]) {
+        await rejected(
+          `INSERT INTO public.tenant_health_reconciliation_generations
+             (generation, protocol_fingerprint) VALUES ($1, $2)`,
+          [invalidGeneration, invalidFingerprint], '23514')
+      }
+      await rejected(
+        `INSERT INTO public.tenant_health_reconciliation_generations
+           (generation, protocol_fingerprint, completed_at) VALUES ($1, $2, 'infinity')`,
+        [`ci-${randomUUID()}`, fingerprint], '23514')
+      await rejected(
+        `INSERT INTO public.tenant_health_reconciliation_generations
+           (generation, protocol_fingerprint) VALUES ($1, $2)`,
+        [generation, fingerprint], '23505')
+      for (const sql of [
+        `UPDATE public.tenant_health_reconciliation_generations SET generation = 'changed' WHERE generation = $1`,
+        `UPDATE public.tenant_health_reconciliation_generations SET protocol_fingerprint = repeat('2', 64) WHERE generation = $1`,
+        `UPDATE public.tenant_health_reconciliation_generations SET completed_at = now() WHERE generation = $1`,
+        `UPDATE public.tenant_health_reconciliation_generations SET completed_at = now() WHERE generation = $1 AND false`,
+        `DELETE FROM public.tenant_health_reconciliation_generations WHERE generation = $1`,
+        `DELETE FROM public.tenant_health_reconciliation_generations WHERE generation = $1 AND false`,
+      ]) await rejected(sql, [generation], '55000')
+      await rejected('TRUNCATE public.tenant_health_reconciliation_generations', [], '55000')
+
+      // A conflict must not replace the receipt. A future runner must SELECT
+      // and compare this fingerprint, not infer success from DO NOTHING.
+      const duplicate = await client.query(
+        `INSERT INTO public.tenant_health_reconciliation_generations
+           (generation, protocol_fingerprint) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [generation, '2'.repeat(64)])
+      assert.equal(duplicate.rowCount, 0)
+      const retained = await client.query<{ protocol_fingerprint: string; completed_at: Date }>(
+        `SELECT protocol_fingerprint, completed_at FROM public.tenant_health_reconciliation_generations
+          WHERE generation = $1`, [generation])
+      assert.equal(retained.rows[0].protocol_fingerprint, fingerprint)
+      assert.equal(retained.rows[0].completed_at.getTime(), inserted.rows[0].completed_at.getTime())
+    } finally {
+      try { await client.query('ROLLBACK') } finally { await client.end() }
+    }
+  })
+
+test('HAW-70 reconciliation receipt and authority change commit or roll back together',
+  { skip: !RUN, timeout: 30_000 }, async () => {
+    // Schema coupling witness only: no production reconciliation runner exists.
+    const writer = new pg.Client({ connectionString: URL! })
+    const observer = new pg.Client({ connectionString: URL! })
+    const [org, tenant, microsoftTenant] = Array.from({ length: 3 }, () => randomUUID())
+    const generation = `ci-${randomUUID()}`
+    const readAuthority = async (client: pg.Client) => (await client.query<{
+      incarnation: string; source_revision: string
+    }>(`SELECT incarnation::text, source_revision::text FROM public.tenant_health_source_authorities
+         WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])).rows
+    const readReceipt = async () => (await observer.query(
+      `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+        WHERE generation = $1`, [generation])).rows
+    const changeAndRecord = async () => {
+      await writer.query(
+        `UPDATE public.tenant_health_source_authorities
+            SET incarnation = gen_random_uuid(), source_revision = source_revision + 1,
+                current_snapshot_id = NULL, current_observation_sequence = 0
+          WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      await writer.query(
+        `INSERT INTO public.tenant_health_reconciliation_generations
+           (generation, protocol_fingerprint) VALUES ($1, $2)`, [generation, '3'.repeat(64)])
+    }
+    await writer.connect()
+    try {
+      await observer.connect()
+      try {
+        await writer.query(
+          `INSERT INTO organizations (id, name, slug, updated_at)
+           VALUES ($1, 'HAW-70 marker witness', $2, now())`, [org, `haw70-${org}`])
+        await writer.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
+        const initial = await readAuthority(observer)
+        assert.equal(initial.length, 1)
+        await writer.query('BEGIN')
+        await changeAndRecord()
+        assert.notDeepEqual(await readAuthority(writer), initial)
+        assert.deepEqual(await readAuthority(observer), initial)
+        assert.deepEqual(await readReceipt(), [], 'No receipt is visible before commit')
+        await writer.query('ROLLBACK')
+        assert.deepEqual(await readAuthority(observer), initial)
+        assert.deepEqual(await readReceipt(), [], 'Rollback retains no completion claim')
+
+        await writer.query('BEGIN')
+        await changeAndRecord()
+        const changed = await readAuthority(writer)
+        assert.notEqual(changed[0].incarnation, initial[0].incarnation)
+        assert.equal(BigInt(changed[0].source_revision), BigInt(initial[0].source_revision) + 1n)
+        assert.deepEqual(await readAuthority(observer), initial)
+        assert.deepEqual(await readReceipt(), [])
+        await writer.query('COMMIT')
+        assert.deepEqual(await readAuthority(observer), changed)
+        assert.deepEqual(await readReceipt(), [{ generation, protocol_fingerprint: '3'.repeat(64) }])
+      } finally {
+        await observer.end()
+      }
+    } finally {
+      try {
+        await writer.query('ROLLBACK')
+        await writer.query('DELETE FROM organizations WHERE id = $1', [org])
+        // The unique synthetic receipt is intentionally retained in disposable
+        // CI: cleanup must not bypass the immutable-marker contract.
+      } finally { await writer.end() }
+    }
+  })
+
 test('HAW-70 six-phase migration has a valid exact key and enforced scope fences',
   { skip: !RUN, timeout: 30_000 }, async () => {
     const client = new pg.Client({ connectionString: URL! })

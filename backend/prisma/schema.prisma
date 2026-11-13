@@ -943,6 +943,17 @@ model TenantHealthSourceAuthority {
   @@map("tenant_health_source_authorities")
 }
 
+// Inactive completion-only receipts. The future reconciliation transaction must
+// insert only after all repair invariants succeed; no reader trusts these yet.
+// SQL rejects UPDATE/DELETE/TRUNCATE. completedAt is not a commit/freshness clock.
+model TenantHealthReconciliationGeneration {
+  generation          String   @id @db.VarChar(120)
+  protocolFingerprint String   @map("protocol_fingerprint") @db.Char(64)
+  completedAt         DateTime @default(now()) @map("completed_at") @db.Timestamptz(6)
+
+  @@map("tenant_health_reconciliation_generations")
+}
+
 // A sync resource can contain multiple independently collected values.  Keep
 // their collection outcome separately from the last successful snapshot so a
 // transient Microsoft failure never turns valid historical data into a blank.
