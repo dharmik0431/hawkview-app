@@ -307,8 +307,9 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
     }
   })
 
-// Held until the tenant lifecycle writer is present. Deleting a tenant must
-// retain an authority tombstone even though its health snapshot cascades away.
+// The registered disposable job enables this after the tenant lifecycle
+// writer migration. Deletion must retain an authority tombstone even though
+// its health snapshot cascades away.
 test('HAW-70 tenant deletion clears current health and retains a dead authority',
   {
     skip: !RUN || process.env.HAWKVIEW_HAW70_TENANT_DELETE_WITNESS !== '1',
