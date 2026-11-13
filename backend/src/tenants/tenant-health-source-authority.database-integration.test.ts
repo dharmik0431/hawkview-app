@@ -4,6 +4,12 @@ import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import pg from 'pg'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
+import { PrismaService } from '../prisma/prisma.service.js'
+import {
+  attemptHistoricalHealthReconciliation as reconcile,
+  HISTORICAL_RECONCILIATION_GENERATION as repairGeneration,
+  HISTORICAL_RECONCILIATION_FINGERPRINT as repairFingerprint,
+} from './tenant-health-historical-reconciliation.js'
 
 // The registered backend CI applies committed migrations before this suite.
 // Only the registered hosted disposable job may exercise this migration witness.
@@ -24,6 +30,101 @@ function sqlState(expected: string) {
   return (error: unknown): boolean =>
     typeof error === 'object' && error !== null && 'code' in error && error.code === expected
 }
+
+test('HAW-70 experimental reconciliation repairs history atomically and exact retry does not rotate again',
+  { skip: !RUN, timeout: 60_000 }, async () => {
+    const client = new pg.Client({ connectionString: URL! })
+    const prisma = new PrismaService()
+    const [org, missing, current, deadCurrent, orphan, deadAbsent, snapshot] =
+      Array.from({ length: 7 }, () => randomUUID())
+    type Authority = { customer_tenant_id: string; incarnation: string; source_revision: string;
+      live: boolean; current_snapshot_id: string | null; current_observation_sequence: string }
+    const readAuthorities = async () => (await client.query<Authority>(
+      `SELECT customer_tenant_id::text, incarnation::text, source_revision::text, live,
+              current_snapshot_id::text, current_observation_sequence::text
+         FROM public.tenant_health_source_authorities WHERE organization_id = $1
+         ORDER BY customer_tenant_id`, [org])).rows
+    const readReceipt = async () => (await client.query(
+      `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+        WHERE generation = $1`, [repairGeneration])).rows
+    await client.connect()
+    try {
+      assert.deepEqual(await readReceipt(), [], 'Each registered job needs a fresh disposable database')
+      await client.query('BEGIN')
+      await client.query(`INSERT INTO organizations (id, name, slug, updated_at)
+        VALUES ($1, 'HAW-70 historical repair fixture', $2, now())`, [org, `haw70-${org}`])
+      for (const tenant of [missing, current, deadCurrent]) {
+        await client.query(`INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+          VALUES ($1, $2, $3, now())`, [tenant, org, randomUUID()])
+      }
+      // Synthesize pre-trigger historical states without disabling any writer.
+      await client.query(`DELETE FROM tenant_health_source_authorities
+        WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, missing])
+      await client.query(`UPDATE tenant_health_source_authorities SET live = false, source_revision = 7
+        WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, deadCurrent])
+      await client.query(`INSERT INTO tenant_health_source_authorities
+        (organization_id, customer_tenant_id, source_revision, live)
+        VALUES ($1, $2, 9, true), ($1, $3, 11, false)`, [org, orphan, deadAbsent])
+      await client.query(`INSERT INTO tenant_health_snapshots
+        (id, organization_id, customer_tenant_id, health_model_version, overall_status, payload,
+         evaluated_at, source_incarnation, source_revision, observation_sequence)
+        SELECT $1, organization_id, customer_tenant_id, 1, 'UNKNOWN', '{}'::jsonb,
+               now(), incarnation, source_revision, 1 FROM tenant_health_source_authorities
+         WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, current])
+      await client.query(`UPDATE tenant_health_source_authorities
+        SET current_snapshot_id = $1, current_observation_sequence = 1
+        WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, current])
+      await client.query('COMMIT')
+      const before = await readAuthorities()
+      const interrupted = new Error('synthetic interruption before commit')
+      const aborting = {
+        $transaction: (callback: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0]) => Promise<unknown>,
+          options: Parameters<typeof prisma.$transaction>[1]) => prisma.$transaction(async tx => {
+          assert.equal((await callback(tx) as { outcome: string }).outcome, 'completed')
+          assert.deepEqual(await readAuthorities(), before, 'Other connection sees only committed authority')
+          assert.deepEqual(await readReceipt(), [], 'Other connection cannot see an uncommitted receipt')
+          throw interrupted
+        }, options),
+      } as unknown as Pick<PrismaService, '$transaction'>
+      await assert.rejects(reconcile(aborting), error => error === interrupted)
+      assert.deepEqual(await readAuthorities(), before)
+      assert.deepEqual(await readReceipt(), [], 'An interrupted transaction records no completion')
+
+      assert.deepEqual(await reconcile(prisma), { outcome: 'completed',
+        generation: repairGeneration, fingerprint: repairFingerprint })
+      const after = await readAuthorities()
+      const byId = new Map(after.map(row => [row.customer_tenant_id, row]))
+      assert.equal(after.length, 5)
+      const fresh = byId.get(missing)!
+      assert.equal(fresh.live, true)
+      assert.equal(fresh.source_revision, '1')
+      assert.equal(fresh.current_snapshot_id, null)
+      assert.equal(fresh.current_observation_sequence, '0')
+      assert.ok(fresh.incarnation)
+      for (const tenant of [current, deadCurrent]) {
+        const old = before.find(row => row.customer_tenant_id === tenant)!
+        const repaired = byId.get(tenant)!
+        assert.notEqual(repaired.incarnation, old.incarnation)
+        assert.equal(BigInt(repaired.source_revision), BigInt(old.source_revision) + 1n)
+        assert.equal(repaired.live, true)
+        assert.equal(repaired.current_snapshot_id, null)
+        assert.equal(repaired.current_observation_sequence, '0')
+      }
+      assert.deepEqual(byId.get(orphan), { ...before.find(row => row.customer_tenant_id === orphan)!,
+        source_revision: '10', live: false, current_snapshot_id: null, current_observation_sequence: '0' })
+      assert.deepEqual(byId.get(deadAbsent), before.find(row => row.customer_tenant_id === deadAbsent))
+      assert.deepEqual(await readReceipt(), [{ generation: repairGeneration, protocol_fingerprint: repairFingerprint }])
+      assert.deepEqual(await reconcile(prisma), { outcome: 'already_completed',
+        generation: repairGeneration, fingerprint: repairFingerprint })
+      assert.deepEqual(await readAuthorities(), after, 'A retry after commit must not rotate authority again')
+    } finally {
+      try {
+        await client.query('ROLLBACK')
+        await client.query('DELETE FROM organizations WHERE id = $1', [org])
+        // Keep the immutable experimental receipt only in this disposable job.
+      } finally { await prisma.$disconnect(); await client.end() }
+    }
+  })
 
 test('HAW-70 private reconciliation receipts reject malformed identity and ordinary mutation',
   { skip: !RUN, timeout: 30_000 }, async () => {
