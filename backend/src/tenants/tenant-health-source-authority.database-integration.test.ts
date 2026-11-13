@@ -31,6 +31,119 @@ function sqlState(expected: string) {
     typeof error === 'object' && error !== null && 'code' in error && error.code === expected
 }
 
+test('HAW-70 late receipt-lock contention defers after releasing earlier source locks',
+  { skip: !RUN, timeout: 60_000 }, async () => {
+    const observer = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+    const blocker = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+    const probe = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+    const prisma = new PrismaService()
+    const [org, tenant, snapshot] = Array.from({ length: 3 }, () => randomUUID())
+    const sourceLock = `LOCK TABLE public.organizations, public.customer_tenants,
+      public.directory_audit_logs, public.tenant_health_snapshots,
+      public.tenant_health_source_authorities IN EXCLUSIVE MODE NOWAIT`
+    const readAuthority = async () => (await observer.query(
+      `SELECT incarnation::text, source_revision::text, live, current_snapshot_id::text,
+              current_observation_sequence::text FROM public.tenant_health_source_authorities
+        WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])).rows
+    const readReceipt = async () => (await observer.query(
+      `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+        WHERE generation = $1`, [repairGeneration])).rows
+    const readMigrationHistory = async () => (await observer.query(
+      `SELECT id, migration_name, checksum, started_at::text, finished_at::text,
+              rolled_back_at::text, applied_steps_count, md5(COALESCE(logs, '')) AS log_digest
+         FROM public._prisma_migrations ORDER BY id`)).rows
+    const assertMarkerHeld = async () => {
+      const held = await blocker.query(
+        `SELECT 1 FROM pg_catalog.pg_locks WHERE pid = pg_backend_pid()
+          AND relation = 'public.tenant_health_reconciliation_generations'::regclass
+          AND mode = 'ShareLock' AND granted`)
+      assert.equal(held.rowCount, 1, 'The competing marker lock must remain held during the probe')
+    }
+    const assertSourcesFree = async () => {
+      await probe.query('BEGIN')
+      try { await probe.query(sourceLock) } finally { await probe.query('ROLLBACK') }
+    }
+    await observer.connect()
+    try {
+      await blocker.connect()
+      try {
+        await probe.connect()
+        try {
+          assert.deepEqual(await readReceipt(), [], 'This witness precedes the fixed-generation success case')
+          await observer.query('BEGIN')
+          await observer.query(`INSERT INTO organizations (id, name, slug, updated_at)
+            VALUES ($1, 'HAW-70 late-lock fixture', $2, now())`, [org, `haw70-${org}`])
+          await observer.query(`INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+            VALUES ($1, $2, $3, now())`, [tenant, org, randomUUID()])
+          await observer.query(`INSERT INTO tenant_health_snapshots
+            (id, organization_id, customer_tenant_id, health_model_version, overall_status, payload,
+             evaluated_at, source_incarnation, source_revision, observation_sequence)
+            SELECT $1, organization_id, customer_tenant_id, 1, 'UNKNOWN', '{}'::jsonb,
+                   now(), incarnation, source_revision, 1 FROM tenant_health_source_authorities
+             WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, tenant])
+          await observer.query(`UPDATE tenant_health_source_authorities
+            SET current_snapshot_id = $1, current_observation_sequence = 1
+            WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, tenant])
+          await observer.query('COMMIT')
+          const before = await readAuthority()
+          assert.equal(before.length, 1)
+          assert.equal(before[0].current_snapshot_id, snapshot)
+          const historyBefore = await readMigrationHistory()
+          await assertSourcesFree()
+          await blocker.query('BEGIN')
+          await blocker.query('LOCK TABLE public.tenant_health_reconciliation_generations IN SHARE MODE')
+          await assertMarkerHeld()
+
+          const startedAt = performance.now()
+          assert.deepEqual(await reconcile(prisma), { outcome: 'deferred', reason: 'source_lock_unavailable' },
+            'The real adapter must preserve a recognized lock error; other errors are not deferrals')
+          assert.ok(performance.now() - startedAt < 8_000,
+            'The exploratory attempt has 2s acquisition + 5s transaction limits, with 1s CI headroom')
+          await assertMarkerHeld()
+          await assertSourcesFree()
+          await assertMarkerHeld()
+          assert.deepEqual(await readAuthority(), before)
+          assert.deepEqual(await readReceipt(), [])
+          assert.deepEqual(await readMigrationHistory(), historyBefore)
+          await blocker.query('ROLLBACK')
+
+          // A later ordinary attempt reaches its receipt after contention ends.
+          // Abort before commit to preserve the fixed generation for the next
+          // test. This is not an automatic-retry or successful-deployment proof.
+          const interrupted = new Error('stop recovered attempt before commit')
+          const aborting = {
+            $transaction: (callback: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0]) => Promise<unknown>,
+              options: Parameters<typeof prisma.$transaction>[1]) => prisma.$transaction(async tx => {
+              assert.equal((await callback(tx) as { outcome: string }).outcome, 'completed')
+              const changed = await tx.$queryRawUnsafe<Array<{ source_revision: bigint; current_snapshot_id: string | null }>>(
+                `SELECT source_revision, current_snapshot_id FROM public.tenant_health_source_authorities
+                  WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid`, org, tenant)
+              assert.equal(changed[0].source_revision, BigInt(before[0].source_revision) + 1n)
+              assert.equal(changed[0].current_snapshot_id, null)
+              assert.deepEqual(await readAuthority(), before)
+              assert.deepEqual(await readReceipt(), [])
+              throw interrupted
+            }, options),
+          } as unknown as Pick<PrismaService, '$transaction'>
+          await assert.rejects(reconcile(aborting), error => error === interrupted)
+          await assertSourcesFree()
+          assert.deepEqual(await readAuthority(), before)
+          assert.deepEqual(await readReceipt(), [])
+          assert.deepEqual(await readMigrationHistory(), historyBefore)
+        } finally {
+          try { await probe.query('ROLLBACK') } finally { await probe.end() }
+        }
+      } finally {
+        try { await blocker.query('ROLLBACK') } finally { await blocker.end() }
+      }
+    } finally {
+      try {
+        await observer.query('ROLLBACK')
+        await observer.query('DELETE FROM organizations WHERE id = $1', [org])
+      } finally { await prisma.$disconnect(); await observer.end() }
+    }
+  })
+
 test('HAW-70 experimental reconciliation repairs history atomically and exact retry does not rotate again',
   { skip: !RUN, timeout: 60_000 }, async () => {
     const client = new pg.Client({ connectionString: URL! })
