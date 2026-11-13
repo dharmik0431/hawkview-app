@@ -617,6 +617,7 @@ model Organization {
   identityRiskFindings IdentityRiskFinding[]
   identityRiskOperationalControls IdentityRiskOperationalControl[]
   healthSnapshots      TenantHealthSnapshot[]
+  healthSourceAuthorities TenantHealthSourceAuthority[]
   notifications      Notification[]
   microsoftConsentAttempts MicrosoftConsentAttempt[]
   notificationPreferences NotificationPreference[]
@@ -907,11 +908,38 @@ model TenantHealthSnapshot {
   payload            Json           @db.JsonB
   evaluatedAt        DateTime       @map("evaluated_at") @db.Timestamptz(6)
   createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
-  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
-  customerTenant     CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  // Legacy rows remain untagged and cannot become a current authority pointer.
+  sourceIncarnation  String?        @map("source_incarnation") @db.Uuid
+  sourceRevision     BigInt?        @map("source_revision")
+  observationSequence BigInt?       @map("observation_sequence")
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  // An organization move must not rewrite the scope of immutable history.
+  customerTenant     CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, onUpdate: Restrict)
+  currentFor         TenantHealthSourceAuthority? @relation("CurrentTenantHealthSnapshot")
 
   @@index([organizationId, customerTenantId, evaluatedAt(sort: Desc)])
+  @@unique([id, organizationId, customerTenantId, sourceIncarnation, sourceRevision, observationSequence], map: "tenant_health_snapshots_exact_source_key")
   @@map("tenant_health_snapshots")
+}
+
+// Inert foundation for a future source-revision protocol. No runtime currently
+// reads or writes this table; a later activation must cover every source writer.
+// The pair survives tenant deletion so delete/recreate cannot reuse an old
+// health incarnation. It is removed only with its owning organization.
+model TenantHealthSourceAuthority {
+  organizationId            String   @map("organization_id") @db.Uuid
+  customerTenantId          String   @map("customer_tenant_id") @db.Uuid
+  incarnation               String   @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sourceRevision            BigInt   @default(1) @map("source_revision")
+  live                      Boolean  @default(true)
+  currentSnapshotId         String?  @map("current_snapshot_id") @db.Uuid
+  currentObservationSequence BigInt  @default(0) @map("current_observation_sequence")
+  organization              Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade, onUpdate: Restrict)
+  currentSnapshot           TenantHealthSnapshot? @relation("CurrentTenantHealthSnapshot", fields: [currentSnapshotId, organizationId, customerTenantId, incarnation, sourceRevision, currentObservationSequence], references: [id, organizationId, customerTenantId, sourceIncarnation, sourceRevision, observationSequence], onDelete: NoAction, onUpdate: NoAction, map: "tenant_health_source_authorities_exact_pointer_fkey")
+
+  @@id([organizationId, customerTenantId])
+  @@unique([currentSnapshotId, organizationId, customerTenantId, incarnation, sourceRevision, currentObservationSequence], map: "tenant_health_source_authorities_exact_pointer_key")
+  @@map("tenant_health_source_authorities")
 }
 
 // A sync resource can contain multiple independently collected values.  Keep
