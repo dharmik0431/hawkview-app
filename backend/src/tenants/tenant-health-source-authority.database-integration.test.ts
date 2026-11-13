@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import pg from 'pg'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 
@@ -596,11 +597,11 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
       }>(`SELECT live, source_revision::text, current_snapshot_id::text
             FROM tenant_health_source_authorities
            WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
-      assert.deepEqual(deleted.rows, [{
-        live: false,
-        source_revision: (sourceRevision + 1n).toString(),
-        current_snapshot_id: null,
-      }], 'Deletion must tombstone and invalidate authority in the same transaction')
+      assert.equal(deleted.rowCount, 1)
+      assert.equal(deleted.rows[0].live, false)
+      assert.equal(deleted.rows[0].current_snapshot_id, null)
+      assert.ok(BigInt(deleted.rows[0].source_revision) > sourceRevision,
+        'Deletion must advance authority even if an audit cascade already invalidated it')
       await client.query('COMMIT')
 
       const retained = await client.query<{
@@ -636,6 +637,177 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
         }
       } finally {
         await client.end()
+      }
+    }
+  })
+
+// Two real clients reproduce the old cycle: tenant deletion waits for an audit
+// row while the audit writer must update the same tenant's source authority.
+// The witness is gated to the registered disposable PostgreSQL CI job.
+test('HAW-70 tenant deletion and audit writes cannot invert source-authority locks',
+  {
+    skip: !RUN || process.env.HAWKVIEW_HAW70_DELETE_LOCK_ORDER_WITNESS !== '1',
+    timeout: 90_000,
+  }, async () => {
+    for (const mode of ['update', 'delete', 'tenant-rollback'] as const) {
+      const auditWriter = new pg.Client({ connectionString: URL! })
+      const tenantDeleter = new pg.Client({ connectionString: URL! })
+      const [org, tenant, microsoftTenant, snapshot, auditLog] =
+        Array.from({ length: 5 }, () => randomUUID())
+      let deleteOutcome: Promise<{ result?: pg.QueryResult; error?: unknown }> | undefined
+      let seeded = false
+
+      await auditWriter.connect()
+      try {
+        await tenantDeleter.connect()
+        await auditWriter.query('BEGIN')
+        await auditWriter.query(
+          `INSERT INTO organizations (id, name, slug, updated_at)
+           VALUES ($1, 'HAW-70 lock-order witness', $2, now())`,
+          [org, `haw70-${org}`])
+        await auditWriter.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
+        await auditWriter.query(
+          `INSERT INTO directory_audit_logs
+             (id, organization_id, customer_tenant_id, microsoft_audit_id,
+              event_date_time, activity_display_name, raw, expires_at)
+           VALUES ($1, $2, $3, $4, now(), 'HAW-70 lock-order witness', '{}'::jsonb,
+                   now() + interval '1 day')`,
+          [auditLog, org, tenant, `haw70-${auditLog}`])
+        const authority = await auditWriter.query<{
+          incarnation: string; source_revision: string
+        }>(`SELECT incarnation::text, source_revision::text
+              FROM tenant_health_source_authorities
+             WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+        assert.equal(authority.rowCount, 1, mode)
+        const { incarnation, source_revision: seededRevision } = authority.rows[0]
+        await auditWriter.query(
+          `INSERT INTO tenant_health_snapshots
+             (id, organization_id, customer_tenant_id, health_model_version,
+              overall_status, payload, evaluated_at, source_incarnation,
+              source_revision, observation_sequence)
+           VALUES ($1, $2, $3, 1, 'HEALTHY', '{}'::jsonb, now(), $4, $5, 1)`,
+          [snapshot, org, tenant, incarnation, seededRevision])
+        await auditWriter.query(
+          `UPDATE tenant_health_source_authorities
+              SET current_snapshot_id = $1, current_observation_sequence = 1
+            WHERE organization_id = $2 AND customer_tenant_id = $3`,
+          [snapshot, org, tenant])
+        await auditWriter.query('COMMIT')
+        seeded = true
+
+        await auditWriter.query('BEGIN')
+        await auditWriter.query("SET LOCAL lock_timeout = '8s'")
+        await auditWriter.query("SET LOCAL statement_timeout = '12s'")
+        const writerPid = (await auditWriter.query<{ pid: number }>(
+          'SELECT pg_backend_pid() AS pid')).rows[0].pid
+        const lockedAudit = await auditWriter.query(
+          'SELECT id FROM directory_audit_logs WHERE id = $1 FOR UPDATE', [auditLog])
+        assert.equal(lockedAudit.rowCount, 1, mode)
+
+        await tenantDeleter.query('BEGIN')
+        await tenantDeleter.query("SET LOCAL lock_timeout = '10s'")
+        await tenantDeleter.query("SET LOCAL statement_timeout = '15s'")
+        const deleterPid = (await tenantDeleter.query<{ pid: number }>(
+          'SELECT pg_backend_pid() AS pid')).rows[0].pid
+        deleteOutcome = tenantDeleter.query(
+          'DELETE FROM customer_tenants WHERE id = $1', [tenant]
+        ).then(result => ({ result }), error => ({ error }))
+
+        const blockDeadline = Date.now() + 6_000
+        let blockedOnWriter = false
+        while (Date.now() < blockDeadline) {
+          const blocked = await auditWriter.query<{ blocked: boolean }>(
+            'SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS blocked',
+            [writerPid, deleterPid])
+          if (blocked.rows[0].blocked) {
+            blockedOnWriter = true
+            break
+          }
+          await delay(25)
+        }
+        assert.equal(blockedOnWriter, true,
+          `${mode}: tenant DELETE must reach the audit row held by the writer`)
+
+        await auditWriter.query('SAVEPOINT authority_lock_probe')
+        try {
+          const unlockedAuthority = await auditWriter.query(
+            `SELECT 1 FROM tenant_health_source_authorities
+              WHERE organization_id = $1 AND customer_tenant_id = $2
+              FOR UPDATE NOWAIT`, [org, tenant])
+          assert.equal(unlockedAuthority.rowCount, 1, mode)
+        } catch (error) {
+          await auditWriter.query('ROLLBACK TO SAVEPOINT authority_lock_probe')
+          throw error
+        }
+
+        if (mode === 'delete') {
+          await auditWriter.query('DELETE FROM directory_audit_logs WHERE id = $1',
+            [auditLog])
+        } else {
+          await auditWriter.query(
+            `UPDATE directory_audit_logs
+                SET activity_display_name = 'HAW-70 corrected audit witness'
+              WHERE id = $1`, [auditLog])
+        }
+        const writerAuthority = await auditWriter.query<{
+          live: boolean; source_revision: string; current_snapshot_id: string | null
+        }>(`SELECT live, source_revision::text, current_snapshot_id::text
+              FROM tenant_health_source_authorities
+             WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+        assert.equal(writerAuthority.rows[0].live, true, mode)
+        assert.equal(writerAuthority.rows[0].current_snapshot_id, null, mode)
+        assert.ok(BigInt(writerAuthority.rows[0].source_revision) > BigInt(seededRevision),
+          `${mode}: audit write must advance source authority`)
+        await auditWriter.query('COMMIT')
+
+        const deletion = await deleteOutcome
+        if (deletion.error) throw deletion.error
+        assert.equal(deletion.result?.rowCount, 1, mode)
+        await tenantDeleter.query(mode === 'tenant-rollback' ? 'ROLLBACK' : 'COMMIT')
+
+        const finalAuthority = await auditWriter.query<{
+          live: boolean; source_revision: string; current_snapshot_id: string | null
+        }>(`SELECT live, source_revision::text, current_snapshot_id::text
+              FROM tenant_health_source_authorities
+             WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+        assert.equal(finalAuthority.rowCount, 1, mode)
+        assert.equal(finalAuthority.rows[0].live, mode === 'tenant-rollback', mode)
+        assert.equal(finalAuthority.rows[0].current_snapshot_id, null, mode)
+        assert.ok(BigInt(finalAuthority.rows[0].source_revision) > BigInt(seededRevision),
+          `${mode}: final source revision must advance`)
+        const retainedTenant = await auditWriter.query(
+          'SELECT id FROM customer_tenants WHERE id = $1', [tenant])
+        assert.equal(retainedTenant.rowCount, mode === 'tenant-rollback' ? 1 : 0, mode)
+        const retainedAudit = await auditWriter.query(
+          'SELECT id FROM directory_audit_logs WHERE id = $1', [auditLog])
+        assert.equal(retainedAudit.rowCount, mode === 'tenant-rollback' ? 1 : 0, mode)
+      } finally {
+        try {
+          await auditWriter.query('ROLLBACK')
+          if (deleteOutcome) await deleteOutcome
+          await tenantDeleter.query('ROLLBACK')
+          if (seeded) {
+            await auditWriter.query('BEGIN')
+            try {
+              await auditWriter.query('DELETE FROM directory_audit_logs WHERE id = $1',
+                [auditLog])
+              await auditWriter.query('DELETE FROM customer_tenants WHERE id = $1', [tenant])
+              await auditWriter.query(
+                'DELETE FROM tenant_health_source_authorities WHERE organization_id = $1 AND customer_tenant_id = $2',
+                [org, tenant])
+              await auditWriter.query('DELETE FROM organizations WHERE id = $1', [org])
+              await auditWriter.query('COMMIT')
+            } catch (error) {
+              await auditWriter.query('ROLLBACK')
+              throw error
+            }
+          }
+        } finally {
+          await tenantDeleter.end()
+          await auditWriter.end()
+        }
       }
     }
   })
