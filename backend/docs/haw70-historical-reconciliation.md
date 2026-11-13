@@ -1,0 +1,52 @@
+# HAW-70 historical authority reconciliation contract
+
+Status: local design only, 13 November 2026. No reconciliation runner, readiness marker, current-reader gate or automatic retry is implemented by this document. The current candidate remains inactive. The prior tenant-create and audit/delete writer slices do not cover the historical rollout interval or the complete source protocol.
+
+## Problem and decision
+
+The initial authority backfill runs before the tenant-create trigger is installed. A tenant born in that interval can have no authority. A tenant deleted and recreated with the same ID in that interval can retain a live authority from an earlier incarnation; checking only for missing or dead authority cannot distinguish that reuse. An audit write before the audit trigger is installed can also leave an existing pointer tagged with an obsolete revision.
+
+Reconcile every current tenant pair under a stable database write boundary before the future reader may trust this protocol. Do not implement routine lock-contention retries as a data migration that is expected to fail under Prisma Migrate. A failed migration can require migration-history repair before later deploys can run, which conflicts with this package's no-manual-recovery release requirement. [Prisma failed-migration documentation](https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/patching-and-hotfixing#failed-migration).
+
+The repository's API image currently runs Prisma migrations before starting the application. The cron image invokes the scheduled API request and is not a separate migration runner. A new reconciliation attempt must therefore be an ordinary application transaction after schema preparation, outside migration-history execution. Its invocation, retry budget and automatic-release integration still need implementation and proof. This document changes neither startup nor the existing scheduler.
+
+## Transaction contract
+
+The future runner receives an expected protocol generation whose complete writer prerequisites are installed and checked. Its private durable marker records historical reconciliation for that generation; it is not by itself proof of all writers, current-reader safety or release readiness. An absent, incomplete, foreign-generation or unverifiable marker cannot authorize a current health assessment.
+
+Use one READ COMMITTED transaction. Before scanning, acquire table locks in a documented fixed order: organizations, customer tenants, directory audit logs, health snapshots, source authorities, then the private generation marker. The exact marker schema and lock strategy remain to be implemented. Organization locking precedes child locks: an organization delete must not hold a parent row while the runner holds a tenant table lock and waits for that parent's foreign-key check.
+
+A conservative candidate is EXCLUSIVE table locks with NOWAIT. EXCLUSIVE allows ordinary reads while excluding source DML and row-locking reads; NOWAIT refuses existing conflicts rather than holding some locks while waiting for another. PostgreSQL locks a list one table at a time, so the runner must roll back the entire transaction immediately if any acquisition fails. A weaker mode needs a proof that no row-locking admission read can recreate a cycle. These choices are proposals for registered CI and capacity measurement, not a production rollout decision. [PostgreSQL lock command](https://www.postgresql.org/docs/16/sql-lock.html), [lock modes](https://www.postgresql.org/docs/16/explicit-locking.html).
+
+After all locks are held, recheck the generation marker and installed writer prerequisites. If this generation is already complete, return without rotating any authority. Otherwise perform these changes in the same transaction:
+
+1. For every current exact organization/tenant pair, insert missing authority with a fresh incarnation, revision one, live state, no snapshot pointer and sequence zero. For an existing row, always generate a fresh incarnation, increment its existing revision, mark it live and clear the pointer/sequence. Do not reset an existing revision to one. Rotating all existing pairs is deliberate: historical tenant-ID reuse may be unobservable.
+2. For each live authority with no current exact organization/tenant pair, increment its revision, mark it dead, and clear its pointer/sequence. Preserve already-dead absent tombstones. Never erase a surviving tombstone merely to make a fresh backfill succeed.
+3. Check that every current pair has one live authority with no pointer and sequence zero, no absent pair has live authority, and no old current pointer survived. An unexpected scope, constraint error or bigint overflow aborts all changes.
+4. Insert or complete the generation marker only after these checks. Marker completion and all authority changes commit together. A completed marker must not be editable into a different generation by an unprivileged caller.
+
+All health-relevant source writers must continue participating after this boundary, including legacy processes still serving during an automatic rollout. Reconciliation cannot compensate for a subsequent unversioned writer. Missing lifecycle, scope-change or non-audit source writers still block activation independently of the marker.
+
+## Contention, crash and retry behavior
+
+Return a distinct deferred result for an explicitly recognized lock-contention outcome only after a full rollback and connection cleanup. Other failures remain failures and keep the marker absent/incomplete. Never swallow an error and record success, edit migration history, run a manual recovery command, or substitute an old marker.
+
+Retries must use a bounded, automatic path within existing operational limits. The future implementation must choose and measure its attempt count, backoff, statement time and total lock-hold budget; no cadence, quota or paid-resource change is authorized here. Contention must not keep a long transaction or connection alive between attempts. Exhaustion leaves the new reader unavailable/unknown for this protocol, rather than allowing a confident HEALTHY determination without authority.
+
+A crash before commit leaves no marker and no partial reconciliation. A crash after commit but before the caller receives success is handled by rereading the exact generation marker: the retry does not rotate incarnations or increment revisions again. Two concurrent attempts must result in one committed generation, with the other either deferred or observing that same completed generation. A later generation requires its own new boundary and acceptance evidence.
+
+## Required registered disposable-PostgreSQL acceptance
+
+- Seed a missing authority, an existing live authority with an exact snapshot pointer, a dead authority whose tenant currently exists, a live orphan and an already-dead absent tombstone. Check the transformation, preserved monotonic revisions and exact scope, including a historical same-ID reuse that still appears live.
+- Hold a conflicting organization, tenant, audit, snapshot, authority or marker lock with a second client. Each attempt must defer/abort within budget, preserve every fixture and marker, and release all locks it acquired. A conflict on the last table must not retain earlier locks. Verify that Prisma migration history remains unchanged by these attempt failures and a subsequent normal deploy is not poisoned.
+- Release contention and let the configured automatic retry complete. Observe old authority and no completed marker from another client before commit, then new authority and the exact marker together after commit. No reader may consume an old trusted pointer at the new generation.
+- Inject a failure after authority writes and before marker completion; verify total rollback. Simulate lost acknowledgment after commit and prove a retry leaves incarnation/revision unchanged. Force two runners through the marker race.
+- Exercise tenant creation/deletion/reuse, organization deletion, audit writes and history admission immediately before and after the lock boundary. Required legacy processes must obey installed database writers or remain excluded from activation. Multi-row/cross-tenant and non-audit writer gates remain separate obligations.
+- Force revision overflow and a malformed/incompatible protocol marker. Both must fail closed without partial data or readiness. No timeout, skipped case, zero-test run or successful schema application is reconciliation proof.
+- At 1,001 tenants with representative histories, measure lock hold and wait time, WAL/write volume, statement plans, memory, connection occupancy and impact on unrelated API requests. The final budget must fit the existing infrastructure and automatic release constraints before this transaction can ship.
+
+The next bounded implementation is the private generation-marker schema and an unused transaction runner with synthetic error classification tests plus registered physical witnesses. Do not wire a caller or reader until the corresponding writer prerequisites, retry/commit protocol and cost gates are reviewable. This is not permission to deploy the existing partial writer migrations independently.
+
+## Fallback and remaining release gates
+
+Keep protected main as the operational fallback and the parent local writer candidate as the reconstruction fallback. No source-authority reader is active today. Do not activate a failed or deferred generation, and do not claim Baseline complete. Authorized independent review of the complete exact source, registered exact-head CI, configured automatic API/cron release, actual health and an authenticated canary remain required. This design neither changes sync cadence nor fixes the separate HAW-21 visit-fencing package.
