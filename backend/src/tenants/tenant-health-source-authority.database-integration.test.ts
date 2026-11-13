@@ -306,3 +306,99 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
       await writer.end()
     }
   })
+
+// Held until the tenant lifecycle writer is present. Deleting a tenant must
+// retain an authority tombstone even though its health snapshot cascades away.
+test('HAW-70 tenant deletion clears current health and retains a dead authority',
+  {
+    skip: !RUN || process.env.HAWKVIEW_HAW70_TENANT_DELETE_WITNESS !== '1',
+    timeout: 30_000,
+  }, async () => {
+    const client = new pg.Client({ connectionString: URL! })
+    const [org, tenant, microsoftTenant, initialIncarnation, snapshot] =
+      Array.from({ length: 5 }, () => randomUUID())
+    await client.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query(
+        `INSERT INTO organizations (id, name, slug, updated_at)
+         VALUES ($1, 'HAW-70 tenant delete witness', $2, now())`,
+        [org, `haw70-${org}`])
+      await client.query(
+        `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+         VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
+      await client.query(
+        `INSERT INTO tenant_health_source_authorities
+           (organization_id, customer_tenant_id, incarnation, source_revision)
+         VALUES ($1, $2, $3, 1)
+         ON CONFLICT (organization_id, customer_tenant_id) DO NOTHING`,
+        [org, tenant, initialIncarnation])
+      const seeded = await client.query<{
+        incarnation: string; source_revision: string
+      }>(`SELECT incarnation::text, source_revision::text
+            FROM tenant_health_source_authorities
+           WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      assert.equal(seeded.rowCount, 1)
+      const { incarnation } = seeded.rows[0]
+      const sourceRevision = BigInt(seeded.rows[0].source_revision)
+      await client.query(
+        `INSERT INTO tenant_health_snapshots
+           (id, organization_id, customer_tenant_id, health_model_version,
+            overall_status, payload, evaluated_at, source_incarnation,
+            source_revision, observation_sequence)
+         VALUES ($1, $2, $3, 1, 'HEALTHY', '{}'::jsonb, now(), $4, $5, 1)`,
+        [snapshot, org, tenant, incarnation, sourceRevision.toString()])
+      await client.query(
+        `UPDATE tenant_health_source_authorities
+            SET current_snapshot_id = $1, current_observation_sequence = 1
+          WHERE organization_id = $2 AND customer_tenant_id = $3`,
+        [snapshot, org, tenant])
+      await client.query('COMMIT')
+
+      await client.query('BEGIN')
+      await client.query('DELETE FROM customer_tenants WHERE id = $1', [tenant])
+      const deleted = await client.query<{
+        live: boolean; source_revision: string; current_snapshot_id: string | null
+      }>(`SELECT live, source_revision::text, current_snapshot_id::text
+            FROM tenant_health_source_authorities
+           WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      assert.deepEqual(deleted.rows, [{
+        live: false,
+        source_revision: (sourceRevision + 1n).toString(),
+        current_snapshot_id: null,
+      }], 'Deletion must tombstone and invalidate authority in the same transaction')
+      await client.query('COMMIT')
+
+      const retained = await client.query<{
+        live: boolean; current_snapshot_id: string | null
+      }>(`SELECT live, current_snapshot_id::text
+            FROM tenant_health_source_authorities
+           WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      assert.deepEqual(retained.rows, [{ live: false, current_snapshot_id: null }])
+      const oldHistory = await client.query(
+        'SELECT id FROM tenant_health_snapshots WHERE id = $1', [snapshot])
+      assert.equal(oldHistory.rowCount, 0, 'The deleted tenant cannot leave current history behind')
+    } finally {
+      try {
+        await client.query('ROLLBACK')
+        await client.query('BEGIN')
+        try {
+          await client.query(
+            `UPDATE tenant_health_source_authorities SET current_snapshot_id = NULL
+              WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+          await client.query('DELETE FROM tenant_health_snapshots WHERE id = $1', [snapshot])
+          await client.query('DELETE FROM customer_tenants WHERE id = $1', [tenant])
+          await client.query(
+            `DELETE FROM tenant_health_source_authorities
+              WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+          await client.query('DELETE FROM organizations WHERE id = $1', [org])
+          await client.query('COMMIT')
+        } catch (error) {
+          await client.query('ROLLBACK')
+          throw error
+        }
+      } finally {
+        await client.end()
+      }
+    }
+  })
