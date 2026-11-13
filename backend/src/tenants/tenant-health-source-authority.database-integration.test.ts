@@ -99,8 +99,8 @@ test('HAW-70 exact pointer rejects stale tags and history blocks a tenant scope 
   { skip: !RUN, timeout: 30_000 }, async () => {
     const client = new pg.Client({ connectionString: URL! })
     await client.connect()
-    const [org, otherOrg, tenant, microsoftTenant, incarnation, snapshot] =
-      Array.from({ length: 6 }, () => randomUUID())
+    const [org, otherOrg, tenant, microsoftTenant, snapshot] =
+      Array.from({ length: 5 }, () => randomUUID())
     await client.query('BEGIN')
     try {
       for (const id of [org, otherOrg]) {
@@ -112,10 +112,12 @@ test('HAW-70 exact pointer rejects stale tags and history blocks a tenant scope 
       await client.query(
         `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
          VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
-      await client.query(
-        `INSERT INTO tenant_health_source_authorities
-           (organization_id, customer_tenant_id, incarnation, source_revision)
-         VALUES ($1, $2, $3, 1)`, [org, tenant, incarnation])
+      const created = await client.query<{ incarnation: string }>(
+        `SELECT incarnation::text
+           FROM tenant_health_source_authorities
+          WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      assert.equal(created.rowCount, 1)
+      const { incarnation } = created.rows[0]
       await client.query(
         `INSERT INTO tenant_health_snapshots
            (id, organization_id, customer_tenant_id, health_model_version,
@@ -157,6 +159,104 @@ test('HAW-70 exact pointer rejects stale tags and history blocks a tenant scope 
     }
   })
 
+test('HAW-70 tenant insert creates authority atomically and reused ID gets a new incarnation',
+  { skip: !RUN, timeout: 30_000 }, async () => {
+    const writer = new pg.Client({ connectionString: URL! })
+    const observer = new pg.Client({ connectionString: URL! })
+    const [org, tenant, firstMicrosoftTenant, secondMicrosoftTenant] =
+      Array.from({ length: 4 }, () => randomUUID())
+    const authority = async (client: pg.Client) => {
+      const result = await client.query<{
+        incarnation: string; source_revision: string; live: boolean;
+        current_snapshot_id: string | null; current_observation_sequence: string
+      }>(`SELECT incarnation::text, source_revision::text, live,
+                 current_snapshot_id::text, current_observation_sequence::text
+            FROM tenant_health_source_authorities
+           WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+      return result.rows
+    }
+
+    await writer.connect()
+    try {
+      await observer.connect()
+      try {
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO organizations (id, name, slug, updated_at)
+           VALUES ($1, 'HAW-70 tenant create witness', $2, now())`,
+          [org, `haw70-${org}`])
+        await writer.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [tenant, org, firstMicrosoftTenant])
+        const uncommitted = await authority(writer)
+        assert.equal(uncommitted.length, 1)
+        assert.deepEqual(uncommitted[0], {
+          incarnation: uncommitted[0].incarnation,
+          source_revision: '1', live: true,
+          current_snapshot_id: null, current_observation_sequence: '0',
+        })
+        assert.deepEqual(await authority(observer), [],
+          'A second client cannot see an uncommitted tenant authority')
+        await writer.query('ROLLBACK')
+        assert.deepEqual(await authority(observer), [],
+          'Rolling back tenant creation also rolls back authority')
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO organizations (id, name, slug, updated_at)
+           VALUES ($1, 'HAW-70 tenant create witness', $2, now())`,
+          [org, `haw70-${org}`])
+        await writer.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [tenant, org, firstMicrosoftTenant])
+        await writer.query('COMMIT')
+        const first = (await authority(observer))[0]
+        assert.equal(first.live, true)
+        assert.equal(first.source_revision, '1')
+
+        await writer.query('BEGIN')
+        await writer.query('DELETE FROM customer_tenants WHERE id = $1', [tenant])
+        await writer.query('COMMIT')
+        const tombstone = (await authority(observer))[0]
+        assert.equal(tombstone.live, false)
+        assert.equal(tombstone.current_snapshot_id, null)
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [tenant, org, secondMicrosoftTenant])
+        await writer.query('COMMIT')
+        const revived = (await authority(observer))[0]
+        assert.equal(revived.live, true)
+        assert.notEqual(revived.incarnation, first.incarnation,
+          'A reused tenant ID must not inherit its old source incarnation')
+        assert.equal(BigInt(revived.source_revision), BigInt(tombstone.source_revision) + 1n)
+        assert.equal(revived.current_snapshot_id, null)
+        assert.equal(revived.current_observation_sequence, '0')
+      } finally {
+        try {
+          await writer.query('ROLLBACK')
+          await writer.query('BEGIN')
+          try {
+            await writer.query('DELETE FROM customer_tenants WHERE id = $1', [tenant])
+            await writer.query(
+              `DELETE FROM tenant_health_source_authorities
+                WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, tenant])
+            await writer.query('DELETE FROM organizations WHERE id = $1', [org])
+            await writer.query('COMMIT')
+          } catch (error) {
+            await writer.query('ROLLBACK')
+            throw error
+          }
+        } finally {
+          await observer.end()
+        }
+      }
+    } finally {
+      await writer.end()
+    }
+  })
+
 // This physical witness runs only in the registered disposable PostgreSQL job.
 test('HAW-70 audit insert, update, and delete invalidate current health in the same transaction',
   {
@@ -165,11 +265,11 @@ test('HAW-70 audit insert, update, and delete invalidate current health in the s
   }, async () => {
     const writer = new pg.Client({ connectionString: URL! })
     const reader = new pg.Client({ connectionString: URL! })
-    const [org, tenant, microsoftTenant, initialIncarnation, firstSnapshot,
+    const [org, tenant, microsoftTenant, firstSnapshot,
       secondSnapshot, thirdSnapshot, auditLog, bulkAuditA, bulkAuditB,
       otherTenant, otherMicrosoftTenant, movedAudit,
       sourceMoveSnapshot, destinationMoveSnapshot] =
-      Array.from({ length: 15 }, () => randomUUID())
+      Array.from({ length: 14 }, () => randomUUID())
     const current = async (client: pg.Client) => {
       const result = await client.query<{
         source_revision: string; current_snapshot_id: string | null
@@ -191,12 +291,6 @@ test('HAW-70 audit insert, update, and delete invalidate current health in the s
         await writer.query(
           `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
            VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
-        await writer.query(
-          `INSERT INTO tenant_health_source_authorities
-             (organization_id, customer_tenant_id, incarnation, source_revision)
-           VALUES ($1, $2, $3, 1)
-           ON CONFLICT (organization_id, customer_tenant_id) DO NOTHING`,
-          [org, tenant, initialIncarnation])
         const seeded = await writer.query<{
           incarnation: string; source_revision: string
         }>(`SELECT incarnation::text, source_revision::text
@@ -354,11 +448,6 @@ test('HAW-70 audit insert, update, and delete invalidate current health in the s
         await writer.query(
           `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
            VALUES ($1, $2, $3, now())`, [otherTenant, org, otherMicrosoftTenant])
-        // Tenant-creation authority is a separate, still-unwired HAW-70 slice.
-        await writer.query(
-          `INSERT INTO tenant_health_source_authorities
-             (organization_id, customer_tenant_id, incarnation, source_revision)
-           VALUES ($1, $2, gen_random_uuid(), 1)`, [org, otherTenant])
         const destination = await writer.query<{ incarnation: string }>(
           `SELECT incarnation::text FROM tenant_health_source_authorities
             WHERE organization_id = $1 AND customer_tenant_id = $2`,
@@ -459,8 +548,8 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
     timeout: 30_000,
   }, async () => {
     const client = new pg.Client({ connectionString: URL! })
-    const [org, tenant, microsoftTenant, initialIncarnation, snapshot, auditLog] =
-      Array.from({ length: 6 }, () => randomUUID())
+    const [org, tenant, microsoftTenant, snapshot, auditLog] =
+      Array.from({ length: 5 }, () => randomUUID())
     await client.connect()
     try {
       await client.query('BEGIN')
@@ -471,12 +560,6 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
       await client.query(
         `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
          VALUES ($1, $2, $3, now())`, [tenant, org, microsoftTenant])
-      await client.query(
-        `INSERT INTO tenant_health_source_authorities
-           (organization_id, customer_tenant_id, incarnation, source_revision)
-         VALUES ($1, $2, $3, 1)
-         ON CONFLICT (organization_id, customer_tenant_id) DO NOTHING`,
-        [org, tenant, initialIncarnation])
       await client.query(
         `INSERT INTO directory_audit_logs
            (id, organization_id, customer_tenant_id, microsoft_audit_id,

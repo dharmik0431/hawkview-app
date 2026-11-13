@@ -922,8 +922,9 @@ model TenantHealthSnapshot {
   @@map("tenant_health_snapshots")
 }
 
-// Inert foundation for a future source-revision protocol. No runtime currently
-// reads or writes this table; a later activation must cover every source writer.
+// Inactive current-health foundation. Migration triggers write limited source
+// revisions, but no runtime reader uses this authority until all sources are
+// fenced and live tenant rows are reconciled before activation.
 // The pair survives tenant deletion so delete/recreate cannot reuse an old
 // health incarnation. It is removed only with its owning organization.
 model TenantHealthSourceAuthority {
