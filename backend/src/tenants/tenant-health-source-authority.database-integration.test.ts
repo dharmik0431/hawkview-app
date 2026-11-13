@@ -157,17 +157,19 @@ test('HAW-70 exact pointer rejects stale tags and history blocks a tenant scope 
     }
   })
 
-// Held until the audit writer migration is present. This test deliberately
-// fails against the migration-only foundation and must run in disposable CI.
-test('HAW-70 audit insert and delete invalidate current health in the same transaction',
+// This physical witness runs only in the registered disposable PostgreSQL job.
+test('HAW-70 audit insert, update, and delete invalidate current health in the same transaction',
   {
     skip: !RUN || process.env.HAWKVIEW_HAW70_AUDIT_WRITER_WITNESS !== '1',
     timeout: 30_000,
   }, async () => {
     const writer = new pg.Client({ connectionString: URL! })
     const reader = new pg.Client({ connectionString: URL! })
-    const [org, tenant, microsoftTenant, initialIncarnation, firstSnapshot, secondSnapshot, auditLog] =
-      Array.from({ length: 7 }, () => randomUUID())
+    const [org, tenant, microsoftTenant, initialIncarnation, firstSnapshot,
+      secondSnapshot, thirdSnapshot, auditLog, bulkAuditA, bulkAuditB,
+      otherTenant, otherMicrosoftTenant, movedAudit,
+      sourceMoveSnapshot, destinationMoveSnapshot] =
+      Array.from({ length: 15 }, () => randomUUID())
     const current = async (client: pg.Client) => {
       const result = await client.query<{
         source_revision: string; current_snapshot_id: string | null
@@ -241,6 +243,20 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
 
         await writer.query('BEGIN')
         await writer.query(
+          `INSERT INTO directory_audit_logs
+             (id, organization_id, customer_tenant_id, microsoft_audit_id,
+              event_date_time, activity_display_name, raw, expires_at)
+           VALUES ($1, $2, $3, $4, now(), 'HAW-70 duplicate witness', '{}'::jsonb,
+                   now() + interval '1 day')
+           ON CONFLICT (customer_tenant_id, microsoft_audit_id) DO NOTHING`,
+          [randomUUID(), org, tenant, `haw70-${auditLog}`])
+        assert.deepEqual(await current(writer), {
+          source_revision: (sourceRevision + 1n).toString(), current_snapshot_id: null,
+        }, 'A skipped duplicate must not advance source authority')
+        await writer.query('COMMIT')
+
+        await writer.query('BEGIN')
+        await writer.query(
           `INSERT INTO tenant_health_snapshots
              (id, organization_id, customer_tenant_id, health_model_version,
               overall_status, payload, evaluated_at, source_incarnation,
@@ -255,13 +271,52 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
         await writer.query('COMMIT')
 
         await writer.query('BEGIN')
-        await writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditLog])
+        await writer.query(
+          `UPDATE directory_audit_logs SET activity_display_name = 'Corrected audit witness'
+            WHERE id = $1`, [auditLog])
         assert.deepEqual(await current(writer), {
           source_revision: (sourceRevision + 2n).toString(), current_snapshot_id: null,
-        }, 'The audit delete must invalidate the pointer before its transaction commits')
+        }, 'An audit correction must invalidate the pointer before commit')
+        assert.deepEqual(await current(reader), {
+          source_revision: (sourceRevision + 1n).toString(), current_snapshot_id: secondSnapshot,
+        }, 'A second client must not see an uncommitted audit correction')
         await writer.query('ROLLBACK')
         assert.deepEqual(await current(reader), {
           source_revision: (sourceRevision + 1n).toString(), current_snapshot_id: secondSnapshot,
+        }, 'A rolled-back correction must preserve current authority')
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `UPDATE directory_audit_logs SET activity_display_name = 'Corrected audit witness'
+            WHERE id = $1`, [auditLog])
+        await writer.query('COMMIT')
+        assert.deepEqual(await current(reader), {
+          source_revision: (sourceRevision + 2n).toString(), current_snapshot_id: null,
+        })
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO tenant_health_snapshots
+             (id, organization_id, customer_tenant_id, health_model_version,
+              overall_status, payload, evaluated_at, source_incarnation,
+              source_revision, observation_sequence)
+           VALUES ($1, $2, $3, 1, 'UNKNOWN', '{}'::jsonb, now(), $4, $5, 3)`,
+          [thirdSnapshot, org, tenant, incarnation, (sourceRevision + 2n).toString()])
+        await writer.query(
+          `UPDATE tenant_health_source_authorities
+              SET current_snapshot_id = $1, current_observation_sequence = 3
+            WHERE organization_id = $2 AND customer_tenant_id = $3`,
+          [thirdSnapshot, org, tenant])
+        await writer.query('COMMIT')
+
+        await writer.query('BEGIN')
+        await writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditLog])
+        assert.deepEqual(await current(writer), {
+          source_revision: (sourceRevision + 3n).toString(), current_snapshot_id: null,
+        }, 'The audit delete must invalidate the pointer before its transaction commits')
+        await writer.query('ROLLBACK')
+        assert.deepEqual(await current(reader), {
+          source_revision: (sourceRevision + 2n).toString(), current_snapshot_id: thirdSnapshot,
         }, 'A rolled-back audit delete must preserve the previous authority')
         const retained = await reader.query(
           'SELECT id FROM directory_audit_logs WHERE id = $1', [auditLog])
@@ -270,12 +325,101 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
         await writer.query('BEGIN')
         await writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditLog])
         assert.deepEqual(await current(writer), {
-          source_revision: (sourceRevision + 2n).toString(), current_snapshot_id: null,
+          source_revision: (sourceRevision + 3n).toString(), current_snapshot_id: null,
         })
         await writer.query('COMMIT')
         assert.deepEqual(await current(reader), {
-          source_revision: (sourceRevision + 2n).toString(), current_snapshot_id: null,
+          source_revision: (sourceRevision + 3n).toString(), current_snapshot_id: null,
         })
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO directory_audit_logs
+             (id, organization_id, customer_tenant_id, microsoft_audit_id,
+              event_date_time, activity_display_name, raw, expires_at)
+           VALUES ($1, $2, $3, $4, now(), 'Bulk audit A', '{}'::jsonb, now() + interval '1 day'),
+                  ($5, $2, $3, $6, now(), 'Bulk audit B', '{}'::jsonb, now() + interval '1 day')`,
+          [bulkAuditA, org, tenant, `haw70-${bulkAuditA}`, bulkAuditB, `haw70-${bulkAuditB}`])
+        assert.deepEqual(await current(writer), {
+          source_revision: (sourceRevision + 4n).toString(), current_snapshot_id: null,
+        }, 'One bulk insert must advance the tenant revision once')
+        await writer.query('DELETE FROM directory_audit_logs WHERE id = ANY($1::uuid[])',
+          [[bulkAuditA, bulkAuditB]])
+        assert.deepEqual(await current(writer), {
+          source_revision: (sourceRevision + 5n).toString(), current_snapshot_id: null,
+        }, 'One bulk delete must advance the tenant revision once')
+        await writer.query('COMMIT')
+
+        await writer.query('BEGIN')
+        await writer.query(
+          `INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+           VALUES ($1, $2, $3, now())`, [otherTenant, org, otherMicrosoftTenant])
+        // Tenant-creation authority is a separate, still-unwired HAW-70 slice.
+        await writer.query(
+          `INSERT INTO tenant_health_source_authorities
+             (organization_id, customer_tenant_id, incarnation, source_revision)
+           VALUES ($1, $2, gen_random_uuid(), 1)`, [org, otherTenant])
+        const destination = await writer.query<{ incarnation: string }>(
+          `SELECT incarnation::text FROM tenant_health_source_authorities
+            WHERE organization_id = $1 AND customer_tenant_id = $2`,
+          [org, otherTenant])
+        assert.equal(destination.rowCount, 1)
+        await writer.query(
+          `INSERT INTO directory_audit_logs
+             (id, organization_id, customer_tenant_id, microsoft_audit_id,
+              event_date_time, activity_display_name, raw, expires_at)
+           VALUES ($1, $2, $3, $4, now(), 'Scope move witness', '{}'::jsonb,
+                   now() + interval '1 day')`,
+          [movedAudit, org, tenant, `haw70-${movedAudit}`])
+        assert.equal((await current(writer)).source_revision,
+          (sourceRevision + 6n).toString())
+        await writer.query(
+          `INSERT INTO tenant_health_snapshots
+             (id, organization_id, customer_tenant_id, health_model_version,
+              overall_status, payload, evaluated_at, source_incarnation,
+              source_revision, observation_sequence)
+           VALUES ($1, $2, $3, 1, 'UNKNOWN', '{}'::jsonb, now(), $4, $5, 4),
+                  ($6, $2, $7, 1, 'UNKNOWN', '{}'::jsonb, now(), $8, 1, 5)`,
+          [sourceMoveSnapshot, org, tenant, incarnation,
+            (sourceRevision + 6n).toString(), destinationMoveSnapshot,
+            otherTenant, destination.rows[0].incarnation])
+        await writer.query(
+          `UPDATE tenant_health_source_authorities
+              SET current_snapshot_id = $1, current_observation_sequence = 4
+            WHERE organization_id = $2 AND customer_tenant_id = $3`,
+          [sourceMoveSnapshot, org, tenant])
+        await writer.query(
+          `UPDATE tenant_health_source_authorities
+              SET current_snapshot_id = $1, current_observation_sequence = 5
+            WHERE organization_id = $2 AND customer_tenant_id = $3`,
+          [destinationMoveSnapshot, org, otherTenant])
+        await writer.query(
+          `UPDATE directory_audit_logs SET customer_tenant_id = $1 WHERE id = $2`,
+          [otherTenant, movedAudit])
+        assert.deepEqual(await current(writer), {
+          source_revision: (sourceRevision + 7n).toString(), current_snapshot_id: null,
+        },
+          'A scope move must invalidate the old tenant')
+        const moved = await writer.query<{
+          source_revision: string; current_snapshot_id: string | null
+        }>(
+          `SELECT source_revision::text, current_snapshot_id::text
+             FROM tenant_health_source_authorities
+            WHERE organization_id = $1 AND customer_tenant_id = $2`,
+          [org, otherTenant])
+        assert.deepEqual(moved.rows, [{
+          source_revision: '2', current_snapshot_id: null,
+        }],
+          'A scope move must also invalidate the destination tenant')
+        await writer.query('ROLLBACK')
+        assert.deepEqual(await current(reader), {
+          source_revision: (sourceRevision + 5n).toString(), current_snapshot_id: null,
+        }, 'A rolled-back scope move must preserve original authority')
+        const rolledBackDestination = await reader.query(
+          `SELECT 1 FROM tenant_health_source_authorities
+            WHERE organization_id = $1 AND customer_tenant_id = $2`,
+          [org, otherTenant])
+        assert.equal(rolledBackDestination.rowCount, 0)
       } finally {
         try {
           await writer.query('ROLLBACK')
@@ -307,17 +451,16 @@ test('HAW-70 audit insert and delete invalidate current health in the same trans
     }
   })
 
-// The registered disposable job enables this after the tenant lifecycle
-// writer migration. Deletion must retain an authority tombstone even though
-// its health snapshot cascades away.
+// Deletion must retain one authority tombstone even when cascading audit rows
+// and its health snapshot away in the same transaction.
 test('HAW-70 tenant deletion clears current health and retains a dead authority',
   {
     skip: !RUN || process.env.HAWKVIEW_HAW70_TENANT_DELETE_WITNESS !== '1',
     timeout: 30_000,
   }, async () => {
     const client = new pg.Client({ connectionString: URL! })
-    const [org, tenant, microsoftTenant, initialIncarnation, snapshot] =
-      Array.from({ length: 5 }, () => randomUUID())
+    const [org, tenant, microsoftTenant, initialIncarnation, snapshot, auditLog] =
+      Array.from({ length: 6 }, () => randomUUID())
     await client.connect()
     try {
       await client.query('BEGIN')
@@ -334,6 +477,13 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
          VALUES ($1, $2, $3, 1)
          ON CONFLICT (organization_id, customer_tenant_id) DO NOTHING`,
         [org, tenant, initialIncarnation])
+      await client.query(
+        `INSERT INTO directory_audit_logs
+           (id, organization_id, customer_tenant_id, microsoft_audit_id,
+            event_date_time, activity_display_name, raw, expires_at)
+         VALUES ($1, $2, $3, $4, now(), 'HAW-70 cascade witness', '{}'::jsonb,
+                 now() + interval '1 day')`,
+        [auditLog, org, tenant, `haw70-${auditLog}`])
       const seeded = await client.query<{
         incarnation: string; source_revision: string
       }>(`SELECT incarnation::text, source_revision::text
@@ -379,6 +529,9 @@ test('HAW-70 tenant deletion clears current health and retains a dead authority'
       const oldHistory = await client.query(
         'SELECT id FROM tenant_health_snapshots WHERE id = $1', [snapshot])
       assert.equal(oldHistory.rowCount, 0, 'The deleted tenant cannot leave current history behind')
+      const oldAudit = await client.query(
+        'SELECT id FROM directory_audit_logs WHERE id = $1', [auditLog])
+      assert.equal(oldAudit.rowCount, 0, 'The deleted tenant cannot leave audit history behind')
     } finally {
       try {
         await client.query('ROLLBACK')
