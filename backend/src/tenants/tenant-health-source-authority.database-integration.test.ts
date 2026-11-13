@@ -144,6 +144,139 @@ test('HAW-70 late receipt-lock contention defers after releasing earlier source 
     }
   })
 
+for (const overflowStage of ['current-authority', 'orphan-tombstone'] as const) {
+  test(`HAW-70 ${overflowStage} revision overflow rolls back the entire reconciliation`,
+    { skip: !RUN, timeout: 60_000 }, async () => {
+      const observer = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+      const probe = new pg.Client({ connectionString: URL!, statement_timeout: 3_000 })
+      const prisma = new PrismaService()
+      const [org, snapshot] = [randomUUID(), randomUUID()]
+      // Same-organization UUID ordering makes the ordinary current row eligible
+      // before the overflowing current row. It does not expose statement internals.
+      const [current, overflowing] = [randomUUID(), randomUUID()].sort()
+      const readAuthorities = async () => (await observer.query(
+        `SELECT customer_tenant_id::text, incarnation::text, source_revision::text, live,
+                current_snapshot_id::text, current_observation_sequence::text
+           FROM public.tenant_health_source_authorities WHERE organization_id = $1
+           ORDER BY customer_tenant_id`, [org])).rows
+      const readSnapshots = async () => (await observer.query(
+        `SELECT id::text, customer_tenant_id::text, source_incarnation::text,
+                source_revision::text, observation_sequence::text, payload, evaluated_at::text
+           FROM public.tenant_health_snapshots WHERE organization_id = $1 ORDER BY id`, [org])).rows
+      const readReceipt = async () => (await observer.query(
+        `SELECT generation, protocol_fingerprint FROM public.tenant_health_reconciliation_generations
+          WHERE generation = $1`, [repairGeneration])).rows
+      const readMigrationHistory = async () => (await observer.query(
+        `SELECT id, migration_name, checksum, started_at::text, finished_at::text,
+                rolled_back_at::text, applied_steps_count, md5(COALESCE(logs, '')) AS log_digest
+           FROM public._prisma_migrations ORDER BY id`)).rows
+      await observer.connect()
+      try {
+        await probe.connect()
+        try {
+          assert.deepEqual(await readReceipt(), [], 'Overflow witnesses precede committed generation success')
+          assert.deepEqual((await observer.query(`SELECT organization_id::text, customer_tenant_id::text
+            FROM public.tenant_health_source_authorities WHERE source_revision = 9223372036854775807`)).rows, [],
+          'An unrelated max-revision row must not cause this fixture to pass')
+          await observer.query('BEGIN')
+          await observer.query(`INSERT INTO organizations (id, name, slug, updated_at)
+            VALUES ($1, 'HAW-70 overflow fixture', $2, now())`, [org, `haw70-${org}`])
+          for (const tenant of overflowStage === 'current-authority' ? [current, overflowing] : [current]) {
+            await observer.query(`INSERT INTO customer_tenants (id, organization_id, microsoft_tenant_id, updated_at)
+              VALUES ($1, $2, $3, now())`, [tenant, org, randomUUID()])
+          }
+          await observer.query(`UPDATE tenant_health_source_authorities SET source_revision = 7
+            WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, current])
+          if (overflowStage === 'current-authority') {
+            await observer.query(`UPDATE tenant_health_source_authorities SET source_revision = 9223372036854775807
+              WHERE organization_id = $1 AND customer_tenant_id = $2`, [org, overflowing])
+          } else {
+            await observer.query(`INSERT INTO tenant_health_source_authorities
+              (organization_id, customer_tenant_id, source_revision, live)
+              VALUES ($1, $2, 9223372036854775807, true)`, [org, overflowing])
+          }
+          await observer.query(`INSERT INTO tenant_health_snapshots
+            (id, organization_id, customer_tenant_id, health_model_version, overall_status, payload,
+             evaluated_at, source_incarnation, source_revision, observation_sequence)
+            SELECT $1, organization_id, customer_tenant_id, 1, 'UNKNOWN', '{}'::jsonb,
+                   now(), incarnation, source_revision, 1 FROM tenant_health_source_authorities
+             WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, current])
+          await observer.query(`UPDATE tenant_health_source_authorities
+            SET current_snapshot_id = $1, current_observation_sequence = 1
+            WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, org, current])
+          await observer.query('COMMIT')
+          const before = await readAuthorities()
+          assert.equal(before.length, 2)
+          const originalCurrent = before.find(row => row.customer_tenant_id === current)!
+          assert.equal(originalCurrent.current_snapshot_id, snapshot)
+          assert.equal(before.find(row => row.customer_tenant_id === overflowing)!.source_revision, '9223372036854775807')
+          const snapshotsBefore = await readSnapshots()
+          assert.equal(snapshotsBefore.length, 1)
+          const historyBefore = await readMigrationHistory()
+          let currentUpsertCompleted = false
+          const observing = {
+            $transaction: (callback: (tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0]) => Promise<unknown>,
+              options: Parameters<typeof prisma.$transaction>[1]) => prisma.$transaction(async tx => {
+              const transaction = {
+                $queryRawUnsafe: tx.$queryRawUnsafe.bind(tx),
+                $executeRawUnsafe: async (sql: string, ...values: unknown[]) => {
+                  const count = await tx.$executeRawUnsafe(sql, ...values)
+                  if (sql.startsWith('INSERT INTO public.tenant_health_source_authorities')) {
+                    currentUpsertCompleted = true
+                    const changed = await tx.$queryRawUnsafe<Array<{
+                      incarnation: string; source_revision: bigint; current_snapshot_id: string | null
+                    }>>(`SELECT incarnation::text, source_revision, current_snapshot_id::text
+                         FROM public.tenant_health_source_authorities
+                        WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid`, org, current)
+                    assert.equal(changed[0].source_revision, 8n)
+                    assert.notEqual(changed[0].incarnation, originalCurrent.incarnation)
+                    assert.equal(changed[0].current_snapshot_id, null)
+                    assert.deepEqual(await readAuthorities(), before, 'Earlier repair is not externally visible')
+                  }
+                  return count
+                },
+              } as unknown as typeof tx
+              return callback(transaction)
+            }, options),
+          } as unknown as Pick<PrismaService, '$transaction'>
+          await assert.rejects(reconcile(observing), (error: unknown) => {
+            // Require actual numeric overflow, not an unrelated prerequisite,
+            // timeout, connection, or synthetic observer assertion failure.
+            if (typeof error !== 'object' || error === null) return false
+            const value = error as { code?: unknown; meta?: { code?: unknown;
+              driverAdapterError?: { cause?: { kind?: unknown; code?: unknown; originalCode?: unknown } } } }
+            const cause = value.meta?.driverAdapterError?.cause
+            return value.code === '22003' || (value.code === 'P2010' && (value.meta?.code === '22003' ||
+              (cause?.kind === 'postgres' && (cause.code === '22003' || cause.originalCode === '22003'))))
+          })
+          assert.equal(currentUpsertCompleted, overflowStage === 'orphan-tombstone',
+            'Late overflow must follow an observed successful real current-authority UPSERT')
+          await probe.query('BEGIN')
+          try {
+            await probe.query(`LOCK TABLE public.organizations, public.customer_tenants,
+              public.directory_audit_logs, public.tenant_health_snapshots,
+              public.tenant_health_source_authorities, public.tenant_health_reconciliation_generations
+              IN EXCLUSIVE MODE NOWAIT`)
+          } finally { await probe.query('ROLLBACK') }
+          assert.deepEqual(await readAuthorities(), before)
+          assert.deepEqual(await readSnapshots(), snapshotsBefore)
+          assert.deepEqual(await readReceipt(), [], 'Overflow cannot leave a completion receipt')
+          assert.deepEqual(await readMigrationHistory(), historyBefore)
+        } finally {
+          try { await probe.query('ROLLBACK') } finally { await probe.end() }
+        }
+      } finally {
+        try {
+          await observer.query('ROLLBACK')
+          // Remove max-revision fixtures before tenant deletion can itself
+          // overflow its tombstone trigger. This is disposable-test cleanup.
+          await observer.query('DELETE FROM tenant_health_source_authorities WHERE organization_id = $1', [org])
+          await observer.query('DELETE FROM organizations WHERE id = $1', [org])
+        } finally { await prisma.$disconnect(); await observer.end() }
+      }
+    })
+}
+
 test('HAW-70 experimental reconciliation repairs history atomically and exact retry does not rotate again',
   { skip: !RUN, timeout: 60_000 }, async () => {
     const client = new pg.Client({ connectionString: URL! })
