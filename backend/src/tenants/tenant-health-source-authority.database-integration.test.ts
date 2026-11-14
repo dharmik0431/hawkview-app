@@ -1696,3 +1696,124 @@ test('HAW-70 sync-state overflow rolls back its source and missing or dead autho
     assert.deepEqual(await f.authority(f.observer, 2), deadBefore)
     assert.equal((await f.observer.query('SELECT count(*)::int AS n FROM sync_states WHERE customer_tenant_id = ANY($1::uuid[])', [[missing.tenantId, dead.tenantId]])).rows[0].n, 2)
   })
+
+// Both child sources must be present: single-child coverage cannot establish
+// ordering when a tenant DELETE queues several cascading source invalidators.
+// Do not infer a deadlock from nested SQL alone; require a real blocking edge.
+test('HAW-70 tenant cascades with both audit and sync-state rows preserve source-before-authority ordering',
+  { skip: !RUN, timeout: 120_000 }, async context => {
+    for (const heldSource of ['sync-state', 'audit'] as const) {
+      for (const mutation of ['update', 'delete'] as const) {
+        for (const outcome of ['commit', 'rollback'] as const) {
+          await context.test(`${heldSource} ${mutation}, tenant ${outcome}`, { timeout: 15_000 }, async subcontext => {
+            const f = await syncStateAuthorityFixture(subcontext)
+            const deleter = new pg.Client({ connectionString: URL!, statement_timeout: 10_000 })
+            const scope = f.scopes[0], syncId = randomUUID(), auditId = randomUUID()
+            let deletion: Promise<{ result?: pg.QueryResult; error?: unknown }> | undefined
+            await deleter.connect()
+            try {
+              await f.insert(f.writer, 0, 'USERS', syncId)
+              await f.writer.query(`INSERT INTO directory_audit_logs
+                (id, organization_id, customer_tenant_id, microsoft_audit_id,
+                 event_date_time, activity_display_name, raw, expires_at)
+                VALUES ($1, $2, $3, $4, now(), 'cascade before', '{}'::jsonb, now() + interval '1 day')`,
+              [auditId, scope.organizationId, scope.tenantId, `haw70-cascade-${auditId}`])
+              const before = await f.tag(0)
+              const untouched = await Promise.all([f.authority(f.observer, 1), f.authority(f.observer, 2)])
+              const readSources = async (client: pg.Client) => ({
+                sync: (await client.query('SELECT id, status FROM sync_states WHERE id = $1', [syncId])).rows,
+                audit: (await client.query('SELECT id, activity_display_name FROM directory_audit_logs WHERE id = $1', [auditId])).rows,
+              })
+              const sourceBefore = await readSources(f.observer)
+              assert.equal(sourceBefore.sync.length, 1)
+              assert.equal(sourceBefore.audit.length, 1)
+              const writerPid = (await f.writer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+              const observerPid = (await f.observer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+              const deleterPid = (await deleter.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+              assert.equal(new Set([writerPid, observerPid, deleterPid]).size, 3)
+
+              await f.writer.query('BEGIN')
+              const locked = heldSource === 'sync-state'
+                ? await f.writer.query('SELECT id FROM sync_states WHERE id = $1 FOR UPDATE', [syncId])
+                : await f.writer.query('SELECT id FROM directory_audit_logs WHERE id = $1 FOR UPDATE', [auditId])
+              assert.equal(locked.rowCount, 1)
+              await deleter.query('BEGIN')
+              await deleter.query("SET LOCAL lock_timeout = '8s'")
+              deletion = deleter.query('DELETE FROM customer_tenants WHERE id = $1', [scope.tenantId])
+                .then(result => ({ result }), error => ({ error }))
+
+              let blocked = false
+              const deadline = Date.now() + 4_000
+              while (Date.now() < deadline) {
+                blocked = (await f.observer.query<{ blocked: boolean }>(
+                  'SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS blocked', [writerPid, deleterPid])).rows[0].blocked
+                if (blocked) break
+                await delay(25)
+              }
+              assert.equal(blocked, true, 'tenant DELETE must actually wait on the held child source')
+              assert.deepEqual(await f.authority(f.observer, 0), before)
+              assert.deepEqual(await readSources(f.observer), sourceBefore)
+              // If a cascade already holds H while waiting for the child row,
+              // reject immediately instead of hiding the cycle behind a retry.
+              const available = await f.writer.query(`SELECT 1 FROM tenant_health_source_authorities
+                WHERE organization_id = $1 AND customer_tenant_id = $2 FOR UPDATE NOWAIT`,
+              [scope.organizationId, scope.tenantId])
+              assert.equal(available.rowCount, 1, 'authority must remain available to the held-source writer')
+
+              const changed = heldSource === 'sync-state'
+                ? mutation === 'delete'
+                  ? await f.writer.query('DELETE FROM sync_states WHERE id = $1', [syncId])
+                  : await f.writer.query("UPDATE sync_states SET status = 'SUCCEEDED', last_successful_at = now() WHERE id = $1", [syncId])
+                : mutation === 'delete'
+                  ? await f.writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditId])
+                  : await f.writer.query("UPDATE directory_audit_logs SET activity_display_name = 'cascade after' WHERE id = $1", [auditId])
+              assert.equal(changed.rowCount, 1)
+              const writerAuthority = f.invalidated(before)
+              assert.deepEqual(await f.authority(f.writer, 0), writerAuthority)
+              assert.deepEqual(await f.authority(f.observer, 0), before)
+              assert.deepEqual(await readSources(f.observer), sourceBefore)
+              const sourceAfterWriter = await readSources(f.writer)
+              if (heldSource === 'sync-state') {
+                assert.deepEqual(sourceAfterWriter.sync, mutation === 'delete' ? [] : [{ id: syncId, status: 'SUCCEEDED' }])
+                assert.deepEqual(sourceAfterWriter.audit, sourceBefore.audit)
+              } else {
+                assert.deepEqual(sourceAfterWriter.audit, mutation === 'delete' ? [] : [{ id: auditId, activity_display_name: 'cascade after' }])
+                assert.deepEqual(sourceAfterWriter.sync, sourceBefore.sync)
+              }
+              await f.writer.query('COMMIT')
+
+              const result = await deletion
+              if (result.error) throw result.error
+              assert.equal(result.result?.rowCount, 1)
+              const deletingAuthority = await f.authority(deleter, 0)
+              assert.equal(deletingAuthority.live, false)
+              assert.equal(deletingAuthority.incarnation, before.incarnation)
+              assert.equal(deletingAuthority.current_snapshot_id, null)
+              assert.equal(deletingAuthority.current_observation_sequence, '0')
+              assert.ok(BigInt(deletingAuthority.source_revision) > BigInt(writerAuthority.source_revision))
+              assert.deepEqual(await readSources(deleter), { sync: [], audit: [] })
+              // The cascade is still uncommitted, so only the writer's commit
+              // may be visible through the independent observer connection.
+              assert.deepEqual(await f.authority(f.observer, 0), writerAuthority)
+              assert.deepEqual(await readSources(f.observer), sourceAfterWriter)
+              assert.equal((await f.observer.query('SELECT id FROM customer_tenants WHERE id = $1', [scope.tenantId])).rowCount, 1)
+              await deleter.query(outcome === 'commit' ? 'COMMIT' : 'ROLLBACK')
+
+              assert.deepEqual(await f.authority(f.observer, 0), outcome === 'commit' ? deletingAuthority : writerAuthority)
+              assert.deepEqual(await readSources(f.observer), outcome === 'commit' ? { sync: [], audit: [] } : sourceAfterWriter)
+              assert.equal((await f.observer.query('SELECT id FROM customer_tenants WHERE id = $1', [scope.tenantId])).rowCount,
+                outcome === 'commit' ? 0 : 1)
+              assert.deepEqual(await Promise.all([f.authority(f.observer, 1), f.authority(f.observer, 2)]), untouched)
+            } finally {
+              // Release the deliberately held source before waiting for the
+              // competing statement; its transaction must end before cleanup.
+              await f.writer.query('ROLLBACK')
+              if (deletion) await deletion
+              await deleter.query('ROLLBACK')
+              await deleter.end()
+            }
+          })
+        }
+      }
+    }
+  })
