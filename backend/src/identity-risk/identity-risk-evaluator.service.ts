@@ -2,9 +2,12 @@ import { createHash, randomUUID } from 'node:crypto'
 import { Inject, Injectable } from '@nestjs/common'
 import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import { assertGlobalRiskCommitScope, assertRiskExecutionBudget, configureRiskStatementBudget } from './risk-global-commit-guard.js'
 import { runRiskTransaction } from './risk-bounded-prisma-transaction.js'
+import { assertRiskAttemptVisitOwner } from './risk-global-work-store.js'
 import { completeGlobalRiskAttempt } from './risk-attempt-causality.js'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
 import { projectStoredRiskAssessment, type StoredRiskAssessment } from './risk-assessment-projection.js'
@@ -754,6 +757,7 @@ export class IdentityRiskEvaluatorService {
         batch.context.organizationId !== request.organizationId
       await this.safety.activate({
         executionDeadlineAt: request.executionDeadlineAt,
+        visitOwner: request.visitOwner,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: crossOrganization
           ? { type: 'GLOBAL' }
@@ -800,6 +804,7 @@ export class IdentityRiskEvaluatorService {
         : 'SECRET_EXPOSURE'
       await this.safety.activate({
         executionDeadlineAt: request.executionDeadlineAt,
+        visitOwner: request.visitOwner,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: {
           type: 'TENANT',
@@ -845,6 +850,7 @@ export class IdentityRiskEvaluatorService {
     if (claim === 'SOURCE_INTEGRITY_CONFLICT') {
       await this.safety.activate({
         executionDeadlineAt: request.executionDeadlineAt,
+        visitOwner: request.visitOwner,
         controlType: 'EVALUATION_HARD_DISABLED',
         scope: {
           type: 'TENANT',
@@ -907,6 +913,7 @@ export class IdentityRiskEvaluatorService {
         request.organizationId,
         request.customerTenantId,
         request.executionDeadlineAt,
+        request.visitOwner,
       )
       const persisted = await this.persistCompletedRun({
         pseudonymKeyVersionId: batch.pseudonymKeyVersionId,
@@ -934,7 +941,9 @@ export class IdentityRiskEvaluatorService {
         runKey,
         alertDeliveryDisabled: persisted.safety.alertDeliveryDisabled,
       }
-    } catch {
+    } catch (error) {
+      const lost = request.visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       await this.failOwnedRun(request, claim.id, leaseToken, 'EVALUATION_FAILED')
       throw new Error('Identity risk evaluation failed.')
     }
@@ -962,6 +971,7 @@ export class IdentityRiskEvaluatorService {
     if (safety.hardDisableEpisodeId) {
       await this.safety.recordHardStopBlocked({
         executionDeadlineAt: request.executionDeadlineAt,
+        visitOwner: request.visitOwner,
         organizationId: request.organizationId,
         customerTenantId: request.customerTenantId,
         episodeId: safety.hardDisableEpisodeId,
@@ -982,35 +992,54 @@ export class IdentityRiskEvaluatorService {
     leaseToken: string,
     failureCode: 'EVALUATION_FAILED' | 'EVALUATION_HARD_DISABLED',
   ) {
+    const visitOwner = request.visitOwner
+    if (visitOwner && (
+      visitOwner.organizationId !== request.organizationId ||
+      visitOwner.customerTenantId !== request.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     if (request.executionDeadlineAt !== undefined) {
       // No abandoned write after deadline: an unmarked run retains its bounded
       // lease and the durable attempt suppresses any prior healthy-looking run.
       if (request.executionDeadlineAt - Date.now() < 100) return
       try {
         await withRiskKeyTransaction(request.executionDeadlineAt, async client => {
+          if (visitOwner) await assertRiskAttemptVisitOwner(client, request, visitOwner)
           await client.query(`UPDATE identity_risk_evaluation_runs SET status='FAILED',failure_code=$5,
             lease_token=NULL,lease_expires_at=NULL WHERE id=$1::uuid AND organization_id=$2::uuid
             AND customer_tenant_id=$3::uuid AND lease_token=$4::uuid AND status='RUNNING'`,
           [runId, request.organizationId, request.customerTenantId, leaseToken, failureCode])
         })
-      } catch { /* The bounded lease is the fail-closed recovery mechanism. */ }
+      } catch (error) {
+        const lost = visitOwner && tenantVisitLeaseLoss(error)
+        if (lost) throw lost
+        /* The bounded lease is the fail-closed recovery mechanism. */
+      }
       return
     }
-    await this.prisma.identityRiskEvaluationRun.updateMany({
-      where: {
-        id: runId,
-        organizationId: request.organizationId,
-        customerTenantId: request.customerTenantId,
-        leaseToken,
-        status: 'RUNNING',
-      },
-      data: {
-        status: 'FAILED',
-        failureCode,
-        leaseToken: null,
-        leaseExpiresAt: null,
-      },
-    })
+    const markFailed = (database: Pick<Prisma.TransactionClient, 'identityRiskEvaluationRun'>) =>
+      database.identityRiskEvaluationRun.updateMany({
+        where: {
+          id: runId,
+          organizationId: request.organizationId,
+          customerTenantId: request.customerTenantId,
+          leaseToken,
+          status: 'RUNNING',
+        },
+        data: {
+          status: 'FAILED',
+          failureCode,
+          leaseToken: null,
+          leaseExpiresAt: null,
+        },
+      })
+    if (visitOwner) {
+      await this.prisma.$transaction(async transaction => {
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        await markFailed(transaction)
+      })
+      return
+    }
+    await markFailed(this.prisma)
   }
 
   private validateRequest(
@@ -1145,6 +1174,10 @@ export class IdentityRiskEvaluatorService {
     | { id: string }
     | { hardDisabled: IdentityRiskSafetyState }
   > {
+    if (input.request.visitOwner && (
+      input.request.visitOwner.organizationId !== input.request.organizationId ||
+      input.request.visitOwner.customerTenantId !== input.request.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     const now = input.platformNow
     return runRiskTransaction(this.prisma, input.request, async (transaction) => {
       await configureRiskStatementBudget(transaction, input.request)
@@ -1156,6 +1189,9 @@ export class IdentityRiskEvaluatorService {
         input.request.customerTenantId,
         false,
       )
+      // Sorted control locks precede the scoped tenant lock. Hold the exact
+      // live visit generation through this run-claim transaction.
+      if (input.request.visitOwner) await assertTenantVisitLeaseOwner(transaction, input.request.visitOwner)
       if (safety.evaluationHardDisabled) return { hardDisabled: safety }
       await assertGlobalRiskCommitScope(transaction, input.request, input.capability, input.mailboxAttestations, input.authenticationProof, input.assessment)
       if (input.pseudonymKeyVersionId) {
@@ -1260,6 +1296,7 @@ export class IdentityRiskEvaluatorService {
     organizationId: string,
     customerTenantId: string,
     executionDeadlineAt?: number,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const aggregates: RuleAggregate[] = []
     const matches = new Map<string, IdentitySignalResult>()
@@ -1284,6 +1321,7 @@ export class IdentityRiskEvaluatorService {
         addReason(aggregate, 'DETECTOR_FAILED')
         await this.safety.recordDetectorRejection({
           executionDeadlineAt,
+          visitOwner,
           organizationId,
           customerTenantId,
           runKey,
@@ -1298,6 +1336,7 @@ export class IdentityRiskEvaluatorService {
         addReason(aggregate, 'RESULT_LIMIT_EXCEEDED')
         await this.safety.recordDetectorRejection({
           executionDeadlineAt,
+          visitOwner,
           organizationId,
           customerTenantId,
           runKey,
@@ -1319,6 +1358,7 @@ export class IdentityRiskEvaluatorService {
         addReason(aggregate, rejectionReason)
         await this.safety.recordDetectorRejection({
           executionDeadlineAt,
+          visitOwner,
           organizationId,
           customerTenantId,
           runKey,
@@ -1342,6 +1382,7 @@ export class IdentityRiskEvaluatorService {
           if (existingOutcome && existingOutcome !== result.outcome) {
             await this.safety.recordDetectorRejection({
               executionDeadlineAt,
+              visitOwner,
               organizationId,
               customerTenantId,
               runKey,
@@ -1374,6 +1415,7 @@ export class IdentityRiskEvaluatorService {
         if (existing) {
           await this.safety.recordDetectorRejection({
             executionDeadlineAt,
+            visitOwner,
             organizationId,
             customerTenantId,
             runKey,
@@ -1434,6 +1476,10 @@ export class IdentityRiskEvaluatorService {
     matches: readonly [string, IdentitySignalResult][]
     platformNow: Date
   }) {
+    if (input.request.visitOwner && (
+      input.request.visitOwner.organizationId !== input.request.organizationId ||
+      input.request.visitOwner.customerTenantId !== input.request.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     return runRiskTransaction(this.prisma, input.request, async (transaction) => {
       await configureRiskStatementBudget(transaction, input.request)
       await enforceRiskUtcTransaction(transaction)
@@ -1443,6 +1489,9 @@ export class IdentityRiskEvaluatorService {
         input.request.customerTenantId,
         true,
       )
+      // The source evaluation may outlive its visit. Hold the exact generation
+      // through all failure, finding, completion, and attempt-head writes.
+      if (input.request.visitOwner) await assertTenantVisitLeaseOwner(transaction, input.request.visitOwner)
       if (safety.evaluationHardDisabled) {
         const failed = await transaction.identityRiskEvaluationRun.updateMany({
           where: {

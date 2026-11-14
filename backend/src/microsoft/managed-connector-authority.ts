@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { StoredSecret } from '../secrets/secret-store.service.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 
 export const IMMUTABLE_MANAGED_SECRET_PREFIX = 'hawkview-managed-revision:'
 const LOCK_KEY = 'hawkview:managed-connector:default:authority:v1'
@@ -71,10 +72,14 @@ export async function captureManagedAuthority(db: AuthorityDatabase): Promise<Ma
  * locked, decryptable stored value into a new immutable revision atomically.
  * No provider calls, mutable-credential fallback, tenant writes or scope opt-in. */
 export async function upgradeLegacyManagedAuthority(db: AuthorityDatabase,
-  prepare: (revision: string, source: StoredSecret) => PreparedManagedPublication['sealed']
+  prepare: (revision: string, source: StoredSecret) => PreparedManagedPublication['sealed'],
+  visitOwner?: TenantVisitLeaseOwner,
 ): Promise<{ status: 'current' | 'upgraded' | 'unavailable' }> {
   return db.$transaction(async tx => {
     const current = await lock(tx, true)
+    // A sync-triggered promotion is a write of that visit. Hold its exact
+    // owner after the global authority lock through the immutable publication.
+    if (visitOwner) await assertTenantVisitLeaseOwner(tx, visitOwner)
     if (!current) return { status: 'unavailable' }
     if (current.credentialReference === `encrypted-secret:${current.configurationRevision}`) return { status: 'current' }
     // A malformed published authority is not an old configuration to adopt.

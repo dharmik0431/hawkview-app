@@ -1,4 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { withMailboxReadTransaction } from './mailbox-read-transaction.js'
 import { IDENTITY_RISK_CATALOG_VERSION, IDENTITY_RISK_ENGINE_VERSION, IDENTITY_RISK_SOURCE_PAYLOAD_SCHEMA_VERSION,
   type IdentityRiskSourceBatch, type IdentityRiskSourceEnvelope } from './identity-risk.contract.js'
@@ -115,7 +116,8 @@ export async function projectMailboxEvidence(scope: MailboxSourceScope, evaluati
 export class MailboxRiskProjector {
   constructor(@Inject(IdentityRiskPseudonymProvider) private readonly provider: IdentityRiskPseudonymProvider) {}
 
-  async load(scope: MailboxSourceScope, evaluationAt: Date, executionDeadlineAt = Date.now() + 30_000): Promise<IdentityRiskSourceBatch> {
+  async load(scope: MailboxSourceScope, evaluationAt: Date, executionDeadlineAt = Date.now() + 30_000,
+    visitOwner?: TenantVisitLeaseOwner): Promise<IdentityRiskSourceBatch> {
     // No tenant source reads, registry lookups, or evaluation writes when unconfigured.
     const environment = process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
     if (!this.provider.configured || !environment || !/^[a-z][a-z0-9-]{0,39}$/.test(environment) ||
@@ -125,7 +127,7 @@ export class MailboxRiskProjector {
     const key = keys[0]
     if (keys.length !== 1 || !key || key.organizationId !== scope.organizationId || key.customerTenantId !== scope.customerTenantId ||
       key.environment !== environment || !['AWS_KMS_HMAC_256', 'WRAPPED_AES_GCM_V1'].includes(key.provider)) throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
-    const session = await this.provider.pin(key as PseudonymKeyVersion, deadlineAt)
+    const session = await this.provider.pin(key as PseudonymKeyVersion, deadlineAt, visitOwner)
     try {
     const snapshots = await withMailboxReadTransaction(deadlineAt, 12000, async (client, transactionDeadlineAt) => {
       const result: AttestedMailboxSnapshot[] = []

@@ -3,6 +3,7 @@ import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { classifyEvidence, isKnownMicrosoftSystemEvent, PRIMARY_CHANGE_CLASSIFICATIONS } from '../changes/change-classification.js'
 import type { PilotEvidenceProjection } from './collection-readiness.js'
 import type { MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
+import { LEGACY_SYNC_FRESHNESS_WINDOWS, resourceFreshnessWindow as freshnessWindow } from './sync-freshness-policy.js'
 
 /**
  * Backend-owned tenant health model.  This deliberately keeps connection,
@@ -39,24 +40,9 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
   { resourceType: 'SHAREPOINT_USAGE', required: false },
 ]
 
-/**
- * HawkView receives lightweight delta/activity updates every five minutes, but
- * full inventory collectors run once per day.  Treating every collector as
- * stale after two hours created false health alerts for otherwise successful
- * daily inventory synchronization.
- */
-export const TENANT_HEALTH_FRESHNESS = {
-  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
-  dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
-} as const
-
-const INCREMENTAL_RESOURCE_TYPES = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'])
-
-function freshnessWindow(resourceType: string) {
-  return INCREMENTAL_RESOURCE_TYPES.has(resourceType)
-    ? TENANT_HEALTH_FRESHNESS.incremental
-    : TENANT_HEALTH_FRESHNESS.dailyInventory
-}
+/** Compatibility constants for the default policy. Runtime inventory freshness
+ * follows the same explicit full20 gate as scheduler eligibility. */
+export const TENANT_HEALTH_FRESHNESS = LEGACY_SYNC_FRESHNESS_WINDOWS
 
 function mfaCoverage(payload: unknown) { if (!Array.isArray(payload)) return null; const rows = payload.filter((row): row is { isMfaRegistered: boolean } => typeof row === 'object' && row !== null && typeof (row as { isMfaRegistered?: unknown }).isMfaRegistered === 'boolean'); return rows.length ? Math.round((rows.filter((row) => row.isMfaRegistered).length / rows.length) * 100) : null }
 function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => Boolean(d)).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }

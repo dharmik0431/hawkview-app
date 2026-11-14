@@ -1,5 +1,7 @@
 import type { Prisma } from '../generated/prisma/client.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import { authenticationWindow, mergeAuthenticationWindow } from './authentication-source-readiness.js'
 import type { AuthSource } from '../risky-users-auth/contract.js'
@@ -15,9 +17,14 @@ export async function persistCompletedAuthenticationWindow(prisma: PrismaService
    * optional: a default would let a caller record 'observed nothing' by saying
    * nothing, which is the collapse this whole change removes, and the compiler
    * naming every call site is the point. */
-  observed: { events: number; latestEventAt: string | null }) {
+  observed: { events: number; latestEventAt: string | null },
+  visitOwner?: TenantVisitLeaseOwner) {
+  if (visitOwner && (visitOwner.organizationId !== scope.organizationId || visitOwner.customerTenantId !== scope.customerTenantId)) {
+    throw new TenantVisitLeaseLostError()
+  }
   if (completedPageChain !== true) throw new Error('IDENTITY_AUTH_WINDOW_INCOMPLETE')
   await prisma.$transaction(async (transaction: Prisma.TransactionClient) => {
+    if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
     await enforceRiskUtcTransaction(transaction)
     await transaction.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', `hawkview:snapshot:${scope.customerTenantId}:SIGN_INS`)
     const previous = await transaction.$queryRawUnsafe<Array<{ payload: unknown; observedAt: Date }>>(`SELECT

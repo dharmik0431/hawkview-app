@@ -157,7 +157,15 @@ test('directory role endpoint stays registered and wired through its dedicated c
   assert.deepEqual(transport[0].arguments.slice(0, 2).map((node: any) => node.getText(service)), ['url', 'token'])
   const legacy = calls(property('legacy'), service, 'this.syncEntraCollection')
   assert.equal(legacy.length, 1, 'Legacy directory collector disappeared')
-  assert.deepEqual(legacy[0].arguments.slice(2).map((node: any) => node.getText(service)), ["'DIRECTORY_ROLES'", 'DIRECTORY_ROLE_URL'])
+  assert.deepEqual(legacy[0].arguments.slice(2).map((node: any) => node.getText(service)),
+    ["'DIRECTORY_ROLES'", 'DIRECTORY_ROLE_URL', 'visitOwner', 'auditRequestedRevision'])
+  for (const name of ['visitOwner', 'auditRequestedRevision']) {
+    const forwarded = dependencies.properties.find((node: any) =>
+      (ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node)) && node.name.getText(service) === name)
+    assert.ok(forwarded, `Managed directory collector lost ${name}`)
+    assert.equal(ts.isShorthandPropertyAssignment(forwarded) ? forwarded.name.getText(service)
+      : forwarded.initializer.getText(service), name)
+  }
   const runtime = collector.statements.find((node: any) => ts.isFunctionDeclaration(node) && node.name.text === 'collectDirectoryRoles')
   assert.ok(runtime?.body, 'Directory collector disappeared')
   const pageCalls = calls(runtime.body, collector, 'deps.fetchPage')

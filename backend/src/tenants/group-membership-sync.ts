@@ -1,3 +1,6 @@
+import { tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
+import { recordTenantVisitLifecycleFailure } from './tenant-visit-lifecycle.js'
+
 export interface GroupMembershipTarget {
   id: string
   displayName?: string | null
@@ -59,12 +62,14 @@ export async function collectGroupMemberships<
   const effectiveBatchSize = Math.max(1, Math.floor(batchSize))
 
   for (let index = 0; index < groups.length; index += effectiveBatchSize) {
+    const firstBatchFailure = failures.length
     await Promise.all(
       groups.slice(index, index + effectiveBatchSize).map(async (group) => {
         try {
           const memberIds = await fetchMemberIds(group)
           memberIdsByGroupId.set(group.id, [...new Set(memberIds)])
         } catch (error) {
+          recordTenantVisitLifecycleFailure(error)
           failures.push({
             groupId: group.id,
             groupName: group.displayName?.trim() || group.id,
@@ -73,6 +78,10 @@ export async function collectGroupMemberships<
         }
       })
     )
+    // Drain the admitted batch, but never turn ownership loss into an
+    // optional relationship failure or admit another provider batch.
+    const lost = failures.slice(firstBatchFailure).map(failure => tenantVisitLeaseLoss(failure.error)).find(Boolean)
+    if (lost) throw lost
   }
 
   return { memberIdsByGroupId, failures }
@@ -88,11 +97,13 @@ export async function collectGroupOwners<T extends GroupMembershipTarget>(
   const effectiveBatchSize = Math.max(1, Math.floor(batchSize))
 
   for (let index = 0; index < groups.length; index += effectiveBatchSize) {
+    const firstBatchFailure = failures.length
     await Promise.all(
       groups.slice(index, index + effectiveBatchSize).map(async (group) => {
         try {
           ownersByGroupId.set(group.id, await fetchOwners(group))
         } catch (error) {
+          recordTenantVisitLifecycleFailure(error)
           failures.push({
             groupId: group.id,
             groupName: group.displayName?.trim() || group.id,
@@ -101,6 +112,10 @@ export async function collectGroupOwners<T extends GroupMembershipTarget>(
         }
       })
     )
+    // Drain the admitted batch, but never turn ownership loss into an
+    // optional relationship failure or admit another provider batch.
+    const lost = failures.slice(firstBatchFailure).map(failure => tenantVisitLeaseLoss(failure.error)).find(Boolean)
+    if (lost) throw lost
   }
 
   return { ownersByGroupId, failures }

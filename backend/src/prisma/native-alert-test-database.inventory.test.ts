@@ -19,6 +19,7 @@ const expected = [
   "alerts/suppressed-evidence-reader.database-integration.test.ts",
   "alerts/suppression-store.database-integration.test.ts",
   "auth/console-session.database-integration.test.ts",
+  "changes/directory-audit-evidence-repair.database-integration.test.ts",
   "identity-risk/authentication-ingestion-capacity.database-integration.test.ts",
   "identity-risk/identity-risk-key.database-integration.test.ts",
   "identity-risk/native-alert-retention.database-integration.test.ts",
@@ -47,6 +48,8 @@ const expected = [
   "tenants/existing-tenant-consent.database-integration.test.ts",
   "tenants/scheduled-sync-cursor.database-integration.test.ts",
   "tenants/tenant-directory.database-integration.test.ts",
+  "tenants/tenant-visit-audit-atomic.database-integration.test.ts",
+  "tenants/tenant-visit-materialization.database-integration.test.ts",
   "workspace/workspace-audit.database-integration.test.ts"
 ] as const
 

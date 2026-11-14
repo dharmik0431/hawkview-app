@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common'
 import { isIdentityRiskOpaqueReferenceKind } from './identity-risk.validation.js'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 
 export type PseudonymScope = Readonly<{ organizationId: string; customerTenantId: string; environment: string }>
 export type PseudonymKeyVersion = PseudonymScope & Readonly<{
@@ -17,7 +18,7 @@ export interface PinnedPseudonymSession {
 export class IdentityRiskPseudonymProvider {
   readonly configured: boolean = false
   allowsScope(_scope: PseudonymScope): boolean { return this.configured }
-  async pin(_key: PseudonymKeyVersion, _deadlineAt: number): Promise<PinnedPseudonymSession> {
+  async pin(_key: PseudonymKeyVersion, _deadlineAt: number, _visitOwner?: TenantVisitLeaseOwner): Promise<PinnedPseudonymSession> {
     throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
   }
 }

@@ -1,4 +1,5 @@
 import type { SyncResourceType } from '../generated/prisma/enums.js'
+import { LEGACY_SYNC_FRESHNESS_WINDOWS, resourceFreshnessWindow as freshnessWindow } from './sync-freshness-policy.js'
 
 /**
  * Per-service synchronization freshness, derived from the persisted collector
@@ -170,18 +171,7 @@ type MustBeNever<T extends never> = T
  * Prisma generates from the schema. */
 export type EveryCollectorHasAnOwningService = MustBeNever<UnownedCollector>
 
-export const SERVICE_FRESHNESS_WINDOWS = {
-  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
-  dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
-} as const
-
-const INCREMENTAL_COLLECTORS = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'])
-
-function freshnessWindow(collector: string) {
-  return INCREMENTAL_COLLECTORS.has(collector)
-    ? SERVICE_FRESHNESS_WINDOWS.incremental
-    : SERVICE_FRESHNESS_WINDOWS.dailyInventory
-}
+export const SERVICE_FRESHNESS_WINDOWS = LEGACY_SYNC_FRESHNESS_WINDOWS
 
 
 function iso(date: Date | null | undefined) {

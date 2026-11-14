@@ -8,6 +8,7 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
 import { MicrosoftConsentService } from './microsoft-consent.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
 import { captureManagedAuthority, publishManagedAuthority, type AuthorityDatabase, type AuthorityTransaction,
   type PreparedManagedPublication } from './managed-connector-authority.js'
 
@@ -32,8 +33,10 @@ test('managed configuration integrated service with actual Prisma transactions',
     await observer.query(`CREATE SCHEMA ${schema}`); created = true
     await observer.query(`SET search_path TO ${schema},public`)
     // Real migrated schema shapes; the CI job applies the complete migration chain.
-    // Clone only these global tables so no test touches the shared public connector.
-    for (const name of ['platform_microsoft_connectors', 'encrypted_secrets', 'managed_connector_authority_revisions']) {
+    // Clone the global tables and minimal visit scope so no test touches the
+    // shared public connector or tenant leases.
+    for (const name of ['platform_microsoft_connectors', 'encrypted_secrets', 'managed_connector_authority_revisions',
+      'organizations', 'customer_tenants', 'tenant_sync_visit_leases']) {
       await observer.query(`CREATE TABLE ${schema}.${name} (LIKE public.${name} INCLUDING ALL)`)
     }
     const host = (hook?: (sql: string) => Promise<void>, beforeCommit?: () => Promise<void>): AuthorityDatabase => ({
@@ -67,6 +70,90 @@ test('managed configuration integrated service with actual Prisma transactions',
       revisions: (await observer.query('SELECT * FROM managed_connector_authority_revisions ORDER BY revision')).rows,
     })
     const reset = async () => { await observer.query('TRUNCATE platform_microsoft_connectors, encrypted_secrets, managed_connector_authority_revisions') }
+    const seedOwnedLegacy = async () => {
+      await reset()
+      await observer.query('TRUNCATE organizations, customer_tenants, tenant_sync_visit_leases')
+      const owner = { organizationId: randomUUID(), customerTenantId: randomUUID(), token: randomUUID(),
+        generation: 4n, expiresAt: new Date(Date.now() + 60000) }
+      await observer.query("INSERT INTO organizations (id,name,slug,updated_at) VALUES ($1,'Synthetic promotion owner',$2,now())",
+        [owner.organizationId, 'promotion-' + owner.organizationId])
+      await observer.query('INSERT INTO customer_tenants (id,organization_id,microsoft_tenant_id,updated_at) VALUES ($1,$2,$3,now())',
+        [owner.customerTenantId, owner.organizationId, randomUUID()])
+      await observer.query(`INSERT INTO tenant_sync_visit_leases
+        (customer_tenant_id,organization_id,owner_token,generation,expires_at) VALUES ($1,$2,$3,4,$4)`,
+      [owner.customerTenantId, owner.organizationId, owner.token, owner.expiresAt])
+      const old = input(), reference = await secret.store('hawkview-microsoft-connector-client-secret', old.clientSecret, PLATFORM_OWNED)
+      await prisma.platformMicrosoftConnector.create({ data: { id: 'default', clientId: old.clientId,
+        homeTenantId: old.homeTenantId, credentialReference: reference } })
+      return owner
+    }
+
+    await t.test('owned legacy promotion rejects a superseded owner without secret, authority or registry effects', async () => {
+      const owner = await seedOwnedLegacy(), before = await state()
+      await observer.query('UPDATE tenant_sync_visit_leases SET owner_token=$1,generation=5', [randomUUID()])
+      await assert.rejects(service().upgradeLegacyManagedConnector(owner),
+        (error: unknown) => error instanceof TenantVisitLeaseLostError)
+      assert.deepEqual(await state(), before)
+    })
+    await t.test('owned legacy promotion rechecks ownership after waiting on global authority', async () => {
+      const owner = await seedOwnedLegacy(), before = await state(), blocker = await pool.connect()
+      let pending: Promise<{ error?: unknown }> | undefined
+      try {
+        await blocker.query('BEGIN')
+        const blockerPid = (await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
+        await blocker.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', ['hawkview:managed-connector:default:authority:v1'])
+        pending = service().upgradeLegacyManagedConnector(owner).then(() => ({}), error => ({ error }))
+        const settled = pending.then(() => { throw Error('promotion did not wait for the authority lock') })
+        const deadline = Date.now() + 4000
+        let blocked = false
+        while (Date.now() < deadline) {
+          const check = await Promise.race([observer.query(
+            'SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))) AS blocked', [blockerPid]), settled])
+          if (check.rows[0].blocked) { blocked = true; break }
+          await new Promise(resolve => setTimeout(resolve, 5))
+        }
+        assert.ok(blocked, 'promotion must be waiting on the global authority lock')
+        await observer.query('UPDATE tenant_sync_visit_leases SET owner_token=$1,generation=5', [randomUUID()])
+        await blocker.query('COMMIT')
+        assert.ok((await pending).error instanceof TenantVisitLeaseLostError)
+        assert.deepEqual(await state(), before)
+      } finally {
+        await blocker.query('ROLLBACK').catch(() => undefined)
+        await pending
+        blocker.release()
+      }
+    })
+    await t.test('owned legacy publication rolls back atomically and holds the owner until commit', async () => {
+      const owner = await seedOwnedLegacy(), before = await state()
+      await assert.rejects(service(host(undefined, async () => { throw Error('owned promotion commit failure') }))
+        .upgradeLegacyManagedConnector(owner), /owned promotion commit failure/)
+      assert.deepEqual(await state(), before)
+      const entered = gate(), release = gate(), contender = await pool.connect()
+      const pending = service(host(async sql => {
+        if (sql.includes('INSERT INTO platform_microsoft_connectors')) { entered.resolve(); await release.promise }
+      })).upgradeLegacyManagedConnector(owner)
+      try {
+        await Promise.race([entered.promise, pending.then(() => { throw Error('promotion settled before publication hold') })])
+        await contender.query(`SET search_path TO ${schema},public`)
+        await contender.query('BEGIN')
+        await assert.rejects(contender.query('SELECT generation FROM tenant_sync_visit_leases WHERE customer_tenant_id=$1 FOR UPDATE NOWAIT',
+          [owner.customerTenantId]), (error: any) => error.code === '55P03')
+        await contender.query('ROLLBACK')
+        assert.deepEqual(await state(), before, 'uncommitted publication must not be visible')
+        release.resolve(); await pending
+        const after = await state()
+        assert.equal(after.secrets.length, before.secrets.length + 1)
+        assert.notEqual(after.connectors[0].configuration_revision, before.connectors[0].configuration_revision)
+        await contender.query('BEGIN')
+        await contender.query('SELECT generation FROM tenant_sync_visit_leases WHERE customer_tenant_id=$1 FOR UPDATE NOWAIT', [owner.customerTenantId])
+        await contender.query('ROLLBACK')
+      } finally {
+        release.resolve()
+        await pending
+        await contender.query('ROLLBACK').catch(() => undefined)
+        contender.release()
+      }
+    })
 
     for (const seeded of [false, true]) for (const winner of ['A', 'B'] as const) {
       await t.test(`two captured ${seeded ? 'existing revision' : 'absent'} requests: ${winner} wins without loser writes`, async () => {

@@ -13,6 +13,8 @@ import {
   HOURLY_INVENTORY_REFRESH_MS,
   HOURLY_INVENTORY_RESOURCES,
   TARGETED_TRANSIENT_RETRY_RESOURCES,
+  TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  shouldCollectInventoryInTwentyMinuteFullPass,
 } from './scheduled-sync-selection.js'
 
 const now = new Date('2026-08-17T16:00:00.000Z')
@@ -32,6 +34,91 @@ test('does not request a daily inventory while both anchors are current', () => 
     requiresDailyInventoryRefresh([...dailyCoverage(), state('LICENSES'), state('DOMAINS')], now),
     false,
   )
+})
+
+test('twenty-minute inventory eligibility is opt-in and inclusive at the boundary', () => {
+  const coverage = [
+    ...dailyCoverage().filter((row) => row.resourceType !== 'GROUPS'),
+    state('USERS', 'SUCCEEDED', now, now),
+    state('LICENSES', 'SUCCEEDED', now, now),
+    state('DOMAINS', 'SUCCEEDED', now, now),
+  ]
+  const candidate = (ageMs: number) => ({
+    id: 'twenty-minute-candidate',
+    syncStates: [
+      ...coverage,
+      state('GROUPS', 'SUCCEEDED', new Date(now.getTime() - ageMs)),
+    ],
+  })
+  const nineteenMinutes = candidate(19 * 60 * 1000)
+  const twentyMinutes = candidate(TWENTY_MINUTE_INVENTORY_REFRESH_MS)
+
+  assert.equal(requiresDailyInventoryRefresh(twentyMinutes.syncStates, now), false)
+  assert.equal(requiresDailyInventoryRefresh(
+    nineteenMinutes.syncStates, now, false, TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  ), false)
+  assert.equal(requiresDailyInventoryRefresh(
+    twentyMinutes.syncStates, now, false, TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  ), true)
+  assert.deepEqual(selectScheduledTenantWork([nineteenMinutes], now, 1,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS), [])
+  assert.equal(selectScheduledTenantWork([twentyMinutes], now, 1,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS)[0]?.fullInventoryDue, true)
+  assert.deepEqual(selectScheduledTenantWork([twentyMinutes], now, 1), [])
+})
+
+test('twenty-minute eligibility preserves failed-resource backoff and query cutoffs', () => {
+  const currentStates = [
+    ...dailyCoverage().filter((row) => row.resourceType !== 'AUTH_REGISTRATIONS'),
+    state('USERS', 'SUCCEEDED', now, now),
+    state('LICENSES', 'SUCCEEDED', now, now),
+    state('DOMAINS', 'SUCCEEDED', now, now),
+  ]
+  const failed = state('AUTH_REGISTRATIONS', 'FAILED', null,
+    new Date(now.getTime() - TWENTY_MINUTE_INVENTORY_REFRESH_MS))
+  assert.equal(requiresDailyInventoryRefresh([...currentStates, failed], now, false,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS), false)
+  assert.deepEqual(selectScheduledTenantWork([{
+    id: 'failed-inventory', syncStates: [...currentStates, failed],
+  }], now, 1, TWENTY_MINUTE_INVENTORY_REFRESH_MS), [])
+
+  const defaultQuery = JSON.stringify(scheduledSyncTenantWhere(now))
+  const candidateQuery = JSON.stringify(scheduledSyncTenantWhere(
+    now, TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  ))
+  assert.match(defaultQuery, /2026-08-16T16:00:00\.000Z/)
+  assert.match(candidateQuery, /2026-08-17T15:40:00\.000Z/)
+  assert.match(candidateQuery, /2026-08-16T16:00:00\.000Z/,
+    'failed daily resources still use the existing one-day guard')
+  assert.match(candidateQuery, /2026-08-17T15:00:00\.000Z/,
+    'failed anchors still use the existing one-hour retry gate')
+})
+
+test('healthy anchors use the selected interval without shortening their failure retry', () => {
+  const coverage = [
+    ...dailyCoverage(),
+    state('USERS', 'SUCCEEDED', now, now),
+    state('DOMAINS', 'SUCCEEDED', now, now),
+  ]
+  const atBoundary = state('LICENSES', 'SUCCEEDED',
+    new Date(now.getTime() - TWENTY_MINUTE_INVENTORY_REFRESH_MS))
+  const recentAttempt = {
+    ...atBoundary, lastAttemptAt: new Date(now.getTime() - 19 * 60 * 1000),
+  }
+  const failed = {
+    ...atBoundary, status: 'FAILED',
+  }
+
+  assert.equal(requiresDailyInventoryRefresh([...coverage, atBoundary], now), false)
+  assert.equal(requiresDailyInventoryRefresh([...coverage, atBoundary], now, false,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS), true)
+  assert.equal(requiresDailyInventoryRefresh([...coverage, recentAttempt], now, false,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS), false)
+  assert.equal(requiresDailyInventoryRefresh([...coverage, failed], now, false,
+    TWENTY_MINUTE_INVENTORY_REFRESH_MS), false)
+  assert.equal(requiresDailyInventoryRefresh([...coverage, {
+    ...failed, lastAttemptAt: new Date(now.getTime() - 60 * 60 * 1000),
+  }], now, false, TWENTY_MINUTE_INVENTORY_REFRESH_MS), true)
 })
 
 test('requests a daily inventory when one anchor is stale even if the other is current', () => {
@@ -992,4 +1079,23 @@ test('risky users in-flight, missing, invalid or future success are never hourly
     state('RISKY_USERS', 'SUCCEEDED', new Date(now.getTime() + HOUR))]) {
     assert.equal(shouldRunHourlyInventoryRefresh(risk, now), false)
   }
+})
+
+
+test('healthy twenty-minute full passes do not bypass existing failed inventory cooldowns', () => {
+  const failed = (resourceType: string, age: number, code = '403') => ({
+    ...state(resourceType, 'FAILED', new Date(now.getTime() - 2 * 86_400_000), new Date(now.getTime() - age)),
+    lastErrorCode: code, consecutiveFailures: 1,
+  })
+  for (const [resource, delay, code] of [
+    ['AUTH_REGISTRATIONS', 86_400_000, '403'], ['DOMAINS', 3_600_000, '403'],
+    ['GROUPS', 1_800_000, '500'], ['SECURE_SCORES', 86_400_000, '500'],
+  ] as const) {
+    assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(failed(resource, delay - 1, code), now), false)
+    assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(failed(resource, delay, code), now), true)
+  }
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(state('GROUPS'), now), true)
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(undefined, now), true)
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(state('GROUPS', 'RUNNING', now, now), now), false)
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(failed('GROUPS', -1, '500'), now), false)
 })

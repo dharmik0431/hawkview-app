@@ -14,6 +14,10 @@ export const DAILY_INVENTORY_ANCHORS = [
   SyncResourceType.DOMAINS,
 ] as const
 export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
+/** Opt-in healthy full inventory interval; the scheduler defaults to daily. */
+export const TWENTY_MINUTE_INVENTORY_REFRESH_MS = 20 * 60 * 1000
+export type InventoryRefreshInterval =
+  typeof DAILY_INVENTORY_REFRESH_MS | typeof TWENTY_MINUTE_INVENTORY_REFRESH_MS
 export const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
 export const USER_INCREMENTAL_REFRESH_MS = 5 * 60 * 1000
 /**
@@ -298,7 +302,11 @@ function earliestDue(values: Array<Date | null | undefined>, now: Date) {
  * cannot turn this guard into a five-minute full-pass loop. Existing targeted
  * retries remain independent and unchanged. RUNNING/anomalous clocks do not
  * manufacture a retry. */
-export function dailyInventoryResourceDueAt(state: DailyInventoryState | undefined, now: Date): Date | null {
+export function dailyInventoryResourceDueAt(
+  state: DailyInventoryState | undefined,
+  now: Date,
+  healthyRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+): Date | null {
   if (!state) return new Date(0)
   if (state.status === SyncStateStatus.RUNNING) return null
   if (state.lastAttemptAt != null && !validPastTime(state.lastAttemptAt, now)) return null
@@ -307,7 +315,12 @@ export function dailyInventoryResourceDueAt(state: DailyInventoryState | undefin
     ? state.lastAttemptAt
     : state.lastSuccessfulAt
   if (!clock) return new Date(0)
-  return now.getTime() - clock.getTime() >= DAILY_INVENTORY_REFRESH_MS ? clock : null
+  // Shortening healthy coverage must not accelerate failures. They retain the
+  // existing daily guard (or their separate targeted retry policy).
+  const refreshMs = state.status === SyncStateStatus.FAILED || !state.lastSuccessfulAt
+    ? DAILY_INVENTORY_REFRESH_MS
+    : healthyRefreshMs
+  return now.getTime() - clock.getTime() >= refreshMs ? clock : null
 }
 
 /**
@@ -319,14 +332,17 @@ export function selectScheduledTenantWork(
   candidates: ScheduledTenantCandidate[],
   now: Date,
   limit: number,
+  healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
 ) {
   const work = candidates.flatMap((candidate): ScheduledTenantWork[] => {
     const byResource = new Map(candidate.syncStates.map((state) => [state.resourceType, state]))
     const exchangeEnabled = Boolean(candidate.connection?.exchangeReadOnlyEnabledAt)
     const dailyDueDates = dailyInventoryResources(exchangeEnabled)
-      .map((resource) => dailyInventoryResourceDueAt(byResource.get(resource), now))
+      .map((resource) => dailyInventoryResourceDueAt(byResource.get(resource), now, healthyInventoryRefreshMs))
       .filter((date): date is Date => date !== null)
-    const fullInventoryDue = requiresDailyInventoryRefresh(candidate.syncStates, now, exchangeEnabled)
+    const fullInventoryDue = requiresDailyInventoryRefresh(
+      candidate.syncStates, now, exchangeEnabled, healthyInventoryRefreshMs,
+    )
     const users = byResource.get(SyncResourceType.USERS)
     // A future/invalid durable timestamp is not an immediate retry signal:
     // attempting it ahead of every other tenant would create starvation. The
@@ -375,11 +391,12 @@ export function requiresDailyInventoryRefresh(
   states: DailyInventoryState[],
   now: Date,
   exchangeReadOnlyEnabled = false,
+  healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
 ) {
   const byResource = new Map(states.map((state) => [state.resourceType, state]))
 
   return dailyInventoryResources(exchangeReadOnlyEnabled).some((resource) =>
-    dailyInventoryResourceDueAt(byResource.get(resource), now) !== null) ||
+    dailyInventoryResourceDueAt(byResource.get(resource), now, healthyInventoryRefreshMs) !== null) ||
     DAILY_INVENTORY_ANCHORS.some((resourceType) => {
     const state = byResource.get(resourceType)
     if (!state) return true
@@ -389,19 +406,47 @@ export function requiresDailyInventoryRefresh(
       !state.lastAttemptAt ||
       now.getTime() - state.lastAttemptAt.getTime() >=
         DAILY_INVENTORY_FAILURE_RETRY_MS
+    const healthyAttemptIsDue =
+      !state.lastAttemptAt ||
+      now.getTime() - state.lastAttemptAt.getTime() >= Math.min(
+        healthyInventoryRefreshMs, DAILY_INVENTORY_FAILURE_RETRY_MS,
+      )
 
     if (state.status === SyncStateStatus.FAILED) return retryIsDue
     if (!state.lastSuccessfulAt) return retryIsDue
 
     return (
       now.getTime() - state.lastSuccessfulAt.getTime() >=
-        DAILY_INVENTORY_REFRESH_MS && retryIsDue
+        healthyInventoryRefreshMs && healthyAttemptIsDue
     )
   })
 }
 
-function dailyResourceCandidate(resourceType: SyncResourceType, now: Date): Prisma.CustomerTenantWhereInput {
-  const cutoff = new Date(now.getTime() - DAILY_INVENTORY_REFRESH_MS)
+/** A faster healthy full pass does not accelerate an unhealthy inventory.
+ * Activity streams retain their own collector eligibility and are handled by
+ * the caller. Unknown/missing inventory gets its existing first opportunity. */
+export function shouldCollectInventoryInTwentyMinuteFullPass(
+  state: DailyInventoryState | undefined,
+  now: Date,
+): boolean {
+  if (!state) return true
+  if (state.lastAttemptAt != null && !validPastTime(state.lastAttemptAt, now)) return false
+  if (state.lastSuccessfulAt != null && !validPastTime(state.lastSuccessfulAt, now)) return false
+  if (state.status === SyncStateStatus.RUNNING) return shouldRunHourlyInventoryRefresh(state, now)
+  if (state.status !== SyncStateStatus.FAILED && state.lastSuccessfulAt) return true
+  if (shouldRunTargetedTransientRetry(state, now)) return true
+  const retryMs = DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])
+    ? DAILY_INVENTORY_FAILURE_RETRY_MS : DAILY_INVENTORY_REFRESH_MS
+  return !state.lastAttemptAt || now.getTime() - state.lastAttemptAt.getTime() >= retryMs
+}
+
+function dailyResourceCandidate(
+  resourceType: SyncResourceType,
+  now: Date,
+  healthyInventoryRefreshMs: InventoryRefreshInterval,
+): Prisma.CustomerTenantWhereInput {
+  const healthyCutoff = new Date(now.getTime() - healthyInventoryRefreshMs)
+  const failureCutoff = new Date(now.getTime() - DAILY_INVENTORY_REFRESH_MS)
   return { OR: [
     { syncStates: { none: { resourceType: resourceType } } },
     { syncStates: { some: {
@@ -411,10 +456,10 @@ function dailyResourceCandidate(resourceType: SyncResourceType, now: Date): Pris
         { OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lte: now } }] },
         { OR: [{ lastSuccessfulAt: null }, { lastSuccessfulAt: { lte: now } }] },
         { OR: [
-          { status: { not: SyncStateStatus.FAILED }, lastSuccessfulAt: { lte: cutoff } },
+          { status: { not: SyncStateStatus.FAILED }, lastSuccessfulAt: { lte: healthyCutoff } },
           { AND: [
             { OR: [{ status: SyncStateStatus.FAILED }, { lastSuccessfulAt: null }] },
-            { OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lte: cutoff } }] },
+            { OR: [{ lastAttemptAt: null }, { lastAttemptAt: { lte: failureCutoff } }] },
           ] },
         ] },
       ],
@@ -432,20 +477,28 @@ function dailyResourceCandidate(resourceType: SyncResourceType, now: Date): Pris
  */
 export function scheduledSyncTenantWhere(
   now: Date,
+  healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
 ): Prisma.CustomerTenantWhereInput {
   const activeLeaseAfter = new Date(now.getTime() - TENANT_SYNC_LEASE_MS)
   const usersStaleBefore = new Date(
     now.getTime() - USER_INCREMENTAL_REFRESH_MS,
   )
   const dailyStaleBefore = new Date(
-    now.getTime() - DAILY_INVENTORY_REFRESH_MS,
+    now.getTime() - healthyInventoryRefreshMs,
   )
+  const healthyAttemptBefore = new Date(now.getTime() - Math.min(
+    healthyInventoryRefreshMs, DAILY_INVENTORY_FAILURE_RETRY_MS,
+  ))
   const dailyRetryBefore = new Date(
     now.getTime() - DAILY_INVENTORY_FAILURE_RETRY_MS,
   )
   const retryDue = [
     { lastAttemptAt: null },
     { lastAttemptAt: { lt: dailyRetryBefore } },
+  ]
+  const healthyAttemptDue = [
+    { lastAttemptAt: null },
+    { lastAttemptAt: { lte: healthyAttemptBefore } },
   ]
   const targetedRetryBefore = new Date(
     now.getTime() - TARGETED_TRANSIENT_RETRY_BASE_MS,
@@ -478,10 +531,10 @@ export function scheduledSyncTenantWhere(
       },
     }, {
       OR: [
-      ...DAILY_INVENTORY_RESOURCES.map((resource) => dailyResourceCandidate(resource, now)),
+      ...DAILY_INVENTORY_RESOURCES.map((resource) => dailyResourceCandidate(resource, now, healthyInventoryRefreshMs)),
       { AND: [
         { connection: { exchangeReadOnlyEnabledAt: { not: null } } },
-        dailyResourceCandidate(SyncResourceType.EXCHANGE_MAILBOX_CONFIGURATION, now),
+        dailyResourceCandidate(SyncResourceType.EXCHANGE_MAILBOX_CONFIGURATION, now, healthyInventoryRefreshMs),
       ] },
       { syncStates: { none: { resourceType: 'USERS' } } },
       {
@@ -506,7 +559,7 @@ export function scheduledSyncTenantWhere(
               OR: [
                 { status: SyncStateStatus.FAILED, OR: retryDue },
                 { lastSuccessfulAt: null, OR: retryDue },
-                { lastSuccessfulAt: { lt: dailyStaleBefore }, OR: retryDue },
+                { status: { not: SyncStateStatus.FAILED }, lastSuccessfulAt: { lte: dailyStaleBefore }, OR: healthyAttemptDue },
               ],
             },
           },

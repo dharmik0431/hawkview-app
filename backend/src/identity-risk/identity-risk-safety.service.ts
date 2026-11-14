@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { BadRequestException, Inject, Injectable } from '@nestjs/common'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import {
   IDENTITY_RISK_RUN_RETENTION_MS,
   type IdentityRiskControlScope,
@@ -111,7 +113,12 @@ export class IdentityRiskSafetyService {
     correlationId?: string
     now?: Date
     executionDeadlineAt?: number
+    visitOwner?: TenantVisitLeaseOwner
   }) {
+    if (input.visitOwner && input.scope.type === 'TENANT' && (
+      input.visitOwner.organizationId !== input.scope.organizationId ||
+      input.visitOwner.customerTenantId !== input.scope.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     const reasonCode = boundedSafeString(input.reasonCode, 80)
     const actorServiceId = boundedSafeString(input.actorServiceId, 128)
     if (!reasonCode || !CONTROL_REASONS.has(reasonCode) || !actorServiceId) {
@@ -127,6 +134,9 @@ export class IdentityRiskSafetyService {
         'SELECT pg_advisory_xact_lock(hashtext($1))',
         `hawkview:identity-risk-control:${input.controlType}:${key}`,
       )
+      // Preserve the control-lock order, then hold the originating visit through
+      // both control and event publication, including a GLOBAL hard stop.
+      if (input.visitOwner) await assertTenantVisitLeaseOwner(transaction, input.visitOwner)
       const existing = await transaction.identityRiskOperationalControl.findUnique({
         where: { controlType_scopeKey: { controlType: input.controlType, scopeKey: key } },
       })
@@ -249,7 +259,12 @@ export class IdentityRiskSafetyService {
     scopeType: 'GLOBAL' | 'TENANT'
     now?: Date
     executionDeadlineAt?: number
+    visitOwner?: TenantVisitLeaseOwner
   }) {
+    if (input.visitOwner && (
+      input.visitOwner.organizationId !== input.organizationId ||
+      input.visitOwner.customerTenantId !== input.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     const now = input.now ?? new Date()
     const scope: IdentityRiskControlScope = input.scopeType === 'GLOBAL'
       ? { type: 'GLOBAL' }
@@ -275,9 +290,12 @@ export class IdentityRiskSafetyService {
           createdAt: now,
         },
       }
-      if (input.executionDeadlineAt === undefined) await this.prisma.identityRiskOperationalEvent.create(data)
+      if (input.executionDeadlineAt === undefined && !input.visitOwner) {
+        await this.prisma.identityRiskOperationalEvent.create(data)
+      }
       else await runRiskTransaction(this.prisma, input, async transaction => {
-        await configureRiskStatementBudget(transaction, input)
+        if (input.executionDeadlineAt !== undefined) await configureRiskStatementBudget(transaction, input)
+        if (input.visitOwner) await assertTenantVisitLeaseOwner(transaction, input.visitOwner)
         await transaction.identityRiskOperationalEvent.create(data)
       })
     } catch (error) {
@@ -293,7 +311,12 @@ export class IdentityRiskSafetyService {
     reasonCode: string
     now: Date
     executionDeadlineAt?: number
+    visitOwner?: TenantVisitLeaseOwner
   }) {
+    if (input.visitOwner && (
+      input.visitOwner.organizationId !== input.organizationId ||
+      input.visitOwner.customerTenantId !== input.customerTenantId
+    )) throw new TenantVisitLeaseLostError()
     const scope: IdentityRiskControlScope = {
       type: 'TENANT',
       organizationId: input.organizationId,
@@ -324,9 +347,12 @@ export class IdentityRiskSafetyService {
           createdAt: input.now,
         },
       }
-      if (input.executionDeadlineAt === undefined) await this.prisma.identityRiskOperationalEvent.create(data)
+      if (input.executionDeadlineAt === undefined && !input.visitOwner) {
+        await this.prisma.identityRiskOperationalEvent.create(data)
+      }
       else await runRiskTransaction(this.prisma, input, async transaction => {
-        await configureRiskStatementBudget(transaction, input)
+        if (input.executionDeadlineAt !== undefined) await configureRiskStatementBudget(transaction, input)
+        if (input.visitOwner) await assertTenantVisitLeaseOwner(transaction, input.visitOwner)
         await transaction.identityRiskOperationalEvent.create(data)
       })
     } catch (error) {

@@ -5,6 +5,8 @@ import { createPilotPseudonymProvider, WrappedRiskPseudonymProvider } from './pi
 import { pilotRiskConfig } from './pilot-risk-config.js'
 import { readRiskWrappingRoot, unwrapRiskKey, wrapRiskKey, wrappedRiskName, WRAPPED_RISK_PROVIDER } from './wrapped-risk-crypto.js'
 import type { PseudonymKeyVersion } from './identity-risk-pseudonym.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
 
 const scope = { environment: 'synthetic', organizationId: randomUUID(), customerTenantId: randomUUID() }
 const version = { ...scope, id: randomUUID(), provider: WRAPPED_RISK_PROVIDER, immutableKeyId: '' }
@@ -279,4 +281,57 @@ test('a provider failure never echoes what it was handling', async () => {
       'the underlying error text must be replaced, not wrapped — an echoed message is how a ' +
       'secret reaches a log')
   })
+})
+
+for (const cause of ['owner-lost', 'decrypt-failed', 'failure-owner-lost'] as const) {
+  test(`owned key session ${cause} carries ownership and never compensates for a lost visit`, async () => {
+    const values = env(), prior = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
+    Object.assign(process.env, values)
+    const owner = { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId,
+      generation: 1n, token: randomUUID(), expiresAt: new Date(Date.now() + 60_000) }
+    const lost = new TenantVisitLeaseLostError(), calls: string[] = []
+    try {
+      const provider = new WrappedRiskPseudonymProvider({
+        ciphertext: async (_key, _deadline, actual) => {
+          assert.equal(actual, owner); calls.push('ciphertext')
+          if (cause === 'owner-lost') throw new Error('IDENTITY_RISK_SOURCE_UNAVAILABLE', { cause: lost })
+          return { ...wrapRiskKey(key, material, root), tag: Buffer.alloc(16) }
+        },
+        recordFailure: async (_key, _deadline, actual) => {
+          assert.equal(actual, owner); calls.push('failure')
+          if (cause === 'failure-owner-lost') throw lost
+        },
+      })
+      await assert.rejects(provider.pin(key, Date.now() + 5000, owner),
+        cause === 'decrypt-failed' ? /KEY_UNAVAILABLE/ : (error: unknown) => error === lost)
+      assert.deepEqual(calls, cause === 'owner-lost' ? ['ciphertext'] : ['ciphertext', 'failure'])
+    } finally {
+      for (const [name, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[name]; else process.env[name] = value
+      }
+    }
+  })
+}
+
+test('runtime provider factory forwards the visit through its wrapped delegate', async () => {
+  const values = env(), prior = Object.fromEntries(Object.keys(values).map(name => [name, process.env[name]]))
+  Object.assign(process.env, values)
+  const original = WrappedRiskKeyStore.prototype.ciphertext
+  const owner = { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId,
+    generation: 1n, token: randomUUID(), expiresAt: new Date(Date.now() + 60_000) }
+  let received: unknown
+  try {
+    WrappedRiskKeyStore.prototype.ciphertext = async (_key, _deadline, actual) => {
+      received = actual
+      return wrapRiskKey(key, material, root)
+    }
+    const session = await createPilotPseudonymProvider().pin(key, Date.now() + 5000, owner)
+    session.close?.()
+    assert.equal(received, owner)
+  } finally {
+    WrappedRiskKeyStore.prototype.ciphertext = original
+    for (const [name, value] of Object.entries(prior)) {
+      if (value === undefined) delete process.env[name]; else process.env[name] = value
+    }
+  }
 })

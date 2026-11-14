@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { captureManagedAuthority, withManagedAuthority, type ManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from '../microsoft/managed-connector-authority.js'
 import type { ChangeEvidenceService } from '../changes/change-evidence.service.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 
 /** Fenced persistence primitive. Provider validation belongs to the directory adapter; no reader trust is enabled.
  * All live authority writers must join this protocol before rollout/activation is trusted.
@@ -189,9 +191,30 @@ function prepared(input: PreparedRoleCollection): { json: string; rows: unknown[
   if (Buffer.byteLength(json, 'utf8') > 180000) throw new Error('ROLE_COLLECTION_TOO_LARGE')
   return { json, rows: JSON.parse(json), digest: input.contentDigest }
 }
+function scopedVisitOwner(visitOwner: TenantVisitLeaseOwner | undefined, who: Pick<RoleIdentity, 'organizationId' | 'customerTenantId'>) {
+  if (!visitOwner) return undefined
+  if (visitOwner.organizationId !== who.organizationId || visitOwner.customerTenantId !== who.customerTenantId) {
+    throw new TenantVisitLeaseLostError()
+  }
+  // Snapshot identity before any lock wait; expiry is always checked by the DB.
+  return { ...visitOwner }
+}
+/** A source refresh may acknowledge only a requested revision bound to a live visit. */
+export function assertDirectoryRoleAuditRequest(visitOwner: TenantVisitLeaseOwner | undefined, requestedRevision: bigint | undefined): void {
+  if (requestedRevision !== undefined && (!visitOwner || typeof requestedRevision !== 'bigint' ||
+    requestedRevision < 1n || requestedRevision > 9223372036854775807n)) {
+    throw new Error('TENANT_AUDIT_RECONCILIATION_SNAPSHOT_RECEIPT_INVALID')
+  }
+}
 async function underAuthority<T>(db: AuthorityDatabase, expected: RoleIdentity,
-  work: (tx: AuthorityTransaction) => Promise<T>): Promise<T | RoleRejection> {
-  const result = await withManagedAuthority(db, expected.configurationRevision, tx => work(tx))
+  work: (tx: AuthorityTransaction) => Promise<T>, visitOwner?: TenantVisitLeaseOwner): Promise<T | RoleRejection> {
+  const owner = scopedVisitOwner(visitOwner, expected)
+  const result = await withManagedAuthority(db, expected.configurationRevision, async tx => {
+    // G → organization/tenant → visit → connection/role → snapshot.
+    // This guard shares the transaction with claim, terminal and publication.
+    if (owner) await assertTenantVisitLeaseOwner(tx, owner)
+    return work(tx)
+  })
   return result.status === 'current' ? result.value : rejected('SUPERSEDED')
 }
 /** G is already locked. Parent locks serialize absent R; NO KEY UPDATE avoids needless FK conflicts. */
@@ -223,13 +246,15 @@ function matches(locked: Locked, ctx: RoleContext): boolean {
  * scope revocation and fenced notification integration. No provider I/O under locks.
  */
 export async function captureRoleAttempt(db: AuthorityDatabase,
-  input: Omit<RoleIdentity, 'configurationRevision'>): Promise<CapturedRoleAttempt> {
+  input: Omit<RoleIdentity, 'configurationRevision'>, visitOwner?: TenantVisitLeaseOwner): Promise<CapturedRoleAttempt> {
   const who = { organizationId: id(input.organizationId), customerTenantId: id(input.customerTenantId),
     microsoftTenantId: id(input.microsoftTenantId) }
+  const owner = scopedVisitOwner(visitOwner, who)
   return db.$transaction(async tx => {
     // Reuse the authority primitive inside this transaction, keeping G through T/C/R.
     const scoped: AuthorityDatabase = { $transaction: work => work(tx) }
     const authority = await captureManagedAuthority(scoped)
+    if (owner) await assertTenantVisitLeaseOwner(tx, owner)
     const tenants = await tx.$queryRawUnsafe<{ status: string }[]>(`SELECT status FROM customer_tenants
       WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid FOR NO KEY UPDATE`,
       who.customerTenantId, who.organizationId, who.microsoftTenantId)
@@ -253,7 +278,7 @@ export async function captureRoleAttempt(db: AuthorityDatabase,
       || s.role_scope_version !== DIRECTORY_ROLE_RECEIPT_SCOPE || !authority
       || authority.credentialReference !== `encrypted-secret:${authority.configurationRevision}`) return rejected('UNAVAILABLE')
     const result = await claimRoleAttempt(scoped, { ...who, configurationRevision: authority.configurationRevision,
-      connectionIncarnation: c.incarnation, scopeIncarnation: s.role_scope_incarnation, scopeVersion: s.role_scope_version })
+      connectionIncarnation: c.incarnation, scopeIncarnation: s.role_scope_incarnation, scopeVersion: s.role_scope_version }, owner)
     return result.status === 'claimed' ? { ...result, authority } : result
   }, { isolationLevel: 'ReadCommitted' })
 }
@@ -296,7 +321,7 @@ export async function activateRoleScope(db: AuthorityDatabase, input: RoleIdenti
       scopeIncarnation: nextScope, scopeVersion: DIRECTORY_ROLE_RECEIPT_SCOPE } }
   })
 }
-export async function claimRoleAttempt(db: AuthorityDatabase, input: RoleContext): Promise<
+export async function claimRoleAttempt(db: AuthorityDatabase, input: RoleContext, visitOwner?: TenantVisitLeaseOwner): Promise<
   { status: 'claimed'; attempt: RoleAttempt; startedAt: Date; expiresAt: Date } | RoleRejection> {
   const ctx = context(input)
   return underAuthority(db, ctx, async tx => {
@@ -312,7 +337,7 @@ export async function claimRoleAttempt(db: AuthorityDatabase, input: RoleContext
       status='RUNNING',last_attempt_at=$5::timestamptz,updated_at=$5::timestamptz WHERE id=$7::uuid`,
       attemptId, ctx.connectionIncarnation, ctx.configurationRevision, ctx.scopeIncarnation, time.checkedAt, expiresAt, s.id)
     return { status: 'claimed', attempt: { ...ctx, attemptId }, startedAt: time.checkedAt, expiresAt }
-  })
+  }, visitOwner)
 }
 async function terminal(tx: AuthorityTransaction, s: State, a: RoleAttempt, time: Date, outcome: 'FAILED' | 'PARTIAL' | 'EXPIRED'): Promise<RoleResult> {
   const updated = await tx.$executeRawUnsafe(`UPDATE sync_states SET role_attempt_outcome=$1,role_attempt_terminal_at=$2::timestamptz,
@@ -323,7 +348,7 @@ async function terminal(tx: AuthorityTransaction, s: State, a: RoleAttempt, time
   if (updated !== 1) throw new Error('ROLE_TERMINAL_CAS_LOST')
   return { status: outcome === 'FAILED' ? 'failed' : outcome === 'PARTIAL' ? 'partial' : 'expired', attemptId: a.attemptId }
 }
-export async function finishRoleAttempt(db: AuthorityDatabase, input: RoleAttempt, outcome: 'FAILED' | 'PARTIAL' | 'EXPIRED'): Promise<RoleResult> {
+export async function finishRoleAttempt(db: AuthorityDatabase, input: RoleAttempt, outcome: 'FAILED' | 'PARTIAL' | 'EXPIRED', visitOwner?: TenantVisitLeaseOwner): Promise<RoleResult> {
   const a = attempt(input)
   if (!['FAILED', 'PARTIAL', 'EXPIRED'].includes(outcome)) throw new Error('INVALID_ROLE_OUTCOME')
   return underAuthority(db, a, async tx => {
@@ -333,7 +358,7 @@ export async function finishRoleAttempt(db: AuthorityDatabase, input: RoleAttemp
     const time = await clock(tx, locked.state)
     if (outcome === 'EXPIRED' && time.live) return rejected('CONFLICT')
     return terminal(tx, locked.state, a, time.checkedAt, time.live ? outcome : 'EXPIRED')
-  })
+  }, visitOwner)
 }
 async function lockSnapshot(tx: AuthorityTransaction, a: RoleAttempt, json: string): Promise<Snapshot | null> {
   // Same advisory key as existing saveSnapshot; never call that nested transaction owner.
@@ -346,7 +371,8 @@ async function lockSnapshot(tx: AuthorityTransaction, a: RoleAttempt, json: stri
   return rows[0] ?? null
 }
 export async function completeRoleAttempt(db: AuthorityDatabase, input: RoleAttempt, collection: PreparedRoleCollection,
-  buildDifference: DifferenceBuilder): Promise<RoleResult> {
+  buildDifference: DifferenceBuilder, visitOwner?: TenantVisitLeaseOwner, auditRequestedRevision?: bigint): Promise<RoleResult> {
+  assertDirectoryRoleAuditRequest(visitOwner, auditRequestedRevision)
   // Capture all mutable caller values before waiting for authority/row locks.
   const a = attempt(input), payload = prepared(collection)
   return underAuthority(db, a, async tx => {
@@ -393,8 +419,18 @@ export async function completeRoleAttempt(db: AuthorityDatabase, input: RoleAtte
       AND role_attempt_outcome='RUNNING'`, time.checkedAt,a.attemptId,a.connectionIncarnation,a.configurationRevision,
       a.scopeIncarnation,a.scopeVersion,a.microsoftTenantId,payload.digest,payload.rows.length,s.id)
     if (updated !== 1) throw new Error('ROLE_COMPLETE_CAS_LOST')
+    if (auditRequestedRevision !== undefined) {
+      // Only this fresh authoritative publication can complete the exact request.
+      // A newer request remains pending; retained role replay above is read-only.
+      const acknowledged = await tx.$executeRawUnsafe(`UPDATE tenant_audit_reconciliation_work
+        SET completed_revision=$3::bigint,last_completed_at=$4::timestamptz,updated_at=$4::timestamptz
+        WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type='DIRECTORY_ROLES'
+          AND requested_revision=$3::bigint AND completed_revision<$3::bigint`,
+        a.organizationId, a.customerTenantId, auditRequestedRevision.toString(), time.checkedAt)
+      if (acknowledged > 1) throw new Error('TENANT_AUDIT_RECONCILIATION_SNAPSHOT_RECEIPT_MULTIPLE_ROWS')
+    }
     return { status: 'committed', receipt: receipt(a, time.checkedAt, payload.digest, payload.rows.length) }
-  })
+  }, visitOwner)
 }
 function receipt(a: RoleAttempt, checkedAt: Date, digest: string, count: number): RoleReceipt {
   return { ...a, contractVersion: 1, checkedAt, snapshotObservedAt: new Date(checkedAt), contentDigest: digest, rowCount: count }

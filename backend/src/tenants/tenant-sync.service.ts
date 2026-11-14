@@ -11,6 +11,13 @@ export {
   type EntraCollectionLimits,
 } from './microsoft-collection-budget.js'
 import { projectSyncOutcome } from './sync-outcome-projection.js'
+import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import {
+  assertTenantVisitLifecycleActive, recordTenantVisitLifecycleFailure,
+  runTenantVisitLifecycle, tenantVisitLifecycleEnabled,
+} from './tenant-visit-lifecycle.js'
+import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type CapturedConnectionVerification } from './connection-verification-store.js'
 import { validatedLicenseRows } from './license-validation.js'
@@ -57,6 +64,11 @@ import { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { evaluateAndPersistTenant } from '../risky-users-wiring/evaluate-and-persist.js'
 import { NotificationsService } from '../notifications/notifications.service.js'
+import {
+  DIRECTORY_AUDIT_SECURITY_SEARCH_TERMS,
+  directoryAuditSecurityIncident,
+  type DirectoryAuditIncidentSource,
+} from './directory-audit-security-incident.js'
 import { resolveDomainDnsHealth } from './domain-dns-health.js'
 import {
   collectGroupMemberships,
@@ -76,6 +88,7 @@ import {
   initialSyncStateRequiresAction,
 } from './initial-sync-status.js'
 import {
+  AUDIT_RECONCILIATION_RESOURCES,
   deriveAuditReconciliationResources,
   type AuditReconciliationResource,
 } from './audit-change-reconciliation.js'
@@ -118,9 +131,17 @@ import {
   RELATED_EXCHANGE_RULE_AUDIT_OPERATIONS,
   RELATED_EXCHANGE_RULE_AUDIT_WINDOW_DAYS,
 } from './exchange-rule-related-audit.js'
+import { selectPendingAuditReconciliationWork } from './tenant-audit-reconciliation-work.js'
 import {
   DAILY_INVENTORY_RESOURCES,
+  DAILY_INVENTORY_REFRESH_MS,
+  TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  type InventoryRefreshInterval,
+  shouldCollectInventoryInTwentyMinuteFullPass,
   DAILY_INVENTORY_ANCHORS,
+  DAILY_INVENTORY_FAILURE_RETRY_MS,
+  dailyInventoryResourceDueAt,
+  type DailyInventoryState,
   requiresDailyInventoryRefresh,
   scheduledSyncTenantWhere,
   selectScheduledTenantWork,
@@ -156,6 +177,10 @@ export const GRAPH_LOG_COLLECTION_DEADLINE_MS = 10 * 60 * 1_000
 export const GRAPH_LOG_PAGE_MAX_BYTES = 2 * 1024 * 1024
 /** Cumulative retained parsed log data. Page and row limits alone permit too much heap. */
 export const GRAPH_LOG_COLLECTION_MAX_MATERIALIZED_BYTES = 8 * 1024 * 1024
+/** Maximum historical raw-only audit rows projected in one owner-bound visit. */
+export const DIRECTORY_AUDIT_EVIDENCE_REPAIR_BATCH_LIMIT = 100
+/** Maximum retained security audit rows checked for missing notices per owner-bound visit. */
+export const DIRECTORY_AUDIT_NOTICE_REPAIR_BATCH_LIMIT = 100
 export const ENTRA_COLLECTION_LIMITS: Readonly<EntraCollectionLimits> = Object.freeze({
   pages: 50,
   rows: 25_000,
@@ -316,11 +341,18 @@ export async function settleSyncCollectorModules(
 
   const settleOne = async (index: number) => {
     const module = modules[index]!
-    results[index] = (await Promise.allSettled([
+    const collect = async () => {
+      assertTenantVisitLifecycleActive()
+      try { return await module.synchronize() } catch (error) {
+        recordTenantVisitLifecycleFailure(error)
+        throw error
+      }
+    }
+    results[index] = (await Promise.allSettled([Promise.resolve().then(() =>
       isBoundedMemoryCollectionResource(module.resource)
-        ? runInSyncMemoryLane(module.synchronize)
-        : module.synchronize(),
-    ]))[0]!
+        ? runInSyncMemoryLane(collect)
+        : collect(),
+    )]))[0]!
   }
   await Promise.all([
     (async () => {
@@ -331,10 +363,18 @@ export async function settleSyncCollectorModules(
   return results
 }
 
-/**
- * An upstream dependency is still being provisioned. This is an expected,
- * retryable lifecycle state, not a failed collection attempt.
- */
+/** Durable authoritative refresh work remains incomplete after this visit. */
+export class AuditReconciliationIncompleteError extends Error {
+  constructor(
+    readonly failedResources: readonly AuditReconciliationResource[],
+    readonly pendingResources: readonly AuditReconciliationResource[],
+  ) {
+    super('AUDIT_RECONCILIATION_INCOMPLETE')
+    this.name = 'AuditReconciliationIncompleteError'
+  }
+}
+
+/** An upstream dependency is still being provisioned; this is retryable. */
 export class CollectionInitializingError extends Error {
   constructor(
     readonly code: string,
@@ -411,8 +451,8 @@ function assertAuthRegistrationFallbackLimits(
 }
 
 /**
- * The only durable tenant-wide lease used by the scheduler and manual sync.
- * Keeping this compare-and-set in one helper makes a test exercise the exact
+ * Legacy USERS claim retained beneath the gated whole-visit owner. Keeping
+ * this compare-and-set in one helper makes a test exercise the exact
  * updateMany/create race used by syncConnectedTenant rather than a parallel
  * in-memory lock model.
  */
@@ -420,12 +460,18 @@ export async function claimTenantUsersLease(
   prisma: any,
   tenant: { id: string; organizationId: string },
   now = new Date(),
+  visitOwner?: TenantVisitLeaseOwner,
+  clearDeltaLinkOnClaim = false,
 ) {
+  if (visitOwner && (
+    visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+  )) throw new TenantVisitLeaseLostError()
   // Each statement is transaction-local UTC. A unique-create loser rolls back
   // before the follow-up lookup, preserving the existing compare-and-set race.
   const inUtc = <T>(work: (transaction: Prisma.TransactionClient) => Promise<T>): Promise<T> =>
     prisma.$transaction(async (transaction: Prisma.TransactionClient) => {
       await enforceRiskUtcTransaction(transaction)
+      if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
       return work(transaction)
     })
   const existingState = await inUtc((transaction) => transaction.syncState.findUnique({
@@ -442,7 +488,10 @@ export async function claimTenantUsersLease(
           { lastAttemptAt: { lt: staleLeaseBefore } },
         ],
       },
-      data: { status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null },
+      data: {
+        status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null,
+        ...(clearDeltaLinkOnClaim ? { deltaLink: null } : {}),
+      },
     }))
     return { claimed: claim.count === 1, existingState }
   }
@@ -452,6 +501,9 @@ export async function claimTenantUsersLease(
     }))
     return { claimed: true, existingState: null }
   } catch (error) {
+    // A lost visit is never a harmless unique-create race.
+    const leaseLoss = visitOwner && tenantVisitLeaseLoss(error)
+    if (leaseLoss) throw leaseLoss
     const competingClaim = await inUtc((transaction) => transaction.syncState.findUnique({
       where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'USERS' } },
       select: { id: true },
@@ -1225,6 +1277,15 @@ function hasGraphContinuation(value: unknown): boolean {
   return false
 }
 
+// Optional enrichment may stay unknown without discarding independently
+// collected registration facts. Only the inactive owner-bearing path opts in.
+function hasGraphBatchQualification(item: { headers?: unknown; body?: unknown }): boolean {
+  const headers = item.headers
+  return (headers !== undefined && !plainRecord(headers)) ||
+    (plainRecord(headers) && Object.keys(headers).some(name => name.toLowerCase() === 'warning')) ||
+    hasGraphContinuation(item.body)
+}
+
 async function readBoundedSingleton(response: Response, baselineSource?: BaselineSourceResource): Promise<Record<string, any>> {
   const parsed = JSON.parse(await readBoundedResponseText(response, SINGLETON_JSON_MAX_BYTES)) as unknown
   if (!plainRecord(parsed)) throw new Error('Microsoft returned an invalid bounded singleton response.')
@@ -1240,10 +1301,10 @@ async function readBoundedSingleton(response: Response, baselineSource?: Baselin
 
 type BaselineSourceResource = 'DOMAINS' | 'SECURITY_DEFAULTS' | 'AUTH_METHOD_POLICIES' | 'SHAREPOINT_SETTINGS'
 
-async function assertCompleteBaselineSourceResponse(response: Response, resourceType: BaselineSourceResource): Promise<void> {
+async function assertCompleteBaselineSourceResponse(response: Response, resourceType: EntraSnapshotResource | 'USERS'): Promise<void> {
   // Graph can send 206 with a syntactically valid but incomplete JSON body.
   // A Warning header can also qualify an otherwise successful response. Only
-  // these baseline evidence collectors require this stricter transport proof.
+  // baseline collectors and owner-bearing snapshot paths opt in.
   const warning = response.headers.get('warning')
   if (response.status === 200 && warning === null) return
   await cancelBoundedStream(() => response.body?.cancel())
@@ -1619,9 +1680,12 @@ export class TenantSyncService {
   private async runPostSyncIdentityRiskEvaluation(tenant: {
     id: string
     organizationId: string
-  }, executionDeadlineAt?: number, globalAttemptId?: string, diagnostic?: (reason: CycleReason) => void) {
+  }, executionDeadlineAt?: number, globalAttemptId?: string, diagnostic?: (reason: CycleReason) => void, visitOwner?: TenantVisitLeaseOwner) {
+    assertTenantVisitLifecycleActive(visitOwner)
+    if (visitOwner && (visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id))
+      throw new TenantVisitLeaseLostError()
     if (!this.identityRiskEvaluationScheduler || (!this.riskAssessmentProjector && !this.mailboxRiskProjector)) return
-    if (isGlobalRiskConfig(riskRuntimeConfig()) && !globalAttemptId) return this.runScopedPostSyncRisk(tenant)
+    if (isGlobalRiskConfig(riskRuntimeConfig()) && !globalAttemptId) return this.runScopedPostSyncRisk(tenant, visitOwner)
     const evaluationAt = new Date()
     const windowStart = new Date(evaluationAt.getTime() - 24 * 60 * 60 * 1_000)
     try {
@@ -1636,8 +1700,9 @@ export class TenantSyncService {
         evaluationAt,
         executionDeadlineAt,
         globalAttemptId,
+        visitOwner,
         loadSources: () => (this.riskAssessmentProjector ?? this.mailboxRiskProjector)!.load({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, evaluationAt,
-          executionDeadlineAt === undefined ? undefined : executionDeadlineAt - 12_000),
+          executionDeadlineAt === undefined ? undefined : executionDeadlineAt - 12_000, visitOwner),
       }
       return this.riskAssessmentProjector ? this.identityRiskEvaluationScheduler!.runAssessmentTenant(request)
         : this.identityRiskEvaluationScheduler!.runTenant({...request,approvedEvaluator:{readiness:'READY',featureFlags:MAILBOX_FIRST_SLICE_FLAGS}})
@@ -1645,7 +1710,9 @@ export class TenantSyncService {
       // COMPLETED is returned only after persistCompletedRun's transaction
       // resolves. OFF/HARD_DISABLED/IN_PROGRESS/REPLAYED are not a new commit.
       observeCycle(diagnostic, this.riskAssessmentProjector && outcome?.status === 'COMPLETED' ? 'COMMITTED' : 'RETURNED_UNCOMMITTED')
-    } catch {
+    } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       // Identity-risk shadow evaluation is isolated from tenant collection.
       this.logger.warn('Post-sync identity-risk evaluation failed.')
       if (executionDeadlineAt !== undefined) throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
@@ -1654,7 +1721,10 @@ export class TenantSyncService {
 
   /** Reuse the global lease/causal-head/key lifecycle for one completed source
    * ingestion. No all-tenant scan, backfill, duplicate background task or GET work. */
-  private async runScopedPostSyncRisk(tenant:{id:string;organizationId:string}) {
+  private async runScopedPostSyncRisk(tenant:{id:string;organizationId:string}, visitOwner?: TenantVisitLeaseOwner) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
     const config=riskRuntimeConfig()
     if(!isGlobalRiskConfig(config)||!this.riskAssessmentProjector)return
     try { await tryInSyncMemoryLane(async()=>{
@@ -1663,12 +1733,20 @@ export class TenantSyncService {
       if(!lease)return
       try{
         const scope={organizationId:tenant.organizationId,customerTenantId:tenant.id,environment:config.environment}
-        const attemptId=await store.recordAttempt(scope,lease,Math.min(deadline,Date.now()+2000))
-        await new WrappedRiskKeyStore().ensureVersion(scope,Math.min(deadline,Date.now()+4000))
-        await this.runPostSyncIdentityRiskEvaluation(tenant,deadline-2000,attemptId)
-      }catch{this.logger.warn('Post-ingestion identity-risk evaluation unavailable.')}
+        const attemptId=await store.recordAttempt(scope,lease,Math.min(deadline,Date.now()+2000),visitOwner)
+        await new WrappedRiskKeyStore().ensureVersion(scope,Math.min(deadline,Date.now()+4000),undefined,visitOwner)
+        await this.runPostSyncIdentityRiskEvaluation(tenant,deadline-2000,attemptId,undefined,visitOwner)
+      }catch(error){
+        const lost=visitOwner && tenantVisitLeaseLoss(error)
+        if(lost)throw lost
+        this.logger.warn('Post-ingestion identity-risk evaluation unavailable.')
+      }
       finally{if(deadline-Date.now()>100)try{await store.releaseCycle(lease,Math.min(deadline,Date.now()+1000))}catch{/* Existing lease expiry provides recovery. */}}
-    }) } catch { this.logger.warn('Post-ingestion identity-risk evaluation unavailable.') }
+    }) } catch(error) {
+      const lost=visitOwner && tenantVisitLeaseLoss(error)
+      if(lost)throw lost
+      this.logger.warn('Post-ingestion identity-risk evaluation unavailable.')
+    }
   }
 
   /** Exactly one global risk path, independent of collector selection. No
@@ -1841,6 +1919,16 @@ export class TenantSyncService {
     customerTenantId: string,
   ) {
     const tenant = await this.getReadableTenant(identity, customerTenantId)
+    if (!tenantVisitLifecycleEnabled()) return this.verifyExchangeReadOnlyTenant(tenant)
+    const outcome = await runTenantVisitLifecycle(this.tenantVisitStore(), {
+      customerTenantId: tenant.id, organizationId: tenant.organizationId,
+    }, visitOwner => this.verifyExchangeReadOnlyTenant(tenant, visitOwner))
+    if (outcome.status === 'completed') return outcome.value
+    throw new ConflictException('A tenant synchronization is already running.')
+  }
+
+  private async verifyExchangeReadOnlyTenant(tenant: TenantSyncTarget, visitOwner?: TenantVisitLeaseOwner) {
+    assertTenantVisitLifecycleActive(visitOwner)
     if (!tenant.connection) throw new BadRequestException('The Microsoft tenant connection is incomplete.')
     const accessToken = await this.microsoftConsent.getTenantExchangeAccessToken({
       microsoftTenantId: tenant.microsoftTenantId,
@@ -1849,7 +1937,7 @@ export class TenantSyncService {
         : 'HAWKVIEW_MANAGED',
       clientId: tenant.connection.clientId,
       credentialReference: tenant.connection.credentialReference,
-    })
+    }, visitOwner)
     const rows = await this.collectExchangeReadOnlyMailboxes(tenant, accessToken)
     const enabledAt = new Date()
     await this.saveSnapshot(
@@ -1870,6 +1958,7 @@ export class TenantSyncService {
           },
         })
       },
+      false, undefined, undefined, visitOwner,
     )
     return {
       enabled: true,
@@ -1895,9 +1984,17 @@ export class TenantSyncService {
     // space. `updatedAt` is not a scheduling signal: a noisy tenant cannot
     // pin every tick to the first 1,000 due IDs.
     const candidateLimit = Math.max(limit, Math.min(1_000, Number(process.env.SCHEDULED_SYNC_CANDIDATE_SCAN_LIMIT ?? 1_000) || 1_000))
-    const { candidateTenants, firstSegmentLength } = await this.readScheduledCandidateWindow(now, candidateLimit)
+    // Rollout remains explicitly OFF until the complete package clears review,
+    // registered database CI, and release verification. Capture once so query,
+    // ranking and execution all use the same cadence for this scheduler visit.
+    const fullTwentyMinuteSync = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED === 'true'
+    const healthyInventoryRefreshMs = fullTwentyMinuteSync
+      ? TWENTY_MINUTE_INVENTORY_REFRESH_MS : DAILY_INVENTORY_REFRESH_MS
+    const { candidateTenants, firstSegmentLength } = await this.readScheduledCandidateWindow(
+      now, candidateLimit, healthyInventoryRefreshMs,
+    )
 
-    const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit)
+    const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit, healthyInventoryRefreshMs)
     const selectedById = new Map(selectedWork.map((work) => [work.tenantId, work]))
     const scanSegmentById = new Map(candidateTenants.map((tenant, index) =>
       [tenant.id, index < firstSegmentLength ? 0 : 1]))
@@ -1923,16 +2020,19 @@ export class TenantSyncService {
       if (!canAdmit()) break
       if (results.filter((result) => result.status !== 'SKIPPED').length >= limit) break
       try {
-        // Keep the five-minute run lightweight, but run a full inventory once
-        // per day (or retry a failed daily inventory anchor after an hour).
-        // This prevents a tenant from remaining permanently stale unless an
-        // administrator manually presses Sync Now.
-        const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(tenant.syncStates, now, Boolean(tenant.connection?.exchangeReadOnlyEnabledAt))
+        // Healthy full inventory uses the selected interval; existing failure
+        // retry gates and per-visit budgets remain unchanged.
+        const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(
+          tenant.syncStates, now, Boolean(tenant.connection?.exchangeReadOnlyEnabledAt), healthyInventoryRefreshMs,
+        )
         const result = await this.syncConnectedTenant(tenant, false, {
           incrementalOnly: !fullInventoryDue,
           includeBundle: false,
+          evaluateRiskAfterSync: process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined,
+          forceFullUsers: fullTwentyMinuteSync && fullInventoryDue,
+          preserveInventoryFailureCooldowns: fullTwentyMinuteSync && fullInventoryDue,
         })
-        if (result.status !== 'SKIPPED' && process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined) {
+        if (result.status !== 'SKIPPED' && process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined && !tenantVisitLifecycleEnabled()) {
           await this.runPostSyncIdentityRiskEvaluation(tenant)
         }
         results.push({
@@ -1962,7 +2062,11 @@ export class TenantSyncService {
     return summary
   }
 
-  private async readScheduledCandidateWindow(now: Date, candidateLimit: number) {
+  private async readScheduledCandidateWindow(
+    now: Date,
+    candidateLimit: number,
+    healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+  ) {
     const select = {
         id: true,
         organizationId: true,
@@ -2013,7 +2117,7 @@ export class TenantSyncService {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const cursor = await this.prisma.scheduledSyncCursor.findUnique({ where: { scopeKey } })
       if (!cursor) throw new Error('Scheduled sync cursor unavailable')
-      const baseWhere = scheduledSyncTenantWhere(now)
+      const baseWhere = scheduledSyncTenantWhere(now, healthyInventoryRefreshMs)
       const readPage = (idWhere: Prisma.CustomerTenantWhereInput, take: number) =>
         this.prisma.customerTenant.findMany({
           where: { AND: [baseWhere, idWhere] },
@@ -2048,47 +2152,55 @@ export class TenantSyncService {
     tenant: TenantSyncTarget,
     accessToken: string,
     resourceType: string,
+    visitOwner?: TenantVisitLeaseOwner,
   ): { resource: string; synchronize: () => Promise<unknown> } | null {
     const synchronizers: Partial<Record<string, () => Promise<unknown>>> = {
-      LICENSES: () => this.syncLicenses(tenant, accessToken),
-      ORGANIZATION_CONFIGURATION: () => this.syncOrganizationConfiguration(tenant, accessToken),
-      DOMAINS: () => this.syncDomains(tenant, accessToken),
-      DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant),
-      SECURE_SCORES: () => this.syncCurrentSecureScore(tenant, accessToken),
-      GROUPS: () => this.syncGroups(tenant, accessToken),
-      AUTH_METHOD_POLICIES: () => this.syncAuthenticationMethodPolicy(tenant, accessToken),
+      LICENSES: () => this.syncLicenses(tenant, accessToken, visitOwner),
+      ORGANIZATION_CONFIGURATION: () => this.syncOrganizationConfiguration(tenant, accessToken, visitOwner),
+      DOMAINS: () => this.syncDomains(tenant, accessToken, visitOwner),
+      DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant, visitOwner),
+      SECURE_SCORES: () => this.syncCurrentSecureScore(tenant, accessToken, visitOwner),
+      GROUPS: () => this.syncGroups(tenant, accessToken, visitOwner),
+      AUTH_METHOD_POLICIES: () => this.syncAuthenticationMethodPolicy(tenant, accessToken, visitOwner),
       CONDITIONAL_ACCESS: () => this.syncEntraCollection(
         tenant, accessToken, 'CONDITIONAL_ACCESS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies',
+        visitOwner,
       ),
       AUTHENTICATION_STRENGTHS: () => this.syncEntraCollection(
         tenant, accessToken, 'AUTHENTICATION_STRENGTHS',
         'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies',
+        visitOwner,
       ),
       NAMED_LOCATIONS: () => this.syncEntraCollection(
         tenant, accessToken, 'NAMED_LOCATIONS',
         'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+        visitOwner,
       ),
       DEVICES: () => this.syncEntraCollection(
         tenant, accessToken, 'DEVICES',
         'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)',
+        visitOwner,
       ),
-      DIRECTORY_ROLES: () => this.syncDirectoryRoles(tenant, accessToken),
+      DIRECTORY_ROLES: () => this.syncDirectoryRoles(tenant, accessToken, visitOwner),
       RISKY_USERS: () => this.syncEntraCollection(
         tenant, accessToken, 'RISKY_USERS',
         'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime',
+        visitOwner,
       ),
       SERVICE_PRINCIPALS: () => this.syncEntraCollection(
         tenant, accessToken, 'SERVICE_PRINCIPALS',
         'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,description,servicePrincipalType,accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,loginUrl,publisherName,verifiedPublisher,tags,preferredSingleSignOnMode,notificationEmailAddresses,appRoles,oauth2PermissionScopes&$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)',
+        visitOwner,
       ),
       APPLICATIONS: () => this.syncEntraCollection(
         tenant, accessToken, 'APPLICATIONS',
         'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,description,createdDateTime,signInAudience,publisherDomain,identifierUris,web,passwordCredentials,keyCredentials,requiredResourceAccess&$expand=owners($select=id,displayName,userPrincipalName)',
+        visitOwner,
       ),
-      SECURITY_DEFAULTS: () => this.syncSecurityDefaults(tenant, accessToken),
-      SHAREPOINT_SITES: () => this.syncSharePointSites(tenant, accessToken),
-      SHAREPOINT_SETTINGS: () => this.syncSharePointSettings(tenant, accessToken),
+      SECURITY_DEFAULTS: () => this.syncSecurityDefaults(tenant, accessToken, visitOwner),
+      SHAREPOINT_SITES: () => this.syncSharePointSites(tenant, accessToken, undefined, visitOwner),
+      SHAREPOINT_SETTINGS: () => this.syncSharePointSettings(tenant, accessToken, visitOwner),
     }
     const synchronize = synchronizers[resourceType]
     return synchronize ? { resource: resourceType, synchronize } : null
@@ -2097,20 +2209,52 @@ export class TenantSyncService {
   private async syncConnectedTenant(
     tenant: TenantSyncTarget,
     throwWhenBusy: boolean,
-    options: { incrementalOnly?: boolean; includeBundle?: boolean } = {}
+    options: { incrementalOnly?: boolean; includeBundle?: boolean; visitOwner?: TenantVisitLeaseOwner; evaluateRiskAfterSync?: boolean; forceFullUsers?: boolean; preserveInventoryFailureCooldowns?: boolean } = {}
   ) {
-    // Acquire before the durable USERS lease, so queued tenants are not
-    // reported RUNNING and cannot have their lease expire while waiting.
-    return runInSyncMemoryLane(() => this.syncConnectedTenantWithinMemoryLane(tenant, throwWhenBusy, options))
+    // Admission is inside the memory lane and before credential/provider work
+    // or the USERS claim. No owner is held while waiting for this process lane.
+    return runInSyncMemoryLane(async () => {
+      if (!tenantVisitLifecycleEnabled() || options.visitOwner) {
+        return this.syncConnectedTenantWithinMemoryLane(tenant, throwWhenBusy, options)
+      }
+      const outcome = await runTenantVisitLifecycle(this.tenantVisitStore(), {
+        organizationId: tenant.organizationId, customerTenantId: tenant.id,
+      }, async visitOwner => {
+        const result = await this.syncConnectedTenantWithinMemoryLane(tenant, throwWhenBusy, { ...options, visitOwner })
+        assertTenantVisitLifecycleActive(visitOwner)
+        if (result.status !== 'SKIPPED' && options.evaluateRiskAfterSync) {
+          await this.runPostSyncIdentityRiskEvaluation(tenant, undefined, undefined, undefined, visitOwner)
+          assertTenantVisitLifecycleActive(visitOwner)
+        }
+        return result
+      })
+      if (outcome.status === 'completed') return outcome.value
+      if (throwWhenBusy) throw new ConflictException('A tenant synchronization is already running.')
+      return { bundle: null, status: 'SKIPPED', failedResources: [] as string[] }
+    })
+  }
+
+  private tenantVisitStore() {
+    return createTenantVisitLifecycleStore(this.prisma)
   }
 
   private async syncConnectedTenantWithinMemoryLane(
     tenant: TenantSyncTarget,
     throwWhenBusy: boolean,
-    options: { incrementalOnly?: boolean; includeBundle?: boolean } = {}
+    options: { incrementalOnly?: boolean; includeBundle?: boolean; visitOwner?: TenantVisitLeaseOwner; forceFullUsers?: boolean; preserveInventoryFailureCooldowns?: boolean } = {}
   ) {
     const incrementalOnly = options.incrementalOnly === true
     const includeBundle = options.includeBundle !== false
+    const forceFullUsers = options.forceFullUsers === true
+    if (forceFullUsers && incrementalOnly) {
+      throw new Error('A full user inventory cannot run in incremental-only mode.')
+    }
+    // Production admission remains behind the default-OFF lifecycle gate.
+    const visitOwner = options.visitOwner
+    assertTenantVisitLifecycleActive(visitOwner)
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
     if (
       tenant.status !== 'ACTIVE' ||
       tenant.connection?.status !== 'CONNECTED'
@@ -2125,14 +2269,17 @@ export class TenantSyncService {
       let capture = await captureConnectionVerification(this.prisma, {
         customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
       }, true)
+      assertTenantVisitLifecycleActive(visitOwner)
       if (capture.status === 'unavailable' && capture.reason === 'MANAGED_CREDENTIAL_CAPTURE_UNAVAILABLE') {
         // Older rows received a revision but retained their old encrypted secret
         // reference. Promote once before any provider work, then capture the new
         // committed authority normally; never run with a mutable credential.
-        await this.microsoftConsent.upgradeLegacyManagedConnector()
+        await this.microsoftConsent.upgradeLegacyManagedConnector(visitOwner)
+        assertTenantVisitLifecycleActive(visitOwner)
         capture = await captureConnectionVerification(this.prisma, {
           customerTenantId: tenant.id, organizationId: tenant.organizationId, microsoftTenantId: tenant.microsoftTenantId,
         }, true)
+        assertTenantVisitLifecycleActive(visitOwner)
       }
       if (capture.status !== 'captured' || capture.context.tenant.status !== 'ACTIVE' || capture.context.connection.status !== 'CONNECTED') {
         throw new ConflictException('The managed connection changed before synchronization.')
@@ -2140,7 +2287,10 @@ export class TenantSyncService {
       capturedManaged = capture.context
     }
     const now = new Date()
-    const { claimed, existingState } = await claimTenantUsersLease(this.prisma, tenant, now)
+    assertTenantVisitLifecycleActive(visitOwner)
+    // Clear the old checkpoint atomically with the durable claim. A failed or
+    // crashed full enumeration must never resume from the earlier delta.
+    const { claimed, existingState } = await claimTenantUsersLease(this.prisma, tenant, now, visitOwner, forceFullUsers)
     if (!claimed) {
       if (throwWhenBusy) {
         throw new ConflictException(
@@ -2157,8 +2307,9 @@ export class TenantSyncService {
     let accessToken: string
     let graphTokenAcquired = false
     try {
+      assertTenantVisitLifecycleActive(visitOwner)
       accessToken = capturedManaged
-        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId)
+        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId, false, visitOwner)
         : await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
@@ -2167,17 +2318,19 @@ export class TenantSyncService {
             : 'HAWKVIEW_MANAGED',
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
-      })
+      }, visitOwner)
       graphTokenAcquired = true
       const result = await this.synchronizeUsers(
         tenant,
         accessToken,
-        existingState?.deltaLink ?? null
+        forceFullUsers ? null : existingState?.deltaLink ?? null,
+        true, undefined, undefined, visitOwner,
       )
       const completedAt = new Date()
 
       await this.prisma.$transaction(async (transaction) => {
         await enforceRiskUtcTransaction(transaction)
+        if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
         await transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
@@ -2205,6 +2358,8 @@ export class TenantSyncService {
         })
       })
     } catch (error) {
+      const leaseLoss = visitOwner && tenantVisitLeaseLoss(error)
+      if (leaseLoss) throw leaseLoss
       const technicalMessage = safeErrorMessage(
         error,
         'Microsoft users synchronization failed.',
@@ -2214,7 +2369,7 @@ export class TenantSyncService {
       // still usable. Collection failures (including a Graph 401/403) belong
       // to the resource and must never suspend the whole customer tenant.
       if (!graphTokenAcquired && failure.failureClass === 'AUTHENTICATION_REQUIRED') {
-        await this.markConnectionUnavailable(tenant, error, capturedManaged)
+        await this.markConnectionUnavailable(tenant, error, capturedManaged, visitOwner)
       }
       const message = customerCollectionFailureMessage(
         'user directory',
@@ -2234,14 +2389,16 @@ export class TenantSyncService {
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
-      }))
+      }), visitOwner)
       if (graphTokenAcquired) {
         try {
           // The Management Activity API is a separate Microsoft resource.
           // A transient Graph users failure must not create an audit blind
           // spot; ingest evidence now and reconcile current state later.
-          await this.m365ManagementActivity.syncTenant(tenant)
+          await this.m365ManagementActivity.syncTenant(tenant, visitOwner)
         } catch (auditError) {
+          const lost = visitOwner && tenantVisitLeaseLoss(auditError)
+          if (lost) throw lost
           this.logOperationalFailure('M365_AUDIT', 'INCREMENTAL', 'INDEPENDENT_AUDIT_UNAVAILABLE')
         }
       }
@@ -2256,7 +2413,7 @@ export class TenantSyncService {
     // Publication is outside the provider/resource catch. A lost context or an
     // uncertain commit cannot trigger compensation or another provider workload.
     if (capturedManaged) {
-      const refreshed = await publishCapturedConnectionRefresh(this.prisma, capturedManaged, 'sync-timestamp')
+      const refreshed = await publishCapturedConnectionRefresh(this.prisma, capturedManaged, 'sync-timestamp', visitOwner)
       if (refreshed.status !== 'applied') throw new ConflictException('The managed connection changed during synchronization.')
       capturedManaged = refreshed.context
     }
@@ -2275,15 +2432,15 @@ export class TenantSyncService {
       }> = [
         {
           resource: 'SIGN_INS',
-          synchronize: () => this.syncSignInLogs(tenant, accessToken),
+          synchronize: () => this.syncSignInLogs(tenant, accessToken, LIMITED_SIGN_IN_ENRICHMENT_LIMITS, visitOwner),
         },
         {
           resource: 'AUDIT_LOGS',
-          synchronize: () => this.syncDirectoryAuditLogs(tenant, accessToken),
+          synchronize: () => this.syncDirectoryAuditLogs(tenant, accessToken, true, visitOwner),
         },
         {
           resource: 'M365_AUDIT',
-          synchronize: () => this.syncM365AuditActivity(tenant, accessToken),
+          synchronize: () => this.syncM365AuditActivity(tenant, accessToken, visitOwner),
         },
       ]
       // Read the union for dispatch reachability; each resource still needs
@@ -2317,6 +2474,7 @@ export class TenantSyncService {
           tenant,
           accessToken,
           state.resourceType,
+          visitOwner,
         )
         if (module) incrementalModules.push(module)
       }
@@ -2330,13 +2488,15 @@ export class TenantSyncService {
       const incrementalResults = await settleSyncCollectorModules(incrementalModules)
       incrementalResults.forEach((result, index) => {
         if (result.status === 'rejected') {
+          const lost = visitOwner && tenantVisitLeaseLoss(result.reason)
+          if (lost) throw lost
           const resource = incrementalModules[index]?.resource ?? 'UNKNOWN'
           rejectedResources.add(resource)
           this.logOperationalFailure(resource, 'INCREMENTAL', 'COLLECTION_UNAVAILABLE')
         }
       })
 
-      await this.refreshCollectionFieldStates(tenant)
+      await this.refreshCollectionFieldStates(tenant, visitOwner)
       const attemptedStates = await this.prisma.syncState.findMany({
         where: {
           organizationId: tenant.organizationId,
@@ -2356,10 +2516,35 @@ export class TenantSyncService {
       }
     }
 
+    // A healthy twenty-minute inventory must not turn a throttled or denied
+    // source into a twenty-minute retry. Keep activity stream behavior intact;
+    // their collector-specific polling and retry rules already apply on every
+    // incremental visit. Legacy full passes retain their previous behavior.
+    const deferredInventoryResources = new Set<string>()
+    const inventoryStates = options.preserveInventoryFailureCooldowns
+      ? await this.prisma.syncState.findMany({
+        where: {
+          organizationId: tenant.organizationId, customerTenantId: tenant.id,
+          resourceType: { notIn: ['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'] },
+        },
+        select: { resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true,
+          lastErrorCode: true, lastErrorMessage: true, consecutiveFailures: true },
+      }) : []
+    const inventoryStateByResource = new Map(inventoryStates.map(state => [state.resourceType, state]))
+    const collectInventory = (resource: string) => {
+      if (!options.preserveInventoryFailureCooldowns || ['SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(resource)) return true
+      const due = shouldCollectInventoryInTwentyMinuteFullPass(
+        inventoryStateByResource.get(resource as typeof inventoryStates[number]['resourceType']), now,
+      )
+      if (!due) deferredInventoryResources.add(resource)
+      return due
+    }
+
     let snapshotAccessToken: string
     try {
+      assertTenantVisitLifecycleActive(visitOwner)
       snapshotAccessToken = capturedManaged
-        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId)
+        ? await this.microsoftConsent.getCapturedManagedAccessToken(capturedManaged.authority, capturedManaged.tenant.microsoftTenantId, false, visitOwner)
         : await this.microsoftConsent.getTenantAccessToken({
         microsoftTenantId: tenant.microsoftTenantId,
         connectionMode:
@@ -2368,12 +2553,14 @@ export class TenantSyncService {
             : 'HAWKVIEW_MANAGED',
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
-      })
+      }, visitOwner)
     } catch (error) {
+      const leaseLoss = visitOwner && tenantVisitLeaseLoss(error)
+      if (leaseLoss) throw leaseLoss
       const technicalMessage = safeErrorMessage(error, 'Microsoft token acquisition failed.')
       const failure = classifyMicrosoftFailure(error, technicalMessage)
       if (failure.failureClass === 'AUTHENTICATION_REQUIRED') {
-        await this.markConnectionUnavailable(tenant, error, capturedManaged)
+        await this.markConnectionUnavailable(tenant, error, capturedManaged, visitOwner)
       }
       throw new BadGatewayException(
         customerCollectionFailureMessage('Microsoft 365', failure, true),
@@ -2388,71 +2575,74 @@ export class TenantSyncService {
     }> = [
       {
         resource: 'LICENSES',
-        synchronize: () => this.syncLicenses(tenant, snapshotAccessToken),
+        synchronize: () => this.syncLicenses(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'ORGANIZATION_CONFIGURATION',
-        synchronize: () => this.syncOrganizationConfiguration(tenant, snapshotAccessToken),
+        synchronize: () => this.syncOrganizationConfiguration(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'DOMAINS',
-        synchronize: () => this.syncDomains(tenant, snapshotAccessToken),
+        synchronize: () => this.syncDomains(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'GROUPS',
-        synchronize: () => this.syncGroups(tenant, snapshotAccessToken),
+        synchronize: () => this.syncGroups(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'SHAREPOINT_SITES',
         synchronize: () =>
-          this.syncSharePointSites(tenant, snapshotAccessToken),
+          this.syncSharePointSites(tenant, snapshotAccessToken, undefined, visitOwner),
       },
       {
         resource: 'SHAREPOINT_SETTINGS',
         synchronize: () =>
-          this.syncSharePointSettings(tenant, snapshotAccessToken),
+          this.syncSharePointSettings(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'SHAREPOINT_USAGE',
         synchronize: () =>
-          this.syncSharePointUsage(tenant, snapshotAccessToken),
+          this.syncSharePointUsage(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'EXCHANGE_MAILBOXES',
         synchronize: () =>
-          this.syncExchangeMailboxDirectory(tenant, snapshotAccessToken),
+          this.syncExchangeMailboxDirectory(tenant, snapshotAccessToken, undefined, visitOwner),
       },
       {
         resource: 'EXCHANGE_MAILBOX_SETTINGS',
         synchronize: () =>
-          this.syncExchangeMailboxSettings(tenant, snapshotAccessToken),
+          this.syncExchangeMailboxSettings(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'EXCHANGE_ACCEPTED_DOMAINS',
         synchronize: () =>
-          this.syncExchangeAcceptedDomains(tenant, snapshotAccessToken),
+          this.syncExchangeAcceptedDomains(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'EXCHANGE_MAILBOX_USAGE',
         synchronize: () =>
-          this.syncExchangeMailboxUsage(tenant, snapshotAccessToken),
+          this.syncExchangeMailboxUsage(tenant, snapshotAccessToken, visitOwner),
       },
       {
         resource: 'EXCHANGE_MAILBOX_RULES',
         synchronize: () =>
-          this.syncExchangeMailboxRules(tenant, snapshotAccessToken),
+          this.syncExchangeMailboxRules(tenant, snapshotAccessToken, undefined, visitOwner),
       },
     ]
     if (tenant.connection.exchangeReadOnlyEnabledAt) {
       snapshotModules.push({
         resource: 'EXCHANGE_MAILBOX_CONFIGURATION',
-        synchronize: () => this.syncExchangeMailboxConfiguration(tenant),
+        synchronize: () => this.syncExchangeMailboxConfiguration(tenant, visitOwner),
       })
     }
-    const snapshotResults = await settleSyncCollectorModules(snapshotModules)
+    const selectedSnapshotModules = snapshotModules.filter(module => collectInventory(module.resource))
+    const snapshotResults = await settleSyncCollectorModules(selectedSnapshotModules)
     snapshotResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const resource = snapshotModules[index]?.resource ?? 'UNKNOWN'
+        const lost = visitOwner && tenantVisitLeaseLoss(result.reason)
+        if (lost) throw lost
+        const resource = selectedSnapshotModules[index]?.resource ?? 'UNKNOWN'
         rejectedResources.add(resource)
         this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
@@ -2461,48 +2651,61 @@ export class TenantSyncService {
     // Run after Microsoft domain discovery so DNS checks always use the
     // latest database-backed domain inventory.
     try {
-      await this.syncDomainDnsHealth(tenant)
+      // Failed or deferred discovery cannot supply a complete current DNS
+      // target list. Keep the previous DNS state/receipt untouched while
+      // independent inventories continue and the aggregate stays partial.
+      if (deferredInventoryResources.has('DOMAINS') || rejectedResources.has('DOMAINS')) {
+        deferredInventoryResources.add('DOMAIN_DNS_HEALTH')
+      }
+      else if (collectInventory('DOMAIN_DNS_HEALTH')) await this.syncDomainDnsHealth(tenant, visitOwner)
     } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       rejectedResources.add('DOMAIN_DNS_HEALTH')
       this.logOperationalFailure('DOMAIN_DNS_HEALTH', 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
     }
 
     const entraModules: SyncCollectorModule[] = [
-      { resource: 'AUTH_REGISTRATIONS', synchronize: () => this.syncAuthenticationRegistrations(tenant, snapshotAccessToken) },
-      { resource: 'AUTH_METHOD_POLICIES', synchronize: () => this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken) },
+      { resource: 'AUTH_REGISTRATIONS', synchronize: () => this.syncAuthenticationRegistrations(tenant, snapshotAccessToken, visitOwner) },
+      { resource: 'AUTH_METHOD_POLICIES', synchronize: () => this.syncAuthenticationMethodPolicy(tenant, snapshotAccessToken, visitOwner) },
       { resource: 'CONDITIONAL_ACCESS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'CONDITIONAL_ACCESS',
-        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies',
+        visitOwner,
       ) },
       { resource: 'AUTHENTICATION_STRENGTHS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'AUTHENTICATION_STRENGTHS',
-        'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies'
+        'https://graph.microsoft.com/v1.0/policies/authenticationStrengthPolicies',
+        visitOwner,
       ) },
       { resource: 'NAMED_LOCATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'NAMED_LOCATIONS',
-        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
+        'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+        visitOwner,
       ) },
-      { resource: 'SIGN_INS', synchronize: () => this.syncSignInLogs(tenant, snapshotAccessToken) },
-      { resource: 'AUDIT_LOGS', synchronize: () => this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false) },
-      { resource: 'M365_AUDIT', synchronize: () => this.syncM365AuditActivity(tenant, snapshotAccessToken) },
+      { resource: 'SIGN_INS', synchronize: () => this.syncSignInLogs(tenant, snapshotAccessToken, LIMITED_SIGN_IN_ENRICHMENT_LIMITS, visitOwner) },
+      { resource: 'AUDIT_LOGS', synchronize: () => this.syncDirectoryAuditLogs(tenant, snapshotAccessToken, false, visitOwner) },
+      { resource: 'M365_AUDIT', synchronize: () => this.syncM365AuditActivity(tenant, snapshotAccessToken, visitOwner) },
       { resource: 'DEVICES', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'DEVICES',
-        'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
+        'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)',
+        visitOwner,
       ) },
-      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncDirectoryRoles(tenant, snapshotAccessToken) },
+      { resource: 'DIRECTORY_ROLES', synchronize: () => this.syncDirectoryRoles(tenant, snapshotAccessToken, visitOwner) },
       { resource: 'RISKY_USERS', synchronize: () => this.syncEntraCollection(
         tenant,
         snapshotAccessToken,
         'RISKY_USERS',
-        'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime'
+        'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$select=id,userPrincipalName,riskLevel,riskState,riskDetail,riskLastUpdatedDateTime',
+        visitOwner,
       ) },
       { resource: 'SERVICE_PRINCIPALS', synchronize: () => this.syncEntraCollection(
         tenant,
@@ -2514,7 +2717,8 @@ export class TenantSyncService {
           'loginUrl,publisherName,verifiedPublisher,tags,' +
           'preferredSingleSignOnMode,notificationEmailAddresses,appRoles,' +
           'oauth2PermissionScopes&' +
-          '$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
+          '$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)',
+        visitOwner,
       ) },
       { resource: 'APPLICATIONS', synchronize: () => this.syncEntraCollection(
         tenant,
@@ -2524,21 +2728,25 @@ export class TenantSyncService {
           '$select=id,appId,displayName,description,createdDateTime,' +
           'signInAudience,publisherDomain,identifierUris,web,' +
           'passwordCredentials,keyCredentials,requiredResourceAccess&' +
-          '$expand=owners($select=id,displayName,userPrincipalName)'
+          '$expand=owners($select=id,displayName,userPrincipalName)',
+        visitOwner,
       ) },
-      { resource: 'SECURE_SCORES', synchronize: () => this.syncCurrentSecureScore(tenant, snapshotAccessToken) },
-      { resource: 'SECURITY_DEFAULTS', synchronize: () => this.syncSecurityDefaults(tenant, snapshotAccessToken) },
+      { resource: 'SECURE_SCORES', synchronize: () => this.syncCurrentSecureScore(tenant, snapshotAccessToken, visitOwner) },
+      { resource: 'SECURITY_DEFAULTS', synchronize: () => this.syncSecurityDefaults(tenant, snapshotAccessToken, visitOwner) },
     ]
-    const entraResults = await settleSyncCollectorModules(entraModules)
+    const selectedEntraModules = entraModules.filter(module => collectInventory(module.resource))
+    const entraResults = await settleSyncCollectorModules(selectedEntraModules)
     entraResults.forEach((result, index) => {
       if (result.status === 'rejected') {
-        const resource = entraModules[index]?.resource ?? 'UNKNOWN'
+        const lost = visitOwner && tenantVisitLeaseLoss(result.reason)
+        if (lost) throw lost
+        const resource = selectedEntraModules[index]?.resource ?? 'UNKNOWN'
         rejectedResources.add(resource)
         this.logOperationalFailure(resource, 'SNAPSHOT', 'COLLECTION_UNAVAILABLE')
       }
     })
 
-    await this.refreshCollectionFieldStates(tenant)
+    await this.refreshCollectionFieldStates(tenant, visitOwner)
     const attemptedStates = await this.prisma.syncState.findMany({
       where: {
         organizationId: tenant.organizationId,
@@ -2554,9 +2762,12 @@ export class TenantSyncService {
         lastErrorMessage: true,
       },
     })
-    const failedStates = attemptedStates.filter(
-      (state) => state.status === 'FAILED',
-    )
+    // A deferred prior failure remains incomplete. Do not fabricate a new
+    // attempt or success, and do not report the healthy subset as a full pass.
+    const failedStates = [...new Map([
+      ...inventoryStates.filter(state => deferredInventoryResources.has(state.resourceType) && state.status === 'FAILED'),
+      ...attemptedStates.filter(state => state.status === 'FAILED'),
+    ].map(state => [state.resourceType, state])).values()]
     const persistedFailedResources = new Set<string>(failedStates.map((state) => state.resourceType))
     const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
     const unclassifiedResources = failedResources.filter((resource) => !persistedFailedResources.has(resource))
@@ -2568,7 +2779,7 @@ export class TenantSyncService {
       .map((state) => state.resourceType)
     const initialSync = !existingState?.lastSuccessfulAt
     if (initialSync) {
-      const unclassified = unclassifiedResources.length > 0
+      const unclassified = unclassifiedResources.length > 0 || deferredInventoryResources.size > 0
       const actionRequired = actionRequiredResources.length > 0
       const retrying = !actionRequired && retryingResources.length > 0
       if (!capturedManaged) await this.notifications.publishIncident({
@@ -2604,15 +2815,17 @@ export class TenantSyncService {
         metadata: {
           failedResources,
           unclassifiedResources,
+          deferredResources: [...deferredInventoryResources].sort(),
           retryingResources,
           actionRequiredResources,
         },
-      })
+      }, visitOwner)
     }
     return {
       bundle: includeBundle ? await this.buildBundle(tenant) : null,
-      status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+      status: failedResources.length > 0 || deferredInventoryResources.size > 0 ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
+      deferredResources: [...deferredInventoryResources].sort(),
     }
   }
 
@@ -2624,7 +2837,10 @@ export class TenantSyncService {
   private async refreshCollectionFieldStates(tenant: {
     id: string
     organizationId: string
-  }) {
+  }, visitOwner?: TenantVisitLeaseOwner) {
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
     const [syncStates, snapshots] = await Promise.all([
       this.prisma.syncState.findMany({
         where: {
@@ -2674,7 +2890,7 @@ export class TenantSyncService {
       { key: 'sharepoint.deleted-sites', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
       { key: 'entra.conditional-access', resource: 'CONDITIONAL_ACCESS', source: 'Microsoft Graph', endpoint: '/identity/conditionalAccess/policies' },
     ]
-    await Promise.all(resources.map(async (definition) => {
+    const upserts: Prisma.TenantCollectionFieldStateUpsertArgs[] = resources.map((definition) => {
       const sync = syncByResource.get(definition.resource as any)
       const hasNoConditionalAccessPolicies =
         definition.key === 'entra.conditional-access' &&
@@ -2700,7 +2916,7 @@ export class TenantSyncService {
                 : 'The stored Microsoft usage report does not contain complete validated period and refresh-date evidence.',
               isStale: definition.projectionEvidence.state !== 'UNVERIFIED_LEGACY',
             }
-      await this.prisma.tenantCollectionFieldState.upsert({
+      return {
         where: { customerTenantId_fieldKey: { customerTenantId: tenant.id, fieldKey: definition.key } },
         create: {
           organizationId: tenant.organizationId, customerTenantId: tenant.id, fieldKey: definition.key,
@@ -2715,45 +2931,40 @@ export class TenantSyncService {
           correlationId: correlationId(sync?.lastErrorMessage ?? null), lastAttemptAt: sync?.lastAttemptAt ?? null,
           lastSuccessfulAt: sync?.lastSuccessfulAt ?? null, isStale: result.isStale,
         },
+      }
+    })
+    if (visitOwner) {
+      await this.prisma.$transaction(async (transaction) => {
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        // Keep a stable row-lock order while the owner lock is held.
+        for (const args of upserts) await transaction.tenantCollectionFieldState.upsert(args)
       })
-    }))
+    } else {
+      await Promise.all(upserts.map((args) => this.prisma.tenantCollectionFieldState.upsert(args)))
+    }
   }
 
   private async markConnectionUnavailable(
     tenant: { id: string; organizationId: string; connection?: { connectionMode: string } | null },
     error: unknown,
-    captured?: CapturedConnectionVerification
+    captured?: CapturedConnectionVerification,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const message = safeErrorMessage(error, 'Microsoft tenant access failed.')
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
     if (tenant.connection?.connectionMode !== 'CUSTOMER_MANAGED') {
       // An uncaptured/old failure grants no authority and emits no incident.
-      if (!captured) return
-      await publishConnectionVerification(this.prisma, captured, { outcome: 'failed', message, authenticationFailure: true })
+      if (!captured) {
+        if (visitOwner) throw new TenantVisitLeaseLostError()
+        return
+      }
+      await publishConnectionVerification(this.prisma, captured,
+        { outcome: 'failed', message, authenticationFailure: true }, visitOwner)
       return
     }
-    const failedAt = new Date()
-
-    await this.prisma.$transaction([
-      this.prisma.customerTenant.update({
-        where: { id: tenant.id },
-        data: { status: 'SUSPENDED' },
-      }),
-      this.prisma.tenantConnection.update({
-        where: {
-          customerTenantId_organizationId: {
-            customerTenantId: tenant.id,
-            organizationId: tenant.organizationId,
-          },
-        },
-        data: {
-          status: 'ERROR',
-          lastVerifiedAt: failedAt,
-          lastErrorCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
-          lastErrorMessage: message,
-        },
-      }),
-    ])
-    await this.notifications.publishIncident({
+    const incident = {
       organizationId: tenant.organizationId,
       customerTenantId: tenant.id,
       eventType: 'tenant.connection_lost',
@@ -2765,16 +2976,51 @@ export class TenantSyncService {
       source: 'microsoft-verification',
       actionUrl: `/tenants/${tenant.id}/settings`,
       actionLabel: 'Reconnect tenant',
-    })
+    } satisfies Parameters<NotificationsService['publishIncident']>[0]
+    const failedAt = new Date()
+    const tenantUpdate = { where: { id: tenant.id }, data: { status: 'SUSPENDED' as const } }
+    const connectionUpdate = {
+      where: {
+        customerTenantId_organizationId: {
+          customerTenantId: tenant.id,
+          organizationId: tenant.organizationId,
+        },
+      },
+      data: {
+        status: 'ERROR' as const,
+        lastVerifiedAt: failedAt,
+        lastErrorCode: 'MICROSOFT_AUTHENTICATION_REQUIRED',
+        lastErrorMessage: message,
+      },
+    }
+    if (visitOwner) {
+      await this.prisma.$transaction(async (transaction) => {
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        await transaction.customerTenant.update(tenantUpdate)
+        await transaction.tenantConnection.update(connectionUpdate)
+        await this.notifications.publishIncidentInTransaction(incident, visitOwner, transaction)
+      })
+    } else {
+      await this.prisma.$transaction([
+        this.prisma.customerTenant.update(tenantUpdate),
+        this.prisma.tenantConnection.update(connectionUpdate),
+      ])
+      await this.notifications.publishIncident(incident)
+    }
+
   }
 
   private async withSnapshotUtc<T>(
     resourceType: string,
     operation: (transaction: Prisma.TransactionClient) => Promise<T>,
+    visitOwner?: TenantVisitLeaseOwner,
   ): Promise<T> {
-    if (resourceType !== 'USERS' && !requiresRiskUtcSnapshot(resourceType)) return operation(this.prisma)
+    assertTenantVisitLifecycleActive(visitOwner)
+    const needsUtc = resourceType === 'USERS' || requiresRiskUtcSnapshot(resourceType)
+    if (!visitOwner && !needsUtc) return operation(this.prisma)
     return this.prisma.$transaction(async (transaction) => {
-      await enforceRiskUtcTransaction(transaction)
+      if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      if (needsUtc) await enforceRiskUtcTransaction(transaction)
       return operation(transaction)
     })
   }
@@ -2788,8 +3034,13 @@ export class TenantSyncService {
       | 'SIGN_INS'
       | 'AUDIT_LOGS'
       | EntraSnapshotResource,
-    synchronize: () => Promise<void>
+    synchronize: () => Promise<void>,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
+    assertTenantVisitLifecycleActive(visitOwner)
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
     const lastAttemptAt = new Date()
     const exchangePhase = resourceType === 'EXCHANGE_MAILBOX_CONFIGURATION'
     if (exchangePhase) {
@@ -2821,7 +3072,7 @@ export class TenantSyncService {
             lastErrorMessage: null,
           }),
         },
-      }))
+      }), visitOwner)
     } catch (error) {
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
@@ -2845,7 +3096,7 @@ export class TenantSyncService {
           lastErrorMessage: null,
           consecutiveFailures: 0,
         },
-      }))
+      }), visitOwner)
       await this.notifications.resolveIncident(
         tenant.organizationId,
         `tenant:${tenant.id}:sync:${resourceType}`,
@@ -2859,12 +3110,16 @@ export class TenantSyncService {
           source: 'tenant-sync',
           actionUrl: `/tenants/${tenant.id}`,
           actionLabel: 'View tenant',
-        }
+        },
+        visitOwner,
       )
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
       }
     } catch (error) {
+      // Ownership loss is not a Microsoft collection failure and must not
+      // write FAILED/RUNNING state or a recovery/failure incident.
+      if (error instanceof TenantVisitLeaseLostError) throw error
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
       }
@@ -2886,13 +3141,15 @@ export class TenantSyncService {
             lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
-        }))
+        }), visitOwner)
         // A previous deployment could have published an incident for this
         // normal provisioning state. Retire it without claiming collection
         // success; readiness will continue to report INITIALIZING.
         await this.notifications.resolveIncident(
           tenant.organizationId,
           `tenant:${tenant.id}:sync:${resourceType}`,
+          undefined,
+          visitOwner,
         )
         return
       }
@@ -2913,10 +3170,12 @@ export class TenantSyncService {
             lastErrorMessage: technicalMessage,
             consecutiveFailures: 0,
           },
-        }))
+        }), visitOwner)
         await this.notifications.resolveIncident(
           tenant.organizationId,
           `tenant:${tenant.id}:sync:${resourceType}`,
+          undefined,
+          visitOwner,
         )
         return
       }
@@ -2958,7 +3217,7 @@ export class TenantSyncService {
           lastErrorMessage: message,
           consecutiveFailures: { increment: 1 },
         },
-      }))
+      }), visitOwner)
       const shouldNotify = failure.retryable
         ? state.consecutiveFailures >= 3
         : state.consecutiveFailures >= 1
@@ -2993,7 +3252,7 @@ export class TenantSyncService {
             failureClass: failure.failureClass,
             reasonCode: failure.reasonCode,
           },
-        })
+        }, visitOwner)
       }
       throw new BadGatewayException(message)
     }
@@ -3001,13 +3260,17 @@ export class TenantSyncService {
 
   private async syncLicenses(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'LICENSES', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'LICENSES', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/subscribedSkus', accessToken, 'license',
         { timeoutMs: 20_000 },
       )
+      if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'LICENSES')
       if (response.status !== 200) throw new Error('Microsoft returned an invalid partial license inventory response.')
       const body = await readBoundedSingleton(response)
       const rows = validatedLicenseRows(body.value)
@@ -3056,14 +3319,18 @@ export class TenantSyncService {
             microsoftSkuId: { notIn: rows.map((row) => row.skuId) },
           },
         })
-      })
-    })
+      }, false, undefined, undefined, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   private async syncDomains(
     tenant: { id: string; organizationId: string; microsoftTenantId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    /** Inactive audit replay seam; ordinary callers do not supply a revision. */
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'DOMAINS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'DOMAINS', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/organization?$select=id,displayName,verifiedDomains',
@@ -3144,8 +3411,8 @@ export class TenantSyncService {
             primaryDomain,
           },
         })
-      })
-    })
+      }, false, undefined, undefined, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   /**
@@ -3156,8 +3423,11 @@ export class TenantSyncService {
    */
   private async syncOrganizationConfiguration(
     tenant: { id: string; organizationId: string; microsoftTenantId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'ORGANIZATION_CONFIGURATION', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'ORGANIZATION_CONFIGURATION', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/organization?$select=id,displayName',
@@ -3165,16 +3435,19 @@ export class TenantSyncService {
         'organization configuration',
         { timeoutMs: 20_000 },
       )
+      if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'ORGANIZATION_CONFIGURATION')
       const body = await readBoundedSingleton(response) as GraphOrganizationConfigurationResponse
       const organization = organizationConfigurationSnapshotForTenant(tenant.microsoftTenantId, body)
-      await this.saveSnapshot(tenant, 'ORGANIZATION_CONFIGURATION', authoritativeSnapshot([organization]))
-    })
+      await this.saveSnapshot(tenant, 'ORGANIZATION_CONFIGURATION', authoritativeSnapshot([organization]),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   private async syncDomainDnsHealth(tenant: {
     id: string
     organizationId: string
-  }) {
+  }, visitOwner?: TenantVisitLeaseOwner, auditRequestedRevision?: bigint) {
+    this.assertSnapshotAuditRequest(tenant, 'DOMAIN_DNS_HEALTH', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'DOMAIN_DNS_HEALTH', async () => {
       const domains = await this.prisma.tenantDomain.findMany({
         where: {
@@ -3194,19 +3467,28 @@ export class TenantSyncService {
       const budget = new MicrosoftCollectionBudget({ ...ENTRA_COLLECTION_LIMITS, pages: 100, rows: 1000 }, 'domain DNS')
       const results = []
       for (let index = 0; index < domains.length; index += 10) {
+        assertTenantVisitLifecycleActive(visitOwner)
         budget.begin(`dns-batch-${index}`)
-        const batch = await Promise.all(domains.slice(index, index + 10).map(({ name }) => resolveDomainDnsHealth(name)))
+        const outcomes = await Promise.allSettled(domains.slice(index, index + 10).map(({ name }) => resolveDomainDnsHealth(name)))
+        assertTenantVisitLifecycleActive(visitOwner)
+        const failure = outcomes.find(outcome => outcome.status === 'rejected')
+        if (failure?.status === 'rejected') throw failure.reason
+        const batch = outcomes.map(outcome => (outcome as PromiseFulfilledResult<Awaited<ReturnType<typeof resolveDomainDnsHealth>>>).value)
         budget.retain(batch)
         results.push(...batch)
       }
-      await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', authoritativeSnapshot(results))
-    })
+      await this.saveSnapshot(tenant, 'DOMAIN_DNS_HEALTH', authoritativeSnapshot(results),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   private async syncGroups(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'GROUPS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'GROUPS', async () => {
       const groupsUrl =
         'https://graph.microsoft.com/v1.0/groups?' +
@@ -3214,19 +3496,33 @@ export class TenantSyncService {
         'securityEnabled,groupTypes,visibility,onPremisesSyncEnabled&' +
         '$top=999'
 
-      const groups = (await this.collectEntraCollection(
+      const collectedGroups = await this.collectEntraCollection(
         accessToken,
         'GROUPS',
         groupsUrl,
         ENTRA_COLLECTION_LIMITS,
         (value) => projectEntraRecord(value, 'GROUPS'),
-      )).filter(
+        visitOwner ? (response) => assertCompleteBaselineSourceResponse(response, 'GROUPS') : undefined,
+      )
+      const assertGroupIdentities = (rows: unknown[], definitions = false) => {
+        const ids = new Set<string>()
+        for (const row of rows) {
+          if (!plainRecord(row) || typeof row.id !== 'string' || !row.id.trim() || ids.has(row.id) ||
+              (definitions && (typeof row.displayName !== 'string' || !row.displayName.trim()))) {
+            throw new Error('Microsoft GROUPS returned an invalid or repeated identity; collection is incomplete.')
+          }
+          ids.add(row.id)
+        }
+      }
+      if (visitOwner) assertGroupIdentities(collectedGroups, true)
+      const groups = collectedGroups.filter(
         (group): group is GraphGroup =>
           plainRecord(group) &&
           typeof group.id === 'string' &&
           typeof group.displayName === 'string',
       )
 
+      const definitionPayload = groups.map(group => ({ ...group }))
       const groupTargets = groups.map((group) => ({
         id: group.id as string,
         displayName: group.displayName,
@@ -3238,7 +3534,7 @@ export class TenantSyncService {
       // the optional relationship subcollections below.  Owners/members are
       // not fields in the GROUPS comparison contract, so a relationship 403
       // must not turn a valid group definition into a false removal.
-      await this.prisma.$transaction(async (transaction) => {
+      const persistGroupDefinitions = async (transaction: Prisma.TransactionClient) => {
         for (const group of groups) {
           const microsoftGroupId = group.id as string
           await transaction.directoryGroup.upsert({
@@ -3281,9 +3577,16 @@ export class TenantSyncService {
             lastSeenAt: { lt: observedAt },
           },
         })
-      })
+      }
 
-      await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups))
+      if (visitOwner) {
+        // A visitor cannot publish definitions separately from the baseline.
+        await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups),
+          persistGroupDefinitions, false, undefined, undefined, visitOwner)
+      } else {
+        await this.prisma.$transaction(persistGroupDefinitions)
+        await this.saveSnapshot(tenant, 'GROUPS', authoritativeSnapshot(groups))
+      }
 
       const relationshipDeadlineAt = Date.now() + GROUP_RELATIONSHIP_LIMITS.collectorDeadlineMs
       let ownerRows = 0
@@ -3298,7 +3601,7 @@ export class TenantSyncService {
         const ownersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/owners?$select=id,displayName,userPrincipalName&$top=999'
-        const owners = (await this.collectEntraCollection(
+        const collectedOwners = await this.collectEntraCollection(
           accessToken,
           'GROUPS',
           ownersUrl,
@@ -3309,7 +3612,10 @@ export class TenantSyncService {
             collectorDeadlineMs: remainingMs,
           },
           (value) => closedFields(value, ['id', 'displayName', 'userPrincipalName']),
-        )).filter(plainRecord) as NonNullable<GraphGroup['owners']>
+        visitOwner ? (response) => assertCompleteBaselineSourceResponse(response, 'GROUPS') : undefined,
+        )
+        if (visitOwner) assertGroupIdentities(collectedOwners)
+        const owners = collectedOwners.filter(plainRecord) as NonNullable<GraphGroup['owners']>
         const bytes = Buffer.byteLength(JSON.stringify(owners), 'utf8')
         if (ownerRows + owners.length > GROUP_RELATIONSHIP_LIMITS.rows || ownerBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
           throw new Error('Microsoft GROUPS relationship synchronization exceeded a bounded collection limit.')
@@ -3345,7 +3651,7 @@ export class TenantSyncService {
         const membersUrl =
           `https://graph.microsoft.com/v1.0/groups/${encodeURIComponent(groupId)}` +
           '/members?$select=id&$top=999'
-        const memberIds = (await this.collectEntraCollection(
+        const collectedMembers = await this.collectEntraCollection(
           accessToken,
           'GROUPS',
           membersUrl,
@@ -3356,7 +3662,10 @@ export class TenantSyncService {
             collectorDeadlineMs: remainingMs,
           },
           (value) => closedFields(value, ['id']),
-        )).map((member) => plainRecord(member) ? member.id : null)
+        visitOwner ? (response) => assertCompleteBaselineSourceResponse(response, 'GROUPS') : undefined,
+        )
+        if (visitOwner) assertGroupIdentities(collectedMembers)
+        const memberIds = collectedMembers.map((member) => plainRecord(member) ? member.id : null)
           .filter((id): id is string => typeof id === 'string')
         const bytes = Buffer.byteLength(JSON.stringify(memberIds), 'utf8')
         if (memberRows + memberIds.length > GROUP_RELATIONSHIP_LIMITS.rows || memberBytes + bytes > GROUP_RELATIONSHIP_LIMITS.materializedBytes) {
@@ -3403,6 +3712,21 @@ export class TenantSyncService {
       )
 
       await this.prisma.$transaction(async (transaction) => {
+        if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        const relationshipsComplete = ownerFailures.length === 0 && membershipFailures.length === 0
+        const relationshipObservedAt = new Date()
+        if (visitOwner && relationshipsComplete) {
+          await transaction.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))',
+            `hawkview:snapshot:${tenant.id}:GROUPS`)
+          // Owners are read from this payload. Publish them only with complete
+          // memberships, without changing the definition-only difference catalog.
+          const enriched = await transaction.tenantEntraSnapshot.updateMany({
+            where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'GROUPS',
+              payload: { equals: definitionPayload as never } },
+            data: { payload: groups as never, observedAt: relationshipObservedAt },
+          })
+          if (enriched.count !== 1) throw new Error('GROUP_RELATIONSHIP_DEFINITION_CHANGED')
+        }
         for (const group of groups) {
           const microsoftGroupId = group.id as string
           const directoryGroupId = directoryGroupIdByMicrosoftId.get(microsoftGroupId)
@@ -3440,18 +3764,26 @@ export class TenantSyncService {
           }
         }
 
+        // Definitions alone do not satisfy a membership/owner audit event.
+        // Only the final complete relationship transaction may acknowledge it.
+        if (auditRequestedRevision !== undefined && relationshipsComplete) {
+          await this.acknowledgeAuditSnapshotInTransaction(
+            transaction, tenant, 'GROUPS', auditRequestedRevision, relationshipObservedAt,
+          )
+        }
       })
 
       assertGroupRelationshipRefreshComplete(
         ownerFailures.length,
         membershipFailures.length
       )
-    })
+    }, visitOwner)
   }
 
   private async syncCurrentSecureScore(
     tenant: { id: string; organizationId: string },
     accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     return this.runSnapshotSync(tenant, 'SECURE_SCORES', async () => {
       const limits = { ...entraCollectionLimitsForResource('SECURE_SCORES'), pages: 1 }
@@ -3502,20 +3834,30 @@ export class TenantSyncService {
         throw error
       }
       // Complete for the explicitly scoped current-score query, not history.
-      await this.saveSnapshot(tenant, 'SECURE_SCORES', currentScoreSnapshot(rows))
-    })
+      await this.saveSnapshot(
+        tenant, 'SECURE_SCORES', currentScoreSnapshot(rows),
+        undefined, false, undefined, undefined, visitOwner)
+    }, visitOwner)
   }
 
-  private async syncDirectoryRoles(tenant: TenantSyncTarget, legacyToken: string) {
+  private async syncDirectoryRoles(
+    tenant: TenantSyncTarget,
+    legacyToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
+  ) {
+    this.assertSnapshotAuditRequest(tenant, 'DIRECTORY_ROLES', visitOwner, auditRequestedRevision)
     const result = await collectDirectoryRoles({ organizationId: tenant.organizationId,
       customerTenantId: tenant.id, microsoftTenantId: tenant.microsoftTenantId }, {
       db: this.prisma,
-      token: (authority, tenantId, deadlineAt) => this.microsoftConsent.getCapturedDirectoryRoleToken(authority, tenantId, deadlineAt),
+      visitOwner,
+      auditRequestedRevision,
+      token: (authority, tenantId, deadlineAt) => this.microsoftConsent.getCapturedDirectoryRoleToken(authority, tenantId, deadlineAt, visitOwner),
       fetchPage: (url, token, deadlineAt) => this.fetchGraphPage(url, token, 'directory roles',
         { deadlineAt, timeoutMs: Math.max(1, Math.min(30000, deadlineAt - Date.now())) }),
       read: readBoundedResponseText,
       buildDifference: input => this.changeEvidence.buildSnapshotDifferenceEvidence(input),
-      legacy: () => this.syncEntraCollection(tenant, legacyToken, 'DIRECTORY_ROLES', DIRECTORY_ROLE_URL),
+      legacy: () => this.syncEntraCollection(tenant, legacyToken, 'DIRECTORY_ROLES', DIRECTORY_ROLE_URL, visitOwner, auditRequestedRevision),
     })
     if (!['legacy', 'committed', 'replayed'].includes(result.status)) {
       // Collector orchestration may report failure, but must not write another terminal state.
@@ -3527,8 +3869,11 @@ export class TenantSyncService {
     tenant: { id: string; organizationId: string },
     accessToken: string,
     resourceType: EntraSnapshotResource,
-    initialUrl: string
+    initialUrl: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, resourceType, visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, resourceType, async () => {
       const rows = await this.collectEntraCollection(
         accessToken,
@@ -3536,9 +3881,13 @@ export class TenantSyncService {
         initialUrl,
         entraCollectionLimitsForResource(resourceType),
         (value) => projectEntraRecord(value, resourceType),
+        visitOwner ? (response) => assertCompleteBaselineSourceResponse(response, resourceType) : undefined,
       )
-      await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
-    })
+      await this.saveSnapshot(
+        tenant, resourceType, authoritativeSnapshot(rows),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
+      )
+    }, visitOwner)
   }
 
   private async collectEntraCollection(
@@ -3547,6 +3896,7 @@ export class TenantSyncService {
     initialUrl: string,
     limits: Readonly<EntraCollectionLimits> = entraCollectionLimitsForResource(resourceType),
     project: (value: unknown) => unknown = (value) => value,
+    assertCompleteResponse?: (response: Response) => Promise<void>,
   ) {
     const rows: unknown[] = []
     const budget = new MicrosoftCollectionBudget(limits, resourceType)
@@ -3566,6 +3916,7 @@ export class TenantSyncService {
           deadlineAt,
         },
       )
+      await assertCompleteResponse?.(response)
       let page: GraphCollectionPage
       try {
         const parsed = await budget.read(response)
@@ -3575,13 +3926,34 @@ export class TenantSyncService {
         if (error instanceof Error && /bounded (?:page-size|collection) limit/.test(error.message)) throw error
         throw new Error(`Microsoft ${resourceType} synchronization returned an unreadable bounded response.`)
       }
+      const candidate = page['@odata.nextLink']
+      if (candidate !== undefined && (typeof candidate !== 'string' ||
+          (assertCompleteResponse && !candidate.trim()))) {
+        throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
+      }
+      if (assertCompleteResponse) {
+        // Expanded relationships have their own pagination. Inspect the raw
+        // response before closed projections can discard its continuation.
+        // Until those pages are collected, no complete snapshot/receipt exists.
+        const pending: unknown[] = [...(page.value ?? [])]
+        while (pending.length > 0) {
+          const value = pending.pop()
+          if (Array.isArray(value)) {
+            for (const item of value) pending.push(item)
+            continue
+          }
+          if (!plainRecord(value)) continue
+          for (const [key, item] of Object.entries(value)) {
+            if (key.endsWith('@odata.nextLink')) {
+              throw new Error(`Microsoft ${resourceType} returned an incomplete expanded relationship.`)
+            }
+            if (item && typeof item === 'object') pending.push(item)
+          }
+        }
+      }
       const projected = (page.value ?? []).map(project)
       budget.retain(projected)
       rows.push(...projected)
-      const candidate = page['@odata.nextLink']
-      if (candidate !== undefined && typeof candidate !== 'string') {
-        throw new Error(`Microsoft returned an invalid ${resourceType} link.`)
-      }
       nextUrl = candidate ?? ''
     }
     return rows
@@ -3589,8 +3961,11 @@ export class TenantSyncService {
 
   private async syncSecurityDefaults(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'SECURITY_DEFAULTS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'SECURITY_DEFAULTS', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy',
@@ -3599,22 +3974,31 @@ export class TenantSyncService {
       )
       await assertCompleteBaselineSourceResponse(response, 'SECURITY_DEFAULTS')
       const policy = closedFields(await readBoundedSingleton(response, 'SECURITY_DEFAULTS'), ['id', 'displayName', 'description', 'isEnabled'])
-      await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy])
-    })
+      await this.saveEntraSnapshot(tenant, 'SECURITY_DEFAULTS', [policy], visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   private async saveEntraSnapshot(
     tenant: { id: string; organizationId: string },
     resourceType: EntraSnapshotResource,
-    rows: unknown[]
+    rows: unknown[],
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
-    await this.saveSnapshot(tenant, resourceType, authoritativeSnapshot(rows))
+    await this.saveSnapshot(
+      tenant, resourceType, authoritativeSnapshot(rows),
+      undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
+    )
   }
 
   private async syncAuthenticationRegistrations(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    /** Inactive audit replay seam; ordinary callers do not supply a revision. */
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'AUTH_REGISTRATIONS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'AUTH_REGISTRATIONS', async () => {
       let registrations: unknown[]
       try {
@@ -3624,6 +4008,7 @@ export class TenantSyncService {
           'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails',
           ENTRA_COLLECTION_LIMITS,
           (value) => projectEntraRecord(value, 'AUTH_REGISTRATIONS'),
+          visitOwner ? (response) => assertCompleteBaselineSourceResponse(response, 'AUTH_REGISTRATIONS') : undefined,
         )
       } catch (error) {
         if (
@@ -3635,19 +4020,43 @@ export class TenantSyncService {
         this.logger.log(JSON.stringify({ event: 'microsoft_collection_runtime_state', resource: 'MFA_REGISTRATION', phase: 'FALLBACK', outcome: 'ACTIVE', reasonCode: 'PREMIUM_REPORTING_UNAVAILABLE' }))
         registrations = await this.collectPerUserAuthenticationMethods(
           accessToken,
+          AUTH_REGISTRATION_FALLBACK_LIMITS,
+          Boolean(visitOwner),
         )
+      }
+      if (visitOwner) {
+        const identities = new Set<string>()
+        for (const row of registrations) {
+          if (!plainRecord(row) || typeof row.id !== 'string' || row.id.length === 0 ||
+              row.id.length > 128 || row.id.trim() !== row.id || identities.has(row.id)) {
+            throw new MicrosoftPartialResponseError(
+              'Microsoft AUTH_REGISTRATIONS returned unverified user identities; baseline was not advanced.', 200)
+          }
+          identities.add(row.id)
+          // The primary registration fact must be known before this collection
+          // can represent complete evidence. Optional enrichment is independent
+          // and must not turn missing/malformed registration into completion.
+          if (typeof row.isMfaRegistered !== 'boolean') {
+            throw new MicrosoftPartialResponseError(
+              'Microsoft AUTH_REGISTRATIONS returned unverified registration facts; baseline was not advanced.', 200)
+          }
+        }
       }
       registrations = await this.enrichAuthenticationRegistrationsWithPerUserMfaState(
         accessToken,
         registrations,
+        undefined,
+        Boolean(visitOwner),
       )
       registrations = await this.enrichAuthenticationRegistrationsWithConditionalAccessContext(
         accessToken,
         registrations,
+        undefined,
+        Boolean(visitOwner),
       )
       new MicrosoftCollectionBudget(ENTRA_COLLECTION_LIMITS, 'authentication registrations').retain(registrations)
-      await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations)
-    })
+      await this.saveEntraSnapshot(tenant, 'AUTH_REGISTRATIONS', registrations, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   private async enrichAuthenticationRegistrationsWithPerUserMfaState(
@@ -3655,6 +4064,7 @@ export class TenantSyncService {
     registrations: unknown[],
     limits: Readonly<AuthRegistrationFallbackLimits> =
       AUTH_REGISTRATION_FALLBACK_LIMITS,
+    requireCompleteResponse = false,
   ) {
     assertAuthRegistrationFallbackLimits(limits)
     const rows = registrations.filter(plainRecord)
@@ -3724,6 +4134,7 @@ export class TenantSyncService {
             },
           },
         )
+        if (requireCompleteResponse) await assertCompleteBaselineSourceResponse(response, 'AUTH_REGISTRATIONS')
         const parsed = JSON.parse(
           await readBoundedResponseText(response, limits.responseBytes),
         ) as unknown
@@ -3756,6 +4167,7 @@ export class TenantSyncService {
         batchIds.forEach((userId, index) => {
           const item = responses.get(String(index + 1))
           if (item?.status !== 200 || !plainRecord(item.body)) return
+          if (requireCompleteResponse && hasGraphBatchQualification(item)) return
           const state = normalizePerUserMfaState(item.body.perUserMfaState)
           if (state) states.set(userId, state)
         })
@@ -3781,6 +4193,7 @@ export class TenantSyncService {
     registrations: unknown[],
     limits: Readonly<AuthRegistrationFallbackLimits> =
       AUTH_REGISTRATION_FALLBACK_LIMITS,
+    requireCompleteResponse = false,
   ) {
     assertAuthRegistrationFallbackLimits(limits)
     const ids = [
@@ -3857,6 +4270,7 @@ export class TenantSyncService {
             },
           },
         )
+        if (requireCompleteResponse) await assertCompleteBaselineSourceResponse(response, 'AUTH_REGISTRATIONS')
         const parsed = JSON.parse(
           await readBoundedResponseText(response, limits.responseBytes),
         ) as unknown
@@ -3883,6 +4297,7 @@ export class TenantSyncService {
           const memberIds = values?.map(value => plainRecord(value) ? value.id : null) ?? null
           const complete =
             item?.status === 200 &&
+            (!requireCompleteResponse || !hasGraphBatchQualification(item)) &&
             memberIds !== null &&
             body !== null && !Object.hasOwn(body, '@odata.nextLink') &&
             memberIds.every((id): id is string =>
@@ -3931,6 +4346,7 @@ export class TenantSyncService {
     accessToken: string,
     limits: Readonly<AuthRegistrationFallbackLimits> =
       AUTH_REGISTRATION_FALLBACK_LIMITS,
+    requireCompleteResponse = false,
   ) {
     assertAuthRegistrationFallbackLimits(limits)
     const deadline = Date.now() + limits.collectorDeadlineMs
@@ -3938,6 +4354,7 @@ export class TenantSyncService {
       accessToken,
       limits,
       deadline,
+      requireCompleteResponse,
     )
     const requiredBatches = Math.ceil(users.length / limits.batchSize)
     if (requiredBatches > limits.maxBatches) {
@@ -3995,6 +4412,7 @@ export class TenantSyncService {
           },
         },
       )
+      if (requireCompleteResponse) await assertCompleteBaselineSourceResponse(response, 'AUTH_REGISTRATIONS')
       const batch = JSON.parse(
         await readBoundedResponseText(response, limits.responseBytes),
       ) as unknown
@@ -4036,6 +4454,26 @@ export class TenantSyncService {
             'Microsoft per-user authentication-method synchronization returned an invalid user-method response; baseline was not advanced.',
           )
         }
+        if (requireCompleteResponse) {
+          const headers = (item as { headers?: unknown }).headers
+          if ((headers !== undefined && !plainRecord(headers)) ||
+              (plainRecord(headers) && Object.keys(headers).some(name => name.toLowerCase() === 'warning')) ||
+              hasGraphContinuation(item.body)) {
+            throw new MicrosoftPartialResponseError(
+              'Microsoft AUTH_REGISTRATIONS returned incomplete method evidence; baseline was not advanced.', 200)
+          }
+          // Password and SSPR email are classified non-MFA methods. Anything
+          // outside the existing positive map and these explicit exclusions is
+          // unknown, never an empty/negative registration result.
+          if (item.body.value.some((method) => !plainRecord(method) ||
+              typeof method['@odata.type'] !== 'string' ||
+              (!Object.hasOwn(methodLabels, method['@odata.type']) &&
+               method['@odata.type'] !== '#microsoft.graph.passwordAuthenticationMethod' &&
+               method['@odata.type'] !== '#microsoft.graph.emailAuthenticationMethod'))) {
+            throw new MicrosoftPartialResponseError(
+              'Microsoft AUTH_REGISTRATIONS returned unclassified method evidence; baseline was not advanced.', 200)
+          }
+        }
         const methods = item.body.value
           .map((method) => method['@odata.type'])
           .filter((type): type is string => typeof type === 'string')
@@ -4061,6 +4499,7 @@ export class TenantSyncService {
     accessToken: string,
     limits: Readonly<AuthRegistrationFallbackLimits>,
     deadline: number,
+    requireCompleteResponse = false,
   ) {
     const users: Array<{
       microsoftUserId: string
@@ -4102,6 +4541,7 @@ export class TenantSyncService {
           deadlineAt: deadline,
         },
       )
+      if (requireCompleteResponse) await assertCompleteBaselineSourceResponse(response, 'AUTH_REGISTRATIONS')
       const parsed = JSON.parse(
         await readBoundedResponseText(response, limits.responseBytes),
       ) as unknown
@@ -4150,8 +4590,11 @@ export class TenantSyncService {
 
   private async syncAuthenticationMethodPolicy(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'AUTH_METHOD_POLICIES', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'AUTH_METHOD_POLICIES', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/policies/authenticationMethodsPolicy',
@@ -4176,9 +4619,11 @@ export class TenantSyncService {
       await this.saveEntraSnapshot(
         tenant,
         'AUTH_METHOD_POLICIES',
-        rows
+        rows,
+        visitOwner,
+        auditRequestedRevision,
       )
-    })
+    }, visitOwner)
   }
 
   private async fetchGraphCollection(
@@ -4236,6 +4681,7 @@ export class TenantSyncService {
       retryUnsafeMethod?: boolean
     } = {},
   ) {
+    assertTenantVisitLifecycleActive()
     const headers = new Headers(options.init?.headers)
     if (!headers.has('Authorization')) headers.set('Authorization', `Bearer ${accessToken}`)
     if (!headers.has('Accept')) headers.set('Accept', 'application/json')
@@ -4249,6 +4695,7 @@ export class TenantSyncService {
         retryUnsafeMethod: options.retryUnsafeMethod,
       },
     )
+    assertTenantVisitLifecycleActive()
     if (response.ok || options.acceptedStatuses?.includes(response.status)) return response
 
     const requestId = response.headers.get('request-id')
@@ -4286,7 +4733,27 @@ export class TenantSyncService {
       : new Date(Date.now() - INITIAL_LOG_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
   }
 
-  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string, enrichmentLimits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS) {
+  private async pruneExpiredSignInLogs(
+    tenant: Pick<TenantSyncTarget, 'id' | 'organizationId'>,
+    cutoff: Date,
+    visitOwner?: TenantVisitLeaseOwner,
+  ) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
+    const where = { customerTenantId: tenant.id, expiresAt: { lte: cutoff } }
+    if (!visitOwner) {
+      await this.prisma.signInLog.deleteMany({ where })
+      return
+    }
+    await this.prisma.$transaction(async (transaction) => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      await transaction.signInLog.deleteMany({ where })
+    })
+  }
+
+  private async syncSignInLogs(tenant: TenantSyncTarget, accessToken: string, enrichmentLimits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
+    visitOwner?: TenantVisitLeaseOwner) {
     await this.runSnapshotSync(tenant, 'SIGN_INS', async () => {
       const start = await this.logSyncStart(tenant.id, 'SIGN_INS')
       const end = new Date()
@@ -4313,7 +4780,7 @@ export class TenantSyncService {
         ) {
           throw error
         }
-        rows = await this.fetchLimitedLoginActivity(tenant, start, end)
+        rows = await this.fetchLimitedLoginActivity(tenant, start, end, visitOwner)
         limited = true
         limitedReason = this.signInFallbackReason(entitlement)
       }
@@ -4384,17 +4851,16 @@ export class TenantSyncService {
           expiresAt,
         }))
       if (records.length > 0) {
-        await persistAuthenticationRecords(this.prisma, {organizationId:tenant.organizationId,customerTenantId:tenant.id}, records as never)
+        await persistAuthenticationRecords(this.prisma, {organizationId:tenant.organizationId,customerTenantId:tenant.id}, records as never,
+          undefined, undefined, visitOwner)
       }
       if (limited && enrichment.locations.size > 0) {
-        const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline)
+        const history = await this.backfillLimitedSignInLocations(tenant, enrichment.locations, enrichmentLimits, enrichmentDeadline, visitOwner)
         enrichment.partial ||= history.partial
         if (history.partial) enrichment.reasons.add('HISTORY_INCOMPLETE')
       }
-      await this.prisma.signInLog.deleteMany({
-        where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
-      })
-      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
+      await this.pruneExpiredSignInLogs(tenant, ingestedAt, visitOwner)
+      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt, visitOwner)
       if (records.length !== rows.length) throw new CollectionPartialError(CORE_AUTHENTICATION_PARTIAL,
         'Some Microsoft authentication records could not be validated. Authentication evidence coverage remains incomplete.')
       // WHAT THE COLLECTION OBSERVED, not what it requested. `records` is what
@@ -4408,7 +4874,7 @@ export class TenantSyncService {
         newest === null || record.eventDateTime > newest ? record.eventDateTime : newest, null)
       await persistCompletedAuthenticationWindow(this.prisma, { organizationId: tenant.organizationId, customerTenantId: tenant.id },
         limited ? 'M365_AUDIT_STS' : 'GRAPH_SIGN_INS', start, end, true,
-        { events: records.length, latestEventAt: observedLatest === null ? null : observedLatest.toISOString() })
+        { events: records.length, latestEventAt: observedLatest === null ? null : observedLatest.toISOString() }, visitOwner)
       if (limitedReason) {
         // Primary limited-source ingestion succeeded. Its freshness stamp may
         // advance, but RUNNING + the partial code must never imply complete
@@ -4420,12 +4886,18 @@ export class TenantSyncService {
         )
         throw limitedReason
       }
-    })
+    }, visitOwner)
+    // This optional owner path remains inactive until the separate post-sync
+    // global risk attempt can be fenced to the same tenant visit.
     try { if (this.riskAssessmentProjector && isGlobalRiskConfig(riskRuntimeConfig())) {
       const proof=await this.prisma.syncState.findFirst({where:{organizationId:tenant.organizationId,customerTenantId:tenant.id,resourceType:'SIGN_INS'},
         select:{status:true,lastSuccessfulAt:true,lastAttemptAt:true,lastErrorCode:true}})
-      if(selectedAuthenticationSource(proof))await this.runScopedPostSyncRisk(tenant)
-    } } catch { this.logger.warn('Post-ingestion identity-risk evaluation unavailable.') }
+      if(selectedAuthenticationSource(proof))await this.runScopedPostSyncRisk(tenant,visitOwner)
+    } } catch(error) {
+      const lost=visitOwner && tenantVisitLeaseLoss(error)
+      if(lost)throw lost
+      this.logger.warn('Post-ingestion identity-risk evaluation unavailable.')
+    }
   }
 
   private async signInEntitlement(
@@ -4596,7 +5068,11 @@ export class TenantSyncService {
     inferredLocations: Map<string, SignInLocation>,
     limits: LimitedSignInEnrichmentLimits = LIMITED_SIGN_IN_ENRICHMENT_LIMITS,
     deadlineAt = Date.now() + limits.deadlineMs,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
     const ips = [...inferredLocations.keys()]
     if (!ips.length) return { partial: false, updatedRows: 0 }
     if (ips.length > limits.uniqueIps || ips.some((ip) => !isIP(ip))) return { partial: true, updatedRows: 0 }
@@ -4612,6 +5088,7 @@ export class TenantSyncService {
       if (take < 1) return { partial: true, updatedRows }
       try {
         const page = await this.prisma.$transaction(async (transaction) => {
+          if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
           const setDeadline = async () => {
             const remaining = deadlineAt - Date.now()
             if (remaining <= 0) throw new Error('Optional sign-in enrichment deadline reached.')
@@ -4661,7 +5138,8 @@ export class TenantSyncService {
         const next = page.rows.at(-1)?.id
         if (!next || next <= cursor) return { partial: true, updatedRows }
         cursor = next
-      } catch {
+      } catch (error) {
+        if (error instanceof TenantVisitLeaseLostError) throw error
         // A failed/timed-out page rolls back; prior pages and primary sign-in
         // evidence remain valid. The next scheduled run retries missing rows.
         return { partial: true, updatedRows }
@@ -4673,7 +5151,8 @@ export class TenantSyncService {
   private async fetchLimitedLoginActivity(
     tenant: TenantSyncTarget,
     requestedStart: Date,
-    end: Date
+    end: Date,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     if (!tenant.connection) {
       throw new Error('The Microsoft tenant connection is incomplete.')
@@ -4687,7 +5166,7 @@ export class TenantSyncService {
             : 'HAWKVIEW_MANAGED',
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
-      })
+      }, visitOwner)
     const baseUrl = `https://manage.office.com/api/v1.0/${encodeURIComponent(tenant.microsoftTenantId)}/activity/feed`
     const activityUrl = (url: string) => {
       const parsed = validateManagementUrl(url, tenant.microsoftTenantId)
@@ -4849,7 +5328,8 @@ export class TenantSyncService {
   private async syncDirectoryAuditLogs(
     tenant: TenantSyncTarget,
     accessToken: string,
-    reconcileChanges = true
+    reconcileChanges = true,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     let reconciliationResources: AuditReconciliationResource[] = []
     await this.runSnapshotSync(tenant, 'AUDIT_LOGS', async () => {
@@ -4927,93 +5407,220 @@ export class TenantSyncService {
       const newRecords = records.filter(
         (record) => !existingAuditIds.has(record.microsoftAuditId)
       )
+      let committedResources: AuditReconciliationResource[] = []
       if (records.length > 0) {
-        await this.prisma.directoryAuditLog.createMany({
-          data: records as never,
-          skipDuplicates: true,
-        })
-        await this.changeEvidence.projectDirectoryAudits(tenant, records)
+        const persisted = await this.persistDirectoryAuditRows(
+          tenant, records, visitOwner, Boolean(visitOwner) || reconcileChanges,
+        )
+        committedResources = persisted?.requestedResources ?? []
+        // An owner-bound visit projects evidence inside the raw/notice write
+        // transaction. The legacy ownerless path retains its separate write.
+        if (!visitOwner) await this.changeEvidence.projectDirectoryAudits(tenant, records)
       }
       // The users delta query ran immediately before the audit collector. For
       // every other recognized directory change, use the audit feed as a
       // lightweight trigger for its own collection instead of waiting for the
       // daily inventory pass or re-reading the entire tenant.
       if (reconcileChanges) {
-        reconciliationResources = deriveAuditReconciliationResources(newRecords)
+        reconciliationResources = visitOwner
+          ? committedResources
+          : deriveAuditReconciliationResources(newRecords)
       }
-      for (const record of newRecords) {
-        const activity = record.activityDisplayName.toLowerCase()
-        const securityEvent =
-          activity.includes('authentication method') || activity.includes('mfa')
-            ? {
-                severity: 'critical' as const,
-                label: 'Authentication methods changed',
-              }
-            : activity.includes('password')
-              ? {
-                  severity: 'high' as const,
-                  label: 'Password-related change detected',
-                }
-              : activity.includes('application') ||
-                  activity.includes('service principal')
-                ? {
-                    severity: 'high' as const,
-                    label: 'Application registration changed',
-                  }
-                : activity.includes('role') ||
-                    activity.includes('administrator')
-                  ? {
-                      severity: 'critical' as const,
-                      label: 'Administrative role changed',
-                    }
-                  : null
-        if (!securityEvent) continue
-        await this.notifications.publishIncident({
-          organizationId: tenant.organizationId,
+      // Owner-bound persistence already inserts notices for every observed
+      // security event in the raw-row transaction, including legacy raw-only
+      // rows reobserved on a later page. Keep the separate first-seen notice
+      // path only for the ownerless collector until visit admission is active.
+      if (!visitOwner) {
+        for (const record of newRecords) {
+          const incident = directoryAuditSecurityIncident(tenant, record)
+          if (incident) await this.notifications.publishIncident(incident)
+        }
+      }
+      // A pre-atomic visitor may have committed a raw row before projecting
+      // evidence. A later provider page need not repeat it. The bounded
+      // retained-row scan is owner-checked and projects only missing evidence;
+      // an additional visit can continue when more than one batch remains.
+      if (visitOwner) {
+        const repair = await this.changeEvidence.projectRetainedDirectoryAuditsMissingEvidence(
+          tenant, visitOwner, DIRECTORY_AUDIT_EVIDENCE_REPAIR_BATCH_LIMIT,
+        )
+        if (repair.hasMore) this.logger.warn(JSON.stringify({
+          event: 'directory_audit_evidence_repair_pending',
           customerTenantId: tenant.id,
-          eventType: 'security.directory_change',
-          category:
-            securityEvent.severity === 'critical' ? 'error' : 'warning',
-          severity: securityEvent.severity,
-          title: securityEvent.label,
-          description: record.activityDisplayName,
-          dedupeKey: `security:directory-audit:${record.microsoftAuditId}`,
-          source: 'microsoft.directoryAudit',
-          actionUrl: `/what-changed?tenantId=${encodeURIComponent(tenant.id)}&from=${encodeURIComponent(record.eventDateTime.toISOString())}`,
-          actionLabel: 'Investigate change',
-          metadata: {
-            microsoftAuditId: record.microsoftAuditId,
-            eventDateTime: record.eventDateTime.toISOString(),
-            result: record.result,
-            category: record.category,
-          },
-        })
+          attempted: repair.attempted,
+        }))
+        const noticeRepair = await this.repairRetainedDirectoryAuditNotices(
+          tenant, visitOwner, DIRECTORY_AUDIT_NOTICE_REPAIR_BATCH_LIMIT,
+        )
+        if (noticeRepair.hasMore) this.logger.warn(JSON.stringify({
+          event: 'directory_audit_notice_repair_pending',
+          customerTenantId: tenant.id,
+          attempted: noticeRepair.attempted,
+        }))
       }
-      await this.prisma.directoryAuditLog.deleteMany({
-        where: { customerTenantId: tenant.id, expiresAt: { lte: ingestedAt } },
-      })
-      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt)
-    })
+      await this.pruneExpiredDirectoryAuditLogs(tenant, ingestedAt, visitOwner)
+      await this.changeEvidence.pruneExpired(tenant.id, ingestedAt, visitOwner)
+    }, visitOwner)
     // The audit page/record arrays are out of scope before another collector
     // starts. Only a closed resource-name list crosses this boundary.
-    await this.reconcileDirectoryAuditResources(tenant, accessToken, reconciliationResources)
+    await this.reconcileDirectoryAuditResources(tenant, accessToken, reconciliationResources, visitOwner)
+  }
+
+  /** Reconcile historical raw security rows that predate atomic raw/notice
+   * persistence. The anti-join precedes the limit so ordinary audit rows and
+   * already-notified rows cannot starve an older missing notice. */
+  private async repairRetainedDirectoryAuditNotices(
+    tenant: Pick<TenantSyncTarget, 'id' | 'organizationId'>,
+    visitOwner: TenantVisitLeaseOwner,
+    limit: number,
+  ): Promise<{ attempted: number; hasMore: boolean }> {
+    if (visitOwner.organizationId !== tenant.organizationId ||
+        visitOwner.customerTenantId !== tenant.id) throw new TenantVisitLeaseLostError()
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('DIRECTORY_AUDIT_NOTICE_REPAIR_LIMIT_INVALID')
+    }
+
+    return this.prisma.$transaction(async (transaction) => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      const terms = DIRECTORY_AUDIT_SECURITY_SEARCH_TERMS
+      const securityPredicate = terms.map((_, index) =>
+        `position($${index + 4}::text in lower(d.activity_display_name)) > 0`).join(' OR ')
+      const missing = await transaction.$queryRawUnsafe<Array<{ id: string }>>(`
+        SELECT d.id::text AS id
+        FROM directory_audit_logs d
+        WHERE d.organization_id=$1::uuid AND d.customer_tenant_id=$2::uuid
+          AND d.expires_at > clock_timestamp()
+          AND (${securityPredicate})
+          AND NOT EXISTS (
+            SELECT 1 FROM notifications n
+            WHERE n.organization_id=d.organization_id
+              AND n.dedupe_key=('security:directory-audit:' || d.microsoft_audit_id)
+              AND n.customer_tenant_id=d.customer_tenant_id
+              AND n.recipient_user_id IS NULL
+              AND n.event_type='security.directory_change'
+              AND n.source='microsoft.directoryAudit'
+          )
+        ORDER BY d.event_date_time ASC, d.id ASC
+        LIMIT $3::int`, tenant.organizationId, tenant.id, limit + 1, ...terms)
+      const ids = missing.slice(0, limit).map((row) => row.id)
+      if (ids.length === 0) return { attempted: 0, hasMore: false }
+
+      const records = await transaction.directoryAuditLog.findMany({
+        where: { id: { in: ids }, organizationId: tenant.organizationId, customerTenantId: tenant.id },
+      })
+      if (records.length !== ids.length) throw new Error('DIRECTORY_AUDIT_NOTICE_REPAIR_ROW_CHANGED')
+      const recordsById = new Map(records.map((record) => [record.id, record]))
+      for (const id of ids) {
+        const incident = directoryAuditSecurityIncident(tenant, recordsById.get(id)!)
+        if (!incident) throw new Error('DIRECTORY_AUDIT_NOTICE_REPAIR_CLASSIFICATION_DRIFT')
+        await this.notifications.publishIncidentIfMissingInTransaction(incident, visitOwner, transaction)
+      }
+      return { attempted: ids.length, hasMore: missing.length > limit }
+    })
+  }
+
+  private async persistDirectoryAuditRows(
+    tenant: Pick<TenantSyncTarget, 'id' | 'organizationId'>,
+    records: Array<DirectoryAuditIncidentSource & Record<string, any>>,
+    visitOwner?: TenantVisitLeaseOwner,
+    enqueueReconciliation = false,
+  ): Promise<{ count: number; requestedResources?: AuditReconciliationResource[] }> {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
+    const persist = (database: Pick<Prisma.TransactionClient, 'directoryAuditLog'>) =>
+      database.directoryAuditLog.createMany({ data: records as never, skipDuplicates: true })
+    if (!visitOwner) return persist(this.prisma)
+    return this.prisma.$transaction(async (transaction) => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      // Return only rows inserted by this transaction. A preliminary existence
+      // read can race another inserter and must not decide durable work.
+      const inserted = enqueueReconciliation
+        ? await transaction.directoryAuditLog.createManyAndReturn({
+          data: records as never, skipDuplicates: true,
+          select: { microsoftAuditId: true },
+        })
+        : null
+      const result = inserted === null
+        ? await persist(transaction)
+        : { count: inserted.length }
+      // Under a visit owner, the raw audit row and its security notice commit
+      // together. Include reobserved legacy raw-only rows here so the notice
+      // can be repaired without a second transaction after this one commits.
+      for (const record of records) {
+        const incident = directoryAuditSecurityIncident(tenant, record)
+        if (incident) await this.notifications.publishIncidentIfMissingInTransaction(incident, visitOwner, transaction)
+      }
+      await this.changeEvidence.projectDirectoryAudits(tenant, records, visitOwner, transaction)
+      const firstRecordById = new Map<string, typeof records[number]>()
+      for (const record of records) {
+        if (!firstRecordById.has(record.microsoftAuditId)) {
+          firstRecordById.set(record.microsoftAuditId, record)
+        }
+      }
+      const requestedResources = inserted === null ? [] : deriveAuditReconciliationResources(
+        inserted.flatMap((row) => {
+          const record = firstRecordById.get(row.microsoftAuditId)
+          if (!record) throw new Error('Inserted audit row was not on the bounded page')
+          return [record]
+        }),
+      )
+      for (const resourceType of requestedResources) {
+        await transaction.tenantAuditReconciliationWork.upsert({
+          where: { organizationId_customerTenantId_resourceType: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType,
+          } },
+          create: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType,
+          },
+          update: { requestedRevision: { increment: 1n } },
+        })
+      }
+      return enqueueReconciliation ? { ...result, requestedResources } : result
+    })
+  }
+
+  private async pruneExpiredDirectoryAuditLogs(
+    tenant: Pick<TenantSyncTarget, 'id' | 'organizationId'>,
+    cutoff: Date,
+    visitOwner?: TenantVisitLeaseOwner,
+  ) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
+    const where = { customerTenantId: tenant.id, expiresAt: { lte: cutoff } }
+    if (!visitOwner) {
+      await this.prisma.directoryAuditLog.deleteMany({ where })
+      return
+    }
+    await this.prisma.$transaction(async (transaction) => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      await transaction.directoryAuditLog.deleteMany({ where })
+    })
   }
 
   private async syncM365AuditActivity(
     tenant: TenantSyncTarget,
-    graphAccessToken: string
+    graphAccessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
-    const changes = await this.m365ManagementActivity.syncTenant(tenant)
+    const changes = await this.m365ManagementActivity.syncTenant(tenant, visitOwner)
     const collectedChanges = changes.length
-    if (changes.length > 0) {
+    if (changes.length > 0 || visitOwner) {
       // The activity feed is evidence. Coalesce all records in this polling
       // run into the smallest set of authoritative current-state refreshes.
+      // Owned empty polls must also retry durable work from an earlier visit.
       const resources = deriveAuditReconciliationResources(changes)
       changes.length = 0
       await this.reconcileDirectoryAuditResources(
         tenant,
         graphAccessToken,
-        resources
+        resources,
+        visitOwner,
       )
     }
     return { collectedChanges }
@@ -5033,96 +5640,229 @@ export class TenantSyncService {
       category?: string | null
       loggedByService?: string | null
       targetResources?: unknown
-    }>
+    }>,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const resources = deriveAuditReconciliationResources(records)
-    return this.reconcileDirectoryAuditResources(tenant, accessToken, resources)
+    return this.reconcileDirectoryAuditResources(tenant, accessToken, resources, visitOwner)
   }
 
   private async reconcileDirectoryAuditResources(
     tenant: TenantSyncTarget,
     accessToken: string,
     resources: AuditReconciliationResource[],
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
-    if (resources.length === 0) return
+    // Read durable unfinished work independently of the current provider page.
+    // A successor must still repair work after an empty response or a crash
+    // between raw-event commit and its authoritative inventory refresh.
+    const pending = visitOwner
+      ? await this.pendingAuditReconciliationWork(tenant, visitOwner)
+      : []
+    // A new provider event keeps its existing immediate-refresh behavior.
+    // Retrying an older unfinished request must obey the existing resource
+    // failure policy, including when Graph and M365 both replay in one visit.
+    const newEventResources = new Set(resources)
+    const retryStates = pending.length > 0 ? await this.prisma.syncState.findMany({
+      where: { organizationId: tenant.organizationId, customerTenantId: tenant.id,
+        resourceType: { in: pending.map((item) => item.resourceType) } },
+      select: { resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true,
+        lastErrorCode: true, lastErrorMessage: true, consecutiveFailures: true },
+    }) : []
+    const retryStateByResource = new Map(retryStates.map((state) => [state.resourceType, state]))
+    const replayNow = new Date()
+    const revisions = new Map(pending.map((item) => [item.resourceType, item.requestedRevision]))
+    const eligiblePending = pending.filter((item) => newEventResources.has(item.resourceType) ||
+      this.auditReconciliationRetryDue(retryStateByResource.get(item.resourceType), replayNow))
+    const requested = new Set([...resources, ...eligiblePending.map((item) => item.resourceType)])
+    const selected = visitOwner
+      ? AUDIT_RECONCILIATION_RESOURCES.filter((resource) => requested.has(resource))
+      : resources
+    if (selected.length === 0) {
+      if (visitOwner && pending.length > 0) {
+        throw new AuditReconciliationIncompleteError([], pending.map(item => item.resourceType))
+      }
+      return
+    }
 
-    const synchronizers: Record<AuditReconciliationResource, () => Promise<unknown>> = {
-      ORGANIZATION_CONFIGURATION: () =>
-        this.syncOrganizationConfiguration(tenant, accessToken),
-      GROUPS: () => this.syncGroups(tenant, accessToken),
-      LICENSES: () => this.syncLicenses(tenant, accessToken),
-      DOMAINS: () => this.syncDomains(tenant, accessToken),
-      DOMAIN_DNS_HEALTH: () => this.syncDomainDnsHealth(tenant),
-      AUTH_REGISTRATIONS: () =>
-        this.syncAuthenticationRegistrations(tenant, accessToken),
-      AUTH_METHOD_POLICIES: () =>
-        this.syncAuthenticationMethodPolicy(tenant, accessToken),
-      CONDITIONAL_ACCESS: () =>
+    const revisionArguments = (revision?: bigint): [] | [bigint] =>
+      revision === undefined ? [] : [revision]
+    const synchronizers: Record<AuditReconciliationResource, (revision?: bigint) => Promise<unknown>> = {
+      ORGANIZATION_CONFIGURATION: (revision) =>
+        this.syncOrganizationConfiguration(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      GROUPS: (revision) => this.syncGroups(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      LICENSES: (revision) => this.syncLicenses(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      DOMAINS: (revision) => this.syncDomains(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      DOMAIN_DNS_HEALTH: (revision) => this.syncDomainDnsHealth(tenant, visitOwner, ...revisionArguments(revision)),
+      AUTH_REGISTRATIONS: (revision) =>
+        this.syncAuthenticationRegistrations(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      AUTH_METHOD_POLICIES: (revision) =>
+        this.syncAuthenticationMethodPolicy(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      CONDITIONAL_ACCESS: (revision) =>
         this.syncEntraCollection(
           tenant,
           accessToken,
           'CONDITIONAL_ACCESS',
-          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
+          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies',
+          visitOwner, ...revisionArguments(revision),
         ),
-      NAMED_LOCATIONS: () =>
+      NAMED_LOCATIONS: (revision) =>
         this.syncEntraCollection(
           tenant,
           accessToken,
           'NAMED_LOCATIONS',
-          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations'
+          'https://graph.microsoft.com/v1.0/identity/conditionalAccess/namedLocations',
+          visitOwner, ...revisionArguments(revision),
         ),
-      DEVICES: () =>
+      DEVICES: (revision) =>
         this.syncEntraCollection(
           tenant,
           accessToken,
           'DEVICES',
-          'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)'
+          'https://graph.microsoft.com/v1.0/devices?$select=id,deviceId,displayName,operatingSystem,operatingSystemVersion,trustType,isCompliant,isManaged,accountEnabled,approximateLastSignInDateTime&$expand=registeredOwners($select=id)',
+          visitOwner, ...revisionArguments(revision),
         ),
-      DIRECTORY_ROLES: () =>
-        this.syncDirectoryRoles(tenant, accessToken),
-      SERVICE_PRINCIPALS: () =>
+      DIRECTORY_ROLES: (revision) =>
+        this.syncDirectoryRoles(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      SERVICE_PRINCIPALS: (revision) =>
         this.syncEntraCollection(
           tenant,
           accessToken,
           'SERVICE_PRINCIPALS',
-          'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,description,servicePrincipalType,accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,loginUrl,publisherName,verifiedPublisher,tags,preferredSingleSignOnMode,notificationEmailAddresses,appRoles,oauth2PermissionScopes&$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)'
+          'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,description,servicePrincipalType,accountEnabled,appRoleAssignmentRequired,createdDateTime,homepage,loginUrl,publisherName,verifiedPublisher,tags,preferredSingleSignOnMode,notificationEmailAddresses,appRoles,oauth2PermissionScopes&$expand=appRoleAssignedTo($select=id,principalId,principalType,principalDisplayName,appRoleId)',
+          visitOwner, ...revisionArguments(revision),
         ),
-      APPLICATIONS: () =>
+      APPLICATIONS: (revision) =>
         this.syncEntraCollection(
           tenant,
           accessToken,
           'APPLICATIONS',
-          'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,description,createdDateTime,signInAudience,publisherDomain,identifierUris,web,passwordCredentials,keyCredentials,requiredResourceAccess&$expand=owners($select=id,displayName,userPrincipalName)'
+          'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,description,createdDateTime,signInAudience,publisherDomain,identifierUris,web,passwordCredentials,keyCredentials,requiredResourceAccess&$expand=owners($select=id,displayName,userPrincipalName)',
+          visitOwner, ...revisionArguments(revision),
         ),
-      SECURITY_DEFAULTS: () => this.syncSecurityDefaults(tenant, accessToken),
-      EXCHANGE_MAILBOXES: () =>
-        this.syncExchangeMailboxDirectory(tenant, accessToken),
-      EXCHANGE_MAILBOX_SETTINGS: () =>
-        this.syncExchangeMailboxSettings(tenant, accessToken),
-      EXCHANGE_MAILBOX_USAGE: () =>
-        this.syncExchangeMailboxUsage(tenant, accessToken),
-      EXCHANGE_ACCEPTED_DOMAINS: () =>
-        this.syncExchangeAcceptedDomains(tenant, accessToken),
-      EXCHANGE_MAILBOX_RULES: () =>
-        this.syncExchangeMailboxRules(tenant, accessToken),
-      SHAREPOINT_SITES: () => this.syncSharePointSites(tenant, accessToken),
-      SHAREPOINT_SETTINGS: () =>
-        this.syncSharePointSettings(tenant, accessToken),
-      SHAREPOINT_USAGE: () => this.syncSharePointUsage(tenant, accessToken),
+      SECURITY_DEFAULTS: (revision) => this.syncSecurityDefaults(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      EXCHANGE_MAILBOXES: (revision) =>
+        this.syncExchangeMailboxDirectory(tenant, accessToken, undefined, visitOwner, ...revisionArguments(revision)),
+      EXCHANGE_MAILBOX_SETTINGS: (revision) =>
+        revision === undefined
+          ? this.syncExchangeMailboxSettings(tenant, accessToken, visitOwner)
+          : this.syncExchangeMailboxSettings(tenant, accessToken, visitOwner, undefined, revision),
+      EXCHANGE_MAILBOX_USAGE: (revision) =>
+        this.syncExchangeMailboxUsage(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      EXCHANGE_ACCEPTED_DOMAINS: (revision) =>
+        this.syncExchangeAcceptedDomains(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      EXCHANGE_MAILBOX_RULES: (revision) =>
+        this.syncExchangeMailboxRules(tenant, accessToken, undefined, visitOwner, ...revisionArguments(revision)),
+      SHAREPOINT_SITES: (revision) => this.syncSharePointSites(tenant, accessToken, undefined, visitOwner, ...revisionArguments(revision)),
+      SHAREPOINT_SETTINGS: (revision) =>
+        this.syncSharePointSettings(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
+      SHAREPOINT_USAGE: (revision) => this.syncSharePointUsage(tenant, accessToken, visitOwner, ...revisionArguments(revision)),
     }
 
-    const results = await settleSyncCollectorModules(
-      resources.map((resource) => ({ resource, synchronize: synchronizers[resource] }))
-    )
+    const modules = selected.map((resource) => ({ resource, synchronize: async () => {
+        // DNS derives its target list from the domain inventory. Never clear
+        // its request against an older list after the domain refresh failed.
+        if (visitOwner && resource === 'DOMAIN_DNS_HEALTH' && revisions.has('DOMAINS') &&
+            (await this.pendingAuditReconciliationWork(tenant, visitOwner))
+              .some((item) => item.resourceType === 'DOMAINS')) {
+          throw new Error('AUDIT_RECONCILIATION_DOMAIN_PREREQUISITE_PENDING')
+        }
+        return synchronizers[resource](revisions.get(resource))
+      } }))
+    const results: PromiseSettledResult<unknown>[] = []
+    if (visitOwner) {
+      // Preserve dependency order and stop before another resource on loss.
+      // At most 22 coalesced requests are attempted per replay.
+      for (const module of modules) {
+        const [result] = await settleSyncCollectorModules([module])
+        if (result.status === 'rejected') {
+          const lost = tenantVisitLeaseLoss(result.reason)
+          if (lost) throw lost
+        }
+        results.push(result)
+      }
+    } else {
+      results.push(...await settleSyncCollectorModules(modules))
+    }
+    const failedResources: AuditReconciliationResource[] = []
     results.forEach((result, index) => {
       if (result.status !== 'rejected') return
-      const resource = resources[index] ?? 'UNKNOWN'
-      const message =
-        result.reason instanceof Error
-          ? result.reason.message
-          : String(result.reason)
-      this.logOperationalFailure(resource, 'RECONCILIATION', 'AUDIT_RECONCILIATION_UNAVAILABLE')
+      const lost = visitOwner && tenantVisitLeaseLoss(result.reason)
+      if (lost) throw lost
+      const resource = selected[index]
+      if (resource) failedResources.push(resource)
+      this.logOperationalFailure(resource ?? 'UNKNOWN', 'RECONCILIATION', 'AUDIT_RECONCILIATION_UNAVAILABLE')
     })
+    if (visitOwner) {
+      // A promise resolving is not an authoritative receipt. This also keeps
+      // cooldown deferrals, partial sources and a superseding revision visible
+      // to the enclosing pass, without changing resource retry counters.
+      const remaining = await this.pendingAuditReconciliationWork(tenant, visitOwner)
+      if (failedResources.length > 0 || remaining.length > 0) {
+        throw new AuditReconciliationIncompleteError(failedResources, remaining.map(item => item.resourceType))
+      }
+    }
+  }
+
+  private auditReconciliationRetryDue(state: DailyInventoryState | undefined, now: Date): boolean {
+    if (!state) return true
+    for (const clock of [state.lastAttemptAt, state.lastSuccessfulAt]) {
+      if (clock != null && (!Number.isFinite(clock.getTime()) || clock > now)) return false
+    }
+    if (state.status === 'RUNNING') return shouldRunHourlyInventoryRefresh(state, now)
+    if (state.status !== 'FAILED' && state.lastSuccessfulAt) return true
+    if (shouldRunTargetedTransientRetry(state, now)) return true
+    if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) {
+      return !state.lastAttemptAt || now.getTime() - state.lastAttemptAt.getTime() >= DAILY_INVENTORY_FAILURE_RETRY_MS
+    }
+    return dailyInventoryResourceDueAt(state, now) !== null
+  }
+
+  private pendingAuditReconciliationWork(
+    tenant: { id: string; organizationId: string },
+    visitOwner: TenantVisitLeaseOwner,
+  ) {
+    return selectPendingAuditReconciliationWork(this.prisma, {
+      organizationId: tenant.organizationId, customerTenantId: tenant.id,
+    }, visitOwner, AUDIT_RECONCILIATION_RESOURCES.length)
+  }
+
+  private assertSnapshotAuditRequest(
+    tenant: { id: string; organizationId: string },
+    resourceType: EntraSnapshotResource,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
+  ): void {
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
+    if (auditRequestedRevision !== undefined && (
+      !visitOwner || !AUDIT_RECONCILIATION_RESOURCES.some((resource) => resource === resourceType) ||
+      typeof auditRequestedRevision !== 'bigint' || auditRequestedRevision < 1n ||
+      auditRequestedRevision > 9223372036854775807n
+    )) throw new Error('TENANT_AUDIT_RECONCILIATION_SNAPSHOT_RECEIPT_INVALID')
+  }
+
+  private async acknowledgeAuditSnapshotInTransaction(
+    transaction: Prisma.TransactionClient,
+    tenant: { id: string; organizationId: string },
+    resourceType: AuditReconciliationResource,
+    requestedRevision: bigint,
+    observedAt: Date,
+  ) {
+    const acknowledged = await transaction.tenantAuditReconciliationWork.updateMany({
+      where: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType,
+        requestedRevision,
+        completedRevision: { lt: requestedRevision },
+      },
+      data: { completedRevision: requestedRevision, lastCompletedAt: observedAt },
+    })
+    if (acknowledged.count > 1) {
+      throw new Error('TENANT_AUDIT_RECONCILIATION_SNAPSHOT_RECEIPT_MULTIPLE_ROWS')
+    }
   }
 
   private async saveSnapshot(
@@ -5137,7 +5877,11 @@ export class TenantSyncService {
      *  advisory lock. Only supplied where a partial payload would otherwise overwrite stored
      *  values with defaults; every other resource keeps replace-wholesale semantics unchanged. */
     mergeWithPrevious?: (previous: readonly unknown[], incoming: readonly unknown[]) => unknown[],
+    visitOwner?: TenantVisitLeaseOwner,
+    /** An audit replay may acknowledge this exact request only with this complete snapshot commit. */
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, resourceType, visitOwner, auditRequestedRevision)
     if (result.completeness !== 'authoritative_complete' &&
       !(resourceType === 'SECURE_SCORES' && result.completeness === 'current_score_complete')) {
       throw new Error(
@@ -5151,6 +5895,7 @@ export class TenantSyncService {
     // PostgreSQL transaction advisory lock serializes this resource across
     // concurrent workers so they cannot compare against one stale baseline.
     await this.prisma.$transaction(async (transaction) => {
+      if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
       if (requiresRiskUtcSnapshot(resourceType)) await enforceRiskUtcTransaction(transaction)
       await transaction.$executeRawUnsafe(
         'SELECT pg_advisory_xact_lock(hashtext($1))',
@@ -5198,6 +5943,14 @@ export class TenantSyncService {
         },
         update: { payload: rows as never, observedAt },
       })
+      if (auditRequestedRevision !== undefined) {
+        // The complete source snapshot and its exact request acknowledgment
+        // either commit together or neither does. A newer audit request keeps
+        // its own revision pending; an absent row is never manufactured here.
+        await this.acknowledgeAuditSnapshotInTransaction(
+          transaction, tenant, resourceType as AuditReconciliationResource, auditRequestedRevision, observedAt,
+        )
+      }
       if (resourceType === 'EXCHANGE_MAILBOX_RULES' || resourceType === 'EXCHANGE_ACCEPTED_DOMAINS') {
         const digest = riskAttestable ? mailboxSourceDigest({ organizationId: tenant.organizationId, customerTenantId: tenant.id }, resourceType, observedAt, rows) : null
         const fieldKey = sourceAttestationKey(resourceType)
@@ -5219,7 +5972,10 @@ export class TenantSyncService {
     tenant: { id: string; organizationId: string },
     accessToken: string,
     limits: Readonly<EntraCollectionLimits> = EXCHANGE_JSON_COLLECTION_LIMITS,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'EXCHANGE_MAILBOXES', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOXES', async () => {
       const budget = new MicrosoftCollectionBudget(limits, 'mailbox directory')
       const initialUrl =
@@ -5239,7 +5995,8 @@ export class TenantSyncService {
             'mailbox directory',
             { timeoutMs: limits.requestTimeoutMs, deadlineAt: budget.deadlineAt },
           )
-          const page = await budget.read(response)
+          if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_MAILBOXES')
+        const page = await budget.read(response)
           if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded mailbox directory page.')
           const projected = page.value.map(projectMailboxDirectoryUser)
           budget.retain(projected)
@@ -5257,8 +6014,8 @@ export class TenantSyncService {
         .map(exchangeMailboxRow)
       await this.saveSnapshot(
         tenant, 'EXCHANGE_MAILBOXES', authoritativeSnapshot(rows),
-        undefined, false, undefined, mergeExchangeMailboxRows)
-    })
+        undefined, false, undefined, mergeExchangeMailboxRows, visitOwner, auditRequestedRevision)
+    }, visitOwner)
   }
 
   /**
@@ -5270,10 +6027,27 @@ export class TenantSyncService {
   private async syncExchangeMailboxSettings(
     tenant: { id: string; organizationId: string },
     accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
     limits: Readonly<EntraCollectionLimits> = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pages: EXCHANGE_JSON_COLLECTION_LIMITS.rows },
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'EXCHANGE_MAILBOX_SETTINGS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_SETTINGS', async () => {
       const budget = new MicrosoftCollectionBudget(limits, 'mailbox settings')
+      let receiptRevision = auditRequestedRevision
+      if (receiptRevision !== undefined) {
+        const directoryState = await this.withSnapshotUtc('USERS', (transaction) => transaction.syncState.findFirst({
+          where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'USERS' },
+          select: { status: true, lastSuccessfulAt: true, lastAttemptAt: true },
+        }), visitOwner)
+        // An empty/stale cached recipient list cannot satisfy an audit repair.
+        // Keep existing collection behavior and leave its durable work pending.
+        if (!directoryState || directoryState.status !== 'SUCCEEDED' || !directoryState.lastSuccessfulAt ||
+            Date.now() - directoryState.lastSuccessfulAt.getTime() > 36 * 60 * 60 * 1000 ||
+            (directoryState.lastAttemptAt && directoryState.lastAttemptAt > directoryState.lastSuccessfulAt)) {
+          receiptRevision = undefined
+        }
+      }
       const users = await collectMailboxRuleUsers((skip, take) =>
         this.prisma.directoryUser.findMany({
           where: { customerTenantId: tenant.id, deletedAt: null },
@@ -5302,6 +6076,7 @@ export class TenantSyncService {
             `Microsoft mailbox settings synchronization returned ${response.status}. Confirm MailboxSettings.Read application permission.`
           )
         }
+        if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_MAILBOX_SETTINGS')
         const settings = closedFields(await budget.read(response), ['userPurpose', 'timeZone'])
         const row = {
           ...settings,
@@ -5311,8 +6086,11 @@ export class TenantSyncService {
         budget.retain([row])
         rows.push(row)
       }
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_SETTINGS', authoritativeSnapshot(rows))
-    })
+      await this.saveSnapshot(
+        tenant, 'EXCHANGE_MAILBOX_SETTINGS', authoritativeSnapshot(rows),
+        undefined, false, undefined, undefined, visitOwner, receiptRevision,
+      )
+    }, visitOwner)
   }
 
   private async collectExchangeReadOnlyMailboxes(
@@ -5388,7 +6166,10 @@ export class TenantSyncService {
     return rows
   }
 
-  private async syncExchangeMailboxConfiguration(tenant: TenantSyncTarget) {
+  private async syncExchangeMailboxConfiguration(
+    tenant: TenantSyncTarget,
+    visitOwner?: TenantVisitLeaseOwner,
+  ) {
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_CONFIGURATION', async () => {
       if (!tenant.connection?.exchangeReadOnlyEnabledAt) {
         throw new Error('Optional Exchange read-only enrichment is not enabled for this tenant.')
@@ -5400,20 +6181,24 @@ export class TenantSyncService {
           : 'HAWKVIEW_MANAGED',
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
-      })
+      }, visitOwner)
       const rows = await this.collectExchangeReadOnlyMailboxes(tenant, accessToken)
       await this.saveSnapshot(
         tenant,
         'EXCHANGE_MAILBOX_CONFIGURATION',
         authoritativeSnapshot(rows),
+        undefined, false, undefined, undefined, visitOwner,
       )
-    })
+    }, visitOwner)
   }
 
   private async syncExchangeAcceptedDomains(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(
       tenant,
       'EXCHANGE_ACCEPTED_DOMAINS',
@@ -5424,6 +6209,7 @@ export class TenantSyncService {
           'accepted-domain',
           { timeoutMs: 30_000 },
         )
+        if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_ACCEPTED_DOMAINS')
         const page = await readBoundedSingleton(response)
         // Organization.Read.All returns tenant-associated verifiedDomains.
         // These are not Exchange accepted-domain objects, so do not invent an
@@ -5432,15 +6218,22 @@ export class TenantSyncService {
         const connection = await this.prisma.customerTenant.findFirst({ where: { id: tenant.id, organizationId: tenant.organizationId }, select: { microsoftTenantId: true } })
         if (!connection) throw new Error('Microsoft verified-domain scope is unavailable.')
         const domains = verifiedOrganizationDomains(page, connection.microsoftTenantId)
-        await this.saveSnapshot(tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains), undefined, true)
-      }
+        await this.saveSnapshot(
+          tenant, 'EXCHANGE_ACCEPTED_DOMAINS', authoritativeSnapshot(domains),
+          undefined, true, undefined, undefined, visitOwner, auditRequestedRevision,
+        )
+      },
+      visitOwner,
     )
   }
 
   private async syncExchangeMailboxUsage(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'EXCHANGE_MAILBOX_USAGE', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_USAGE', async () => {
       const response = await this.fetchGraphPage(
         "https://graph.microsoft.com/v1.0/reports/getMailboxUsageDetail(period='D30')",
@@ -5453,7 +6246,13 @@ export class TenantSyncService {
         },
       )
       let csv = ''
-      if (response.ok) csv = await readBoundedResponseText(response, MAILBOX_USAGE_CSV_MAX_BYTES)
+      if (visitOwner && response.headers.get('warning') !== null) {
+        await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_MAILBOX_USAGE')
+      }
+      if (response.ok) {
+        if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_MAILBOX_USAGE')
+        csv = await readBoundedResponseText(response, MAILBOX_USAGE_CSV_MAX_BYTES)
+      }
       else if (response.status === 302) {
         const location = response.headers.get('location')
         if (!location?.startsWith('https://'))
@@ -5469,6 +6268,7 @@ export class TenantSyncService {
           throw new Error(
             `Microsoft mailbox usage report download returned ${download.status}.`
           )
+        if (visitOwner) await assertCompleteBaselineSourceResponse(download, 'EXCHANGE_MAILBOX_USAGE')
         csv = await readBoundedResponseText(download, MAILBOX_USAGE_CSV_MAX_BYTES)
       } else {
         throw new Error(
@@ -5478,16 +6278,20 @@ export class TenantSyncService {
       await this.saveSnapshot(
         tenant,
         'EXCHANGE_MAILBOX_USAGE',
-        authoritativeSnapshot(parseMailboxUsageCsv(csv))
+        authoritativeSnapshot(parseMailboxUsageCsv(csv)),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
       )
-    })
+    }, visitOwner)
   }
 
   private async syncExchangeMailboxRules(
     tenant: { id: string; organizationId: string },
     accessToken: string,
     limits: Readonly<EntraCollectionLimits> = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pages: 50_000, rows: EXCHANGE_JSON_COLLECTION_LIMITS.tenantRules },
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'EXCHANGE_MAILBOX_RULES', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'EXCHANGE_MAILBOX_RULES', async () => {
       const budget = new MicrosoftCollectionBudget(limits, 'inbox rules')
       const users = await collectMailboxRuleUsers((skip, take) => this.prisma.directoryUser.findMany({
@@ -5518,21 +6322,25 @@ export class TenantSyncService {
           await cancelBoundedStream(() => response.body?.cancel())
           return { value: [] }
         }
+        if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'EXCHANGE_MAILBOX_RULES')
         const page = await budget.read(response)
         if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded inbox-rules page.')
         const projected = page.value.map(projectMailboxRule)
         budget.retain(projected)
         return { value: projected, '@odata.nextLink': page['@odata.nextLink'] } as GraphCollectionPage
       }, 1, { maxTotalRecords: limits.rows, maxMaterializedBytes: limits.materializedBytes, deadlineAt: budget.deadlineAt })
-      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows), undefined, riskAttestable, riskFailureReason)
-    })
+      await this.saveSnapshot(tenant, 'EXCHANGE_MAILBOX_RULES', authoritativeSnapshot(rows), undefined, riskAttestable, riskFailureReason, undefined, visitOwner, riskAttestable ? auditRequestedRevision : undefined)
+    }, visitOwner)
   }
 
   private async syncSharePointSites(
     tenant: TenantSyncTarget,
     accessToken: string,
     limits: typeof SHAREPOINT_COLLECTION_LIMITS = SHAREPOINT_COLLECTION_LIMITS,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'SHAREPOINT_SITES', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SITES', async () => {
       const deadlineAt = Date.now() + limits.collectorDeadlineMs // safely below the 15-minute tenant lease
       const maxSitePages = limits.sitePages
@@ -5541,6 +6349,9 @@ export class TenantSyncService {
       const budget = new MicrosoftCollectionBudget({ ...ENTRA_COLLECTION_LIMITS, pages: limits.sitePages + 1, rows: limits.sites, pageBytes: limits.responseBytes, collectorDeadlineMs: limits.collectorDeadlineMs }, 'SharePoint sites')
       const projectSite = (value: unknown) => {
         const site = closedFields(value, ['id', 'name', 'displayName', 'webUrl', 'createdDateTime', 'lastModifiedDateTime'])
+        if (visitOwner && (typeof site.id !== 'string' || !site.id.trim())) {
+          throw new Error('Microsoft SharePoint sites returned an invalid identity; collection is incomplete.')
+        }
         if (plainRecord(value) && plainRecord(value.root)) site.root = {}
         if (plainRecord(value) && plainRecord(value.siteCollection)) site.siteCollection = closedFields(value.siteCollection, ['hostname', 'dataLocationCode'])
         return site
@@ -5564,6 +6375,7 @@ export class TenantSyncService {
         },
       )
       if (rootResponse.ok) {
+        if (visitOwner) await assertCompleteBaselineSourceResponse(rootResponse, 'SHAREPOINT_SITES')
         const root = projectSite(await budget.read(rootResponse))
         budget.retain([root])
         sites.push(root)
@@ -5594,13 +6406,15 @@ export class TenantSyncService {
           'SharePoint sites',
           { timeoutMs: sharePointRequestTimeout(deadlineAt, limits.requestTimeoutMs), deadlineAt },
         )
+        if (visitOwner) await assertCompleteBaselineSourceResponse(response, 'SHAREPOINT_SITES')
         const page = await budget.read(response)
         if (!plainRecord(page) || !Array.isArray(page.value)) throw new Error('Microsoft returned an invalid bounded SharePoint sites page.')
         const projected = page.value.map(projectSite)
         budget.retain(projected)
         sites.push(...projected)
         if (sites.length > maxSites) throw new Error('SharePoint site inventory reached a bounded record limit before completion.')
-        if (page['@odata.nextLink'] !== undefined && typeof page['@odata.nextLink'] !== 'string') throw new Error('Microsoft returned an invalid SharePoint sites link.')
+        if (page['@odata.nextLink'] !== undefined && (typeof page['@odata.nextLink'] !== 'string' ||
+            (visitOwner && !page['@odata.nextLink'].trim()))) throw new Error('Microsoft returned an invalid SharePoint sites link.')
         nextUrl = page['@odata.nextLink'] as string ?? ''
       }
 
@@ -5630,15 +6444,19 @@ export class TenantSyncService {
       await this.saveSnapshot(
         tenant,
         'SHAREPOINT_SITES',
-        authoritativeSnapshot(enrichedSites)
+        authoritativeSnapshot(enrichedSites),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
       )
-    })
+    }, visitOwner)
   }
 
   private async syncSharePointSettings(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'SHAREPOINT_SETTINGS', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'SHAREPOINT_SETTINGS', async () => {
       const response = await this.fetchGraphPage(
         'https://graph.microsoft.com/v1.0/admin/sharepoint/settings',
@@ -5673,14 +6491,20 @@ export class TenantSyncService {
         'isSharePointMobileNotificationEnabled', 'isSharePointNewsfeedEnabled', 'tenantDefaultTimezone',
       ])
       if (plainRecord(settings.idleSessionSignOut)) projected.idleSessionSignOut = closedFields(settings.idleSessionSignOut, ['isEnabled', 'warnAfterInSeconds', 'signOutAfterInSeconds'])
-      await this.saveSnapshot(tenant, 'SHAREPOINT_SETTINGS', authoritativeSnapshot([projected]))
-    })
+      await this.saveSnapshot(
+        tenant, 'SHAREPOINT_SETTINGS', authoritativeSnapshot([projected]),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
+      )
+    }, visitOwner)
   }
 
   private async syncSharePointUsage(
     tenant: { id: string; organizationId: string },
-    accessToken: string
+    accessToken: string,
+    visitOwner?: TenantVisitLeaseOwner,
+    auditRequestedRevision?: bigint,
   ) {
+    this.assertSnapshotAuditRequest(tenant, 'SHAREPOINT_USAGE', visitOwner, auditRequestedRevision)
     return this.runSnapshotSync(tenant, 'SHAREPOINT_USAGE', async () => {
       const downloadReport = async (reportUrl: string, label: string) => {
         const reportResponse = await this.fetchGraphPage(
@@ -5698,7 +6522,13 @@ export class TenantSyncService {
           MICROSOFT_USAGE_REPORT_CSV_MAX_BYTES,
           `Microsoft ${label} usage report exceeded the bounded response-size limit.`,
         )
-        if (reportResponse.ok) return boundedUsageText(reportResponse)
+        if (visitOwner && reportResponse.headers.get('warning') !== null) {
+          await assertCompleteBaselineSourceResponse(reportResponse, 'SHAREPOINT_USAGE')
+        }
+        if (reportResponse.ok) {
+          if (visitOwner) await assertCompleteBaselineSourceResponse(reportResponse, 'SHAREPOINT_USAGE')
+          return boundedUsageText(reportResponse)
+        }
         if (reportResponse.status !== 302) {
           const graphRequestId = reportResponse.headers.get('request-id')
           throw new Error(
@@ -5721,6 +6551,7 @@ export class TenantSyncService {
             `Microsoft ${label} report download returned ${downloadResponse.status}.`
           )
         }
+        if (visitOwner) await assertCompleteBaselineSourceResponse(downloadResponse, 'SHAREPOINT_USAGE')
         return boundedUsageText(downloadResponse)
       }
 
@@ -5738,8 +6569,11 @@ export class TenantSyncService {
         sharePointUsage,
         oneDriveUsage,
       )
-      await this.saveSnapshot(tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload))
-    })
+      await this.saveSnapshot(
+        tenant, 'SHAREPOINT_USAGE', authoritativeSnapshot(payload),
+        undefined, false, undefined, undefined, visitOwner, auditRequestedRevision,
+      )
+    }, visitOwner)
   }
 
   private async synchronizeUsers(
@@ -5752,7 +6586,11 @@ export class TenantSyncService {
     allowDeltaReset = true,
     limits: Readonly<EntraCollectionLimits> = USER_DELTA_COLLECTION_LIMITS,
     budget: MicrosoftCollectionBudget = new MicrosoftCollectionBudget(limits, 'users'),
+    visitOwner?: TenantVisitLeaseOwner,
   ): Promise<{ deltaLink: string }> {
+    if (visitOwner && (
+      visitOwner.customerTenantId !== tenant.id || visitOwner.organizationId !== tenant.organizationId
+    )) throw new TenantVisitLeaseLostError()
     const fullSyncStartedAt = deltaLink ? null : new Date()
     let nextUrl =
       deltaLink ??
@@ -5776,7 +6614,7 @@ export class TenantSyncService {
           users.length = 0
           // A 410 invalidates the checkpoint, not the whole-visit resource
           // budget. Rebuild with the same page, byte, and deadline ceilings.
-          return this.synchronizeUsers(tenant, accessToken, null, false, limits, budget)
+          return this.synchronizeUsers(tenant, accessToken, null, false, limits, budget, visitOwner)
         }
         throw new MicrosoftGraphCollectionError(
           `Microsoft users synchronization returned 410${metadata.suffix}.`,
@@ -5785,6 +6623,10 @@ export class TenantSyncService {
           response.headers.get('request-id'),
         )
       }
+      // A full enumeration drives absence-based deletion. A qualified response
+      // is never complete enough to sweep unseen users or advance its checkpoint,
+      // including when the full-inventory gate is enabled before visit fencing.
+      if (visitOwner || fullSyncStartedAt) await assertCompleteBaselineSourceResponse(response, 'USERS')
       const parsed = await budget.read(response)
       if (!plainRecord(parsed) || !Array.isArray(parsed.value)) throw new Error('Microsoft returned an invalid bounded users page.')
       const page = parsed as GraphUsersPage
@@ -5807,12 +6649,13 @@ export class TenantSyncService {
     // for the entire tenant.
     for (let offset = 0; offset < users.length; offset += 250) {
       const observedAt = new Date()
-      const operations = users.slice(offset, offset + 250)
+      const batch = users.slice(offset, offset + 250)
+      const operationsFor = (client: Pick<Prisma.TransactionClient, 'directoryUser'>) => batch
         .filter((user) => typeof user.id === 'string')
         .map((user) => {
           const microsoftUserId = user.id as string
           if (user['@removed']) {
-            return this.prisma.directoryUser.updateMany({
+            return client.directoryUser.updateMany({
               where: {
                 customerTenantId: tenant.id,
                 microsoftUserId,
@@ -5835,7 +6678,7 @@ export class TenantSyncService {
           const observedAccountEnabled = typeof user.accountEnabled === 'boolean'
             ? { accountEnabled: user.accountEnabled }
             : {}
-          return this.prisma.directoryUser.upsert({
+          return client.directoryUser.upsert({
             where: {
               customerTenantId_microsoftUserId: {
                 customerTenantId: tenant.id,
@@ -5866,12 +6709,18 @@ export class TenantSyncService {
             },
           })
         })
-      if (operations.length > 0) {
-        await this.prisma.$transaction(operations)
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          for (const operation of operationsFor(transaction)) await operation
+        })
+      } else {
+        const operations = operationsFor(this.prisma)
+        if (operations.length > 0) await this.prisma.$transaction(operations)
       }
     }
     if (fullSyncStartedAt) {
-      await this.prisma.directoryUser.updateMany({
+      const sweep = (client: Pick<Prisma.TransactionClient, 'directoryUser'>) => client.directoryUser.updateMany({
         where: {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
@@ -5880,6 +6729,12 @@ export class TenantSyncService {
         },
         data: { deletedAt: new Date() },
       })
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          await sweep(transaction)
+        })
+      } else await sweep(this.prisma)
     }
     return { deltaLink: finalDeltaLink }
   }

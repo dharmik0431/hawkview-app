@@ -9,6 +9,8 @@ import {
   PREVIOUS_KEY_VARIABLE,
 } from './secret-encryption-keys.js'
 import { PLATFORM_OWNED, TENANT_SCOPE_UNSUPPORTED } from './secret-owner.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { runTenantVisitLifecycle } from '../tenants/tenant-visit-lifecycle.js'
 
 /** Key rotation, and the one property the whole change exists for: **rotating the
  * encryption key must not make a stored secret unreadable.**
@@ -243,6 +245,86 @@ test('a concurrent re-seal cannot leave a row labelled one version and sealed wi
   assert.equal([...world.rows.values()][0].keyVersion, 2)
   await withKeys({ current: KEY_TWO, version: '2' }, async () => {
     assert.equal(await world.service().access(reference), 'value')
+  })
+})
+
+for (const accessPath of ['explicit', 'context', 'context-or-create', 'legacy-reference'] as const) {
+  test(`a displaced ${accessPath} visit cannot opportunistically reseal a credential`, async () => {
+    const world = database()
+    let reference = ''
+    await withKeys({ current: KEY_ONE }, async () => {
+      reference = await world.service().store('visit-reseal-secret', 'synthetic-value', PLATFORM_OWNED)
+    })
+    const row = [...world.rows.values()][0]!
+    if (accessPath === 'legacy-reference') {
+      row.legacyReference = 'projects/test/secrets/visit/versions/1'
+      reference = row.legacyReference
+    }
+    const before = structuredClone(row)
+    const owner = { organizationId: randomUUID(), customerTenantId: randomUUID(), token: randomUUID(),
+      generation: 7n, expiresAt: new Date(Date.now() + 60_000) }
+    let live = false, updates = 0, transactions = 0
+    const service = new SecretStoreService({
+      ...world.prisma,
+      $transaction: async (work: (transaction: any) => Promise<unknown>) => {
+        transactions++
+        return work({
+          $queryRawUnsafe: async (sql: string, ...values: unknown[]) => {
+            if (sql.includes('FROM organizations')) return [{ id: owner.organizationId }]
+            if (sql.includes('FROM customer_tenants')) return [{ id: owner.customerTenantId }]
+            if (sql.includes('FROM tenant_sync_visit_leases')) {
+              assert.deepEqual(values, [owner.customerTenantId, owner.organizationId, owner.token, '7'])
+              return live ? [{ generation: '7' }] : []
+            }
+            assert.fail(sql)
+          },
+          encryptedSecret: { updateMany: async (args: any) => {
+            updates++
+            return world.prisma.encryptedSecret.updateMany(args)
+          } },
+        })
+      },
+    } as never)
+    const contextual = accessPath === 'context' || accessPath === 'context-or-create'
+    const read = () => contextual
+      ? runTenantVisitLifecycle({ acquire: async () => owner, renew: async () => owner, release: async () => true },
+        owner, () => accessPath === 'context-or-create'
+          ? service.accessOrCreate('visit-reseal-secret', () => assert.fail('existing-secret access must not mint a new value'))
+          : service.access(reference), { now: () => 0, schedule: () => 0, cancel: () => {} })
+      : service.access(reference, owner)
+    await withKeys({ current: KEY_TWO, version: '2', previous: KEY_ONE }, async () => {
+      await assert.rejects(read, TenantVisitLeaseLostError)
+      assert.equal(updates, 0)
+      assert.deepEqual(row, before)
+      live = true
+      const result = await read()
+      assert.deepEqual(result, contextual ? { status: 'completed', value: 'synthetic-value' } : 'synthetic-value')
+      assert.equal(updates, 1)
+      assert.equal(transactions, 2)
+      assert.equal(row.keyVersion, 2)
+    })
+    await withKeys({ current: KEY_TWO, version: '2' }, async () => {
+      assert.equal(await service.access(reference, owner), 'synthetic-value')
+      assert.equal(transactions, 2, 'current-version access does not add a rotation write')
+    })
+  })
+}
+
+test('owned ordinary storage failure still defers resealing without changing the rotation read policy', async () => {
+  const world = database()
+  let reference = ''
+  await withKeys({ current: KEY_ONE }, async () => {
+    reference = await world.service().store('visit-reseal-unavailable', 'synthetic-value', PLATFORM_OWNED)
+  })
+  const before = structuredClone([...world.rows.values()][0])
+  const owner = { organizationId: randomUUID(), customerTenantId: randomUUID(), token: randomUUID(),
+    generation: 1n, expiresAt: new Date(Date.now() + 60_000) }
+  const service = new SecretStoreService({ ...world.prisma,
+    $transaction: async () => { throw new Error('Synthetic storage unavailable') },
+  } as never)
+  await withKeys({ current: KEY_TWO, version: '2', previous: KEY_ONE }, async () => {
+    assert.equal(await service.access(reference, owner), 'synthetic-value')
+    assert.deepEqual([...world.rows.values()][0], before)
   })
 })
 

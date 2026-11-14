@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { captureManagedAuthority, type AuthorityDatabase, type AuthorityTransaction,
   type ManagedAuthority } from '../microsoft/managed-connector-authority.js'
+import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
 
 interface TenantRow { id: string; organizationId: string; microsoftTenantId: string; status: string; revision: string }
 interface ConnectionRow {
@@ -19,8 +21,12 @@ export type VerificationPublication =
   | { outcome: 'failed'; message: string; authenticationFailure?: boolean }
 
 // Hold the existing nullable G lock through T/C, including bootstrap absence.
-async function lockContext(tx: AuthorityTransaction, who: { customerTenantId: string; organizationId: string; microsoftTenantId: string }) {
+async function lockContext(tx: AuthorityTransaction, who: { customerTenantId: string; organizationId: string; microsoftTenantId: string },
+  visitOwner?: TenantVisitLeaseOwner) {
   const authority = await captureManagedAuthority({ $transaction: work => work(tx) })
+  // For a visit-originated publication only, hold its exact owner before
+  // taking connection and role locks or committing any of their writes.
+  if (visitOwner) await assertTenantVisitLeaseOwner(tx, visitOwner)
   const tenants = await tx.$queryRawUnsafe<TenantRow[]>(`/* verification:tenant */ SELECT id, organization_id AS "organizationId",
     microsoft_tenant_id AS "microsoftTenantId", status, updated_at::text AS revision FROM customer_tenants
     WHERE id=$1::uuid AND organization_id=$2::uuid AND microsoft_tenant_id=$3::uuid FOR NO KEY UPDATE`,
@@ -81,15 +87,17 @@ async function sameCapturedScope(tx: AuthorityTransaction, expected: CapturedCon
 }
 
 export async function publishConnectionVerification(db: AuthorityDatabase, captured: CapturedConnectionVerification,
-  input: VerificationPublication
+  input: VerificationPublication, visitOwner?: TenantVisitLeaseOwner
 ): Promise<Refused | { status: 'applied'; connected: boolean }> {
+  if (visitOwner && (visitOwner.customerTenantId !== captured.tenant.id ||
+    visitOwner.organizationId !== captured.tenant.organizationId)) throw new TenantVisitLeaseLostError()
   const expected = { tenant: { ...captured.tenant }, connection: { ...captured.connection, permissions: [...captured.connection.permissions] }, authority: { ...captured.authority },
     ...(captured.directoryScope ? { directoryScope: { ...captured.directoryScope } } : {}) }
   const result = input.outcome === 'failed' ? { ...input, message: input.message.slice(0, 2000) }
     : { ...input, grantedPermissions: [...input.grantedPermissions], missingRequiredPermissions: [...input.missingRequiredPermissions] }
   return db.$transaction(async tx => {
     const t = expected.tenant, c = expected.connection
-    const locked = await lockContext(tx, { customerTenantId: t.id, organizationId: t.organizationId, microsoftTenantId: t.microsoftTenantId })
+    const locked = await lockContext(tx, { customerTenantId: t.id, organizationId: t.organizationId, microsoftTenantId: t.microsoftTenantId }, visitOwner)
     if (!locked) return { status: 'superseded', reason: 'CONNECTION_CHANGED' }
     if (!sameCapturedContext(locked, expected) || !await sameCapturedScope(tx, expected)) {
       return { status: 'superseded', reason: 'CONNECTION_CHANGED' }
@@ -135,12 +143,16 @@ export async function publishConnectionVerification(db: AuthorityDatabase, captu
 /** Only the shared timestamp and optional Exchange grant callers use this path.
  * No arbitrary effects/callbacks execute under the authority locks. */
 export async function publishCapturedConnectionRefresh(db: AuthorityDatabase, captured: CapturedConnectionVerification,
-  effect: 'sync-timestamp' | 'exchange-consent'): Promise<Refused | { status: 'applied'; context: CapturedConnectionVerification }> {
+  effect: 'sync-timestamp' | 'exchange-consent', visitOwner?: TenantVisitLeaseOwner
+): Promise<Refused | { status: 'applied'; context: CapturedConnectionVerification }> {
   const expected = structuredClone(captured)
   if (!expected.directoryScope || !['sync-timestamp','exchange-consent'].includes(effect)) throw new Error('INVALID_CAPTURED_REFRESH')
+  if (visitOwner && effect !== 'sync-timestamp') throw new Error('INVALID_CAPTURED_REFRESH')
+  if (visitOwner && (visitOwner.customerTenantId !== expected.tenant.id ||
+    visitOwner.organizationId !== expected.tenant.organizationId)) throw new TenantVisitLeaseLostError()
   return db.$transaction(async tx => {
     const t = expected.tenant, c = expected.connection
-    const locked = await lockContext(tx, { customerTenantId: t.id, organizationId: t.organizationId, microsoftTenantId: t.microsoftTenantId })
+    const locked = await lockContext(tx, { customerTenantId: t.id, organizationId: t.organizationId, microsoftTenantId: t.microsoftTenantId }, visitOwner)
     if (!locked || !sameCapturedContext(locked,expected) || !await sameCapturedScope(tx,expected)) {
       return { status: 'superseded', reason: 'CONNECTION_CHANGED' }
     }

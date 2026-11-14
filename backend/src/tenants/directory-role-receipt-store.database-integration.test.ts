@@ -7,6 +7,8 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
+import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
+import { releaseTenantVisitLease, tryAcquireTenantVisitLease } from './tenant-visit-lease-store.js'
 import { collectDirectoryRoles } from './directory-role-collector.js'
 import { publishManagedAuthority, type AuthorityDatabase, type AuthorityTransaction } from '../microsoft/managed-connector-authority.js'
 import { captureRoleAttempt, activateRoleScope, claimRoleAttempt, completeRoleAttempt, finishRoleAttempt,
@@ -43,7 +45,7 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
     await observer.query(`CREATE SCHEMA ${schema}`)
     await observer.query(`SET search_path TO ${schema},public`)
     // Clone actual migrated table shapes. No fixture-only SQL reimplementation of the core.
-    for (const name of ['customer_tenants','tenant_connections','sync_states','tenant_entra_snapshots','change_evidence_events',
+    for (const name of ['organizations','tenant_sync_visit_leases','tenant_audit_reconciliation_work','customer_tenants','tenant_connections','sync_states','tenant_entra_snapshots','change_evidence_events',
       'platform_microsoft_connectors','encrypted_secrets','managed_connector_authority_revisions']) {
       await observer.query(`CREATE TABLE ${schema}.${name} (LIKE public.${name} INCLUDING ALL)`)
     }
@@ -86,6 +88,7 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
     const evidence=async()=> (await observer.query('SELECT * FROM change_evidence_events ORDER BY id')).rows
     const claim=async(ctx:RoleContext, database=db)=>{const r=await claimRoleAttempt(database,ctx);assert.equal(r.status,'claimed');if(r.status!=='claimed')throw Error('claim');return r.attempt}
     let ctx!:RoleContext
+    await observer.query(`INSERT INTO organizations(id,name,slug,updated_at) VALUES($1,'Role visit CI',$2,now())`,[organizationId,'role-visit-'+organizationId])
     await observer.query(`INSERT INTO customer_tenants(id,organization_id,microsoft_tenant_id,status,updated_at) VALUES($1,$2,$3,'ACTIVE',now())`,[customerTenantId,organizationId,microsoftTenantId])
     await observer.query(`INSERT INTO tenant_connections(id,organization_id,customer_tenant_id,status,connection_mode,updated_at) VALUES($1,$2,$3,'CONNECTED','HAWKVIEW_MANAGED',now())`,[randomUUID(),organizationId,customerTenantId])
     assert.equal((await publishManagedAuthority(db,publication(null,revision))).status,'published')
@@ -110,6 +113,59 @@ test('role receipt composed actual Prisma transactions', { skip, timeout: 90000 
     })
     // Subtest failures do not throw from t.test; do not cascade with an absent context.
     assert.ok(ctx,'initial managed activation must establish the shared test context')
+    await t.test('visit-owned role publication holds its lease and rejects superseded claim, success and failure', {
+      skip: url.port !== '5432' || process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES !== '1' || process.env.GITHUB_ACTIONS !== 'true',
+    }, async () => {
+      // Shared guard above already verified the exact registered hosted CI context.
+      const scope = { organizationId, customerTenantId }
+      const owner = await tryAcquireTenantVisitLease(db as never, scope, 300_000)
+      assert.ok(owner)
+      await observer.query(`INSERT INTO tenant_audit_reconciliation_work(organization_id,customer_tenant_id,resource_type,requested_revision) VALUES($1,$2,'DIRECTORY_ROLES',2)`,[organizationId,customerTenantId])
+      const auditReceipt = async () => (await observer.query(`SELECT completed_revision,last_completed_at FROM tenant_audit_reconciliation_work WHERE organization_id=$1 AND customer_tenant_id=$2 AND resource_type='DIRECTORY_ROLES'`,[organizationId,customerTenantId])).rows[0]
+      const captured = await captureRoleAttempt(db, who, owner)
+      assert.equal(captured.status, 'claimed')
+      if (captured.status !== 'claimed') throw new Error('Expected owned role claim')
+      const entered = gate(), release = gate()
+      const before = { state: await state(), snapshot: await snapshot(), evidence: await evidence(), audit: await auditReceipt() }
+      const pending = completeRoleAttempt(host(undefined, async () => { entered.resolve(); await release.promise }),
+        captured.attempt, collection(), difference, owner, 2n)
+      try {
+        await waitForGate(entered, pending, t.signal)
+        assert.deepEqual({ state: await state(), snapshot: await snapshot(), evidence: await evidence(), audit: await auditReceipt() }, before)
+        await observer.query('BEGIN')
+        try {
+          await assert.rejects(observer.query('SELECT * FROM tenant_sync_visit_leases WHERE customer_tenant_id=$1 AND organization_id=$2 FOR UPDATE NOWAIT',
+            [customerTenantId, organizationId]), (error: unknown) => (error as { code?: string }).code === '55P03')
+        } finally { await observer.query('ROLLBACK') }
+      } finally { release.resolve(); await Promise.allSettled([pending]) }
+      assert.equal((await pending).status, 'committed')
+      assert.equal((await auditReceipt()).completed_revision, '2')
+      assert.equal(+(await auditReceipt()).last_completed_at, +(await state()).role_complete_checked_at)
+      await observer.query(`UPDATE tenant_audit_reconciliation_work SET requested_revision=3 WHERE organization_id=$1 AND customer_tenant_id=$2 AND resource_type='DIRECTORY_ROLES'`,[organizationId,customerTenantId])
+      const rollbackAttempt = await claimRoleAttempt(db, ctx, owner)
+      assert.equal(rollbackAttempt.status, 'claimed')
+      if (rollbackAttempt.status !== 'claimed') throw new Error('Expected rollback role claim')
+      const rollbackBefore = { state: await state(), snapshot: await snapshot(), evidence: await evidence(), audit: await auditReceipt() }
+      await assert.rejects(completeRoleAttempt(host(undefined, async () => { throw new Error('injected owned role commit failure') }),
+        rollbackAttempt.attempt, collection([role('rollback-owned')]), difference, owner, 3n), /injected owned role commit failure/)
+      assert.deepEqual({ state: await state(), snapshot: await snapshot(), evidence: await evidence(), audit: await auditReceipt() }, rollbackBefore)
+      assert.equal((await finishRoleAttempt(db, rollbackAttempt.attempt, 'FAILED', owner)).status, 'failed')
+      assert.equal(await db.$transaction(tx => releaseTenantVisitLease(tx as never, owner)), true)
+      const successor = await tryAcquireTenantVisitLease(db as never, scope, 300_000)
+      assert.ok(successor)
+      const retained = { state: await state(), snapshot: await snapshot(), evidence: await evidence() }
+      await assert.rejects(captureRoleAttempt(db, who, owner), TenantVisitLeaseLostError)
+      await assert.rejects(claimRoleAttempt(db, ctx, owner), TenantVisitLeaseLostError)
+      await assert.rejects(completeRoleAttempt(db, captured.attempt, collection(), difference, owner), TenantVisitLeaseLostError)
+      await assert.rejects(finishRoleAttempt(db, captured.attempt, 'FAILED', owner), TenantVisitLeaseLostError)
+      assert.deepEqual({ state: await state(), snapshot: await snapshot(), evidence: await evidence() }, retained)
+      const next = await captureRoleAttempt(db, who, successor)
+      assert.equal(next.status, 'claimed')
+      if (next.status !== 'claimed') throw new Error('Expected successor role claim')
+      assert.equal((await completeRoleAttempt(db, next.attempt, collection(), difference, successor, 2n)).status, 'committed')
+      assert.equal((await auditReceipt()).completed_revision, '2', 'stale revision leaves request 3 pending')
+      assert.equal(await db.$transaction(tx => releaseTenantVisitLease(tx as never, successor)), true)
+    })
     await t.test('runtime capture rejects retained marker on revoked/inactive authority, never legacy',async()=>{
       const before=await state()
       try {

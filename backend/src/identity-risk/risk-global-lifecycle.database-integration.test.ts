@@ -5,7 +5,7 @@ import test from 'node:test'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
-import { RiskGlobalWorkStore } from './risk-global-work-store.js'
+import { RiskGlobalWorkStore, riskTenantScopeOpaqueId } from './risk-global-work-store.js'
 import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
 import { WrappedRiskPseudonymProvider } from './pilot-pseudonym-provider.js'
 import { MailboxRiskProjector, MAILBOX_FIRST_SLICE_FLAGS } from './mailbox-risk-projector.service.js'
@@ -16,8 +16,12 @@ import { IDENTITY_RISK_CATALOG_VERSION, IDENTITY_RISK_ENGINE_VERSION } from './i
 import { approvedIdentitySignalDetectors } from './identity-risk-approved-evaluator.adapter.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
+import { releaseTenantVisitLease, tryAcquireTenantVisitLease } from '../tenants/tenant-visit-lease-store.js'
+import { tenantVisitLeaseLoss, TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { RiskAssessmentProjector } from './risk-assessment-projector.service.js'
 
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
+const registeredVisitCi = enabled && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1' && process.env.GITHUB_ACTIONS === 'true'
 async function fixture(work: (f: { prisma: PrismaService; client: pg.Client; scope: { organizationId: string; customerTenantId: string; environment: string }; store: WrappedRiskKeyStore }) => Promise<void>) {
   const url = assertDisposableTestDatabase()
   assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname), 'Disposable local DB only')
@@ -304,4 +308,131 @@ test('durable keyset advances beyond 1000 including failed/ineligible tenants, o
   }
   assert.equal(wrapped, true); assert.equal(foundLow, true)
   await work.releaseCycle(successor, deadline())
+}))
+
+test('physical visit owner fences separate-pg key creation, session diagnostics, retention and both source projectors', {
+  skip: !registeredVisitCi, timeout: 60_000, concurrency: false,
+}, () => fixture(async ({ prisma, client, scope, store }) => {
+  const old = await tryAcquireTenantVisitLease(prisma, scope, 300_000)
+  assert.ok(old)
+  assert.equal(await releaseTenantVisitLease(prisma, old), true)
+  const current = await tryAcquireTenantVisitLease(prisma, scope, 300_000)
+  assert.ok(current)
+  const lost = (error: unknown) => tenantVisitLeaseLoss(error) instanceof TenantVisitLeaseLostError
+  await assert.rejects(store.ensureVersion(scope, deadline(), undefined, old), lost)
+  assert.equal(await prisma.identityRiskPseudonymKeyVersion.count({ where: { customerTenantId: scope.customerTenantId } }), 0)
+  const key = await store.ensureVersion(scope, deadline(), undefined, current)
+  const expired = randomUUID()
+  await client.query(`INSERT INTO identity_risk_key_events(key_version_id,kind,bucket,correlation_id,expires_at)
+    VALUES($1,'SESSION_FAILED',date_trunc('minute',CURRENT_TIMESTAMP)-INTERVAL '91 days',$2,date_trunc('minute',CURRENT_TIMESTAMP)-INTERVAL '1 day')`, [key.id, expired])
+  const read = async () => (await client.query(`SELECT * FROM identity_risk_key_events
+    WHERE key_version_id=$1 ORDER BY kind,bucket`, [key.id])).rows
+  const before = await read()
+  const provider = new WrappedRiskPseudonymProvider(store)
+  const mailbox = new MailboxRiskProjector(provider)
+  for (const attempt of [
+    () => store.ciphertext(key, deadline(), old),
+    () => store.recordFailure(key, deadline(), old),
+    () => provider.pin(key, deadline(), old),
+    () => mailbox.load(scope, new Date(), deadline(), old),
+    () => new RiskAssessmentProjector(provider, mailbox).load(scope, new Date(), deadline(), old),
+  ]) {
+    await assert.rejects(attempt(), lost)
+    assert.deepEqual(await read(), before, 'stale diagnostics may neither append nor prune expired evidence')
+  }
+  // The real key admission adapter must retain its visit lock while blocked
+  // later on the key advisory lock; a different connection cannot take over.
+  const keyLock = `risk-key:${scope.environment}:${scope.organizationId}:${scope.customerTenantId}`
+  await client.query('BEGIN')
+  await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [keyLock])
+  const pending = store.ensureVersion(scope, deadline(), undefined, current)
+  try {
+    await waitForAdvisoryWait(client, keyLock, 'hawkview-mailbox-risk-read')
+    await assert.rejects(prisma.$transaction(tx => tx.$queryRawUnsafe(`SELECT generation FROM tenant_sync_visit_leases
+      WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid FOR UPDATE NOWAIT`, scope.customerTenantId, scope.organizationId)),
+    (error: unknown) => /55P03|could not obtain lock/i.test(String(error)))
+  } finally { await client.query('ROLLBACK'); assert.equal((await pending).id, key.id) }
+  const session = await provider.pin(key, deadline(), current)
+  session.close?.()
+  await store.recordFailure(key, deadline(), current)
+  const after = await read()
+  assert.ok(after.some(row => row.kind === 'SESSION_OPENED'))
+  assert.ok(after.some(row => row.kind === 'SESSION_FAILED'))
+  assert.ok(!after.some(row => row.correlation_id === expired), 'live guarded diagnostic retains bounded expiry cleanup')
+}))
+
+test('physical visit owner fences separate-pg attempt and failure adapters plus bounded evaluator and diagnostic commits', {
+  skip: !registeredVisitCi, timeout: 60_000, concurrency: false,
+}, () => fixture(async ({ prisma, client, scope }) => {
+  const cycles = new RiskGlobalWorkStore(), correlations: string[] = []
+  const old = await tryAcquireTenantVisitLease(prisma, scope, 300_000)
+  assert.ok(old)
+  const lost = (error: unknown) => tenantVisitLeaseLoss(error) instanceof TenantVisitLeaseLostError
+  const safety = new IdentityRiskSafetyService(prisma)
+  const evaluator = new IdentityRiskEvaluatorService(prisma, safety) as any
+  const scopeOnly = { organizationId: scope.organizationId, customerTenantId: scope.customerTenantId }
+  const now = new Date(), expiresAt = new Date(now.getTime() + 3_600_000)
+  const attempt = async (owner: typeof old) => {
+    const cycle = await cycles.claimCycle(deadline()); assert.ok(cycle); correlations.push(cycle.id)
+    try { return await cycles.recordAttempt(scope, cycle, deadline(), owner) }
+    finally { await cycles.releaseCycle(cycle, deadline()) }
+  }
+  try {
+    const oldAttempt = await attempt(old)
+    const request = { ...scopeOnly, executionDeadlineAt: deadline(), globalAttemptId: oldAttempt, visitOwner: old,
+      evaluationAt: now, windowStart: new Date(now.getTime() - 3_600_000), windowEnd: now,
+      engineVersion: IDENTITY_RISK_ENGINE_VERSION, catalogVersion: IDENTITY_RISK_CATALOG_VERSION }
+    const input = { request, platformNow: now, capability: 'UNAVAILABLE', runKey: randomUUID(), leaseToken: randomUUID(),
+      watermarkHash: 'a'.repeat(64), sourceContentHash: 'b'.repeat(64), expiresAt, aggregates: [], matches: [] }
+    const claimed = await evaluator.claimRun(input)
+    assert.ok(claimed.id)
+    assert.equal(await releaseTenantVisitLease(prisma, old), true)
+    const current = await tryAcquireTenantVisitLease(prisma, scope, 300_000)
+    assert.ok(current)
+    const currentAttempt = await attempt(current)
+    const headBefore = await prisma.identityRiskAttemptHead.findUniqueOrThrow({
+      where: { organizationId_customerTenantId_environment: scope },
+    })
+    await assert.rejects(attempt(old), lost)
+    assert.deepEqual(await prisma.identityRiskAttemptHead.findUniqueOrThrow({
+      where: { organizationId_customerTenantId_environment: scope },
+    }), headBefore, 'a stale separate-pg attempt cannot reset the successor causal head')
+    const freshRequest = () => ({ ...request, executionDeadlineAt: deadline(), globalAttemptId: currentAttempt })
+    const runBefore = await prisma.identityRiskEvaluationRun.findUniqueOrThrow({ where: { id: claimed.id } })
+    await assert.rejects(evaluator.claimRun({ ...input, request: freshRequest(), runKey: randomUUID() }), lost)
+    await assert.rejects(evaluator.persistCompletedRun({ ...input, request: freshRequest(), runId: claimed.id }), lost)
+    await assert.rejects(evaluator.failOwnedRun(freshRequest(), claimed.id, input.leaseToken, 'EVALUATION_FAILED'), lost)
+    assert.deepEqual(await prisma.identityRiskEvaluationRun.findUniqueOrThrow({ where: { id: claimed.id } }), runBefore)
+    assert.equal(await prisma.identityRiskRuleCoverage.count({ where: scopeOnly }), 0)
+    assert.equal(await prisma.identityRiskFinding.count({ where: scopeOnly }), 0)
+    const episodeId = randomUUID(); correlations.push(episodeId)
+    const blocked = { ...scopeOnly, episodeId, scopeType: 'GLOBAL' as const, executionDeadlineAt: deadline(), visitOwner: old }
+    const rejected = { ...scopeOnly, runKey: input.runKey, ruleId: 'HV-ID-CHG-001.v1', reasonCode: 'DETECTOR_FAILED',
+      now, executionDeadlineAt: deadline(), visitOwner: old }
+    const readDiagnostics = () => prisma.identityRiskOperationalEvent.findMany({ where: { OR: [
+      { correlationId: episodeId }, { scopeType: 'TENANT', scopeOpaqueId: riskTenantScopeOpaqueId(scope) },
+    ] }, orderBy: { id: 'asc' } })
+    const eventsBefore = await readDiagnostics()
+    await assert.rejects(safety.recordHardStopBlocked(blocked), lost)
+    await assert.rejects(safety.recordDetectorRejection(rejected), lost)
+    assert.deepEqual(await readDiagnostics(), eventsBefore)
+    await evaluator.failOwnedRun({ ...freshRequest(), visitOwner: current }, claimed.id, input.leaseToken, 'EVALUATION_FAILED')
+    assert.equal((await prisma.identityRiskEvaluationRun.findUniqueOrThrow({ where: { id: claimed.id } })).status, 'FAILED')
+    const next = { ...input, request: { ...freshRequest(), visitOwner: current }, runKey: randomUUID(), leaseToken: randomUUID() }
+    const nextClaim = await evaluator.claimRun(next)
+    assert.ok(nextClaim.id)
+    await evaluator.persistCompletedRun({ ...next, request: { ...next.request, executionDeadlineAt: deadline() }, runId: nextClaim.id })
+    assert.equal((await prisma.identityRiskEvaluationRun.findUniqueOrThrow({ where: { id: nextClaim.id } })).status, 'COMPLETED')
+    assert.equal((await prisma.identityRiskAttemptHead.findUniqueOrThrow({
+      where: { organizationId_customerTenantId_environment: scope },
+    })).completedRunId, nextClaim.id)
+    await safety.recordHardStopBlocked({ ...blocked, executionDeadlineAt: deadline(), visitOwner: current })
+    await safety.recordDetectorRejection({ ...rejected, executionDeadlineAt: deadline(), visitOwner: current })
+  } finally {
+    // Diagnostic correlation for detector rejection is random; clean only this
+    // fixture's opaque tenant scope, plus the explicit global-block episode.
+    await prisma.identityRiskOperationalEvent.deleteMany({ where: { OR: [
+      { correlationId: { in: correlations } }, { scopeType: 'TENANT', scopeOpaqueId: riskTenantScopeOpaqueId(scope) },
+    ] } })
+  }
 }))

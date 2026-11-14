@@ -19,7 +19,8 @@ import {
   IdentityRiskEvaluatorService,
   type IdentityRiskPlatformClock,
 } from './identity-risk-evaluator.service.js'
-import type { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
+import { IdentityRiskSafetyService } from './identity-risk-safety.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
 import { IdentityRiskService } from './identity-risk.service.js'
 import { projectMailboxEvidence, MAILBOX_FIRST_SLICE_FLAGS } from './mailbox-risk-projector.service.js'
 import { mailboxScope, mailboxKey, mailboxNow, syntheticManagedProvider, mailboxRule, mailboxSnapshots, boundedMailboxSnapshots } from './mailbox-risk.test-fixtures.js'
@@ -142,6 +143,34 @@ function safety(
     },
   } as unknown as IdentityRiskSafetyService
   return { service, calls }
+}
+
+// Exercise the production activation boundary in held-evaluator races. State
+// reads stay synthetic; any control/event access before rejecting the stale
+// owner fails the test, so forwarding alone cannot satisfy these regressions.
+function safetyWithVisitActivation(currentGeneration: () => bigint) {
+  const observed = safety()
+  const transaction = {
+    $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async (sql: string, ...values: unknown[]) => {
+      if (sql.includes('FROM organizations')) return [{ id: organizationId }]
+      if (sql.includes('FROM customer_tenants')) return [{ id: tenantId }]
+      if (sql.includes('FROM tenant_sync_visit_leases')) {
+        return values[3] === currentGeneration().toString() ? [{ generation: currentGeneration().toString() }] : []
+      }
+      throw new Error('Unexpected activation query')
+    },
+    get identityRiskOperationalControl() { throw new Error('Stale activation reached controls') },
+    get identityRiskOperationalEvent() { throw new Error('Stale activation reached events') },
+  }
+  const real = new IdentityRiskSafetyService({
+    $transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => work(transaction),
+  } as unknown as PrismaService)
+  observed.service.activate = async input => {
+    observed.calls.activated.push(input)
+    return real.activate(input)
+  }
+  return observed
 }
 
 function persistence(activeControls: Array<Record<string, unknown>> = []) {
@@ -2028,6 +2057,240 @@ test('source scope mismatch hard-stops without run or detector writes', async ()
   } finally {
     if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
     else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('superseded visit cannot publish a global hard stop after held source loading', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    let sourceEntered!: () => void
+    let resumeSource!: () => void
+    const entered = new Promise<void>(resolve => { sourceEntered = resolve })
+    const held = new Promise<void>(resolve => { resumeSource = resolve })
+    const visitOwner = {
+      organizationId,
+      customerTenantId: tenantId,
+      token: '55555555-5555-4555-8555-555555555555',
+      generation: 1n,
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+    }
+    let liveGeneration = visitOwner.generation
+    const mismatchedLoader = async () => {
+      sourceEntered()
+      await held
+      return {
+        context: {
+          organizationId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          customerTenantId: tenantId,
+          evaluationAt,
+          engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+          catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        },
+        sourceEnvelopes: [],
+        orderedSourceWatermarks: ['directory-0001'],
+        earliestSourceExpiry: null,
+        capability: 'FULL' as const,
+      }
+    }
+    const store = persistence()
+    const observedSafety = safetyWithVisitActivation(() => liveGeneration)
+    const pending = new IdentityRiskEvaluatorService(
+      store.prisma,
+      observedSafety.service,
+    ).evaluate({ ...request(noMatchDetector, mismatchedLoader), visitOwner })
+    await entered
+    liveGeneration = 2n // A successor now owns the tenant visit while A's loader is held.
+    resumeSource()
+    await assert.rejects(pending, TenantVisitLeaseLostError)
+
+    assert.equal(liveGeneration, 2n)
+    assert.equal(observedSafety.calls.activated.length, 1)
+    assert.deepEqual(observedSafety.calls.activated[0]?.scope, { type: 'GLOBAL' })
+    assert.equal(observedSafety.calls.activated[0]?.visitOwner, visitOwner)
+    assert.equal(store.calls.runCreates, 0)
+    assert.equal(store.calls.transactions, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('superseded visit cannot publish a tenant hard stop after the final safety read', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  try {
+    let secondReadEntered!: () => void
+    let resumeSecondRead!: () => void
+    const entered = new Promise<void>(resolve => { secondReadEntered = resolve })
+    const held = new Promise<void>(resolve => { resumeSecondRead = resolve })
+    const visitOwner = {
+      organizationId,
+      customerTenantId: tenantId,
+      token: '66666666-6666-4666-8666-666666666666',
+      generation: 1n,
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+    }
+    let liveGeneration = visitOwner.generation
+    const observedSafety = safetyWithVisitActivation(() => liveGeneration)
+    const baseStateForTenant = observedSafety.service.stateForTenant.bind(observedSafety.service)
+    let reads = 0
+    const heldSafety = {
+      ...(observedSafety.service as unknown as Record<string, unknown>),
+      stateForTenant: async (...args: Parameters<IdentityRiskSafetyService['stateForTenant']>) => {
+        reads += 1
+        if (reads === 2) {
+          secondReadEntered()
+          await held
+        }
+        return baseStateForTenant(...args)
+      },
+    } as unknown as IdentityRiskSafetyService
+    const store = persistence()
+    const pending = new IdentityRiskEvaluatorService(
+      store.prisma,
+      heldSafety,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate({
+      ...request(noMatchDetector, async () => ({
+        context: {
+          organizationId,
+          customerTenantId: tenantId,
+          evaluationAt,
+          engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+          catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        },
+        sourceEnvelopes: [
+          immutableSource(sourcePayload([{ name: 'enabled', value: true }], 'conflict-a')),
+          immutableSource(sourcePayload([{ name: 'enabled', value: false }], 'conflict-b')),
+        ],
+        orderedSourceWatermarks: ['directory-0001'],
+        earliestSourceExpiry: null,
+        capability: 'FULL',
+      })),
+      visitOwner,
+    })
+
+    await entered
+    liveGeneration = 2n // A successor takes over before A's final safety read returns.
+    resumeSecondRead()
+    await assert.rejects(pending, TenantVisitLeaseLostError)
+
+    assert.equal(liveGeneration, 2n)
+    assert.equal(reads, 2)
+    assert.equal(observedSafety.calls.activated.length, 1)
+    assert.equal(observedSafety.calls.activated[0]?.reasonCode, 'SOURCE_INTEGRITY_CONFLICT')
+    assert.deepEqual(observedSafety.calls.activated[0]?.scope, {
+      type: 'TENANT', organizationId, customerTenantId: tenantId,
+    })
+    assert.equal(observedSafety.calls.activated[0]?.visitOwner, visitOwner)
+    assert.equal(store.calls.runCreates, 0)
+    assert.equal(store.calls.transactions, 0)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+  }
+})
+
+test('post-claim source conflict cannot publish a tenant hard stop after takeover', async () => {
+  const previous = process.env.HAWKVIEW_IDENTITY_RISK_MODE
+  const previousRollout = process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT
+  process.env.HAWKVIEW_IDENTITY_RISK_MODE = 'shadow'
+  delete process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT
+  try {
+    let claimReturned!: () => void
+    let resumeClaim!: () => void
+    const entered = new Promise<void>(resolve => { claimReturned = resolve })
+    const held = new Promise<void>(resolve => { resumeClaim = resolve })
+    const visitOwner = {
+      organizationId,
+      customerTenantId: tenantId,
+      token: '77777777-7777-4777-8777-777777777777',
+      generation: 1n,
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+    }
+    let liveGeneration = visitOwner.generation
+    let ownerChecks = 0
+    let runCreates = 0
+    let transactions = 0
+    const transaction = {
+      $queryRawUnsafe: async (sql: string, ...params: unknown[]) => {
+        if (sql.includes('FROM organizations')) return [{ id: organizationId }]
+        if (sql.includes('FROM customer_tenants')) return [{ id: tenantId }]
+        if (sql.includes('FROM tenant_sync_visit_leases')) {
+          ownerChecks += 1
+          assert.deepEqual(params, [tenantId, organizationId, visitOwner.token, '1'])
+          assert.match(sql, /expires_at > clock_timestamp\(\)/)
+          return liveGeneration === visitOwner.generation ? [{ generation: '1' }] : []
+        }
+        if (sql.includes("current_setting('TimeZone')")) return [{ timezone: 'UTC' }]
+        throw new Error('Unexpected claim query')
+      },
+      $executeRawUnsafe: async () => [],
+      identityRiskOperationalControl: { findMany: async () => [] },
+      identityRiskEvaluationRun: {
+        findUnique: async () => ({
+          id: '33333333-3333-4333-8333-333333333333',
+          status: 'COMPLETED',
+          leaseExpiresAt: null,
+          sourceContentHash: 'different-immutable-content',
+        }),
+        create: async () => { runCreates += 1; throw new Error('Unexpected run creation') },
+      },
+    }
+    const prisma = {
+      $transaction: async (work: (tx: typeof transaction) => Promise<unknown>) => {
+        transactions += 1
+        const result = await work(transaction)
+        assert.equal(result, 'SOURCE_INTEGRITY_CONFLICT')
+        // Model the gap after the guarded claim commits but before the
+        // separate safety-control activation begins.
+        claimReturned()
+        await held
+        return result
+      },
+    } as unknown as PrismaService
+    const observedSafety = safetyWithVisitActivation(() => liveGeneration)
+    const pending = new IdentityRiskEvaluatorService(
+      prisma,
+      observedSafety.service,
+      { now: () => evaluationAt } as IdentityRiskPlatformClock,
+    ).evaluate({
+      ...request(noMatchDetector, async () => ({
+        context: {
+          organizationId,
+          customerTenantId: tenantId,
+          evaluationAt,
+          engineVersion: IDENTITY_RISK_ENGINE_VERSION,
+          catalogVersion: IDENTITY_RISK_CATALOG_VERSION,
+        },
+        sourceEnvelopes: [immutableSource(sourcePayload())],
+        orderedSourceWatermarks: ['directory-0001'],
+        earliestSourceExpiry: null,
+        capability: 'FULL',
+      })),
+      visitOwner,
+    })
+
+    await entered
+    assert.equal(ownerChecks, 1)
+    liveGeneration = 2n
+    resumeClaim()
+    await assert.rejects(pending, TenantVisitLeaseLostError)
+
+    assert.equal(transactions, 1)
+    assert.equal(runCreates, 0)
+    assert.equal(observedSafety.calls.activated.length, 1)
+    assert.equal(observedSafety.calls.activated[0]?.reasonCode, 'SOURCE_INTEGRITY_CONFLICT')
+    assert.deepEqual(observedSafety.calls.activated[0]?.scope, {
+      type: 'TENANT', organizationId, customerTenantId: tenantId,
+    })
+    assert.equal(observedSafety.calls.activated[0]?.visitOwner, visitOwner)
+  } finally {
+    if (previous === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_MODE
+    else process.env.HAWKVIEW_IDENTITY_RISK_MODE = previous
+    if (previousRollout === undefined) delete process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT
+    else process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT = previousRollout
   }
 })
 

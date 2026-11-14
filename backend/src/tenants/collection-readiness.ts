@@ -1,4 +1,5 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
+import { syncFreshnessWindow } from './sync-freshness-policy.js'
 import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
@@ -250,11 +251,6 @@ export function microsoftRiskSourceAllowed(input: Pick<ReadinessInput, 'connecti
   return grants === 'CONFIRMED' && fromSyncState(input.syncStates.find((state) => state.resourceType === 'LICENSES'), now, 'daily').state === 'READY' && entraP2Applicability(input.licenseServicePlans) === 'APPLICABLE'
 }
 
-const CURRENT_MS = 15 * 60 * 1000
-const AGING_MS = 2 * 60 * 60 * 1000
-const DAILY_CURRENT_MS = 24 * 60 * 60 * 1000
-const DAILY_AGING_MS = 26 * 60 * 60 * 1000
-
 export const M365_ACTIVITY_CONTENT_TYPES = [
   'Audit.Exchange',
   'Audit.AzureActiveDirectory',
@@ -330,10 +326,9 @@ function freshness(
   if (!validSuccess) return lastSuccessfulAt ? 'UNKNOWN' : 'NEVER_SUCCEEDED'
   const age = now.getTime() - validSuccess.getTime()
   if (age < 0) return 'UNKNOWN'
-  const current = cadence === 'incremental' ? CURRENT_MS : DAILY_CURRENT_MS
-  const aging = cadence === 'incremental' ? AGING_MS : DAILY_AGING_MS
-  if (age <= current) return 'CURRENT'
-  if (age <= aging) return 'AGING'
+  const window = syncFreshnessWindow(cadence)
+  if (age <= window.currentMs) return 'CURRENT'
+  if (age <= window.agingMs) return 'AGING'
   return 'STALE'
 }
 

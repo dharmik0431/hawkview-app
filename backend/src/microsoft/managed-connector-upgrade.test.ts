@@ -7,6 +7,7 @@ import { MicrosoftConsentService } from './microsoft-consent.service.js'
 import { TenantSyncService } from '../tenants/tenant-sync.service.js'
 import { managedSyncTestDatabase } from '../tenants/managed-sync.test-fixtures.js'
 import { withManagedAuthority } from './managed-connector-authority.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
 
 const envNames = ['SECRET_ENCRYPTION_KEY', 'SECRET_ENCRYPTION_KEY_VERSION', 'SECRET_ENCRYPTION_KEY_PREVIOUS']
 const saved = envNames.map(name => process.env[name])
@@ -19,11 +20,13 @@ const copy = <T>(value:T):T => structuredClone(value)
 async function fixture() {
   const tenant = { id: randomUUID(), organizationId: randomUUID(), microsoftTenantId: randomUUID(), status: 'ACTIVE', displayName: null, primaryDomain: null,
     connection: { status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED', clientId: null, credentialReference: null } }
+  const owner = { customerTenantId: tenant.id, organizationId: tenant.organizationId,
+    token: randomUUID(), generation: 4n, expiresAt: new Date('2030-01-01T00:00:00Z') }
   const world = {
     authority: { configurationRevision: randomUUID(), clientId: randomUUID(), homeTenantId: randomUUID(), credentialReference: '',
       operationId: null as string | null, fingerprint: null as string | null, credentialExpiresAt: new Date('2030-01-01T00:00:00Z') as Date | null },
     secrets: [] as any[], revisions: [] as string[], active: false, trace: [] as string[],
-    leases: 0, tokens: 0, collectors: [] as string[], sourceWrites: 0, failAt: '' as string,
+    leases: 0, tokens: 0, collectors: [] as string[], sourceWrites: 0, failAt: '' as string, visitLive: true,
   }
   const db:any = managedSyncTestDatabase({
     syncState: {
@@ -51,6 +54,17 @@ async function fixture() {
     }
     if(sql.includes('FROM platform_microsoft_connectors'))return [copy(world.authority)]
     if(sql.includes('UNION ALL SELECT revision'))return world.secrets.some(s=>s.id===v[0]||s.name===v[1])||world.revisions.includes(v[0])?[{id:v[0]}]:[]
+    if(sql.startsWith('SELECT id FROM organizations')) {
+      assert.deepEqual(v,[owner.organizationId]);world.trace.push('organization-lock');return [{id:owner.organizationId}]
+    }
+    if(sql.startsWith('SELECT id FROM customer_tenants')) {
+      assert.deepEqual(v,[owner.customerTenantId,owner.organizationId]);world.trace.push('tenant-lock');return [{id:owner.customerTenantId}]
+    }
+    if(sql.includes('FROM tenant_sync_visit_leases')) {
+      assert.match(sql,/expires_at > clock_timestamp\(\) FOR SHARE/)
+      assert.deepEqual(v,[owner.customerTenantId,owner.organizationId,owner.token,'4'])
+      world.trace.push('owner-lock');return world.visitLive?[{generation:'4'}]:[]
+    }
     return utcQuery(sql,...v)
   }
   db.$executeRawUnsafe=async(sql:string,...v:any[])=>{
@@ -91,8 +105,41 @@ async function fixture() {
   sync.fetchGraphPage=async()=>Response.json({value:[],'@odata.deltaLink':'https://graph.microsoft.com/v1.0/users/delta?synthetic'})
   for(const method of ['syncSignInLogs','syncDirectoryAuditLogs','syncM365AuditActivity'])sync[method]=async()=>{world.collectors.push(method)}
   sync.refreshCollectionFieldStates=async()=>{}
-  return {world,db,secret,consent,tenant,run:()=>sync.syncConnectedTenant(tenant,false,{incrementalOnly:true,includeBundle:false})}
+  return {world,db,secret,consent,tenant,owner,
+    run:()=>sync.syncConnectedTenant(tenant,false,{incrementalOnly:true,includeBundle:false}),
+    runOwned:()=>sync.syncConnectedTenantWithinMemoryLane(tenant,false,{incrementalOnly:true,includeBundle:false,visitOwner:owner})}
 }
+
+test('actual owned sync rejects stale legacy promotion before immutable writes, resource claims or provider calls',async()=>{
+  const f=await fixture();f.world.visitLive=false
+  const before=copy({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions})
+  await assert.rejects(f.runOwned,(error:unknown)=>error instanceof TenantVisitLeaseLostError)
+  assert.deepEqual({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions},before)
+  assert.equal(f.world.tokens,0);assert.equal(f.world.leases,0);assert.equal(f.world.sourceWrites,0)
+  assert.deepEqual(f.world.collectors,[])
+  assert.deepEqual(f.world.trace.slice(-4),['G-exclusive','organization-lock','tenant-lock','owner-lock'])
+  assert.equal(f.world.trace.includes('legacy-secret-lock'),false)
+})
+
+test('live owned promotion holds global, organization, tenant and owner order through immutable publication',async()=>{
+  const f=await fixture()
+  await f.consent.upgradeLegacyManagedConnector(f.owner)
+  assert.deepEqual(f.world.trace.slice(0,5),['G-exclusive','organization-lock','tenant-lock','owner-lock','legacy-secret-lock'])
+  assert.ok(f.world.trace.indexOf('owner-lock')<f.world.trace.indexOf('insert-immutable'))
+  assert.ok(f.world.trace.indexOf('insert-immutable')<f.world.trace.indexOf('publish'))
+  const before=copy({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions})
+  f.world.visitLive=false
+  await assert.rejects(f.consent.upgradeLegacyManagedConnector(f.owner),(error:unknown)=>error instanceof TenantVisitLeaseLostError)
+  assert.deepEqual({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions},before)
+})
+
+for(const failure of ['secret','commit'])test(`owned promotion rolls back all publication state after ${failure} failure`,async()=>{
+  const f=await fixture();f.world.failAt=failure
+  const before=copy({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions})
+  await assert.rejects(f.consent.upgradeLegacyManagedConnector(f.owner),/injected/)
+  assert.deepEqual({authority:f.world.authority,secrets:f.world.secrets,revisions:f.world.revisions},before)
+  assert.ok(f.world.trace.includes('owner-lock'))
+})
 
 test('legacy managed authority from additive migration reaches actual sync only after immutable promotion',async()=>{
   const f=await fixture(),before=copy(f.world.authority),oldSecret=copy(f.world.secrets[0])

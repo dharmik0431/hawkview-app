@@ -196,10 +196,10 @@ test('actual mailbox directory, settings, rules and optional configuration enfor
     ;(service as any).saveSnapshot = async () => { saves += 1 }
     ;(service as any).fetchGraphPage = async () => { fetches += 1; return new Response(new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(1025)) }, cancel() { cancelled = true; throw new Error('hostile cancel') } })) }
     const limits = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pageBytes: 1024 }
-    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', limits), /bounded page-size limit/, method)
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', ...(method === 'syncExchangeMailboxSettings' ? [undefined, limits] : [limits])), /bounded page-size limit/, method)
     assert.equal(cancelled, true, method); assert.equal(saves, 0, method); assert.equal(fetches, 1, method)
     fetches = 0
-    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', { ...limits, collectorDeadlineMs: 0 }), /bounded.*(?:limit|deadline)/, method)
+    await assert.rejects(() => (service as any)[method](boundedTenant, 'token', ...(method === 'syncExchangeMailboxSettings' ? [undefined, { ...limits, collectorDeadlineMs: 0 }] : [{ ...limits, collectorDeadlineMs: 0 }])), /bounded.*(?:limit|deadline)/, method)
     assert.equal(fetches, 0, method)
   }
 })
@@ -260,6 +260,30 @@ test('actual full sync stops at a bounded USERS failure without a successful che
   assert.deepEqual(updates, [{ where: { customerTenantId_resourceType: { customerTenantId: 'tenant', resourceType: 'USERS' } }, data: {
     status: 'FAILED', lastErrorCode: 'HAWKVIEW_CAPACITY_GUARD', lastErrorMessage: 'HawkView stopped the user directory refresh at a safety limit and retained the previous data. Contact HawkView support if this continues.', consecutiveFailures: { increment: 1 },
   } }])
+})
+
+test('failed forced full USERS keeps its old delta invalidated before any provider work', async () => {
+  const state: any = { id: 'state', deltaLink: 'previous-delta', lastSuccessfulAt: new Date() }
+  const updates: any[] = []
+  const service = new TenantSyncService(managedSyncTestDatabase({
+    syncState: {
+      findUnique: async () => ({ ...state }),
+      updateMany: async ({ data }: any) => { Object.assign(state, data); return { count: 1 } },
+      update: async ({ data }: any) => { updates.push(data); Object.assign(state, data) },
+    },
+  }, boundedTenant) as any, { getCapturedManagedAccessToken: managedSyncTestToken(boundedTenant) } as any,
+  {} as any, {} as any, {} as any, { syncTenant: async () => [] } as any)
+  ;(service as any).synchronizeUsers = async (_tenant: unknown, _token: string, delta: string | null) => {
+    assert.equal(delta, null)
+    assert.equal(state.deltaLink, null, 'claim cleared the durable checkpoint before enumeration starts')
+    throw new Error('synthetic user collection failure')
+  }
+  await assert.rejects(() => (service as any).syncConnectedTenant(boundedTenant, false, {
+    includeBundle: false, forceFullUsers: true,
+  }), /synthetic user collection failure/)
+  assert.equal(state.deltaLink, null, 'failure cannot restore the earlier delta')
+  assert.equal(state.status, 'FAILED')
+  assert.equal(updates.some(update => update.status === 'SUCCEEDED'), false)
 })
 
 test('singletons and accepted domains reject oversized streaming bodies before successful evidence', async () => {
@@ -818,7 +842,8 @@ test('actual Exchange JSON paths accept the exact streamed page-byte cap with cl
     const exact = JSON.stringify({ ...fixture, padding: 'x'.repeat(1024 - Buffer.byteLength(base, 'utf8')) })
     assert.equal(Buffer.byteLength(exact, 'utf8'), 1024)
     ;(service as any).fetchGraphPage = async () => new Response(exact)
-    const result = await (service as any)[method](boundedTenant, 'token', { ...EXCHANGE_JSON_COLLECTION_LIMITS, pageBytes: 1024 })
+    const limits = { ...EXCHANGE_JSON_COLLECTION_LIMITS, pageBytes: 1024 }
+    const result = await (service as any)[method](boundedTenant, 'token', ...(method === 'syncExchangeMailboxSettings' ? [undefined, limits] : [limits]))
     const evidence = JSON.stringify(method === 'collectExchangeReadOnlyMailboxes' ? result : saved)
     assert.equal(evidence.includes('not-retained'), false, method)
     assert.equal(evidence.includes('padding'), false, method)
@@ -1125,6 +1150,9 @@ function aggregateSyncFixture(options: {
   rejected?: string[]
   persistedFailures?: Array<{ resourceType: string; lastErrorCode?: string }>
   initial?: boolean
+  forceFullUsers?: boolean
+  preserveInventoryFailureCooldowns?: boolean
+  inventoryStates?: any[]
 } = {}) {
   const tenant = {
     ...boundedTenant,
@@ -1134,10 +1162,11 @@ function aggregateSyncFixture(options: {
   const messages: string[] = []
   const incidents: any[] = []
   const stateWrites: string[] = []
+  const userClaims: any[] = []
   const prisma = utcTestDatabase({
     syncState: {
       findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: options.initial ? null : new Date(), deltaLink: 'previous-delta' }),
-      updateMany: async () => { stateWrites.push('USERS:RUNNING'); return { count: 1 } },
+      updateMany: async (args: any) => { userClaims.push(args); stateWrites.push('USERS:RUNNING'); return { count: 1 } },
       update: async ({ where, data }: any) => {
         assert.equal(where.customerTenantId_resourceType.resourceType, 'USERS')
         assert.equal(data.deltaLink, 'next-delta')
@@ -1147,6 +1176,7 @@ function aggregateSyncFixture(options: {
       findMany: async ({ where }: any) => {
         assert.equal(where.organizationId, tenant.organizationId)
         assert.equal(where.customerTenantId, tenant.id)
+        if (where.resourceType?.notIn) return options.inventoryStates ?? []
         if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
         assert.ok(where.lastAttemptAt.gte instanceof Date)
         return (options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null }))
@@ -1158,7 +1188,7 @@ function aggregateSyncFixture(options: {
     { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
     { publishIncident: async (incident: any) => { incidents.push(incident) } } as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async (_tenant: unknown, _token: string, delta: string) => {
-    assert.equal(delta, 'previous-delta')
+    assert.equal(delta, options.forceFullUsers ? null : 'previous-delta')
     return { deltaLink: 'next-delta' }
   }
   const collect = async (resource: string) => {
@@ -1179,10 +1209,95 @@ function aggregateSyncFixture(options: {
   ;(service as any).syncEntraCollection = (_tenant: unknown, _token: string, resource: string) => collect(resource)
   ;(service as any).refreshCollectionFieldStates = async () => undefined
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
-  return { calls, messages, incidents, stateWrites,
-    run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
+  return { calls, messages, incidents, stateWrites, userClaims,
+    run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, {
+      incrementalOnly, includeBundle: false, forceFullUsers: options.forceFullUsers,
+      preserveInventoryFailureCooldowns: options.preserveInventoryFailureCooldowns,
+    }),
   }
 }
+
+test('opt-in full USERS discards the prior delta in the lease before collecting; default full mode keeps it', async () => {
+  const ordinary = aggregateSyncFixture()
+  assert.equal((await ordinary.run()).status, 'SUCCEEDED')
+  assert.equal(ordinary.userClaims[0].data.deltaLink, undefined)
+
+  const forced = aggregateSyncFixture({ forceFullUsers: true })
+  assert.equal((await forced.run()).status, 'SUCCEEDED')
+  assert.equal(forced.userClaims[0].data.deltaLink, null)
+  assert.deepEqual(forced.stateWrites, ['USERS:RUNNING', 'USERS:SUCCEEDED'])
+
+  const invalid = aggregateSyncFixture({ forceFullUsers: true })
+  await assert.rejects(() => invalid.run(true), /cannot run in incremental-only mode/)
+  assert.deepEqual(invalid.userClaims, [])
+})
+
+test('twenty-minute full mode preserves failed inventory cooldowns and reports the deferred portion as incomplete', async t => {
+  const now = new Date('2026-11-14T12:00:00Z')
+  t.mock.timers.enable({ apis: ['Date'], now })
+  const failedState = (resourceType: string, ageMinutes: number, lastErrorCode = 'MICROSOFT_PERMISSION_REQUIRED') => ({
+    resourceType, status: 'FAILED', lastSuccessfulAt: new Date(now.getTime() - 2 * 86_400_000),
+    lastAttemptAt: new Date(now.getTime() - ageMinutes * 60_000), lastErrorCode,
+    lastErrorMessage: null, consecutiveFailures: 1,
+  })
+  const inventoryStates = [failedState('AUTH_REGISTRATIONS', 20), failedState('GROUPS', 20, '500'),
+    failedState('DOMAINS', 20), failedState('SIGN_INS', 1)]
+  const legacy = aggregateSyncFixture({ inventoryStates })
+  assert.equal((await legacy.run()).status, 'SUCCEEDED')
+  assert.ok(legacy.calls.includes('AUTH_REGISTRATIONS') && legacy.calls.includes('GROUPS') && legacy.calls.includes('DOMAINS'))
+
+  const guarded = aggregateSyncFixture({ initial: true, forceFullUsers: true,
+    preserveInventoryFailureCooldowns: true, inventoryStates })
+  const result = await guarded.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['AUTH_REGISTRATIONS', 'DOMAINS', 'GROUPS'])
+  assert.deepEqual(result.deferredResources, ['AUTH_REGISTRATIONS', 'DOMAINS', 'DOMAIN_DNS_HEALTH', 'GROUPS'])
+  assert.deepEqual(guarded.calls, legacy.calls.filter(resource => !result.deferredResources.includes(resource)),
+    'all independent healthy collectors and activity streams remain included')
+  assert.ok(guarded.calls.includes('SIGN_INS') && guarded.calls.includes('AUDIT_LOGS') && guarded.calls.includes('M365_AUDIT'))
+  assert.equal(guarded.incidents[0].eventType, 'tenant.initial_sync_action_required')
+  assert.deepEqual(guarded.stateWrites, ['USERS:RUNNING', 'USERS:SUCCEEDED'], 'deferral must not fabricate a new persisted attempt')
+
+  const due = aggregateSyncFixture({ forceFullUsers: true, preserveInventoryFailureCooldowns: true,
+    inventoryStates: [failedState('AUTH_REGISTRATIONS', 24 * 60), failedState('GROUPS', 30, '500'), failedState('DOMAINS', 60)] })
+  assert.equal((await due.run()).status, 'SUCCEEDED')
+  assert.deepEqual(due.calls, legacy.calls, 'each failed resource resumes at its existing daily/hourly/targeted boundary')
+})
+
+test('twenty-minute full mode cannot claim completion while an inventory remains running', async t => {
+  const now = new Date('2026-11-14T12:00:00Z')
+  t.mock.timers.enable({ apis: ['Date'], now })
+  const fixture = aggregateSyncFixture({ forceFullUsers: true, preserveInventoryFailureCooldowns: true,
+    inventoryStates: [{ resourceType: 'GROUPS', status: 'RUNNING', lastSuccessfulAt: now, lastAttemptAt: now,
+      lastErrorCode: null, lastErrorMessage: null }] })
+  const result = await fixture.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, [])
+  assert.deepEqual(result.deferredResources, ['GROUPS'])
+  assert.equal(fixture.calls.includes('GROUPS'), false)
+})
+
+test('failed full-pass domain discovery defers DNS without fresh state while independent work continues', async () => {
+  for (const forceFullUsers of [false, true]) {
+    const failed = aggregateSyncFixture({
+      forceFullUsers, preserveInventoryFailureCooldowns: forceFullUsers, rejected: ['DOMAINS'],
+    })
+    const result = await failed.run()
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, ['DOMAINS'])
+    assert.deepEqual(result.deferredResources, ['DOMAIN_DNS_HEALTH'])
+    assert.equal(failed.calls.includes('DOMAINS'), true)
+    assert.equal(failed.calls.includes('DOMAIN_DNS_HEALTH'), false,
+      'the dependent collector cannot stamp fresh status, evidence, or audit receipt')
+    assert.ok(failed.calls.includes('GROUPS') && failed.calls.includes('AUTH_REGISTRATIONS') && failed.calls.includes('M365_AUDIT'))
+    assert.deepEqual(failed.stateWrites, ['USERS:RUNNING', 'USERS:SUCCEEDED'],
+      'do not synthesize a DNS failure, attempt, or success')
+
+    const recovered = aggregateSyncFixture({ forceFullUsers, preserveInventoryFailureCooldowns: forceFullUsers })
+    assert.equal((await recovered.run()).status, 'SUCCEEDED')
+    assert.equal(recovered.calls.includes('DOMAIN_DNS_HEALTH'), true)
+  }
+})
 
 test('actual sync aggregates rejected collectors with current persisted failures', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })

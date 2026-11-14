@@ -1,8 +1,205 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { NotificationsService } from './notifications.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
 
 const hostile = 'user@example.test access_token=never password=never https://private.example/path'
+
+test('optional visit owner fences notice and read-state reset in one transaction', async () => {
+  const owner = {
+    organizationId: 'org', customerTenantId: 'tenant', token: 'lease-token',
+    generation: 1n, expiresAt: new Date('2026-10-24T00:00:00Z'),
+  }
+  const input = {
+    organizationId: owner.organizationId, customerTenantId: owner.customerTenantId,
+    eventType: 'tenant.connection_lost', category: 'error' as const,
+    title: 'Connection lost', description: 'Synthetic test', dedupeKey: 'tenant:tenant:connection', source: 'test',
+  }
+  let inTransaction = false
+  let live = true
+  const writes: string[] = []
+  const database: any = {
+    $transaction: async (work: (tx: any) => Promise<unknown>) => {
+      inTransaction = true
+      try { return await work(database) } finally { inTransaction = false }
+    },
+    $queryRawUnsafe: async (sql: string) => {
+      if (sql.includes('FROM organizations')) return [{ id: owner.organizationId }]
+      if (sql.includes('FROM customer_tenants')) return [{ id: owner.customerTenantId }]
+      if (sql.includes('FROM tenant_sync_visit_leases')) return live ? [{ generation: '1' }] : []
+      throw new Error('unexpected query')
+    },
+    notification: { upsert: async () => {
+      assert.equal(inTransaction, true)
+      writes.push('upsert')
+      return { ...input, recipientUserId: null, id: 'notice', occurrenceCount: 1 }
+    } },
+    notificationUserState: { deleteMany: async () => {
+      assert.equal(inTransaction, true)
+      writes.push('clear')
+      return { count: 0 }
+    } },
+  }
+  const service = new NotificationsService(database)
+  ;(service as any).logger = { log: () => {}, error: () => {} }
+  assert.equal((await service.publishIncident(input, owner))?.id, 'notice')
+  assert.deepEqual(writes, ['upsert', 'clear'])
+
+  live = false
+  await assert.rejects(() => service.publishIncident(input, owner),
+    (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  await assert.rejects(() => service.publishIncident({ ...input, customerTenantId: 'other' }, owner),
+    (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  assert.deepEqual(writes, ['upsert', 'clear'], 'stale or wrong-scope owner cannot mutate notices')
+})
+
+test('owner-bound incident recovery inserts only missing notice and preserves an existing alert and read state', async () => {
+  const owner = {
+    organizationId: 'org', customerTenantId: 'tenant', token: 'lease-token',
+    generation: 1n, expiresAt: new Date('2026-10-24T00:00:00Z'),
+  }
+  const input = {
+    organizationId: owner.organizationId, customerTenantId: owner.customerTenantId,
+    eventType: 'security.directory_audit', category: 'warning' as const,
+    title: 'Synthetic event', description: 'Synthetic test',
+    dedupeKey: 'security:directory-audit:synthetic', source: 'test',
+  }
+  let inTransaction = false
+  let live = true
+  let notice: any = null
+  let failInsert = false
+  let inserts = 0
+  let completions = 0
+  const database: any = {
+    $transaction: async (work: (tx: any) => Promise<unknown>) => {
+      inTransaction = true
+      try { return await work(database) } finally { inTransaction = false }
+    },
+    $queryRawUnsafe: async (sql: string) => {
+      assert.equal(inTransaction, true)
+      if (sql.includes('FROM organizations')) return [{ id: owner.organizationId }]
+      if (sql.includes('FROM customer_tenants')) return [{ id: owner.customerTenantId }]
+      if (sql.includes('FROM tenant_sync_visit_leases')) return live ? [{ generation: '1' }] : []
+      throw new Error('unexpected query')
+    },
+    notification: {
+      createMany: async ({ data, skipDuplicates }: any) => {
+        assert.equal(inTransaction, true)
+        assert.equal(skipDuplicates, true)
+        if (failInsert) throw new Error('synthetic persistence failure')
+        if (notice) return { count: 0 }
+        notice = { id: 'notice', occurrenceCount: 1, resolvedAt: null, ...data[0] }
+        inserts++
+        return { count: 1 }
+      },
+      findUnique: async () => {
+        assert.equal(inTransaction, true)
+        return notice
+      },
+    },
+    notificationUserState: { deleteMany: async () => { throw new Error('replay must not reset read state') } },
+  }
+  const service = new NotificationsService(database)
+  const complete = async (transaction: any) => {
+    assert.equal(transaction, database)
+    assert.equal(inTransaction, true)
+    assert.equal(notice?.id, 'notice', 'completion follows a verified notice')
+    completions++
+  }
+  assert.equal((await service.publishIncidentIfMissing(input, owner, complete)).id, 'notice')
+  notice.occurrenceCount = 3
+  notice.resolvedAt = new Date('2026-10-24T02:00:00Z')
+  const originalLastOccurredAt = notice.lastOccurredAt
+  assert.equal((await service.publishIncidentIfMissing(input, owner, complete)).id, 'notice')
+  assert.equal(inserts, 1)
+  assert.equal(completions, 2)
+  assert.equal(notice.occurrenceCount, 3)
+  assert.notEqual(notice.resolvedAt, null)
+  assert.equal(notice.lastOccurredAt, originalLastOccurredAt)
+
+  live = false
+  await assert.rejects(() => service.publishIncidentIfMissing(input, owner, complete),
+    (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  await assert.rejects(() => service.publishIncidentIfMissing({ ...input, customerTenantId: 'other' }, owner, complete),
+    (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  assert.equal(inserts, 1)
+  assert.equal(completions, 2)
+
+  live = true
+  notice.customerTenantId = 'other'
+  await assert.rejects(() => service.publishIncidentIfMissing(input, owner, complete), /TENANT_VISIT_NOTIFICATION_DEDUPE_COLLISION/)
+  notice.customerTenantId = owner.customerTenantId
+  failInsert = true
+  await assert.rejects(() => service.publishIncidentIfMissing(input, owner, complete), /synthetic persistence failure/)
+  assert.equal(completions, 2, 'failed or colliding writes cannot clear pending recovery work')
+  failInsert = false
+  await assert.rejects(() => service.publishIncidentIfMissing(input, owner, async () => {
+    assert.equal(inTransaction, true)
+    throw new Error('synthetic completion failure')
+  }), /synthetic completion failure/)
+})
+
+test('optional visit owner commits incident resolution and recovery together', async () => {
+  const owner = {
+    organizationId: 'org', customerTenantId: 'tenant', token: 'lease-token',
+    generation: 1n, expiresAt: new Date('2026-10-24T00:00:00Z'),
+  }
+  const recovery = {
+    customerTenantId: owner.customerTenantId, eventType: 'tenant.sync_recovered',
+    category: 'success' as const, title: 'Recovered', description: 'Synthetic test', source: 'test',
+  }
+  const writes: string[] = []
+  let inTransaction = false
+  let live = false
+  let incidentTenant = owner.customerTenantId
+  let transactionCount = 0
+  const database: any = {
+    $transaction: async (work: (tx: any) => Promise<unknown>) => {
+      transactionCount += 1
+      inTransaction = true
+      try { return await work(database) } finally { inTransaction = false }
+    },
+    $queryRawUnsafe: async (sql: string) => {
+      if (sql.includes('FROM organizations')) return [{ id: owner.organizationId }]
+      if (sql.includes('FROM customer_tenants')) return [{ id: owner.customerTenantId }]
+      if (sql.includes('FROM tenant_sync_visit_leases')) return live ? [{ generation: '1' }] : []
+      throw new Error('unexpected query')
+    },
+    notification: {
+      findUnique: async () => ({ id: 'incident', customerTenantId: incidentTenant, resolvedAt: null, occurrenceCount: 2 }),
+      update: async () => {
+        assert.equal(inTransaction, true)
+        writes.push('resolve')
+        return {}
+      },
+      upsert: async () => {
+        assert.equal(inTransaction, true)
+        writes.push('recovery')
+        return { ...recovery, recipientUserId: null, id: 'recovery', occurrenceCount: 1 }
+      },
+    },
+    notificationUserState: { deleteMany: async () => {
+      assert.equal(inTransaction, true)
+      writes.push('clear')
+      return { count: 0 }
+    } },
+  }
+  const service = new NotificationsService(database)
+  ;(service as any).logger = { log: () => {}, error: () => {} }
+  const resolve = () => service.resolveIncident(owner.organizationId, 'tenant:tenant:sync:USERS', recovery, owner)
+
+  await assert.rejects(resolve, (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  assert.deepEqual(writes, [], 'stale owner cannot resolve a current incident')
+  live = true
+  incidentTenant = 'other'
+  await assert.rejects(resolve, (error: unknown) => error instanceof TenantVisitLeaseLostError)
+  assert.deepEqual(writes, [], 'tenant-scoped owner cannot resolve another tenant incident')
+  incidentTenant = owner.customerTenantId
+  const before = transactionCount
+  assert.equal((await resolve())?.id, 'incident')
+  assert.deepEqual(writes, ['resolve', 'recovery', 'clear'])
+  assert.equal(transactionCount, before + 1, 'no crash boundary separates resolution from recovery')
+})
 
 test('notification operational logs never include hostile caller event types on success or failure', async () => {
   const messages: string[] = []
