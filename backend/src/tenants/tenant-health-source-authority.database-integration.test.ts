@@ -1868,3 +1868,217 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
       }
     })
 }
+
+const healthGuardFunctions = [
+  'tenant_health_authorize_on_tenant_insert',
+  'tenant_health_invalidate_on_audit_change',
+  'tenant_health_invalidate_on_sync_state_change',
+  'tenant_health_tombstone_on_tenant_delete',
+] as const
+
+async function healthFunctionSettings(client: pg.Client) {
+  return (await client.query(`SELECT p.proname, p.prosecdef, p.proowner::text,
+      p.proacl::text, md5(p.prosrc) AS body_digest,
+      ARRAY(SELECT setting FROM unnest(p.proconfig) AS setting ORDER BY setting) AS settings
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public' AND p.proname = ANY($1::text[]) AND p.pronargs = 0
+    ORDER BY p.proname`, [healthGuardFunctions])).rows
+}
+
+// A synthetic effective-role probe, not proof that a production login cannot
+// SET/RESET ROLE. All role/policy changes are confined to registered CI fixtures.
+async function withRestrictedHealthWriter(
+  f: Awaited<ReturnType<typeof syncStateAuthorityFixture>>,
+  table: 'directory_audit_logs' | 'sync_states' | 'customer_tenants',
+  run: (beginRestricted: (sourcePolicy?: boolean) => Promise<void>, role: string) => Promise<void>,
+) {
+  const role = `haw70_rls_${randomUUID().replaceAll('-', '')}`
+  const policy = `${role}_source`
+  const scope = f.scopes[0]
+  const settings = await healthFunctionSettings(f.writer)
+  assert.deepEqual(settings.map(row => row.proname), healthGuardFunctions)
+  for (const row of settings) {
+    assert.equal(row.prosecdef, false)
+    assert.deepEqual(row.settings, ['row_security=off', 'search_path=pg_catalog'])
+  }
+  const beginRestricted = async (sourcePolicy = true) => {
+    await f.writer.query('BEGIN')
+    await f.writer.query("SET LOCAL lock_timeout = '2s'")
+    await f.writer.query('SET LOCAL row_security = on')
+    if (!sourcePolicy) await f.writer.query(`DROP POLICY "${policy}" ON public.${table}`)
+    await f.writer.query(`SET LOCAL ROLE "${role}"`)
+    const identities = (await f.writer.query(`SELECT current_user AS effective_role,
+        r.rolsuper, r.rolbypassrls, r.rolinherit, r.rolcanlogin,
+        pg_has_role(current_user, c.relowner, 'USAGE') AS owner_rights,
+        row_security_active(c.oid) AS rls_active
+      FROM pg_roles r CROSS JOIN pg_class c
+      WHERE r.rolname = current_user
+        AND c.oid IN ($1::regclass, 'public.tenant_health_source_authorities'::regclass)`,
+    [`public.${table}`])).rows
+    assert.equal(identities.length, 2)
+    for (const row of identities) assert.deepEqual(row, {
+      effective_role: role, rolsuper: false, rolbypassrls: false, rolinherit: false,
+      rolcanlogin: false, owner_rights: false, rls_active: true,
+    })
+  }
+  try {
+    await f.writer.query('BEGIN')
+    await f.writer.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOBYPASSRLS
+      NOINHERIT NOCREATEDB NOCREATEROLE NOREPLICATION`)
+    await f.writer.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
+    await f.writer.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON public.${table} TO "${role}"`)
+    await f.writer.query(`GRANT SELECT, INSERT, UPDATE ON public.tenant_health_source_authorities TO "${role}"`)
+    // UUID and identifiers are generated in this fixture, never caller input.
+    await f.writer.query(`CREATE POLICY "${policy}" ON public.${table} FOR ALL TO "${role}"
+      USING (organization_id = '${scope.organizationId}'::uuid)
+      WITH CHECK (organization_id = '${scope.organizationId}'::uuid)`)
+    await f.writer.query('COMMIT')
+    await run(beginRestricted, role)
+  } finally {
+    await f.writer.query('ROLLBACK')
+    await f.writer.query('RESET ROLE')
+    if ((await f.writer.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role])).rowCount) {
+      await f.writer.query(`DROP POLICY IF EXISTS "${policy}" ON public.${table}`)
+      await f.writer.query(`REVOKE ALL ON public.${table}, public.tenant_health_source_authorities FROM "${role}"`)
+      await f.writer.query(`REVOKE ALL ON SCHEMA public FROM "${role}"`)
+      await f.writer.query(`DROP ROLE "${role}"`)
+    }
+    assert.deepEqual(await healthFunctionSettings(f.writer), settings,
+      'Negative controls must not commit weaker function settings or change bodies/owners/ACLs')
+  }
+}
+
+function authorityRlsError(functionName: typeof healthGuardFunctions[number]) {
+  return (error: unknown): boolean => {
+    assert.ok(sqlState('42501')(error))
+    assert.ok(error instanceof Error)
+    assert.match(error.message, /row-level security.*tenant_health_source_authorities/)
+    assert.ok('where' in error && String(error.where).includes(`${functionName}()`),
+      'The intended authority-writing trigger must reject, not an unrelated source ACL/policy')
+    return true
+  }
+}
+
+for (const source of ['audit', 'sync-state'] as const) {
+  test(`HAW-70 ${source} authority RLS guard rejects real restricted writes and preserves owner invalidation`,
+    { skip: !RUN, timeout: 60_000 }, async context => {
+      const f = await syncStateAuthorityFixture(context)
+      const table = source === 'audit' ? 'directory_audit_logs' : 'sync_states'
+      const fn = source === 'audit'
+        ? 'tenant_health_invalidate_on_audit_change' : 'tenant_health_invalidate_on_sync_state_change'
+      const [id, extraId] = [randomUUID(), randomUUID()], scope = f.scopes[0]
+      const insert = (newId: ReturnType<typeof randomUUID>) => source === 'audit'
+        ? f.writer.query(`INSERT INTO directory_audit_logs
+            (id, organization_id, customer_tenant_id, microsoft_audit_id,
+             event_date_time, activity_display_name, raw, expires_at)
+            VALUES ($1, $2, $3, $4, now(), 'initial', '{}'::jsonb, now() + interval '1 day')`,
+        [newId, scope.organizationId, scope.tenantId, `haw70-rls-${newId}`])
+        : f.insert(f.writer, 0, newId === id ? 'USERS' : 'GROUPS', newId)
+      const update = (value: string) => f.writer.query(source === 'audit'
+        ? 'UPDATE directory_audit_logs SET activity_display_name = $2 WHERE id = $1'
+        : 'UPDATE sync_states SET delta_link = $2 WHERE id = $1', [id, value])
+      const readSource = async (client = f.observer) => (await client.query(
+        `SELECT * FROM public.${table} WHERE id = ANY($1::uuid[]) ORDER BY id`, [[id, extraId]])).rows
+      await insert(id)
+      const before = await f.tag(0), siblingBefore = await f.authority(f.observer, 1)
+      const sourceBefore = await readSource()
+      await withRestrictedHealthWriter(f, table, async (beginRestricted, role) => {
+        // No source policy: zero changes or an authority-RLS error from the
+        // statement trigger are both valid. Neither reproduces a stale write.
+        await beginRestricted(false)
+        assert.deepEqual(await readSource(f.writer), [])
+        try { assert.equal((await update('source-denied')).rowCount, 0) }
+        catch (error) { authorityRlsError(fn)(error) }
+        await f.writer.query('ROLLBACK')
+        assert.deepEqual(await readSource(), sourceBefore)
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+
+        // Temporarily recover the exact unguarded body inside one transaction.
+        // Restore its guard before COMMIT: only the fixture mutation commits.
+        const settings = await healthFunctionSettings(f.writer)
+        await f.writer.query('BEGIN')
+        await f.writer.query(`ALTER FUNCTION public.${fn}() RESET row_security`)
+        await f.writer.query('SET LOCAL row_security = on')
+        await f.writer.query(`SET LOCAL ROLE "${role}"`)
+        assert.equal((await readSource(f.writer)).length, 1)
+        assert.equal(await f.authority(f.writer, 0), undefined, 'Live authority is hidden, not absent')
+        assert.equal((await update('unguarded-committed')).rowCount, 1)
+        await f.writer.query('RESET ROLE')
+        assert.deepEqual(await f.authority(f.writer, 0), before)
+        assert.deepEqual(await readSource(), sourceBefore, 'The observer must not see uncommitted source data')
+        await f.writer.query(`ALTER FUNCTION public.${fn}() SET row_security = off`)
+        assert.deepEqual(await healthFunctionSettings(f.writer), settings)
+        await f.writer.query('COMMIT')
+        const staleSource = await readSource()
+        assert.equal(staleSource.length, 1)
+        assert.equal(staleSource[0][source === 'audit' ? 'activity_display_name' : 'delta_link'], 'unguarded-committed')
+        assert.deepEqual(await f.authority(f.observer, 0), before,
+          'The committed negative control must retain the old current pointer for a privileged reader')
+
+        for (const mutation of [() => update('guarded'), () => insert(extraId),
+          () => f.writer.query(`DELETE FROM public.${table} WHERE id = $1`, [id])]) {
+          await beginRestricted()
+          assert.equal((await readSource(f.writer)).length, 1)
+          assert.equal(await f.authority(f.writer, 0), undefined)
+          await assert.rejects(mutation(), authorityRlsError(fn))
+          await f.writer.query('ROLLBACK')
+          assert.deepEqual(await readSource(), staleSource)
+          assert.deepEqual(await f.authority(f.observer, 0), before)
+        }
+
+        // Separate ACL denial from the earlier rewrite-time RLS guard. The
+        // temporary guard reset and failed write both roll back together.
+        await f.writer.query(`REVOKE SELECT, INSERT, UPDATE ON public.tenant_health_source_authorities FROM "${role}"`)
+        await f.writer.query('BEGIN')
+        await f.writer.query(`ALTER FUNCTION public.${fn}() RESET row_security`)
+        await f.writer.query('SET LOCAL row_security = on')
+        await f.writer.query(`SET LOCAL ROLE "${role}"`)
+        await assert.rejects(update('no-authority-acl'), error => {
+          assert.ok(sqlState('42501')(error) && error instanceof Error)
+          assert.match(error.message, /permission denied for table tenant_health_source_authorities/)
+          return true
+        })
+        await f.writer.query('ROLLBACK')
+        assert.deepEqual(await healthFunctionSettings(f.writer), settings)
+        assert.deepEqual(await readSource(), staleSource)
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+
+        await f.writer.query('BEGIN')
+        assert.equal((await update('owner-committed')).rowCount, 1)
+        assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(before))
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+        await f.writer.query('COMMIT')
+        assert.equal((await readSource())[0][source === 'audit' ? 'activity_display_name' : 'delta_link'], 'owner-committed')
+        assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(before))
+        assert.deepEqual(await f.authority(f.observer, 1), siblingBefore)
+      })
+    })
+}
+
+test('HAW-70 tenant lifecycle authority writes reject an RLS-dependent source writer atomically',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context), scope = f.scopes[0], newTenant = randomUUID()
+    const before = await f.authority(f.observer, 0)
+    const readTenants = async () => (await f.observer.query(
+      'SELECT id FROM customer_tenants WHERE organization_id = $1 ORDER BY id', [scope.organizationId])).rows
+    const tenantsBefore = await readTenants()
+    await withRestrictedHealthWriter(f, 'customer_tenants', async beginRestricted => {
+      for (const [fn, mutation] of [
+        ['tenant_health_authorize_on_tenant_insert', () => f.writer.query(`INSERT INTO customer_tenants
+          (id, organization_id, microsoft_tenant_id, updated_at) VALUES ($1, $2, $3, now())`,
+        [newTenant, scope.organizationId, randomUUID()])],
+        ['tenant_health_tombstone_on_tenant_delete', () => f.writer.query(
+          'DELETE FROM customer_tenants WHERE id = $1', [scope.tenantId])],
+      ] as const) {
+        await beginRestricted()
+        assert.equal((await f.writer.query('SELECT id FROM customer_tenants WHERE id = $1', [scope.tenantId])).rowCount, 1)
+        assert.equal(await f.authority(f.writer, 0), undefined)
+        await assert.rejects(mutation(), authorityRlsError(fn))
+        await f.writer.query('ROLLBACK')
+        assert.deepEqual(await readTenants(), tenantsBefore)
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+        assert.equal((await f.observer.query(`SELECT 1 FROM tenant_health_source_authorities
+          WHERE organization_id = $1 AND customer_tenant_id = $2`, [scope.organizationId, newTenant])).rowCount, 0)
+      }
+    })
+  })

@@ -6,6 +6,18 @@ Design checkpoint, 14 November 2026. Reviewed source parent:
 This document changes no permissions, migrations, reader gate or receipt generation.
 The incomplete candidate remains inactive. No physical database was used for this review.
 
+Follow-up local implementation: an unpublished forward migration now adds the
+function-local error-on-RLS guard to all four authority-writing trigger functions.
+Three additional registered physical cases specify audit/sync source denial,
+committed unguarded negative controls, guarded INSERT/UPDATE/DELETE rollback,
+missing-ACL rejection, owner invalidation and tenant lifecycle rejection. The
+negative controls restore the guard before committing their fixture writes.
+These cases have not executed in PostgreSQL. SET LOCAL ROLE probes effective DML
+rights only; an administrator session cannot prove production login containment.
+TRUNCATE guards, actual runtime role attestation, complete activation/preflight
+and cross-scope restricted-writer coverage remain open. The earlier design below
+states the full acceptance target; this slice does not complete it.
+
 ## Observed source contract
 
 - The [historical RLS migration](../prisma/migrations/20260909120000_lock_down_public_schema_grants_and_rls/migration.sql)
@@ -22,7 +34,8 @@ The incomplete candidate remains inactive. No physical database was used for thi
   [tenant tombstone](../prisma/migrations/20261113021500_tenant_health_tenant_deletion_tombstone/migration.sql)
   and [tenant insertion](../prisma/migrations/20261113144000_tenant_health_authority_on_tenant_insert/migration.sql)
   functions use default invoker security, qualified authority references and
-  `search_path = pg_catalog`. None sets `row_security = off`. Invalidation permits
+  `search_path = pg_catalog`. At the reviewed parent, none sets
+  `row_security = off`. Invalidation permits
   zero authority updates intentionally: missing/dead authority stays untrusted.
 - Source invalidation covers INSERT/UPDATE/DELETE, without source TRUNCATE guards.
   The [receipt mutation guard](../prisma/migrations/20261113170000_tenant_health_reconciliation_marker/migration.sql)
