@@ -1518,3 +1518,181 @@ test('HAW-70 tenant deletion and audit writes cannot invert source-authority loc
       }
     }
   })
+
+// Sync-state source participation is a separate, unpublished writer slice. These
+// witnesses use only the already registered hosted disposable PostgreSQL suite.
+async function syncStateAuthorityFixture(context: import('node:test').TestContext) {
+  assert.equal(assertDisposableTestDatabase().port, '5432')
+  const writer = new pg.Client({ connectionString: URL!, statement_timeout: 5_000 })
+  const observer = new pg.Client({ connectionString: URL!, statement_timeout: 5_000 })
+  const organizations = [randomUUID(), randomUUID()]
+  const scopes = [
+    { organizationId: organizations[0], tenantId: randomUUID() },
+    { organizationId: organizations[0], tenantId: randomUUID() },
+    { organizationId: organizations[1], tenantId: randomUUID() },
+  ]
+  context.after(async () => {
+    try {
+      await writer.query('ROLLBACK')
+      await observer.query('ROLLBACK')
+      // An overflow fixture must not poison cleanup's source/deletion triggers.
+      await observer.query(`UPDATE tenant_health_source_authorities
+        SET source_revision = 1, current_snapshot_id = NULL, current_observation_sequence = 0
+        WHERE organization_id = ANY($1::uuid[])`, [organizations])
+      await observer.query('DELETE FROM organizations WHERE id = ANY($1::uuid[])', [organizations])
+      await observer.query('DELETE FROM tenant_health_source_authorities WHERE organization_id = ANY($1::uuid[])', [organizations])
+    } finally { await Promise.all([writer.end(), observer.end()]) }
+  })
+  await Promise.all([writer.connect(), observer.connect()])
+  assert.notEqual((await writer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid,
+    (await observer.query('SELECT pg_backend_pid() AS pid')).rows[0].pid)
+  const authority = async (client: pg.Client, index: number) => {
+    const scope = scopes[index]
+    const result = await client.query<{
+      incarnation: string; source_revision: string; live: boolean;
+      current_snapshot_id: string | null; current_observation_sequence: string;
+    }>(`SELECT incarnation::text, source_revision::text, live,
+        current_snapshot_id::text, current_observation_sequence::text
+        FROM tenant_health_source_authorities
+        WHERE organization_id = $1 AND customer_tenant_id = $2`, [scope.organizationId, scope.tenantId])
+    return result.rows[0]
+  }
+  const tag = async (index: number) => {
+    const scope = scopes[index], snapshot = randomUUID()
+    await writer.query('BEGIN')
+    await writer.query(`INSERT INTO tenant_health_snapshots
+      (id, organization_id, customer_tenant_id, health_model_version, overall_status,
+       payload, evaluated_at, source_incarnation, source_revision, observation_sequence)
+      SELECT $1, organization_id, customer_tenant_id, 1, 'UNKNOWN', '{}'::jsonb,
+        now(), incarnation, source_revision, 1 FROM tenant_health_source_authorities
+        WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, scope.organizationId, scope.tenantId])
+    await writer.query(`UPDATE tenant_health_source_authorities
+      SET current_snapshot_id = $1, current_observation_sequence = 1
+      WHERE organization_id = $2 AND customer_tenant_id = $3`, [snapshot, scope.organizationId, scope.tenantId])
+    await writer.query('COMMIT')
+    const result = await authority(observer, index)
+    assert.equal(result.current_snapshot_id, snapshot)
+    return result
+  }
+  await writer.query('BEGIN')
+  for (const org of organizations) await writer.query(`INSERT INTO organizations (id, name, slug, updated_at)
+    VALUES ($1, 'HAW-70 sync-state witness', $2, now())`, [org, `haw70-sync-${org}`])
+  for (const scope of scopes) await writer.query(`INSERT INTO customer_tenants
+    (id, organization_id, microsoft_tenant_id, updated_at) VALUES ($1, $2, $3, now())`,
+  [scope.tenantId, scope.organizationId, randomUUID()])
+  await writer.query('COMMIT')
+  for (let i = 0; i < scopes.length; i++) await tag(i)
+  const insert = (client: pg.Client, index: number, resource = 'USERS', id = randomUUID()) => {
+    const scope = scopes[index]
+    return client.query(`INSERT INTO sync_states
+      (id, organization_id, customer_tenant_id, resource_type, status, updated_at)
+      VALUES ($1, $2, $3, $4::"SyncResourceType", 'IDLE', now())`,
+    [id, scope.organizationId, scope.tenantId, resource])
+  }
+  const invalidated = (before: Awaited<ReturnType<typeof authority>>) => ({ ...before,
+    source_revision: (BigInt(before.source_revision) + 1n).toString(),
+    current_snapshot_id: null, current_observation_sequence: '0' })
+  return { writer, observer, scopes, authority, tag, insert, invalidated }
+}
+
+test('HAW-70 sync-state create, claim, terminal outcomes and deletion invalidate only at their source commit',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const id = randomUUID()
+    const untouched = await f.authority(f.observer, 1)
+    const changes = [
+      () => f.insert(f.writer, 0, 'USERS', id),
+      () => f.writer.query(`UPDATE sync_states SET status = 'RUNNING', last_attempt_at = now() WHERE id = $1`, [id]),
+      () => f.writer.query(`UPDATE sync_states SET status = 'SUCCEEDED', last_successful_at = now() WHERE id = $1`, [id]),
+      () => f.writer.query(`UPDATE sync_states SET status = 'FAILED', last_error_code = 'SYNTHETIC',
+        last_error_message = 'synthetic failure', consecutive_failures = 1 WHERE id = $1`, [id]),
+      () => f.writer.query('UPDATE sync_states SET delta_link = delta_link WHERE id = $1', [id]),
+      () => f.writer.query('DELETE FROM sync_states WHERE id = $1', [id]),
+    ]
+    for (let step = 0; step < changes.length; step++) {
+      const before = await f.authority(f.observer, 0)
+      const sourceBefore = (await f.observer.query('SELECT * FROM sync_states WHERE id = $1', [id])).rows
+      await f.writer.query('BEGIN')
+      assert.equal((await changes[step]()).rowCount, 1)
+      assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(before))
+      assert.deepEqual(await f.authority(f.observer, 0), before, 'an independent session still sees the old current pointer')
+      assert.deepEqual((await f.observer.query('SELECT * FROM sync_states WHERE id = $1', [id])).rows, sourceBefore)
+      await f.writer.query('COMMIT')
+      assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(before))
+      assert.deepEqual(await f.authority(f.observer, 1), untouched)
+      const sourceAfter = (await f.observer.query('SELECT * FROM sync_states WHERE id = $1', [id])).rows
+      if (step === 5) assert.deepEqual(sourceAfter, [])
+      else assert.equal(sourceAfter[0].status, ['IDLE', 'RUNNING', 'SUCCEEDED', 'FAILED', 'FAILED'][step])
+      if (step < changes.length - 1) await f.tag(0)
+    }
+  })
+
+test('HAW-70 sync-state bulk, conflict, zero-row, rollback and cross-organization scope moves use exact affected pairs',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const before = await f.authority(f.observer, 0), otherBefore = await f.authority(f.observer, 1)
+    const ids = [randomUUID(), randomUUID()], scope = f.scopes[0]
+    await f.writer.query(`INSERT INTO sync_states
+      (id, organization_id, customer_tenant_id, resource_type, updated_at)
+      VALUES ($1, $3, $4, 'USERS', now()), ($2, $3, $4, 'GROUPS', now())`,
+    [...ids, scope.organizationId, scope.tenantId])
+    assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(before), 'bulk rows coalesce per event')
+    await f.tag(0)
+    const tagged = await f.authority(f.observer, 0)
+    await f.writer.query(`INSERT INTO sync_states
+      (id, organization_id, customer_tenant_id, resource_type, updated_at)
+      VALUES ($1, $2, $3, 'USERS', now()) ON CONFLICT (customer_tenant_id, resource_type) DO NOTHING`,
+    [randomUUID(), scope.organizationId, scope.tenantId])
+    await f.writer.query('UPDATE sync_states SET status = status WHERE id = $1', [randomUUID()])
+    await f.writer.query('DELETE FROM sync_states WHERE id = $1', [randomUUID()])
+    assert.deepEqual(await f.authority(f.observer, 0), tagged)
+    await f.writer.query(`INSERT INTO sync_states
+      (id, organization_id, customer_tenant_id, resource_type, status, updated_at)
+      VALUES ($1, $2, $3, 'USERS', 'FAILED', now())
+      ON CONFLICT (customer_tenant_id, resource_type) DO UPDATE SET status = EXCLUDED.status`,
+    [randomUUID(), scope.organizationId, scope.tenantId])
+    assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(tagged), 'empty INSERT transition and actual UPDATE count once')
+    await f.tag(0)
+    const moveFrom = await f.authority(f.observer, 0), moveTo = await f.authority(f.observer, 2)
+    const move = () => f.writer.query(`UPDATE sync_states SET organization_id = $2, customer_tenant_id = $3,
+      resource_type = 'DEVICES' WHERE id = $1`, [ids[1], f.scopes[2].organizationId, f.scopes[2].tenantId])
+    await f.writer.query('BEGIN')
+    await move()
+    assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(moveFrom))
+    assert.deepEqual(await f.authority(f.writer, 2), f.invalidated(moveTo))
+    assert.deepEqual(await f.authority(f.observer, 0), moveFrom)
+    assert.deepEqual(await f.authority(f.observer, 2), moveTo)
+    await f.writer.query('ROLLBACK')
+    assert.deepEqual(await f.authority(f.observer, 0), moveFrom)
+    assert.deepEqual(await f.authority(f.observer, 2), moveTo)
+    assert.equal((await f.observer.query('SELECT customer_tenant_id FROM sync_states WHERE id = $1', [ids[1]])).rows[0].customer_tenant_id, scope.tenantId)
+    await move()
+    assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(moveFrom))
+    assert.deepEqual(await f.authority(f.observer, 2), f.invalidated(moveTo))
+    assert.equal((await f.observer.query('SELECT customer_tenant_id FROM sync_states WHERE id = $1', [ids[1]])).rows[0].customer_tenant_id, f.scopes[2].tenantId)
+    assert.deepEqual(await f.authority(f.observer, 1), otherBefore)
+  })
+
+test('HAW-70 sync-state overflow rolls back its source and missing or dead authority never becomes trusted',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const first = f.scopes[0]
+    await f.writer.query(`UPDATE tenant_health_source_authorities SET source_revision = 9223372036854775807,
+      current_snapshot_id = NULL, current_observation_sequence = 0 WHERE organization_id = $1 AND customer_tenant_id = $2`,
+    [first.organizationId, first.tenantId])
+    const overflowBefore = await f.authority(f.observer, 0)
+    await assert.rejects(f.insert(f.writer, 0), sqlState('22003'))
+    assert.deepEqual(await f.authority(f.observer, 0), overflowBefore)
+    assert.equal((await f.observer.query('SELECT count(*)::int AS n FROM sync_states WHERE customer_tenant_id = $1', [first.tenantId])).rows[0].n, 0)
+    const missing = f.scopes[1], dead = f.scopes[2]
+    await f.writer.query('DELETE FROM tenant_health_source_authorities WHERE organization_id = $1 AND customer_tenant_id = $2', [missing.organizationId, missing.tenantId])
+    await f.writer.query(`UPDATE tenant_health_source_authorities SET live = false,
+      current_snapshot_id = NULL, current_observation_sequence = 0 WHERE organization_id = $1 AND customer_tenant_id = $2`,
+    [dead.organizationId, dead.tenantId])
+    const deadBefore = await f.authority(f.observer, 2)
+    await f.insert(f.writer, 1)
+    await f.insert(f.writer, 2)
+    assert.equal(await f.authority(f.observer, 1), undefined)
+    assert.deepEqual(await f.authority(f.observer, 2), deadBefore)
+    assert.equal((await f.observer.query('SELECT count(*)::int AS n FROM sync_states WHERE customer_tenant_id = ANY($1::uuid[])', [[missing.tenantId, dead.tenantId]])).rows[0].n, 2)
+  })
