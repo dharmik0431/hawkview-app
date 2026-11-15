@@ -1891,10 +1891,13 @@ async function withRestrictedHealthWriter(
   f: Awaited<ReturnType<typeof syncStateAuthorityFixture>>,
   table: 'directory_audit_logs' | 'sync_states' | 'customer_tenants',
   run: (beginRestricted: (sourcePolicy?: boolean) => Promise<void>, role: string) => Promise<void>,
+  sourceOrganizations: readonly string[] = [f.scopes[0].organizationId],
 ) {
   const role = `haw70_rls_${randomUUID().replaceAll('-', '')}`
   const policy = `${role}_source`
-  const scope = f.scopes[0]
+  assert.ok(sourceOrganizations.includes(f.scopes[0].organizationId))
+  for (const org of sourceOrganizations) assert.ok(f.scopes.some(scope => scope.organizationId === org))
+  const policyOrganizations = [...new Set(sourceOrganizations)].map(org => `'${org}'::uuid`).join(', ')
   const settings = await healthFunctionSettings(f.writer)
   assert.deepEqual(settings.map(row => row.proname), healthGuardFunctions)
   for (const row of settings) {
@@ -1930,8 +1933,8 @@ async function withRestrictedHealthWriter(
     await f.writer.query(`GRANT SELECT, INSERT, UPDATE ON public.tenant_health_source_authorities TO "${role}"`)
     // UUID and identifiers are generated in this fixture, never caller input.
     await f.writer.query(`CREATE POLICY "${policy}" ON public.${table} FOR ALL TO "${role}"
-      USING (organization_id = '${scope.organizationId}'::uuid)
-      WITH CHECK (organization_id = '${scope.organizationId}'::uuid)`)
+      USING (organization_id IN (${policyOrganizations}))
+      WITH CHECK (organization_id IN (${policyOrganizations}))`)
     await f.writer.query('COMMIT')
     await run(beginRestricted, role)
   } finally {
@@ -2052,6 +2055,99 @@ for (const source of ['audit', 'sync-state'] as const) {
         assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(before))
         assert.deepEqual(await f.authority(f.observer, 1), siblingBefore)
       })
+    })
+}
+
+for (const source of ['audit', 'sync-state'] as const) {
+  test(`HAW-70 ${source} restricted scope moves cannot retain old and new tenant health pointers`,
+    { skip: !RUN, timeout: 120_000 }, async context => {
+      for (const destination of [1, 2] as const) {
+        await context.test(destination === 1 ? 'same organization' : 'different organization',
+          { timeout: 30_000 }, async subcontext => {
+            const f = await syncStateAuthorityFixture(subcontext)
+            const table = source === 'audit' ? 'directory_audit_logs' : 'sync_states'
+            const fn = source === 'audit'
+              ? 'tenant_health_invalidate_on_audit_change' : 'tenant_health_invalidate_on_sync_state_change'
+            const id = randomUUID(), from = f.scopes[0], to = f.scopes[destination]
+            if (source === 'audit') await f.writer.query(`INSERT INTO directory_audit_logs
+              (id, organization_id, customer_tenant_id, microsoft_audit_id,
+               event_date_time, activity_display_name, raw, expires_at)
+              VALUES ($1, $2, $3, $4, now(), 'restricted move', '{}'::jsonb, now() + interval '1 day')`,
+            [id, from.organizationId, from.tenantId, `haw70-move-${id}`])
+            else await f.insert(f.writer, 0, 'USERS', id)
+            await f.tag(0)
+            const readSource = async (client: pg.Client) => (await client.query(
+              `SELECT * FROM public.${table} WHERE id = $1`, [id])).rows
+            const readAuthorities = (client: pg.Client) => Promise.all(f.scopes.map((_, index) => f.authority(client, index)))
+            const readSnapshots = async (client: pg.Client) => (await client.query(`SELECT * FROM tenant_health_snapshots
+              WHERE customer_tenant_id = ANY($1::uuid[]) ORDER BY id`, [f.scopes.map(scope => scope.tenantId)])).rows
+            const move = (origin: number, target: number) => f.writer.query(`UPDATE public.${table}
+              SET organization_id = $4, customer_tenant_id = $5
+              WHERE id = $1 AND organization_id = $2 AND customer_tenant_id = $3`,
+            [id, f.scopes[origin].organizationId, f.scopes[origin].tenantId,
+              f.scopes[target].organizationId, f.scopes[target].tenantId])
+            const before = await readAuthorities(f.observer), sourceBefore = await readSource(f.observer)
+            const snapshotsBefore = await readSnapshots(f.observer)
+            assert.equal(sourceBefore.length, 1)
+            assert.equal(sourceBefore[0].organization_id, from.organizationId)
+            assert.equal(sourceBefore[0].customer_tenant_id, from.tenantId)
+            for (const authority of before) assert.ok(authority.live && authority.current_snapshot_id)
+            const movedSource = [{ ...sourceBefore[0], organization_id: to.organizationId, customer_tenant_id: to.tenantId }]
+            await withRestrictedHealthWriter(f, table, async (beginRestricted, role) => {
+              const settings = await healthFunctionSettings(f.writer)
+              // The source policy permits BOTH endpoints. Remove only the matching
+              // authority guard, commit a real move, and restore settings first.
+              await beginRestricted()
+              try {
+                await f.writer.query('RESET ROLE')
+                await f.writer.query(`ALTER FUNCTION public.${fn}() RESET row_security`)
+                await f.writer.query(`SET LOCAL ROLE "${role}"`)
+                assert.deepEqual(await readSource(f.writer), sourceBefore)
+                assert.equal(await f.authority(f.writer, 0), undefined)
+                assert.equal(await f.authority(f.writer, destination), undefined)
+                assert.equal((await move(0, destination)).rowCount, 1)
+                assert.deepEqual(await readSource(f.writer), movedSource)
+                await f.writer.query('RESET ROLE')
+                assert.deepEqual(await readAuthorities(f.writer), before)
+                assert.deepEqual(await readSource(f.observer), sourceBefore)
+                await f.writer.query(`ALTER FUNCTION public.${fn}() SET row_security = off`)
+                assert.deepEqual(await healthFunctionSettings(f.writer), settings)
+                await f.writer.query('COMMIT')
+              } finally { await f.writer.query('ROLLBACK') }
+              assert.deepEqual(await readSource(f.observer), movedSource)
+              assert.deepEqual(await readAuthorities(f.observer), before,
+                'The committed unguarded move must leave both old pointers visible to an independent reader')
+
+              // Reverse the actual committed move, not a no-op at its destination.
+              await beginRestricted()
+              try {
+                assert.deepEqual(await readSource(f.writer), movedSource)
+                assert.equal(await f.authority(f.writer, 0), undefined)
+                assert.equal(await f.authority(f.writer, destination), undefined)
+                await assert.rejects(move(destination, 0), authorityRlsError(fn))
+              } finally { await f.writer.query('ROLLBACK') }
+              assert.deepEqual(await readSource(f.observer), movedSource)
+              assert.deepEqual(await readAuthorities(f.observer), before)
+              assert.deepEqual(await readSnapshots(f.observer), snapshotsBefore)
+
+              const invalidated = before.map((authority, index) => index === 0 || index === destination
+                ? f.invalidated(authority) : authority)
+              await f.writer.query('BEGIN')
+              try {
+                assert.equal((await move(destination, 0)).rowCount, 1)
+                assert.deepEqual(await readSource(f.writer), sourceBefore)
+                assert.deepEqual(await readAuthorities(f.writer), invalidated)
+                assert.deepEqual(await readSource(f.observer), movedSource)
+                assert.deepEqual(await readAuthorities(f.observer), before)
+                await f.writer.query('COMMIT')
+              } finally { await f.writer.query('ROLLBACK') }
+              assert.deepEqual(await readSource(f.observer), sourceBefore)
+              assert.deepEqual(await readAuthorities(f.observer), invalidated,
+                'Owner movement invalidates each endpoint exactly once and leaves the third scope unchanged')
+              assert.deepEqual(await readSnapshots(f.observer), snapshotsBefore)
+            }, [from.organizationId, to.organizationId])
+          })
+      }
     })
 }
 

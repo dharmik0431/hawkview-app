@@ -40,6 +40,17 @@ Every attempt rolls back its grants and sentinel update before observer checks.
 The physical test count remains twenty-two; this extends the existing truncation
 case, and none has run locally. No migration or runtime contract changes here.
 
+A further registered test extension covers audit and sync-state moves within an
+organization and across two fixture organizations. The source policy explicitly
+permits both endpoints. Its negative control commits an actual move with both
+old health pointers unchanged, restoring the matching function's guard before
+commit. A guarded reverse move must reject at that authority function and leave
+source, all three authorities and history unchanged. An owner reverse move must
+invalidate both endpoints exactly once at commit while preserving the third scope.
+These are four prepared subcases in two new top-level tests, bringing the physical
+case count to twenty-four; none has executed. No production policy or migration
+changes, actual login-containment proof or reader activation is implied.
+
 ## Observed source contract
 
 - The [historical RLS migration](../prisma/migrations/20260909120000_lock_down_public_schema_grants_and_rls/migration.sql)
