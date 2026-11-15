@@ -2210,6 +2210,64 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
         } finally { await f.writer.query('ROLLBACK') }
         assert.deepEqual(await readState(f.observer), before)
       }
+
+      // CASCADE checks privileges on dependent tables before BEFORE triggers.
+      // Grant the catalog-derived ordinary-table closure inside each rollback-only
+      // attempt so an unrelated ACL failure cannot masquerade as guard refusal.
+      const cascades = commands.filter(command => command.sql.endsWith(' CASCADE'))
+      assert.equal(cascades.length, 3)
+      for (const command of cascades) {
+        const closure = (await f.writer.query(`WITH RECURSIVE affected(oid) AS (
+            SELECT $1::regclass::oid
+            UNION
+            SELECT fk.conrelid FROM pg_constraint fk
+            JOIN affected parent ON fk.confrelid = parent.oid WHERE fk.contype = 'f'
+          ) SELECT c.oid::int AS oid, n.nspname, c.relname, c.relkind, c.relispartition,
+            EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid OR i.inhparent = c.oid) AS inherited
+          FROM affected a JOIN pg_class c ON c.oid = a.oid
+          JOIN pg_namespace n ON n.oid = c.relnamespace ORDER BY c.oid`, [`public.${command.first}`])).rows
+        assert.ok(closure.length > 1)
+        assert.equal(closure.filter(row => row.relname === command.first).length, 1)
+        for (const relation of closure) {
+          assert.equal(relation.nspname, 'public')
+          assert.equal(relation.relkind, 'r', 'This bounded witness supports ordinary tables only')
+          assert.equal(relation.relispartition, false)
+          assert.equal(relation.inherited, false, 'Partition/inheritance closure requires a separate witness')
+          assert.notEqual(relation.relname, 'tenant_health_reconciliation_generations')
+        }
+        const relationIds = closure.map(row => row.oid)
+        const privileges = async () => (await f.writer.query(`SELECT c.oid::int AS oid,
+            has_table_privilege($2::name, c.oid, 'TRUNCATE') AS can_truncate
+          FROM pg_class c WHERE c.oid = ANY($1::oid[]) ORDER BY c.oid`, [relationIds, role])).rows
+        const priorPrivileges = await privileges()
+        const rootId = closure.find(row => row.relname === command.first)!.oid
+        assert.equal(priorPrivileges.find(row => row.oid === rootId)?.can_truncate, false)
+        context.diagnostic(`${command.first} CASCADE privilege closure: ${closure.map(row => row.relname).join(', ')}`)
+        const quoteIdentifier = (value: string) => `"${value.replaceAll('"', '""')}"`
+        const relations = closure.map(row => `${quoteIdentifier(row.nspname)}.${quoteIdentifier(row.relname)}`).join(', ')
+        await f.writer.query('BEGIN')
+        try {
+          await f.writer.query("SET LOCAL lock_timeout = '2s'")
+          await f.writer.query("SET LOCAL session_replication_role = 'origin'")
+          await f.writer.query(`GRANT TRUNCATE ON TABLE ${relations} TO "${role}"`)
+          await f.writer.query(`GRANT SELECT ON public.${command.first} TO "${role}"`)
+          await f.writer.query("UPDATE haw70_truncate_sentinel SET value = 'must roll back'")
+          await f.writer.query('SET LOCAL row_security = on')
+          await f.writer.query(`SET LOCAL ROLE "${role}"`)
+          assert.deepEqual((await f.writer.query(`SELECT rolname, rolsuper, rolbypassrls, rolinherit
+            FROM pg_roles WHERE rolname = current_user`)).rows,
+          [{ rolname: role, rolsuper: false, rolbypassrls: false, rolinherit: false }])
+          assert.deepEqual(await privileges(), relationIds.map(oid => ({ oid, can_truncate: true })))
+          assert.equal((await f.writer.query(`SELECT 1 FROM pg_class c WHERE c.oid = ANY($1::oid[])
+            AND pg_has_role(current_user, c.relowner, 'USAGE')`, [relationIds])).rowCount, 0)
+          assert.equal((await f.writer.query('SELECT row_security_active($1::oid) AS active', [rootId])).rows[0].active, true)
+          assert.equal((await f.writer.query(`SELECT 1 FROM public.${command.first}`)).rowCount, 0)
+          await assert.rejects(f.writer.query(command.sql), refuses(command.first))
+        } finally { await f.writer.query('ROLLBACK') }
+        assert.deepEqual(await privileges(), priorPrivileges, 'Temporary cascade grants must also roll back')
+        assert.deepEqual((await f.writer.query('SELECT value FROM haw70_truncate_sentinel')).rows, [{ value: 'unchanged' }])
+        assert.deepEqual(await readState(f.observer), before)
+      }
     } finally {
       await f.writer.query('ROLLBACK')
       await f.writer.query('RESET ROLE')

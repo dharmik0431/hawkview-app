@@ -30,6 +30,16 @@ This witness has not executed. Owners can still disable or drop guards, runtime
 role attestation is absent, and future health sources need their own coverage.
 The partial receipt and inactive reader/preflight remain unchanged.
 
+The next local test extension specifies three restricted-role parent/history
+CASCADE attempts. It derives the dependent ordinary-table set from all foreign
+keys, grants TRUNCATE on that set only inside the attempt, verifies each effective
+privilege and absence of owner rights, then requires the initiating table's exact
+refusal. The role has no RLS-visible parent rows. It rejects partitioned, inherited,
+foreign or non-public relations rather than treating this graph as universal.
+Every attempt rolls back its grants and sentinel update before observer checks.
+The physical test count remains twenty-two; this extends the existing truncation
+case, and none has run locally. No migration or runtime contract changes here.
+
 ## Observed source contract
 
 - The [historical RLS migration](../prisma/migrations/20260909120000_lock_down_public_schema_grants_and_rls/migration.sql)
