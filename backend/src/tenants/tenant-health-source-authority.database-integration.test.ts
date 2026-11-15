@@ -2082,3 +2082,142 @@ test('HAW-70 tenant lifecycle authority writes reject an RLS-dependent source wr
       }
     })
   })
+
+test('HAW-70 truncation refuses source, parent cascade and multi-table operations without committing fixture loss',
+  { skip: !RUN, timeout: 120_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const tables = ['customer_tenants', 'directory_audit_logs', 'organizations',
+      'sync_states', 'tenant_health_snapshots', 'tenant_health_source_authorities'] as const
+    const organizations = [...new Set(f.scopes.map(scope => scope.organizationId))]
+    const role = `haw70_truncate_${randomUUID().replaceAll('-', '')}`
+    const triggerState = async () => (await f.writer.query(`SELECT c.relname, t.tgenabled,
+        t.tgtype::int, t.tgisinternal, p.proname, p.prosecdef, p.proconfig
+      FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_proc p ON p.oid = t.tgfoid
+      WHERE n.nspname = 'public' AND c.relname = ANY($1::text[])
+        AND t.tgname = 'tenant_health_refuse_truncate' ORDER BY c.relname`, [tables])).rows
+    const readState = async (client: pg.Client) => {
+      const state: Record<string, unknown[]> = {}
+      for (const table of tables) state[table] = (await client.query(`SELECT to_jsonb(source) AS row
+        FROM public.${table} AS source WHERE ${table === 'organizations' ? 'id' : 'organization_id'} = ANY($1::uuid[])
+        ORDER BY to_jsonb(source)::text`, [organizations])).rows
+      state.receipts = (await client.query(`SELECT generation, protocol_fingerprint, completed_at::text
+        FROM tenant_health_reconciliation_generations ORDER BY generation`)).rows
+      return state
+    }
+    const refuses = (firstTable: typeof tables[number]) => (error: unknown): boolean => {
+      assert.ok(sqlState('55000')(error) && error instanceof Error)
+      assert.equal(error.message, 'TENANT_HEALTH_TRUNCATE_REQUIRES_VERSIONED_DELETE')
+      assert.ok('schema' in error && error.schema === 'public')
+      assert.ok('table' in error && error.table === firstTable)
+      return true
+    }
+    for (let index = 0; index < f.scopes.length; index++) {
+      await f.insert(f.writer, index)
+      const scope = f.scopes[index], auditId = randomUUID()
+      await f.writer.query(`INSERT INTO directory_audit_logs
+        (id, organization_id, customer_tenant_id, microsoft_audit_id,
+         event_date_time, activity_display_name, raw, expires_at)
+        VALUES ($1, $2, $3, $4, now(), 'truncate fixture', '{}'::jsonb, now() + interval '1 day')`,
+      [auditId, scope.organizationId, scope.tenantId, `haw70-truncate-${auditId}`])
+      await f.tag(index)
+    }
+    const before = await readState(f.observer), guards = await triggerState()
+    assert.equal(before.directory_audit_logs.length, 3)
+    assert.equal(before.sync_states.length, 3)
+    assert.equal(before.tenant_health_source_authorities.length, 3)
+    assert.deepEqual(guards.map(row => row.relname), tables)
+    for (const guard of guards) assert.deepEqual(guard, {
+      relname: guard.relname, tgenabled: 'A', tgtype: 34, tgisinternal: false,
+      proname: 'tenant_health_refuse_truncate', prosecdef: false, proconfig: ['search_path=pg_catalog'],
+    }, 'Every installed guard must be BEFORE STATEMENT TRUNCATE and ENABLE ALWAYS')
+    await f.writer.query('CREATE TEMP TABLE haw70_truncate_sentinel (value text NOT NULL)')
+    await f.writer.query("INSERT INTO haw70_truncate_sentinel VALUES ('unchanged')")
+    try {
+      // Negative control is rollback-only, never a committed truncation. It
+      // proves DELETE invalidation is absent without losing shared CI data.
+      assert.equal((await f.writer.query(`SELECT 1 FROM pg_constraint
+        WHERE contype = 'f' AND confrelid = 'public.directory_audit_logs'::regclass`)).rowCount, 0)
+      assert.equal((await f.writer.query(`SELECT 1 FROM pg_trigger t
+        WHERE t.tgrelid = 'public.directory_audit_logs'::regclass
+          AND t.tgname = 'tenant_health_audit_delete_invalidate'
+          AND t.tgtype = 8 AND t.tgenabled IN ('O', 'A')
+          AND t.tgfoid = 'public.tenant_health_invalidate_on_audit_change()'::regprocedure`)).rowCount, 1)
+      await f.writer.query('BEGIN')
+      try {
+        await f.writer.query("SET LOCAL lock_timeout = '2s'")
+        await f.writer.query("SET LOCAL session_replication_role = 'origin'")
+        await f.writer.query('ALTER TABLE public.directory_audit_logs DISABLE TRIGGER tenant_health_refuse_truncate')
+        await f.writer.query('TRUNCATE public.directory_audit_logs')
+        assert.equal((await f.writer.query('SELECT 1 FROM directory_audit_logs')).rowCount, 0)
+        for (let index = 0; index < f.scopes.length; index++) {
+          const authority = await f.authority(f.writer, index)
+          assert.ok(authority.current_snapshot_id)
+        }
+        const unguarded = await readState(f.writer)
+        assert.deepEqual(unguarded, { ...before, directory_audit_logs: [] })
+      } finally { await f.writer.query('ROLLBACK') }
+      assert.deepEqual(await triggerState(), guards)
+      assert.deepEqual(await readState(f.observer), before)
+
+      const commands: Array<{ sql: string; first: typeof tables[number] }> = [
+        ...tables.map(table => ({ first: table,
+          sql: `TRUNCATE public.${table}${['customer_tenants', 'organizations', 'tenant_health_snapshots'].includes(table) ? ' CASCADE' : ''}` })),
+        { sql: 'TRUNCATE public.directory_audit_logs, public.sync_states', first: 'directory_audit_logs' },
+        { sql: 'TRUNCATE public.sync_states, public.directory_audit_logs', first: 'sync_states' },
+        { sql: 'TRUNCATE pg_temp.haw70_truncate_sentinel, public.directory_audit_logs RESTART IDENTITY', first: 'directory_audit_logs' },
+      ]
+      for (const mode of ['origin', 'local', 'replica'] as const) {
+        for (const command of commands) {
+          await f.writer.query('BEGIN')
+          try {
+            await f.writer.query("SET LOCAL lock_timeout = '2s'")
+            await f.writer.query(`SET LOCAL session_replication_role = '${mode}'`)
+            await f.writer.query("UPDATE haw70_truncate_sentinel SET value = 'must roll back'")
+            await assert.rejects(f.writer.query(command.sql), refuses(command.first))
+          } finally { await f.writer.query('ROLLBACK') }
+          assert.deepEqual((await f.writer.query('SELECT value FROM haw70_truncate_sentinel')).rows, [{ value: 'unchanged' }])
+          assert.deepEqual(await readState(f.observer), before)
+        }
+      }
+
+      // Explicit TRUNCATE privileges reach the installed guard even though this
+      // effective role sees no source rows under RLS. This is not login proof.
+      await f.writer.query('BEGIN')
+      await f.writer.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEROLE NOCREATEDB NOREPLICATION`)
+      await f.writer.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
+      await f.writer.query(`GRANT SELECT, TRUNCATE ON public.directory_audit_logs, public.sync_states TO "${role}"`)
+      await f.writer.query('COMMIT')
+      for (const command of commands.filter(value =>
+        !value.sql.includes('pg_temp') && ['directory_audit_logs', 'sync_states'].includes(value.first))) {
+        await f.writer.query('BEGIN')
+        try {
+          await f.writer.query("SET LOCAL lock_timeout = '2s'")
+          await f.writer.query('SET LOCAL row_security = on')
+          await f.writer.query(`SET LOCAL ROLE "${role}"`)
+          const access = (await f.writer.query(`SELECT c.relname,
+              has_table_privilege(current_user, c.oid, 'TRUNCATE') AS can_truncate,
+              row_security_active(c.oid) AS rls_active,
+              pg_has_role(current_user, c.relowner, 'USAGE') AS owner_rights
+            FROM pg_class c WHERE c.oid IN ('public.directory_audit_logs'::regclass, 'public.sync_states'::regclass)
+            ORDER BY c.relname`)).rows
+          assert.deepEqual(access, ['directory_audit_logs', 'sync_states'].map(relname => ({
+            relname, can_truncate: true, rls_active: true, owner_rights: false,
+          })))
+          assert.equal((await f.writer.query('SELECT 1 FROM directory_audit_logs')).rowCount, 0)
+          assert.equal((await f.writer.query('SELECT 1 FROM sync_states')).rowCount, 0)
+          await assert.rejects(f.writer.query(command.sql), refuses(command.first))
+        } finally { await f.writer.query('ROLLBACK') }
+        assert.deepEqual(await readState(f.observer), before)
+      }
+    } finally {
+      await f.writer.query('ROLLBACK')
+      await f.writer.query('RESET ROLE')
+      if ((await f.writer.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role])).rowCount) {
+        await f.writer.query(`REVOKE ALL ON public.directory_audit_logs, public.sync_states FROM "${role}"`)
+        await f.writer.query(`REVOKE ALL ON SCHEMA public FROM "${role}"`)
+        await f.writer.query(`DROP ROLE "${role}"`)
+      }
+      assert.deepEqual(await triggerState(), guards)
+    }
+  })

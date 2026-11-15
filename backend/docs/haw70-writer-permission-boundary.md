@@ -14,9 +14,21 @@ missing-ACL rejection, owner invalidation and tenant lifecycle rejection. The
 negative controls restore the guard before committing their fixture writes.
 These cases have not executed in PostgreSQL. SET LOCAL ROLE probes effective DML
 rights only; an administrator session cannot prove production login containment.
-TRUNCATE guards, actual runtime role attestation, complete activation/preflight
+At that checkpoint, TRUNCATE guards, actual runtime role attestation, complete activation/preflight
 and cross-scope restricted-writer coverage remain open. The earlier design below
 states the full acceptance target; this slice does not complete it.
+
+A further unpublished slice adds BEFORE STATEMENT TRUNCATE refusal guards on
+audit logs, sync states, tenants, organizations, health snapshots and source
+authorities. Only these six guards use ENABLE ALWAYS, so their refusal also
+applies in replica mode; other triggers are unchanged. A registered physical
+witness specifies a rollback-only unguarded audit truncation, direct and parent
+CASCADE refusal, both source-table orders, a preceding temporary-table sentinel,
+and effective roles with explicit TRUNCATE grants but no RLS-visible source rows.
+Every truncation attempt is rolled back even if its expected refusal fails.
+This witness has not executed. Owners can still disable or drop guards, runtime
+role attestation is absent, and future health sources need their own coverage.
+The partial receipt and inactive reader/preflight remain unchanged.
 
 ## Observed source contract
 
@@ -37,7 +49,7 @@ states the full acceptance target; this slice does not complete it.
   `search_path = pg_catalog`. At the reviewed parent, none sets
   `row_security = off`. Invalidation permits
   zero authority updates intentionally: missing/dead authority stays untrusted.
-- Source invalidation covers INSERT/UPDATE/DELETE, without source TRUNCATE guards.
+- At the reviewed parent, source invalidation covers INSERT/UPDATE/DELETE without source TRUNCATE guards.
   The [receipt mutation guard](../prisma/migrations/20261113170000_tenant_health_reconciliation_marker/migration.sql)
   rejects TRUNCATE only on its receipt table. It does not guard source tables.
 - [Registered database CI](../../.github/workflows/quality-gates.yml) uses a
