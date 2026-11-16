@@ -52,8 +52,40 @@ and relevant snapshot rows together. Each source can be held by the writer while
 an independent tenant or organization deleter actually blocks. The test demands
 authority remain available, then checks source mutation and independent commit
 visibility, deletion commit/rollback, sibling isolation and actual catalog cascade
-order. This covers held existing-row update/delete schedules only; it is not yet
-proof of fresh insert/upsert FK races, every writer ordering, retry or recovery.
+order. That witness covers held existing-row update/delete schedules only.
+
+Four additional registered top-level cases now prepare 42 snapshot-statement
+schedules across tenant and organization deletion. The variants are a fresh MFA
+INSERT, a fresh risky-user UPSERT and an MFA UPSERT that conflicts with an existing
+snapshot. Each fixture includes audit and sync-state children, current health
+history, a same-organization sibling and an outside tenant. Three independent
+sessions perform the writer, deleter and observer roles.
+
+- Writer first: the source statement finishes inside an open transaction, the
+  parent DELETE must actually block on that writer, and source commit/rollback
+  is checked independently from deletion commit/rollback. This has 24 schedules.
+- Deleter first: the parent DELETE and its cascades finish without committing;
+  the snapshot statement must actually block on that deleter. Parent commit must
+  produce a snapshot foreign-key failure followed by writer rollback. Parent
+  rollback permits the source statement, then its own commit/rollback is checked.
+  This has 18 schedules.
+
+Blocking is observed with the actual blocking-session relationship, not a timed
+sleep or an assumed FK/tuple lock. A conflicting upsert may block on a cascaded
+child row or transaction; the witness does not prescribe which lock is acquired.
+Tenant deletion must leave dead authority with an advanced revision and cleared
+pointer. Organization deletion must remove authority, including the same-org
+sibling, while the outside tenant remains unchanged. Revision advance on deletion
+is deliberately not fixed at one: child invalidation and the tombstone can both
+participate. A failed source transaction rolls back before final assertions, and
+cleanup releases the known blocker before awaiting the competing statement.
+
+These schedules are prepared but unexecuted. The deleter-first cases begin after
+cascade work completes; they do not establish every in-flight cascade interleaving.
+No barrier trigger or extra lock is inserted. This tests the source-statement
+boundary, not the full collector's earlier advisory lock, baseline read or change
+evidence transaction. It does not prove all writer ordering, retries, takeover or
+recovery, and it does not change the candidate migration.
 
 The separately documented customer-managed connection lock dependency remains
 open. This slice does not implement HAW-21 ownership, reader admission, time/model
@@ -74,7 +106,8 @@ adds/extends these hosted disposable-PostgreSQL cases:
   and missing/dead authority without resurrection.
 - Restricted source access with hidden authority, old/new resource membership,
   separate ACL failure and excluded writes without authority privileges.
-- Mixed-source parent deletion schedules and whole-table truncation refusal as
+- Mixed-source parent deletion schedules, fresh/conflicting snapshot write races
+  in both stated orderings, and whole-table truncation refusal as
   owner/restricted role, including replica mode and parent CASCADE.
 
 The local gate deliberately skips physical cases. Passing TypeScript, lint,
@@ -83,9 +116,10 @@ PostgreSQL proof. Registration does not mean execution. The new migration has no
 been installed locally, in CI or in production. A future exact-source-authorized
 CI run must exercise this child and apply all migrations before these assertions.
 
-Before activation, add and pass the remaining fresh-insert/upsert FK/deletion
-schedules and failed-save outcome witnesses (no success receipt/notification after
-snapshot failure, including a failing terminal sync-state update). Prove every
+Before activation, execute these exact registered FK/deletion schedules and extend
+coverage for any remaining production-writer interleavings. Add and pass failed-save
+outcome witnesses (no success receipt/notification after snapshot failure, including
+a failing terminal sync-state update). Prove every
 remaining writer, authority reader/recovery admission and fleet-scale behavior.
 The existing historical reconciliation receipt is not extended by this slice.
 No full protocol or Baseline completion is claimed.

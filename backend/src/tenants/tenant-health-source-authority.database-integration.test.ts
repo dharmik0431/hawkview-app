@@ -2073,6 +2073,205 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
     })
 }
 
+const snapshotRaceVariants = [
+  { name: 'insert', resource: 'AUTH_REGISTRATIONS', upsert: false, existing: false },
+  { name: 'fresh upsert', resource: 'RISKY_USERS', upsert: true, existing: false },
+  { name: 'conflicting upsert', resource: 'AUTH_REGISTRATIONS', upsert: true, existing: true },
+] as const
+
+// These are source-statement schedules. They do not inject locks/triggers or
+// claim to exercise the complete collector's advisory/evidence transaction.
+async function snapshotParentRaceFixture(
+  context: import('node:test').TestContext,
+  variant: typeof snapshotRaceVariants[number],
+  deleteTarget: 'tenant' | 'organization',
+) {
+  const f = await syncStateAuthorityFixture(context)
+  const scope = f.scopes[0], sourceId = randomUUID(), auditId = randomUUID()
+  await f.insert(f.writer, 0)
+  await f.writer.query(`INSERT INTO directory_audit_logs
+    (id, organization_id, customer_tenant_id, microsoft_audit_id,
+     event_date_time, activity_display_name, raw, expires_at)
+    VALUES ($1, $2, $3, $4, now(), 'snapshot race', '{}'::jsonb, now() + interval '1 day')`,
+  [auditId, scope.organizationId, scope.tenantId, `haw70-snapshot-race-${auditId}`])
+  if (variant.existing) await insertHealthInputSnapshot(f, 0, variant.resource, sourceId)
+  await f.tag(0)
+  const read = async (client: pg.Client) => ({
+    organization: (await client.query('SELECT id FROM organizations WHERE id = $1', [scope.organizationId])).rows,
+    tenants: (await client.query('SELECT id FROM customer_tenants WHERE organization_id = $1 ORDER BY id', [scope.organizationId])).rows,
+    source: (await client.query(`SELECT id, resource_type, payload, observed_at FROM tenant_entra_snapshots
+      WHERE customer_tenant_id = $1 AND resource_type = $2::"SyncResourceType"`, [scope.tenantId, variant.resource])).rows,
+    sync: (await client.query('SELECT id, status FROM sync_states WHERE customer_tenant_id = $1 ORDER BY id', [scope.tenantId])).rows,
+    audit: (await client.query('SELECT id, activity_display_name FROM directory_audit_logs WHERE customer_tenant_id = $1 ORDER BY id', [scope.tenantId])).rows,
+    histories: (await client.query(`SELECT id, customer_tenant_id FROM tenant_health_snapshots
+      WHERE organization_id = $1 ORDER BY id`, [scope.organizationId])).rows,
+    authorities: await Promise.all(f.scopes.map((_, index) => f.authority(client, index))),
+  })
+  const before = await read(f.observer)
+  assert.equal(before.source.length, variant.existing ? 1 : 0)
+  assert.equal(before.organization.length, 1)
+  assert.equal(before.tenants.length, 2)
+  assert.equal(before.sync.length, 1)
+  assert.equal(before.audit.length, 1)
+  assert.ok(before.histories.some(row => row.customer_tenant_id === f.scopes[1].tenantId))
+  const write = () => f.writer.query(`INSERT INTO tenant_entra_snapshots
+    (id, organization_id, customer_tenant_id, resource_type, payload, observed_at, updated_at)
+    VALUES ($1, $2, $3, $4::"SyncResourceType", '[{"witness":"candidate"}]'::jsonb, '2026-11-16T03:45:00Z', now())
+    ${variant.upsert ? `ON CONFLICT (customer_tenant_id, resource_type)
+      DO UPDATE SET payload = EXCLUDED.payload, observed_at = EXCLUDED.observed_at` : ''}`,
+  [variant.existing ? randomUUID() : sourceId, scope.organizationId, scope.tenantId, variant.resource])
+  const deleteParent = (client: pg.Client) => deleteTarget === 'organization'
+    ? client.query('DELETE FROM organizations WHERE id = $1', [scope.organizationId])
+    : client.query('DELETE FROM customer_tenants WHERE id = $1', [scope.tenantId])
+  const assertWritten = (state: Awaited<ReturnType<typeof read>>) => {
+    assert.deepEqual(state.source, [{ id: sourceId, resource_type: variant.resource,
+      payload: [{ witness: 'candidate' }], observed_at: new Date('2026-11-16T03:45:00Z') }])
+    assert.deepEqual(state.authorities, [f.invalidated(before.authorities[0]), ...before.authorities.slice(1)])
+    assert.deepEqual({ ...state, source: before.source, authorities: before.authorities }, before)
+  }
+  const assertDeleted = (state: Awaited<ReturnType<typeof read>>, prior: Awaited<ReturnType<typeof read>>) => {
+    const authority = state.authorities[0]
+    if (deleteTarget === 'organization') assert.equal(authority, undefined)
+    else {
+      assert.ok(BigInt(authority.source_revision) > BigInt(prior.authorities[0].source_revision))
+      assert.deepEqual({ ...authority, source_revision: prior.authorities[0].source_revision },
+        { ...prior.authorities[0], live: false, current_snapshot_id: null, current_observation_sequence: '0' })
+    }
+    assert.deepEqual(state, { ...prior,
+      organization: deleteTarget === 'organization' ? [] : prior.organization,
+      tenants: deleteTarget === 'organization' ? [] : prior.tenants.filter(row => row.id !== scope.tenantId),
+      source: [], sync: [], audit: [],
+      histories: deleteTarget === 'organization' ? [] : prior.histories.filter(row => row.customer_tenant_id !== scope.tenantId),
+      authorities: [authority, deleteTarget === 'organization' ? undefined : prior.authorities[1], prior.authorities[2]],
+    })
+  }
+  return { ...f, before, read, write, deleteParent, assertWritten, assertDeleted }
+}
+
+async function snapshotRacePids(writer: pg.Client, observer: pg.Client, deleter: pg.Client) {
+  const pids = await Promise.all([writer, observer, deleter].map(async client =>
+    (await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid))
+  assert.equal(new Set(pids).size, 3)
+  return { writerPid: pids[0], deleterPid: pids[2] }
+}
+
+async function assertSnapshotRaceBlocks(observer: pg.Client, holderPid: number, blockedPid: number) {
+  const deadline = Date.now() + 4_000
+  while (Date.now() < deadline) {
+    const blocked = (await observer.query<{ blocked: boolean }>(
+      'SELECT $1::int = ANY(pg_blocking_pids($2::int)) AS blocked', [holderPid, blockedPid])).rows[0].blocked
+    if (blocked) return
+    await delay(25)
+  }
+  assert.fail('The competing statement must actually block on the other session, not merely run later')
+}
+
+function captureSnapshotRaceQuery(query: Promise<pg.QueryResult>): Promise<{ result?: pg.QueryResult; error?: unknown }> {
+  return query.then(result => ({ result }), error => ({ error }))
+}
+
+for (const deleteTarget of ['tenant', 'organization'] as const) {
+  test(`HAW-70 snapshot insert/upsert before ${deleteTarget} deletion preserves writer and deletion commit boundaries`,
+    { skip: !RUN, timeout: 120_000 }, async context => {
+      for (const variant of snapshotRaceVariants) {
+        for (const writerOutcome of ['commit', 'rollback'] as const) {
+          for (const deleteOutcome of ['commit', 'rollback'] as const) {
+            await context.test(`${variant.name}, source ${writerOutcome}, parent ${deleteOutcome}`,
+              { timeout: 15_000 }, async subcontext => {
+                const f = await snapshotParentRaceFixture(subcontext, variant, deleteTarget)
+                const deleter = new pg.Client({ connectionString: URL!, statement_timeout: 10_000 })
+                let pendingDelete: ReturnType<typeof captureSnapshotRaceQuery> | undefined
+                await deleter.connect()
+                try {
+                  const pids = await snapshotRacePids(f.writer, f.observer, deleter)
+                  await f.writer.query('BEGIN')
+                  assert.equal((await f.write()).rowCount, 1)
+                  const written = await f.read(f.writer)
+                  f.assertWritten(written)
+                  assert.deepEqual(await f.read(f.observer), f.before)
+                  await deleter.query('BEGIN')
+                  await deleter.query("SET LOCAL lock_timeout = '8s'")
+                  pendingDelete = captureSnapshotRaceQuery(f.deleteParent(deleter))
+                  await assertSnapshotRaceBlocks(f.observer, pids.writerPid, pids.deleterPid)
+                  assert.deepEqual(await f.read(f.observer), f.before)
+                  await f.writer.query(writerOutcome === 'commit' ? 'COMMIT' : 'ROLLBACK')
+                  const deletion = await pendingDelete
+                  if (deletion.error) throw deletion.error
+                  assert.equal(deletion.result?.rowCount, 1)
+                  const visibleWriterState = writerOutcome === 'commit' ? written : f.before
+                  const deleted = await f.read(deleter)
+                  f.assertDeleted(deleted, visibleWriterState)
+                  assert.deepEqual(await f.read(f.observer), visibleWriterState,
+                    'Only the resolved writer transaction is visible while deletion is uncommitted')
+                  await deleter.query(deleteOutcome === 'commit' ? 'COMMIT' : 'ROLLBACK')
+                  assert.deepEqual(await f.read(f.observer), deleteOutcome === 'commit' ? deleted : visibleWriterState)
+                } finally {
+                  // The writer is the known blocker in this schedule. Release
+                  // it before awaiting the queued DELETE or fixture cleanup.
+                  await f.writer.query('ROLLBACK')
+                  if (pendingDelete) await pendingDelete
+                  await deleter.query('ROLLBACK')
+                  await deleter.end()
+                }
+              })
+          }
+        }
+      }
+    })
+
+  test(`HAW-70 snapshot insert/upsert after uncommitted ${deleteTarget} deletion rejects removed parents and preserves rollback`,
+    { skip: !RUN, timeout: 120_000 }, async context => {
+      for (const variant of snapshotRaceVariants) {
+        for (const outcome of ['parent commits', 'parent rolls back, source commits', 'both roll back'] as const) {
+          await context.test(`${variant.name}, ${outcome}`, { timeout: 15_000 }, async subcontext => {
+            const f = await snapshotParentRaceFixture(subcontext, variant, deleteTarget)
+            const deleter = new pg.Client({ connectionString: URL!, statement_timeout: 10_000 })
+            let pendingWrite: ReturnType<typeof captureSnapshotRaceQuery> | undefined
+            await deleter.connect()
+            try {
+              const pids = await snapshotRacePids(f.writer, f.observer, deleter)
+              await deleter.query('BEGIN')
+              assert.equal((await f.deleteParent(deleter)).rowCount, 1)
+              const deleted = await f.read(deleter)
+              f.assertDeleted(deleted, f.before)
+              assert.deepEqual(await f.read(f.observer), f.before)
+              await f.writer.query('BEGIN')
+              pendingWrite = captureSnapshotRaceQuery(f.write())
+              await assertSnapshotRaceBlocks(f.observer, pids.deleterPid, pids.writerPid)
+              assert.deepEqual(await f.read(f.observer), f.before)
+              await deleter.query(outcome === 'parent commits' ? 'COMMIT' : 'ROLLBACK')
+              const write = await pendingWrite
+              if (outcome === 'parent commits') {
+                assert.ok(sqlState('23503')(write.error) && write.error instanceof Error)
+                assert.ok('table' in write.error && write.error.table === 'tenant_entra_snapshots',
+                  'The refused write must fail the snapshot parent FK, not unrelated fixture setup')
+                assert.equal(write.result, undefined)
+                await f.writer.query('ROLLBACK')
+                assert.deepEqual(await f.read(f.observer), deleted)
+              } else {
+                if (write.error) throw write.error
+                assert.equal(write.result?.rowCount, 1)
+                const written = await f.read(f.writer)
+                f.assertWritten(written)
+                assert.deepEqual(await f.read(f.observer), f.before,
+                  'Parent rollback does not make the still-uncommitted snapshot write visible')
+                await f.writer.query(outcome === 'both roll back' ? 'ROLLBACK' : 'COMMIT')
+                assert.deepEqual(await f.read(f.observer), outcome === 'both roll back' ? f.before : written)
+              }
+            } finally {
+              // Reverse the release order: this schedule's completed but
+              // uncommitted parent deletion is the source statement's blocker.
+              await deleter.query('ROLLBACK')
+              if (pendingWrite) await pendingWrite
+              await f.writer.query('ROLLBACK')
+              await deleter.end()
+            }
+          })
+        }
+      }
+    })
+}
+
 const healthGuardFunctions = [
   'tenant_health_authorize_on_tenant_insert',
   'tenant_health_invalidate_on_audit_change',
