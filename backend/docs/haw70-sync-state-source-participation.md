@@ -139,9 +139,14 @@ contract explicitly covers and measures them. No such retry is added here.
 
 ## Remaining activation gates and fallback
 
-`sync_states` is only one uncovered input. `tenant_connections` and tenant status,
-selected `tenant_entra_snapshots`, usage `tenant_collection_field_states`, license
-service plans and `m365_activity_subscriptions` all feed the current mapper.
+`sync_states` is only one input. `tenant_connections` and tenant status,
+health-relevant `tenant_entra_snapshots` and license service plans remain outside
+this writer slice. Selection by the mapper alone does not prove that a source
+affects persisted health: the later
+[saved-input audit](haw70-persisted-input-dependencies.md) establishes that the two
+usage projection fields affect neighboring readiness, not the current saved
+health/freshness payload, and narrows the demonstrated snapshot inputs. Other
+relations, including activity subscriptions, need the same transitive trace.
 Connection/consent and tenant-scope changes must participate too. Complete tagged
 snapshot publication, coherent evidence reads, bounded per-tenant audit reads
 and the current-reader admission gate remain separate unfinished work.
