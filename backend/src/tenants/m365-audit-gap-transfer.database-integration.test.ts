@@ -104,22 +104,34 @@ async function snapshot(client: pg.Client, tenantId: string) {
   return rows
 }
 
-type SourceRace = {
+async function coverageState(client: pg.Client, tenantId: string) {
+  const result = await client.query(`SELECT generation::text,
+    to_char(incomplete_since AT TIME ZONE 'UTC', $2) AS "incompleteSince",
+    to_char(last_gap_at AT TIME ZONE 'UTC', $2) AS "lastGapAt", has_purged_unrepaired_gap AS purged
+    FROM public.m365_audit_coverage_states WHERE customer_tenant_id = $1`, [tenantId, format])
+  assert.equal(result.rowCount, 1)
+  return result.rows[0] as { generation: string; incompleteSince: string; lastGapAt: string; purged: boolean }
+}
+
+type TransferRace = {
   blocker: pg.Client
   waiter: pg.Client
   blockerPid: number
   waiterPid: number
   owner: Scope
   claim: SelectedAuditGapClaim
-  start: () => Promise<StagedAuditGapTransfer>
+  secondClaim: SelectedAuditGapClaim | undefined
+  start: (claim?: SelectedAuditGapClaim) => Promise<StagedAuditGapTransfer>
+  track: <T>(operation: () => Promise<T>) => Promise<T>
 }
 
 // Committed synthetic fixtures are necessary for both connections to see them.
-// The real helper's transaction always rolls back; cleanup is scoped to the one
-// newly generated organization and happens only after in-flight work settles.
-async function sourceRace(
+// Individual cases explicitly commit or roll back component writes. Cleanup is
+// scoped to the newly generated organization after all in-flight work settles.
+async function transferRace(
   overrides: (client: pg.Client) => Promise<Partial<SelectedAuditGapClaim>>,
-  run: (race: SourceRace) => Promise<void>,
+  run: (race: TransferRace) => Promise<void>,
+  settings: { lockSourceBeforeRun?: boolean; seedSecondSource?: boolean } = {},
 ) {
   const url = assertDisposableTestDatabase()
   assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
@@ -128,7 +140,7 @@ async function sourceRace(
   const waiter = new pg.Client(configuration)
   const organizationId = randomUUID()
   const connected = new Set<pg.Client>()
-  let pending: Promise<StagedAuditGapTransfer> | undefined
+  let pending: Promise<unknown> | undefined
   try {
     for (const client of [blocker, waiter]) {
       await client.connect()
@@ -144,18 +156,23 @@ async function sourceRace(
     await blocker.query('BEGIN ISOLATION LEVEL READ COMMITTED')
     const owner = await scope(blocker, organizationId)
     const claim = await source(blocker, owner, await overrides(blocker))
+    const secondClaim = settings.seedSecondSource ? await source(blocker, owner) : undefined
     await blocker.query('COMMIT')
     await blocker.query('BEGIN ISOLATION LEVEL READ COMMITTED')
-    assert.equal((await blocker.query('SELECT id FROM public.m365_activity_contents WHERE id = $1 FOR UPDATE', [claim.id])).rowCount, 1)
+    if (settings.lockSourceBeforeRun !== false)
+      assert.equal((await blocker.query('SELECT id FROM public.m365_activity_contents WHERE id = $1 FOR UPDATE', [claim.id])).rowCount, 1)
     await waiter.query('BEGIN ISOLATION LEVEL READ COMMITTED')
-    await run({ blocker, waiter, blockerPid, waiterPid, owner, claim, start: () => {
-      assert.equal(pending, undefined, 'Start exactly one real helper call per race')
-      pending = stageExpiredAuditGapTransfer(adapter(waiter), claim)
+    const track = <T>(operation: () => Promise<T>): Promise<T> => {
+      assert.equal(pending, undefined, 'Track exactly one pending waiter operation per race')
+      const operationResult = operation()
+      pending = operationResult
       // Attach immediately to prevent an unhandled rejection during observation;
       // the original promise is still awaited by the assertion and by cleanup.
       void pending.catch(() => undefined)
-      return pending
-    } })
+      return operationResult
+    }
+    await run({ blocker, waiter, blockerPid, waiterPid, owner, claim, secondClaim, track,
+      start: (selected = claim) => track(() => stageExpiredAuditGapTransfer(adapter(waiter), selected)) })
   } finally {
     const failures: unknown[] = []
     const clean = async (operation: () => Promise<unknown>) => {
@@ -173,11 +190,14 @@ async function sourceRace(
     })
     await clean(() => waiter.end())
     await clean(() => blocker.end())
-    if (failures.length) throw new AggregateError(failures, 'Synthetic source-race cleanup failed')
+    if (failures.length) throw new AggregateError(failures, 'Synthetic transfer-race cleanup failed')
   }
 }
 
-async function sourceWait(race: SourceRace) {
+const sourceLockQuery = /^\s*SELECT id FROM public\.m365_activity_contents WHERE id = \$1::uuid[\s\S]+FOR UPDATE\s*$/
+const tenantLockQuery = /^\s*SELECT id FROM public\.customer_tenants\s+WHERE id = \$1::uuid AND organization_id = \$2::uuid FOR UPDATE\s*$/
+
+async function rowWait(race: TransferRace, queryPattern: RegExp) {
   // A transaction can cache activity snapshots; explicitly refresh each poll.
   await race.blocker.query('SELECT pg_stat_clear_snapshot()')
   const result = await race.blocker.query(`SELECT state, wait_event_type, query,
@@ -188,20 +208,21 @@ async function sourceWait(race: SourceRace) {
   const row = result.rows[0]
   const blocked = row.state === 'active' && row.wait_event_type === 'Lock'
     && row.blockers.length === 1 && row.blockers[0] === race.blockerPid
-    && /^\s*SELECT id FROM public\.m365_activity_contents WHERE id = \$1::uuid[\s\S]+FOR UPDATE\s*$/.test(row.query)
+    && queryPattern.test(row.query)
   return { blocked, expired: row.expired as boolean | null }
 }
 
-async function untilSourceWait(race: SourceRace, afterExpiry = false) {
+async function untilRowWait(race: TransferRace,
+  { afterExpiry = false, queryPattern = sourceLockQuery }: { afterExpiry?: boolean; queryPattern?: RegExp } = {}) {
   const deadline = Date.now() + 12_000
   while (Date.now() < deadline) {
-    const observation = await sourceWait(race)
+    const observation = await rowWait(race, queryPattern)
     if (observation.blocked && (!afterExpiry || observation.expired === true)) return observation
     // Polling delay bounds work; only the server's blocker/query/clock evidence
     // satisfies this barrier. Elapsed wall time alone never passes the test.
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  assert.fail('Expected exact source-row blocker/clock barrier was not observed')
+  assert.fail('Expected exact row-statement blocker/clock barrier was not observed')
 }
 
 test('HAW-75 transfer computes earliest microsecond deadline and tie precedence under nondefault session settings',
@@ -348,10 +369,10 @@ test('HAW-75 a real generation overflow rejects and rolls back the preceding gap
   }))
 
 test('HAW-75 source revision committed during an observed row wait invalidates the selected claim',
-  { ...options, timeout: 45_000 }, async () => sourceRace(async () => ({}), async race => {
+  { ...options, timeout: 45_000 }, async () => transferRace(async () => ({}), async race => {
     const { blocker, waiter, owner, claim } = race
     const pending = race.start()
-    assert.equal((await untilSourceWait(race)).blocked, true)
+    assert.equal((await untilRowWait(race)).blocked, true)
     assert.equal((await blocker.query(`UPDATE public.m365_activity_contents
       SET updated_at = updated_at + interval '1 microsecond' WHERE id = $1`, [claim.id])).rowCount, 1)
     const replacement = await select(blocker, claim.id)
@@ -371,7 +392,7 @@ test('HAW-75 source revision committed during an observed row wait invalidates t
   }))
 
 test('HAW-75 source expires during an observed row wait and uses post-wait database time',
-  { ...options, timeout: 45_000 }, async () => sourceRace(async client => {
+  { ...options, timeout: 45_000 }, async () => transferRace(async client => {
     const times = (await client.query(`WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
       SELECT to_char(at AT TIME ZONE 'UTC', $1) AS discovered,
         to_char((at + interval '24 hours') AT TIME ZONE 'UTC', $1) AS ledger,
@@ -383,8 +404,8 @@ test('HAW-75 source expires during an observed row wait and uses post-wait datab
     assert.equal((await waiter.query(`SELECT transaction_timestamp() < $1::timestamptz
       AND clock_timestamp() < $1::timestamptz AS before_expiry`, [claim.contentExpiresAt])).rows[0].before_expiry, true)
     const pending = race.start()
-    assert.equal((await untilSourceWait(race)).expired, false, 'Must observe the actual source wait before expiry')
-    assert.equal((await untilSourceWait(race, true)).expired, true, 'Same source wait must persist across the database deadline')
+    assert.equal((await untilRowWait(race)).expired, false, 'Must observe the actual source wait before expiry')
+    assert.equal((await untilRowWait(race, { afterExpiry: true })).expired, true, 'Same source wait must persist across the database deadline')
     const releasedAfter = (await blocker.query(`SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', $1) AS at`, [format])).rows[0].at
     // Release the source unchanged: only time advances, not its selected fields.
     await blocker.query('COMMIT')
@@ -405,3 +426,85 @@ test('HAW-75 source expires during an observed row wait and uses post-wait datab
     await waiter.query('ROLLBACK')
     assert.deepEqual(await snapshot(blocker, owner.tenantId), original, 'Full rollback restores the committed source')
   }))
+
+test('HAW-75 committed transfer prevents a blocked raw source update from resurrecting the deleted row',
+  { ...options, timeout: 45_000 }, async () => transferRace(async () => ({}), async race => {
+    const { blocker, waiter, claim, owner } = race
+    assert.equal((await stageExpiredAuditGapTransfer(adapter(blocker), claim)).staged, true)
+    const staged = await snapshot(blocker, owner.tenantId)
+    assert.deepEqual(staged.m365_activity_contents, [])
+    assert.equal(staged.m365_audit_coverage_gaps!.length, 1)
+    assert.equal((await coverageState(blocker, owner.tenantId)).generation, '1')
+    const uncommittedView = await snapshot(waiter, owner.tenantId)
+    assert.equal(uncommittedView.m365_activity_contents!.length, 1)
+    assert.deepEqual(uncommittedView.m365_audit_coverage_gaps, [])
+    assert.deepEqual(uncommittedView.m365_audit_coverage_states, [])
+    // Synthetic non-key UPDATE only: not the production completion transaction,
+    // discovery INSERT/UPSERT, record/blob accounting or the HAW-21 owner fence.
+    const pending = race.track(() => waiter.query(`UPDATE public.m365_activity_contents SET status = 'COMPLETED',
+      updated_at = clock_timestamp() WHERE id = $1::uuid RETURNING id`, [claim.id]))
+    await untilRowWait(race, {
+      queryPattern: /^\s*UPDATE public\.m365_activity_contents SET status = 'COMPLETED',\s+updated_at = clock_timestamp\(\) WHERE id = \$1::uuid RETURNING id\s*$/,
+    })
+    await blocker.query('COMMIT')
+    const result = await pending
+    assert.equal(result.rowCount, 0)
+    assert.deepEqual(result.rows, [])
+    assert.deepEqual(await snapshot(waiter, owner.tenantId), staged)
+    await waiter.query('COMMIT')
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), staged, 'Committed gap/state survives the late no-op write')
+  }, { lockSourceBeforeRun: false }))
+
+test('HAW-75 same-identity first-gap transfers serialize on the tenant without refreshing evidence',
+  { ...options, timeout: 45_000 }, async () => transferRace(async () => ({}), async race => {
+    const { blocker, waiter, claim, owner } = race
+    const before = await snapshot(waiter, owner.tenantId)
+    assert.deepEqual(before.m365_audit_coverage_gaps, [])
+    assert.deepEqual(before.m365_audit_coverage_states, [])
+    assert.deepEqual(await stageExpiredAuditGapTransfer(adapter(blocker), claim), { staged: true, reason: 'LEDGER_EXPIRED' })
+    const first = await snapshot(blocker, owner.tenantId)
+    assert.deepEqual(first.m365_activity_contents, [])
+    assert.equal(first.m365_audit_coverage_gaps!.length, 1)
+    assert.equal((await coverageState(blocker, owner.tenantId)).generation, '1')
+    const pending = race.start()
+    await untilRowWait(race, { queryPattern: tenantLockQuery })
+    await blocker.query('COMMIT')
+    assert.deepEqual(await pending, { staged: false, reason: 'SOURCE_CHANGED_OR_ABSENT' })
+    assert.deepEqual(await snapshot(waiter, owner.tenantId), first, 'No duplicate evidence, generation bump or retention refresh')
+    await waiter.query('COMMIT')
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), first)
+  }, { lockSourceBeforeRun: false }))
+
+test('HAW-75 distinct first-gap transfers preserve both identities and advance one sticky generation per gap',
+  { ...options, timeout: 45_000 }, async () => transferRace(async () => ({}), async race => {
+    const { blocker, waiter, claim, secondClaim, owner } = race
+    assert.ok(secondClaim)
+    assert.notEqual(secondClaim.microsoftContentId, claim.microsoftContentId)
+    const before = await snapshot(waiter, owner.tenantId)
+    assert.equal(before.m365_activity_contents!.length, 2)
+    assert.deepEqual(before.m365_audit_coverage_gaps, [])
+    assert.deepEqual(before.m365_audit_coverage_states, [])
+    assert.deepEqual(await stageExpiredAuditGapTransfer(adapter(blocker), claim), { staged: true, reason: 'LEDGER_EXPIRED' })
+    const first = await snapshot(blocker, owner.tenantId)
+    const firstState = await coverageState(blocker, owner.tenantId)
+    assert.equal(first.m365_audit_coverage_gaps!.length, 1)
+    assert.equal(firstState.generation, '1')
+    const pending = race.start(secondClaim)
+    await untilRowWait(race, { queryPattern: tenantLockQuery })
+    await blocker.query('COMMIT')
+    assert.deepEqual(await pending, { staged: true, reason: 'LEDGER_EXPIRED' })
+    const second = await snapshot(waiter, owner.tenantId)
+    assert.deepEqual(second.m365_activity_contents, [])
+    assert.equal(second.m365_audit_coverage_gaps!.length, 2)
+    assert.ok(second.m365_audit_coverage_gaps!.includes(first.m365_audit_coverage_gaps![0]!))
+    assert.deepEqual(second.m365_audit_coverage_gaps!.map(row => JSON.parse(row).content_id_sha256).sort(),
+      [claim, secondClaim].map(row => createHash('sha256').update(row.microsoftContentId).digest('hex')).sort())
+    const secondState = await coverageState(waiter, owner.tenantId)
+    assert.equal(secondState.generation, '2')
+    assert.equal(secondState.incompleteSince, firstState.incompleteSince)
+    assert.equal(secondState.purged, false)
+    assert.equal((await waiter.query('SELECT $1::timestamptz >= $2::timestamptz AS monotonic',
+      [secondState.lastGapAt, firstState.lastGapAt])).rows[0].monotonic, true)
+    await waiter.query('COMMIT')
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), second, 'Both committed identities and generation are visible')
+  }, { lockSourceBeforeRun: false, seedSecondSource: true }))
