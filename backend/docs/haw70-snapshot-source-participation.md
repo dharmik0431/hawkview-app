@@ -117,9 +117,25 @@ been installed locally, in CI or in production. A future exact-source-authorized
 CI run must exercise this child and apply all migrations before these assertions.
 
 Before activation, execute these exact registered FK/deletion schedules and extend
-coverage for any remaining production-writer interleavings. Add and pass failed-save
-outcome witnesses (no success receipt/notification after snapshot failure, including
-a failing terminal sync-state update). Prove every
+coverage for any remaining production-writer interleavings. The ordinary
+[`snapshot-persistence-outcome.test.ts`](../src/tenants/snapshot-persistence-outcome.test.ts)
+now exercises the real resource entry methods, snapshot save, terminal wrapper and
+difference builder with synthetic collector, storage and notification boundaries.
+Across premium MFA, exact-code non-premium MFA fallback and risky users, it checks
+upsert rejection shaped as overflow/privilege/RLS errors, including rejection of
+the subsequent FAILED state write. It requires no SUCCEEDED write, no successful
+incident resolution, no advance of last-success time and no storage-driven MFA
+fallback. A deferred transaction promise checks that callback completion alone
+cannot signal success: rejection remains failure, while resolution precedes the
+positive-control terminal success and recovery incident.
+
+Those local control-flow tests do not execute PostgreSQL or prove rollback,
+trigger installation, actual diagnostics, ownership, the complete tenant/initial
+sync outcome, or a durable success receipt. The selected paths expose a terminal
+sync-state write and recovery incident, not a separate snapshot success receipt.
+Failure-state recording rejection still propagates and can leave the earlier
+RUNNING state; this slice does not invent recovery or change that failure policy.
+Prove every
 remaining writer, authority reader/recovery admission and fleet-scale behavior.
 The existing historical reconciliation receipt is not extended by this slice.
 No full protocol or Baseline completion is claimed.
