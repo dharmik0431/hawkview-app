@@ -1,14 +1,42 @@
 # HAW-77 proof storage and coherent projection: inactive contract
 
-Design against `3aa4c4e0757149412713c1441c9a05044490556d`. This refines the
-[resource proof contract](haw77-resource-completion-proof.md) and its unused
-[validator](../src/tenants/initial-sync-completion-proof.ts). It installs no
-columns, constraints, queries or callers. The held orchestration defects are
-not repaired by this document.
+Contract originally designed against `3aa4c4e0757149412713c1441c9a05044490556d`.
+This refines the [resource proof contract](haw77-resource-completion-proof.md)
+and its unused [validator](../src/tenants/initial-sync-completion-proof.ts).
+The local storage candidate below remains uninstalled and adds no runtime
+queries or callers. The held orchestration defects remain unresolved.
+
+## Local storage candidate — 16 November 2026
+
+The subsequent inactive implementation now includes the seven nullable Prisma
+fields and additive migration `20261116191000_initial_sync_completion_proof_storage`.
+Twelve named checks are added NOT VALID and then validated within one transaction,
+with a five-second lock timeout and sixty-second per-statement timeout. All-null
+legacy rows retain their existing behavior; no defaults or backfill mint proof.
+The transaction retains its DDL locks through commit: NOT VALID followed by
+VALIDATE here does not create a lower-lock online deployment phase. Actual scan
+cost, lock duration and upgrade compatibility remain unmeasured.
+
+The registered storage suite covers metadata, all 32 receipt-null combinations,
+required/optional legacy writes, every required resource's positive receipt,
+non-nil/matching identities, connection pairing, source kinds, terminal errors,
+finite timestamps and a one-microsecond completion inversion. It also checks
+existing scope/uniqueness/cascades and preservation of DIRECTORY_ROLES fields.
+These SQL fixture transitions do not exercise actual collectors or prove that
+stored assertions are truthful. They do not establish migration-on-populated-data
+compatibility, restricted-role visibility, coherent reads or takeover safety.
+
+Local validation can only check registration, types, syntax and guarded skipping.
+No physical database has run this migration or suite. The suite is wired into
+the existing hosted disposable database inventory and refuses local execution.
+Keep the entire candidate uninstalled, unpublished and unmerged until separately
+authorized review/CI and all activation prerequisites are satisfied. The future
+writer, projection and notice work below remains outstanding; the historical
+“to implement” text describes the contract implemented locally, not deployment.
 
 ## Exact existing boundary
 
-`backend/prisma/schema.prisma` currently defines:
+At the design baseline, `backend/prisma/schema.prisma` defined:
 
 - `CustomerTenant`: UUID tenant identity, organization and tenant status.
 - `TenantConnection`: composite tenant/organization relation and uniqueness,
@@ -83,7 +111,7 @@ No new history/retention policy or cross-tenant epoch lookup is introduced.
 Use named, row-local checks with explicit null tests. PostgreSQL permits a
 CHECK result that is NULL, so an equality alone does not enforce this shape.
 Do not check a mutable connection or other table through a CHECK function.
-These are properties of the future migration, not executed DDL.
+These are now properties of the local migration, not executed DDL.
 [PostgreSQL constraints](https://www.postgresql.org/docs/16/ddl-constraints.html).
 
 For short notation, E/A/P/C/K are the five sync-state fields above, respectively.
@@ -181,7 +209,7 @@ inversion; this design neither adds a lease nor claims a proven lock order.
 
 ## Migration and rollback boundaries
 
-A future additive migration changes real database behavior even while helpers
+Installing the additive migration changes real database behavior even while helpers
 are unused. Keep it inactive until reviewed with its compatibility tests. The
 all-null legacy path must work for every existing required and optional writer.
 Once populated, old writers may violate new checks or leave stale certificates;
@@ -204,9 +232,11 @@ Any later schema rollback needs a separately reviewed compatibility plan.
 
 ## Required registered-CI evidence and next step
 
-The next bounded implementation is the inactive nullable schema and named
-row-shape checks, with a registered storage witness. No runtime proof writers
-or source upload are authorized by this design. Required cases are:
+The nullable schema, named row-shape checks and registered storage witness are
+now prepared locally. The next implementation is an unused coherent projection
+and strict mapper with registered precision/scope tests. Storage upgrade and
+restricted-role evidence remain prerequisites too. No runtime activation or
+source upload is authorized by this design. Required cases are:
 
 - All-null old rows and ordinary old updates accepted for required and optional
   resources; every partial-null/mismatch/nil-ID/kind/resource/status/error/time
