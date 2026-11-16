@@ -1737,19 +1737,167 @@ test('HAW-70 sync-state overflow rolls back its source and missing or dead autho
     assert.equal((await f.observer.query('SELECT count(*)::int AS n FROM sync_states WHERE customer_tenant_id = ANY($1::uuid[])', [[missing.tenantId, dead.tenantId]])).rows[0].n, 2)
   })
 
-// Both child sources must be present: single-child coverage cannot establish
+function insertHealthInputSnapshot(
+  f: Awaited<ReturnType<typeof syncStateAuthorityFixture>>,
+  index: number, resource = 'AUTH_REGISTRATIONS', id = randomUUID(),
+) {
+  const scope = f.scopes[index]
+  return f.writer.query(`INSERT INTO tenant_entra_snapshots
+    (id, organization_id, customer_tenant_id, resource_type, payload, observed_at, updated_at)
+    VALUES ($1, $2, $3, $4::"SyncResourceType", '[]'::jsonb, '2026-11-16T02:00:00Z', now())`,
+  [id, scope.organizationId, scope.tenantId, resource])
+}
+
+test('HAW-70 saved-health snapshot inputs invalidate payload, observation, no-op and deletion only at commit',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const siblingBefore = await f.authority(f.observer, 1)
+    for (const resource of ['AUTH_REGISTRATIONS', 'RISKY_USERS']) {
+      const id = randomUUID()
+      const read = async (client: pg.Client) => (await client.query(
+        'SELECT payload, observed_at::text FROM tenant_entra_snapshots WHERE id = $1', [id])).rows
+      const mutations = [
+        () => insertHealthInputSnapshot(f, 0, resource, id),
+        () => f.writer.query(`UPDATE tenant_entra_snapshots SET payload = '[{"changed":true}]'::jsonb WHERE id = $1`, [id]),
+        () => f.writer.query(`UPDATE tenant_entra_snapshots SET observed_at = observed_at + interval '1 minute' WHERE id = $1`, [id]),
+        () => f.writer.query('UPDATE tenant_entra_snapshots SET payload = payload WHERE id = $1', [id]),
+        () => f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [id]),
+      ]
+      for (let step = 0; step < mutations.length; step++) {
+        const before = await f.tag(0), sourceBefore = await read(f.observer)
+        await f.writer.query('BEGIN')
+        assert.equal((await mutations[step]()).rowCount, 1)
+        assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(before))
+        const sourceAfter = await read(f.writer)
+        if (step === 3) assert.deepEqual(sourceAfter, sourceBefore)
+        else assert.notDeepEqual(sourceAfter, sourceBefore)
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+        assert.deepEqual(await read(f.observer), sourceBefore)
+        await f.writer.query('COMMIT')
+        assert.deepEqual(await f.authority(f.observer, 0), f.invalidated(before))
+        assert.deepEqual(await read(f.observer), sourceAfter)
+        assert.deepEqual(await f.authority(f.observer, 1), siblingBefore)
+      }
+    }
+  })
+
+test('HAW-70 snapshot membership, upsert and scope transitions invalidate exactly the old and new relevant pairs',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const ids = [randomUUID(), randomUUID(), randomUUID()], scope = f.scopes[0]
+    const transition = async (affected: number[], mutate: () => Promise<pg.QueryResult>) => {
+      const before = []
+      for (let i = 0; i < f.scopes.length; i++) before.push(await f.tag(i))
+      await mutate()
+      for (let i = 0; i < f.scopes.length; i++) assert.deepEqual(await f.authority(f.observer, i),
+        affected.includes(i) ? f.invalidated(before[i]) : before[i])
+    }
+    await transition([0], () => f.writer.query(`INSERT INTO tenant_entra_snapshots
+      (id, organization_id, customer_tenant_id, resource_type, updated_at)
+      VALUES ($1, $4, $5, 'AUTH_REGISTRATIONS', now()), ($2, $4, $5, 'RISKY_USERS', now()),
+        ($3, $6, $7, 'SECURE_SCORES', now())`,
+    [...ids, scope.organizationId, scope.tenantId, f.scopes[1].organizationId, f.scopes[1].tenantId]))
+    const upsert = (index: number, action: 'NOTHING' | 'UPDATE') => {
+      const target = f.scopes[index]
+      return f.writer.query(`INSERT INTO tenant_entra_snapshots
+        (id, organization_id, customer_tenant_id, resource_type, payload, updated_at)
+        VALUES ($1, $2, $3, 'AUTH_REGISTRATIONS', '[{"updated":true}]'::jsonb, now())
+        ON CONFLICT (customer_tenant_id, resource_type) DO ${action === 'NOTHING' ? 'NOTHING' : 'UPDATE SET payload = EXCLUDED.payload'}`,
+      [randomUUID(), target.organizationId, target.tenantId])
+    }
+    await transition([], () => upsert(0, 'NOTHING'))
+    await transition([0], () => upsert(0, 'UPDATE'))
+    await transition([1], () => upsert(1, 'UPDATE')) // Fresh INSERT path of the same statement.
+    const mixedBefore = await f.tag(1), mixedId = randomUUID(), mixedScope = f.scopes[1]
+    assert.equal((await f.writer.query(`INSERT INTO tenant_entra_snapshots
+      (id, organization_id, customer_tenant_id, resource_type, payload, updated_at)
+      VALUES ($1, $3, $4, 'AUTH_REGISTRATIONS', '[{"mixed":true}]'::jsonb, now()),
+        ($2, $3, $4, 'RISKY_USERS', '[]'::jsonb, now())
+      ON CONFLICT (customer_tenant_id, resource_type) DO UPDATE SET payload = EXCLUDED.payload`,
+    [randomUUID(), mixedId, mixedScope.organizationId, mixedScope.tenantId])).rowCount, 2)
+    assert.deepEqual(await f.authority(f.observer, 1), f.invalidated(f.invalidated(mixedBefore)),
+      'One inserted row plus one updated row advance the same scope once per actual event')
+    assert.equal((await f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [mixedId])).rowCount, 1)
+    await transition([], () => f.writer.query('UPDATE tenant_entra_snapshots SET payload = payload WHERE id = $1', [randomUUID()]))
+    await transition([], () => f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [randomUUID()]))
+    for (const resource of ['SIGN_INS', 'DIRECTORY_ROLES', 'SECURITY_DEFAULTS', 'CONDITIONAL_ACCESS', 'SECURE_SCORES']) {
+      const excludedId = randomUUID()
+      await transition([], () => insertHealthInputSnapshot(f, 2, resource, excludedId))
+      await transition([], () => f.writer.query('UPDATE tenant_entra_snapshots SET payload = payload WHERE id = $1', [excludedId]))
+      await transition([], () => f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [excludedId]))
+    }
+    const move = (index: number, resource: string) => f.writer.query(`UPDATE tenant_entra_snapshots
+      SET organization_id = $2, customer_tenant_id = $3, resource_type = $4::"SyncResourceType" WHERE id = $1`,
+    [ids[1], f.scopes[index].organizationId, f.scopes[index].tenantId, resource])
+    await transition([0], () => move(0, 'SECURE_SCORES')) // Included -> excluded, old membership counts.
+    await transition([], () => move(0, 'CONDITIONAL_ACCESS'))
+    await transition([2], () => move(2, 'RISKY_USERS')) // Excluded old scope is not invalidated.
+    await transition([2, 1], () => move(1, 'RISKY_USERS'))
+    await transition([1, 0], () => move(0, 'RISKY_USERS')) // Same organization, distinct tenants.
+    await transition([0, 2], () => move(2, 'AUTH_REGISTRATIONS'))
+    await transition([2], () => move(2, 'SECURE_SCORES'))
+    await transition([0], () => move(0, 'RISKY_USERS'))
+    const before = await f.tag(0), otherBefore = await f.tag(2)
+    await f.writer.query('BEGIN')
+    await move(2, 'RISKY_USERS')
+    assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(before))
+    assert.deepEqual(await f.authority(f.writer, 2), f.invalidated(otherBefore))
+    assert.deepEqual(await f.authority(f.observer, 0), before)
+    assert.deepEqual(await f.authority(f.observer, 2), otherBefore)
+    await f.writer.query('ROLLBACK')
+    assert.deepEqual(await f.authority(f.observer, 0), before)
+    assert.deepEqual(await f.authority(f.observer, 2), otherBefore)
+    assert.equal((await f.observer.query('SELECT customer_tenant_id FROM tenant_entra_snapshots WHERE id = $1', [ids[1]])).rows[0].customer_tenant_id, scope.tenantId)
+  })
+
+test('HAW-70 snapshot authority overflow rolls back source changes without resurrecting absent or dead authority',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const id = randomUUID(), first = f.scopes[0]
+    await insertHealthInputSnapshot(f, 0, 'AUTH_REGISTRATIONS', id)
+    await f.writer.query(`UPDATE tenant_health_source_authorities SET source_revision = 9223372036854775807,
+      current_snapshot_id = NULL, current_observation_sequence = 0 WHERE organization_id = $1 AND customer_tenant_id = $2`,
+    [first.organizationId, first.tenantId])
+    const before = await f.authority(f.observer, 0)
+    const readSource = async () => (await f.observer.query(`SELECT * FROM tenant_entra_snapshots
+      WHERE customer_tenant_id = $1 ORDER BY id`, [first.tenantId])).rows
+    const sourceBefore = await readSource()
+    for (const mutate of [() => insertHealthInputSnapshot(f, 0, 'RISKY_USERS'),
+      () => f.writer.query(`UPDATE tenant_entra_snapshots SET payload = '[{"changed":true}]'::jsonb WHERE id = $1`, [id]),
+      () => f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [id])]) {
+      await assert.rejects(mutate(), sqlState('22003'))
+      assert.deepEqual(await readSource(), sourceBefore)
+      assert.deepEqual(await f.authority(f.observer, 0), before)
+    }
+    await insertHealthInputSnapshot(f, 0, 'SECURE_SCORES')
+    assert.deepEqual(await f.authority(f.observer, 0), before, 'An unrelated snapshot must not touch exhausted authority')
+    const missing = f.scopes[1], dead = f.scopes[2]
+    await f.writer.query('DELETE FROM tenant_health_source_authorities WHERE organization_id = $1 AND customer_tenant_id = $2', [missing.organizationId, missing.tenantId])
+    await f.writer.query(`UPDATE tenant_health_source_authorities SET live = false,
+      current_snapshot_id = NULL, current_observation_sequence = 0 WHERE organization_id = $1 AND customer_tenant_id = $2`,
+    [dead.organizationId, dead.tenantId])
+    const deadBefore = await f.authority(f.observer, 2)
+    await insertHealthInputSnapshot(f, 1)
+    await insertHealthInputSnapshot(f, 2, 'RISKY_USERS')
+    assert.equal(await f.authority(f.observer, 1), undefined)
+    assert.deepEqual(await f.authority(f.observer, 2), deadBefore)
+    assert.equal((await f.observer.query(`SELECT count(*)::int AS n FROM tenant_entra_snapshots
+      WHERE customer_tenant_id = ANY($1::uuid[])`, [[missing.tenantId, dead.tenantId]])).rows[0].n, 2)
+  })
+
+// All participating child sources must be present: single-child coverage cannot establish
 // ordering when a parent DELETE also cascades through other child sources.
 // Do not infer a deadlock from nested SQL alone; require a real blocking edge.
 for (const deleteTarget of ['tenant', 'organization'] as const) {
-  test(`HAW-70 ${deleteTarget} cascades with both audit and sync-state rows preserve source-before-authority ordering`,
+  test(`HAW-70 ${deleteTarget} cascades with audit, sync-state and health-input snapshot rows preserve source-before-authority ordering`,
     { skip: !RUN, timeout: 120_000 }, async context => {
-      for (const heldSource of ['sync-state', 'audit'] as const) {
+      for (const heldSource of ['sync-state', 'audit', 'snapshot'] as const) {
         for (const mutation of ['update', 'delete'] as const) {
           for (const outcome of ['commit', 'rollback'] as const) {
             await context.test(`${heldSource} ${mutation}, ${deleteTarget} ${outcome}`, { timeout: 15_000 }, async subcontext => {
               const f = await syncStateAuthorityFixture(subcontext)
               const deleter = new pg.Client({ connectionString: URL!, statement_timeout: 10_000 })
-              const scope = f.scopes[0], syncId = randomUUID(), auditId = randomUUID()
+              const scope = f.scopes[0], syncId = randomUUID(), auditId = randomUUID(), snapshotId = randomUUID()
               let deletion: Promise<{ result?: pg.QueryResult; error?: unknown }> | undefined
               await deleter.connect()
               try {
@@ -1759,6 +1907,7 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                    event_date_time, activity_display_name, raw, expires_at)
                   VALUES ($1, $2, $3, $4, now(), 'cascade before', '{}'::jsonb, now() + interval '1 day')`,
                 [auditId, scope.organizationId, scope.tenantId, `haw70-cascade-${auditId}`])
+                await insertHealthInputSnapshot(f, 0, 'RISKY_USERS', snapshotId)
                 const before = await f.tag(0)
                 const siblingBefore = await f.authority(f.observer, 1)
                 const outsideBefore = await f.authority(f.observer, 2)
@@ -1789,19 +1938,22 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                       AND constraint_row.convalidated
                       AND constraint_row.confrelid = 'public.organizations'::regclass
                       AND child.oid IN ('public.customer_tenants'::regclass, 'public.sync_states'::regclass,
-                        'public.directory_audit_logs'::regclass, 'public.tenant_health_source_authorities'::regclass)
+                        'public.directory_audit_logs'::regclass, 'public.tenant_entra_snapshots'::regclass,
+                        'public.tenant_health_source_authorities'::regclass)
                     ORDER BY trigger.tgname COLLATE "C"`)
                   assert.deepEqual(cascadeOrder.rows.map(row => row.child).sort(),
-                    ['customer_tenants', 'directory_audit_logs', 'sync_states', 'tenant_health_source_authorities'])
+                    ['customer_tenants', 'directory_audit_logs', 'sync_states', 'tenant_entra_snapshots', 'tenant_health_source_authorities'])
                   subcontext.diagnostic(`Relevant organization DELETE cascade order: ${JSON.stringify(cascadeOrder.rows)}`)
                 }
                 const readSources = async (client: pg.Client) => ({
                   sync: (await client.query('SELECT id, status FROM sync_states WHERE id = $1', [syncId])).rows,
                   audit: (await client.query('SELECT id, activity_display_name FROM directory_audit_logs WHERE id = $1', [auditId])).rows,
+                  inputSnapshot: (await client.query('SELECT id, payload FROM tenant_entra_snapshots WHERE id = $1', [snapshotId])).rows,
                 })
                 const sourceBefore = await readSources(f.observer)
                 assert.equal(sourceBefore.sync.length, 1)
                 assert.equal(sourceBefore.audit.length, 1)
+                assert.equal(sourceBefore.inputSnapshot.length, 1)
                 const writerPid = (await f.writer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
                 const observerPid = (await f.observer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
                 const deleterPid = (await deleter.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
@@ -1810,7 +1962,9 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                 await f.writer.query('BEGIN')
                 const locked = heldSource === 'sync-state'
                   ? await f.writer.query('SELECT id FROM sync_states WHERE id = $1 FOR UPDATE', [syncId])
-                  : await f.writer.query('SELECT id FROM directory_audit_logs WHERE id = $1 FOR UPDATE', [auditId])
+                  : heldSource === 'audit'
+                    ? await f.writer.query('SELECT id FROM directory_audit_logs WHERE id = $1 FOR UPDATE', [auditId])
+                    : await f.writer.query('SELECT id FROM tenant_entra_snapshots WHERE id = $1 FOR UPDATE', [snapshotId])
                 assert.equal(locked.rowCount, 1)
                 await deleter.query('BEGIN')
                 await deleter.query("SET LOCAL lock_timeout = '8s'")
@@ -1841,9 +1995,13 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                   ? mutation === 'delete'
                     ? await f.writer.query('DELETE FROM sync_states WHERE id = $1', [syncId])
                     : await f.writer.query("UPDATE sync_states SET status = 'SUCCEEDED', last_successful_at = now() WHERE id = $1", [syncId])
-                  : mutation === 'delete'
-                    ? await f.writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditId])
-                    : await f.writer.query("UPDATE directory_audit_logs SET activity_display_name = 'cascade after' WHERE id = $1", [auditId])
+                  : heldSource === 'audit'
+                    ? mutation === 'delete'
+                      ? await f.writer.query('DELETE FROM directory_audit_logs WHERE id = $1', [auditId])
+                      : await f.writer.query("UPDATE directory_audit_logs SET activity_display_name = 'cascade after' WHERE id = $1", [auditId])
+                    : mutation === 'delete'
+                      ? await f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [snapshotId])
+                      : await f.writer.query("UPDATE tenant_entra_snapshots SET payload = '[{\"changed\":true}]'::jsonb WHERE id = $1", [snapshotId])
                 assert.equal(changed.rowCount, 1)
                 const writerAuthority = f.invalidated(before)
                 assert.deepEqual(await f.authority(f.writer, 0), writerAuthority)
@@ -1853,9 +2011,15 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                 if (heldSource === 'sync-state') {
                   assert.deepEqual(sourceAfterWriter.sync, mutation === 'delete' ? [] : [{ id: syncId, status: 'SUCCEEDED' }])
                   assert.deepEqual(sourceAfterWriter.audit, sourceBefore.audit)
-                } else {
+                  assert.deepEqual(sourceAfterWriter.inputSnapshot, sourceBefore.inputSnapshot)
+                } else if (heldSource === 'audit') {
                   assert.deepEqual(sourceAfterWriter.audit, mutation === 'delete' ? [] : [{ id: auditId, activity_display_name: 'cascade after' }])
                   assert.deepEqual(sourceAfterWriter.sync, sourceBefore.sync)
+                  assert.deepEqual(sourceAfterWriter.inputSnapshot, sourceBefore.inputSnapshot)
+                } else {
+                  assert.deepEqual(sourceAfterWriter.inputSnapshot, mutation === 'delete' ? [] : [{ id: snapshotId, payload: [{ changed: true }] }])
+                  assert.deepEqual(sourceAfterWriter.sync, sourceBefore.sync)
+                  assert.deepEqual(sourceAfterWriter.audit, sourceBefore.audit)
                 }
                 await f.writer.query('COMMIT')
 
@@ -1874,7 +2038,7 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                   assert.equal(deletingAuthority.current_observation_sequence, '0')
                   assert.ok(BigInt(deletingAuthority.source_revision) > BigInt(writerAuthority.source_revision))
                 }
-                assert.deepEqual(await readSources(deleter), { sync: [], audit: [] })
+                assert.deepEqual(await readSources(deleter), { sync: [], audit: [], inputSnapshot: [] })
                 // The cascade is still uncommitted, so only the writer's commit
                 // may be visible through the independent observer connection.
                 assert.deepEqual(await f.authority(f.observer, 0), writerAuthority)
@@ -1884,7 +2048,7 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
                 await deleter.query(outcome === 'commit' ? 'COMMIT' : 'ROLLBACK')
 
                 assert.deepEqual(await f.authority(f.observer, 0), outcome === 'commit' ? deletingAuthority : writerAuthority)
-                assert.deepEqual(await readSources(f.observer), outcome === 'commit' ? { sync: [], audit: [] } : sourceAfterWriter)
+                assert.deepEqual(await readSources(f.observer), outcome === 'commit' ? { sync: [], audit: [], inputSnapshot: [] } : sourceAfterWriter)
                 assert.equal((await f.observer.query('SELECT id FROM customer_tenants WHERE id = $1', [scope.tenantId])).rowCount,
                   outcome === 'commit' ? 0 : 1)
                 assert.deepEqual(await f.authority(f.observer, 1),
@@ -1912,6 +2076,7 @@ for (const deleteTarget of ['tenant', 'organization'] as const) {
 const healthGuardFunctions = [
   'tenant_health_authorize_on_tenant_insert',
   'tenant_health_invalidate_on_audit_change',
+  'tenant_health_invalidate_on_input_snapshot_change',
   'tenant_health_invalidate_on_sync_state_change',
   'tenant_health_tombstone_on_tenant_delete',
 ] as const
@@ -1929,7 +2094,7 @@ async function healthFunctionSettings(client: pg.Client) {
 // SET/RESET ROLE. All role/policy changes are confined to registered CI fixtures.
 async function withRestrictedHealthWriter(
   f: Awaited<ReturnType<typeof syncStateAuthorityFixture>>,
-  table: 'directory_audit_logs' | 'sync_states' | 'customer_tenants',
+  table: 'directory_audit_logs' | 'sync_states' | 'customer_tenants' | 'tenant_entra_snapshots',
   run: (beginRestricted: (sourcePolicy?: boolean) => Promise<void>, role: string) => Promise<void>,
   sourceOrganizations: readonly string[] = [f.scopes[0].organizationId],
 ) {
@@ -2219,11 +2384,60 @@ test('HAW-70 tenant lifecycle authority writes reject an RLS-dependent source wr
     })
   })
 
+test('HAW-70 snapshot RLS and authority permissions fail closed while unrelated resources remain writable',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    const f = await syncStateAuthorityFixture(context)
+    const id = randomUUID(), excludedId = randomUUID()
+    await insertHealthInputSnapshot(f, 0, 'AUTH_REGISTRATIONS', id)
+    await insertHealthInputSnapshot(f, 0, 'SECURE_SCORES', excludedId)
+    const before = await f.tag(0)
+    const readSource = async () => (await f.observer.query(`SELECT * FROM tenant_entra_snapshots
+      WHERE customer_tenant_id = $1 ORDER BY id`, [f.scopes[0].tenantId])).rows
+    const sourceBefore = await readSource()
+    const update = () => f.writer.query(`UPDATE tenant_entra_snapshots
+      SET observed_at = observed_at + interval '1 minute' WHERE id = $1`, [id])
+    await withRestrictedHealthWriter(f, 'tenant_entra_snapshots', async (beginRestricted, role) => {
+      const mutations = [update, () => insertHealthInputSnapshot(f, 0, 'RISKY_USERS'),
+        () => f.writer.query('DELETE FROM tenant_entra_snapshots WHERE id = $1', [id]),
+        () => f.writer.query(`UPDATE tenant_entra_snapshots SET resource_type = 'SECURITY_DEFAULTS' WHERE id = $1`, [id]),
+        () => f.writer.query(`UPDATE tenant_entra_snapshots SET resource_type = 'RISKY_USERS' WHERE id = $1`, [excludedId])]
+      for (const mutate of mutations) {
+        await beginRestricted()
+        assert.equal((await f.writer.query('SELECT id FROM tenant_entra_snapshots WHERE id = $1', [id])).rowCount, 1)
+        assert.equal(await f.authority(f.writer, 0), undefined, 'Authority is hidden, not absent')
+        await assert.rejects(mutate(), authorityRlsError('tenant_health_invalidate_on_input_snapshot_change'))
+        await f.writer.query('ROLLBACK')
+        assert.deepEqual(await readSource(), sourceBefore)
+        assert.deepEqual(await f.authority(f.observer, 0), before)
+      }
+      await f.writer.query(`REVOKE SELECT, INSERT, UPDATE ON public.tenant_health_source_authorities FROM "${role}"`)
+      // Isolate ACL denial from the RLS rewrite guard; reset only inside this
+      // rollback-only transaction, as in the existing audit/sync witnesses.
+      await f.writer.query('BEGIN')
+      await f.writer.query('ALTER FUNCTION public.tenant_health_invalidate_on_input_snapshot_change() RESET row_security')
+      await f.writer.query('SET LOCAL row_security = on')
+      await f.writer.query(`SET LOCAL ROLE "${role}"`)
+      await assert.rejects(update(), error => {
+        assert.ok(sqlState('42501')(error) && error instanceof Error)
+        assert.match(error.message, /permission denied for table tenant_health_source_authorities/)
+        return true
+      })
+      await f.writer.query('ROLLBACK')
+      assert.deepEqual(await readSource(), sourceBefore)
+      assert.deepEqual(await f.authority(f.observer, 0), before)
+      await beginRestricted()
+      assert.equal((await f.writer.query('UPDATE tenant_entra_snapshots SET payload = payload WHERE id = $1', [excludedId])).rowCount, 1)
+      await f.writer.query('COMMIT')
+      assert.deepEqual(await readSource(), sourceBefore)
+      assert.deepEqual(await f.authority(f.observer, 0), before, 'Excluded transitions never access authority')
+    })
+  })
+
 test('HAW-70 truncation refuses source, parent cascade and multi-table operations without committing fixture loss',
   { skip: !RUN, timeout: 120_000 }, async context => {
     const f = await syncStateAuthorityFixture(context)
     const tables = ['customer_tenants', 'directory_audit_logs', 'organizations',
-      'sync_states', 'tenant_health_snapshots', 'tenant_health_source_authorities'] as const
+      'sync_states', 'tenant_entra_snapshots', 'tenant_health_snapshots', 'tenant_health_source_authorities'] as const
     const organizations = [...new Set(f.scopes.map(scope => scope.organizationId))]
     const role = `haw70_truncate_${randomUUID().replaceAll('-', '')}`
     const triggerState = async () => (await f.writer.query(`SELECT c.relname, t.tgenabled,
@@ -2250,6 +2464,7 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
     }
     for (let index = 0; index < f.scopes.length; index++) {
       await f.insert(f.writer, index)
+      await insertHealthInputSnapshot(f, index)
       const scope = f.scopes[index], auditId = randomUUID()
       await f.writer.query(`INSERT INTO directory_audit_logs
         (id, organization_id, customer_tenant_id, microsoft_audit_id,
@@ -2261,6 +2476,7 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
     const before = await readState(f.observer), guards = await triggerState()
     assert.equal(before.directory_audit_logs.length, 3)
     assert.equal(before.sync_states.length, 3)
+    assert.equal(before.tenant_entra_snapshots.length, 3)
     assert.equal(before.tenant_health_source_authorities.length, 3)
     assert.deepEqual(guards.map(row => row.relname), tables)
     for (const guard of guards) assert.deepEqual(guard, {
@@ -2322,10 +2538,10 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
       await f.writer.query('BEGIN')
       await f.writer.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT NOCREATEROLE NOCREATEDB NOREPLICATION`)
       await f.writer.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
-      await f.writer.query(`GRANT SELECT, TRUNCATE ON public.directory_audit_logs, public.sync_states TO "${role}"`)
+      await f.writer.query(`GRANT SELECT, TRUNCATE ON public.directory_audit_logs, public.sync_states, public.tenant_entra_snapshots TO "${role}"`)
       await f.writer.query('COMMIT')
       for (const command of commands.filter(value =>
-        !value.sql.includes('pg_temp') && ['directory_audit_logs', 'sync_states'].includes(value.first))) {
+        !value.sql.includes('pg_temp') && ['directory_audit_logs', 'sync_states', 'tenant_entra_snapshots'].includes(value.first))) {
         await f.writer.query('BEGIN')
         try {
           await f.writer.query("SET LOCAL lock_timeout = '2s'")
@@ -2335,13 +2551,14 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
               has_table_privilege(current_user, c.oid, 'TRUNCATE') AS can_truncate,
               row_security_active(c.oid) AS rls_active,
               pg_has_role(current_user, c.relowner, 'USAGE') AS owner_rights
-            FROM pg_class c WHERE c.oid IN ('public.directory_audit_logs'::regclass, 'public.sync_states'::regclass)
+            FROM pg_class c WHERE c.oid IN ('public.directory_audit_logs'::regclass, 'public.sync_states'::regclass, 'public.tenant_entra_snapshots'::regclass)
             ORDER BY c.relname`)).rows
-          assert.deepEqual(access, ['directory_audit_logs', 'sync_states'].map(relname => ({
+          assert.deepEqual(access, ['directory_audit_logs', 'sync_states', 'tenant_entra_snapshots'].map(relname => ({
             relname, can_truncate: true, rls_active: true, owner_rights: false,
           })))
           assert.equal((await f.writer.query('SELECT 1 FROM directory_audit_logs')).rowCount, 0)
           assert.equal((await f.writer.query('SELECT 1 FROM sync_states')).rowCount, 0)
+          assert.equal((await f.writer.query('SELECT 1 FROM tenant_entra_snapshots')).rowCount, 0)
           await assert.rejects(f.writer.query(command.sql), refuses(command.first))
         } finally { await f.writer.query('ROLLBACK') }
         assert.deepEqual(await readState(f.observer), before)
@@ -2408,7 +2625,7 @@ test('HAW-70 truncation refuses source, parent cascade and multi-table operation
       await f.writer.query('ROLLBACK')
       await f.writer.query('RESET ROLE')
       if ((await f.writer.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role])).rowCount) {
-        await f.writer.query(`REVOKE ALL ON public.directory_audit_logs, public.sync_states FROM "${role}"`)
+        await f.writer.query(`REVOKE ALL ON public.directory_audit_logs, public.sync_states, public.tenant_entra_snapshots FROM "${role}"`)
         await f.writer.query(`REVOKE ALL ON SCHEMA public FROM "${role}"`)
         await f.writer.query(`DROP ROLE "${role}"`)
       }

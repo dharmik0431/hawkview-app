@@ -42,6 +42,11 @@ endpoint or a later model cannot inherit this audit's exclusions.
 
 ## Writer boundaries and next source slice
 
+Follow-up: the [inactive snapshot writer candidate](haw70-snapshot-source-participation.md)
+implements the two-resource boundary below with registered but unexecuted physical
+witnesses. The dependency evidence here remains synthetic; it does not acquire the
+follow-up's missing physical or complete-protocol proof.
+
 `refreshCollectionFieldStates` in
 [`tenant-sync.service.ts`](../src/tenants/tenant-sync.service.ts) performs separate
 upserts for its field definitions after reading sync states and selected payloads.
