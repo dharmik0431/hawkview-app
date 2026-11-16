@@ -79,7 +79,7 @@ If legitimate later discovery produces new retained gap evidence after purge, th
 
 ## Required executable witnesses before activation
 
-These are acceptance cases to implement and register, not passing tests or additions to the current three-case storage suite. Run physical races only in authorized registered hosted disposable PostgreSQL CI with barriers that prove the intended overlap; timing sleeps alone are not evidence.
+These are acceptance cases, not passing tests. The three-case storage suite and the new six-case transfer suite below cover only portions of this contract and have no physical result at this candidate. Run physical races only in authorized registered hosted disposable PostgreSQL CI with barriers that prove the intended overlap; timing sleeps alone are not evidence.
 
 | Case | Setup and required assertion |
 | --- | --- |
@@ -107,8 +107,16 @@ Ten [scripted-transaction tests](../src/tenants/m365-audit-gap-transfer.test.ts)
 
 PostgreSQL ignores null arguments to `LEAST`, allowing a missing provider expiry while the required ledger/age deadlines remain; explicit `MATERIALIZED` evaluation and UTC `to_char` formatting avoid relying on repeated clock evaluation or session-dependent timestamp text. These are implementation choices requiring physical verification, not tested guarantees. See [conditional expressions](https://www.postgresql.org/docs/16/functions-conditional.html#FUNCTIONS-GREATEST-LEAST), [CTE materialization](https://www.postgresql.org/docs/16/queries-with.html#QUERIES-WITH-CTE-MATERIALIZATION) and [timestamp formatting](https://www.postgresql.org/docs/16/functions-formatting.html).
 
+## Prepared transfer database witnesses
+
+The [six-case transfer suite](../src/tenants/m365-audit-gap-transfer.database-integration.test.ts) calls the actual helper through a thin `pg` transport with synthetic fixtures. Both opt-ins, the shared disposable boundary and the exact hosted port are required before client creation. It is registered in both inventories and the serial database phase; without opt-in it skips. No local PostgreSQL execution is permitted.
+
+Prepared assertions cover seven earliest-deadline/tie combinations separated by one microsecond under non-default timezone/date formatting, fresh future expiry, nine stale selected-field mutations, retained evidence versus new-identity generation, SQL failure after staged success, and actual BIGINT overflow after gap insertion. Sibling and outside-scope source rows must remain unchanged. Savepoint rollback compares lossless database snapshots and overflow checks the server error code, so a fixture or earlier SQL error cannot masquerade as the intended failure.
+
+These tests are prepared, not physically passed. The `pg` adapter transports BIGINT as a string; production Prisma mapping remains separate. Past/future deadlines and deterministic ties between source deadlines do not prove exact equality with a live observation clock. Savepoint rollback does not prove durable commit or unknown-result recovery. Two-client lock waits, real ownership/takeover, production writers/outcomes/readers, authorization roles, purge and repair remain unproved. No production caller, owner callback or clock override was added.
+
 ## Next step and fallback
 
-Add registered physical witnesses for the inactive transaction body, then the required selection/fence, discovery/completion/reader integration. Keep production callers absent until the full contract passes. This is not a complete HAW-75 package or a claim of tenant-wide SYNC protection.
+Prepare registered two-client barriers for source changes and expiry after lock waits, then the required selection/fence, discovery/completion/reader integration. Execute physical suites only after exact-source publication authorization for registered disposable CI. Keep production callers absent until the full contract passes. This is not a complete HAW-75 package or a claim of tenant-wide SYNC protection.
 
 Protected main remains the release fallback. No destructive schema rollback or manual production repair is proposed. Public upload or Claude review of this new material still needs exact-source authorization; HAW-70 approval does not cover it. Complete authorized independent review, exact-head CI, protected merge, configured automatic release, actual health and authenticated canary remain release gates. Baseline remains incomplete.
