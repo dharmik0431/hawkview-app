@@ -1,0 +1,293 @@
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import test from 'node:test'
+import pg from 'pg'
+import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
+import { INITIAL_SYNC_RESOURCE_TYPES } from './initial-sync-status.js'
+import { readInitialSyncProof, type InitialSyncProofScope } from './initial-sync-proof-reader.js'
+import { validateInitialSyncCompletionProjection } from './initial-sync-proof-projection.js'
+
+// Registered hosted PostgreSQL only. Fixtures assert stored facts, not producer
+// completeness, deployed-role access, Prisma transport or notice ownership.
+const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
+  && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
+const options = { skip: !enabled, timeout: 45_000 }
+const stamp = (fraction: string) => `2020-01-01T12:00:00.${fraction}Z`
+const start = stamp('000100'), attempted = stamp('000200'), succeeded = stamp('000800')
+type Fixture = {
+  scope: InitialSyncProofScope
+  connectionId: string
+  epoch: string
+  states: Map<string, { id: string; attempt: string }>
+}
+type Row = Record<string, unknown>
+
+function client() {
+  const url = assertDisposableTestDatabase(process.env, { requireUtc: true })
+  assert.equal(url.port, '5432', 'Only registered hosted disposable PostgreSQL is permitted')
+  return new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000 })
+}
+
+async function settings(db: pg.Client) {
+  await db.query("SET LOCAL statement_timeout = '5s'")
+  await db.query("SET LOCAL lock_timeout = '2s'")
+}
+
+async function transaction(run: (db: pg.Client) => Promise<void>) {
+  const db = client()
+  let began = false
+  try {
+    await db.connect()
+    await db.query('BEGIN')
+    began = true
+    await settings(db)
+    await run(db)
+  } finally {
+    try { if (began) await db.query('ROLLBACK') } finally { await db.end() }
+  }
+}
+
+async function fixture(db: pg.Client): Promise<Fixture> {
+  const scope = { organizationId: randomUUID(), customerTenantId: randomUUID() }
+  const connectionId = randomUUID(), epoch = randomUUID()
+  await db.query(`INSERT INTO public.organizations (id, name, slug, updated_at)
+    VALUES ($1, 'Synthetic proof projection fixture', $2, CURRENT_TIMESTAMP)`, [scope.organizationId, scope.organizationId])
+  await db.query(`INSERT INTO public.customer_tenants
+    (id, organization_id, microsoft_tenant_id, status, updated_at)
+    VALUES ($1, $2, $3, 'ACTIVE', CURRENT_TIMESTAMP)`,
+  [scope.customerTenantId, scope.organizationId, randomUUID()])
+  await db.query(`INSERT INTO public.tenant_connections
+    (id, organization_id, customer_tenant_id, status, initial_sync_epoch_id, initial_sync_epoch_started_at, updated_at)
+    VALUES ($1, $2, $3, 'CONNECTED', $4, $5, CURRENT_TIMESTAMP)`,
+  [connectionId, scope.organizationId, scope.customerTenantId, epoch, start])
+  const states = new Map<string, { id: string; attempt: string }>()
+  for (const resource of INITIAL_SYNC_RESOURCE_TYPES) {
+    const id = randomUUID(), attempt = randomUUID()
+    states.set(resource, { id, attempt })
+    await db.query(`INSERT INTO public.sync_states
+      (id, organization_id, customer_tenant_id, resource_type, status, last_attempt_at, last_successful_at,
+       initial_sync_attempt_epoch_id, initial_sync_attempt_id, initial_sync_persisted_attempt_id,
+       initial_sync_completed_attempt_id, initial_sync_persisted_kind, updated_at)
+      VALUES ($1, $2, $3, $4::public."SyncResourceType", 'SUCCEEDED', $5, $6, $7, $8, $8, $8, $9, CURRENT_TIMESTAMP)`,
+    [id, scope.organizationId, scope.customerTenantId, resource, attempted, succeeded, epoch, attempt,
+      resource === 'SIGN_INS' ? 'GRAPH_SIGN_INS' : 'FULL_RESOURCE'])
+  }
+  return { scope, connectionId, epoch, states }
+}
+
+async function read(db: pg.Client, scope: InitialSyncProofScope) {
+  let calls = 0
+  let rows: Row[] = []
+  const result = await readInitialSyncProof(scope, async (sql, values) => {
+    calls++
+    rows = (await db.query(sql, [...values])).rows
+    return rows
+  })
+  assert.equal(calls, 1)
+  return { rows, result }
+}
+
+async function savepoint(db: pg.Client, run: () => Promise<void>) {
+  await db.query('SAVEPOINT witness')
+  try { await run() } finally {
+    await db.query('ROLLBACK TO SAVEPOINT witness')
+    await db.query('RELEASE SAVEPOINT witness')
+  }
+}
+
+test('HAW-77 coherent reader returns thirteen scoped precise receipts under non-default session settings', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db)
+    await db.query("SET LOCAL TIME ZONE 'America/Los_Angeles'")
+    await db.query("SET LOCAL DateStyle = 'SQL, DMY'")
+    await db.query('SET LOCAL search_path TO pg_catalog')
+    // Optional role receipts are unrelated and must not multiply the projection.
+    const roleId = randomUUID()
+    await db.query(`INSERT INTO public.sync_states
+      (id, organization_id, customer_tenant_id, resource_type, status, role_scope_version, role_scope_incarnation, updated_at)
+      VALUES ($1, $2, $3, 'DIRECTORY_ROLES', 'FAILED', 'projection-fixture', $4, CURRENT_TIMESTAMP)`,
+    [roleId, owner.scope.organizationId, owner.scope.customerTenantId, randomUUID()])
+    const before = (await db.query('SELECT to_jsonb(s) AS row FROM public.sync_states s WHERE customer_tenant_id = $1 ORDER BY id', [owner.scope.customerTenantId])).rows
+    const { rows, result } = await read(db, owner.scope)
+    assert.equal(result.complete, true)
+    assert.deepEqual(rows.map(row => row.expectedResourceType), [...INITIAL_SYNC_RESOURCE_TYPES])
+    assert.equal(new Set(rows.map(row => row.observedAtUtc)).size, 1)
+    for (const row of rows) {
+      assert.equal(row.contextTimeValid, true)
+      assert.equal(row.proofTimeValid, true)
+      assert.equal(row.epochStartedAtUtc, start)
+      assert.equal(row.lastAttemptAtUtc, attempted)
+      assert.equal(row.lastSuccessfulAtUtc, succeeded)
+      assert.match(String(row.observedAtUtc), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+      assert.equal(row.organizationId, owner.scope.organizationId)
+      assert.equal(row.customerTenantId, owner.scope.customerTenantId)
+      assert.equal(row.initialSyncEpochId, owner.epoch)
+      assert.equal(typeof row.lastAttemptAtUtc, 'string')
+    }
+    assert.deepEqual((await db.query('SELECT to_jsonb(s) AS row FROM public.sync_states s WHERE customer_tenant_id = $1 ORDER BY id', [owner.scope.customerTenantId])).rows, before)
+  }))
+
+test('HAW-77 reader preserves every missing slot and refuses foreign or absent tenant and connection context', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), sibling = await fixture(db)
+    for (const resource of INITIAL_SYNC_RESOURCE_TYPES) {
+      await savepoint(db, async () => {
+        await db.query('DELETE FROM public.sync_states WHERE id = $1', [owner.states.get(resource)!.id])
+        const { rows, result } = await read(db, owner.scope)
+        assert.equal(rows.length, 13)
+        const missing = rows.find(row => row.expectedResourceType === resource)!
+        assert.equal(missing.stateId, null)
+        assert.equal(missing.stateResourceType, null)
+        assert.equal(missing.proofTimeValid, false)
+        assert.deepEqual(result.incompleteResources, [resource])
+        assert.equal((await read(db, sibling.scope)).result.complete, true)
+      })
+    }
+    for (const scope of [{ ...owner.scope, organizationId: sibling.scope.organizationId },
+      { ...owner.scope, customerTenantId: randomUUID() }]) {
+      const actual = await read(db, scope)
+      assert.deepEqual(actual.rows, [])
+      assert.equal(actual.result.complete, false)
+    }
+    await savepoint(db, async () => {
+      await db.query('DELETE FROM public.tenant_connections WHERE id = $1', [owner.connectionId])
+      const actual = await read(db, owner.scope)
+      assert.equal(actual.rows.length, 13)
+      assert.ok(actual.rows.every(row => row.connectionId === null && row.contextTimeValid === false))
+      assert.equal(actual.result.reason, 'INVALID_CONTEXT')
+    })
+    for (const status of ['PENDING_CONSENT', 'ERROR']) await savepoint(db, async () => {
+      await db.query('UPDATE public.tenant_connections SET status = $1::public."TenantConnectionStatus" WHERE id = $2', [status, owner.connectionId])
+      const actual = await read(db, owner.scope)
+      assert.equal(actual.rows.length, 13, 'ineligible context is not prefiltered')
+      assert.equal(actual.result.reason, 'INVALID_CONTEXT')
+    })
+    await db.query("UPDATE public.customer_tenants SET status = 'SUSPENDED' WHERE id = $1", [owner.scope.customerTenantId])
+    assert.equal((await read(db, owner.scope)).result.reason, 'INVALID_CONTEXT')
+  }))
+
+test('HAW-77 SQL precision rejects microsecond epoch and order violations plus unsupported and future times', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), stateId = owner.states.get('SIGN_INS')!.id
+    await savepoint(db, async () => {
+      await db.query('UPDATE public.sync_states SET last_attempt_at = $1 WHERE id = $2', [stamp('000099'), stateId])
+      const actual = await read(db, owner.scope), row = actual.rows.find(row => row.stateId === stateId)!
+      assert.equal(new Date(row.lastAttemptAtUtc as string).getTime(), new Date(row.epochStartedAtUtc as string).getTime())
+      assert.equal(row.proofTimeValid, false)
+      assert.deepEqual(actual.result.incompleteResources, ['SIGN_INS'])
+    })
+    // Completed-time storage rejects this inversion; a persisted-only row may
+    // retain an older success. Test the SQL predicate itself, not only mapping.
+    await savepoint(db, async () => {
+      await db.query(`UPDATE public.sync_states SET initial_sync_completed_attempt_id = NULL,
+        last_successful_at = $1 WHERE id = $2`, [stamp('000199'), stateId])
+      const actual = await read(db, owner.scope), row = actual.rows.find(row => row.stateId === stateId)!
+      assert.equal(new Date(row.lastAttemptAtUtc as string).getTime(), new Date(row.lastSuccessfulAtUtc as string).getTime())
+      assert.equal(row.proofTimeValid, false)
+      assert.deepEqual(actual.result.incompleteResources, ['SIGN_INS'])
+    })
+    await savepoint(db, async () => {
+      await db.query('UPDATE public.sync_states SET last_successful_at = $1 WHERE id = $2', ['9999-12-31T23:59:59.999999Z', stateId])
+      const actual = await read(db, owner.scope)
+      assert.equal(actual.rows.find(row => row.stateId === stateId)!.proofTimeValid, false)
+      assert.equal(actual.result.complete, false)
+    })
+    for (const invalid of ['infinity', '-infinity', '0001-01-01 00:00:00+00 BC', '10000-01-01 00:00:00+00']) {
+      await savepoint(db, async () => {
+        await db.query(`UPDATE public.sync_states SET initial_sync_completed_attempt_id = NULL,
+          last_successful_at = $1 WHERE id = $2`, [invalid, stateId])
+        const actual = await read(db, owner.scope), row = actual.rows.find(row => row.stateId === stateId)!
+        assert.equal(row.lastSuccessfulAtUtc, null, invalid)
+        assert.equal(row.proofTimeValid, false, invalid)
+        assert.equal(actual.result.complete, false)
+      })
+    }
+    for (const invalid of ['0001-01-01 00:00:00+00 BC', '10000-01-01 00:00:00+00', '9999-12-31T23:59:59.999999Z']) {
+      await savepoint(db, async () => {
+        await db.query('UPDATE public.tenant_connections SET initial_sync_epoch_started_at = $1 WHERE id = $2', [invalid, owner.connectionId])
+        const actual = await read(db, owner.scope)
+        assert.ok(actual.rows.every(row => row.contextTimeValid === false))
+        assert.equal(actual.result.reason, 'INVALID_CONTEXT')
+      })
+    }
+  }))
+
+test('HAW-77 reader retains current legacy failed and replaced-attempt rows without fallback to old success', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), stateId = owner.states.get('SIGN_INS')!.id
+    await savepoint(db, async () => {
+      await db.query('UPDATE public.tenant_connections SET initial_sync_epoch_id = $1 WHERE id = $2', [randomUUID(), owner.connectionId])
+      const actual = await read(db, owner.scope)
+      assert.equal(actual.rows.length, 13)
+      assert.deepEqual(actual.result.incompleteResources, [...INITIAL_SYNC_RESOURCE_TYPES])
+    })
+    await savepoint(db, async () => {
+      await db.query(`UPDATE public.sync_states SET initial_sync_attempt_epoch_id = NULL, initial_sync_attempt_id = NULL,
+        initial_sync_persisted_attempt_id = NULL, initial_sync_completed_attempt_id = NULL,
+        initial_sync_persisted_kind = NULL WHERE id = $1`, [stateId])
+      const actual = await read(db, owner.scope)
+      assert.equal(actual.rows.find(row => row.stateId === stateId)!.status, 'SUCCEEDED')
+      assert.deepEqual(actual.result.incompleteResources, ['SIGN_INS'])
+    })
+    await db.query(`UPDATE public.sync_states SET initial_sync_attempt_id = $1, initial_sync_persisted_attempt_id = NULL,
+      initial_sync_completed_attempt_id = NULL, initial_sync_persisted_kind = NULL,
+      status = 'RUNNING', last_attempt_at = $2 WHERE id = $3`, [randomUUID(), stamp('000801'), stateId])
+    let actual = await read(db, owner.scope)
+    assert.equal(actual.rows.find(row => row.stateId === stateId)!.lastSuccessfulAtUtc, succeeded)
+    assert.deepEqual(actual.result.incompleteResources, ['SIGN_INS'])
+    await db.query(`UPDATE public.sync_states SET initial_sync_persisted_attempt_id = initial_sync_attempt_id,
+      initial_sync_persisted_kind = 'GRAPH_SIGN_INS', status = 'FAILED',
+      last_error_message = 'Synthetic failure after persistence' WHERE id = $1`, [stateId])
+    actual = await read(db, owner.scope)
+    assert.equal(actual.rows.find(row => row.stateId === stateId)!.status, 'FAILED')
+    assert.deepEqual(actual.result.incompleteResources, ['SIGN_INS'])
+  }))
+
+test('HAW-77 two-client reader sees committed snapshots and an old result never reserves current epoch authority', options,
+  async () => {
+    const reader = client(), writer = client()
+    let owner: Fixture | undefined, writerBegan = false, readerBegan = false
+    try {
+      await reader.connect()
+      await writer.connect()
+      await writer.query('BEGIN'); writerBegan = true
+      await settings(writer)
+      owner = await fixture(writer)
+      await writer.query('COMMIT'); writerBegan = false
+      await reader.query('BEGIN READ ONLY'); readerBegan = true
+      await settings(reader)
+      const first = await read(reader, owner.scope)
+      assert.equal(first.result.complete, true)
+      const nextEpoch = randomUUID()
+      await writer.query('BEGIN'); writerBegan = true
+      await settings(writer)
+      await writer.query('UPDATE public.tenant_connections SET initial_sync_epoch_id = $1 WHERE id = $2', [nextEpoch, owner.connectionId])
+      for (const state of owner.states.values()) {
+        const nextAttempt = randomUUID()
+        await writer.query(`UPDATE public.sync_states SET initial_sync_attempt_epoch_id = $1, initial_sync_attempt_id = $2,
+          initial_sync_persisted_attempt_id = $2, initial_sync_completed_attempt_id = $2 WHERE id = $3`,
+        [nextEpoch, nextAttempt, state.id])
+      }
+      const uncommitted = await read(reader, owner.scope)
+      assert.equal(uncommitted.result.complete, true)
+      assert.ok(uncommitted.rows.every(row => row.initialSyncEpochId === owner!.epoch && row.initialSyncAttemptEpochId === owner!.epoch))
+      await writer.query('ROLLBACK'); writerBegan = false
+      assert.ok((await read(reader, owner.scope)).rows.every(row => row.initialSyncEpochId === owner!.epoch))
+      // Commit only an epoch replacement: all old resource facts must be stale.
+      await writer.query('BEGIN'); writerBegan = true
+      await settings(writer)
+      await writer.query('UPDATE public.tenant_connections SET initial_sync_epoch_id = $1 WHERE id = $2', [nextEpoch, owner.connectionId])
+      await writer.query('COMMIT'); writerBegan = false
+      const current = await read(reader, owner.scope)
+      assert.ok(current.rows.every(row => row.initialSyncEpochId === nextEpoch && row.initialSyncAttemptEpochId === owner!.epoch))
+      assert.equal(current.result.complete, false)
+      assert.equal(validateInitialSyncCompletionProjection(owner.scope, first.rows).complete, true,
+        'saved rows still describe the earlier snapshot; notice mutation must recheck locked authority')
+    } finally {
+      try {
+        if (readerBegan) await reader.query('ROLLBACK')
+        if (writerBegan) await writer.query('ROLLBACK')
+        if (owner) await writer.query('DELETE FROM public.organizations WHERE id = $1', [owner.scope.organizationId])
+      } finally { await Promise.all([reader.end(), writer.end()]) }
+    }
+  })

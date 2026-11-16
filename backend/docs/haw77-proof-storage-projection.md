@@ -6,9 +6,66 @@ and its unused [validator](../src/tenants/initial-sync-completion-proof.ts).
 The local storage candidate below remains uninstalled and adds no runtime
 queries or callers. The held orchestration defects remain unresolved.
 
+## Local single-statement reader candidate — 16 November 2026
+
+The next unused component now supplies the mapper from one parameterized SELECT.
+`readInitialSyncProof` captures and freezes the authorized organization and tenant
+before awaiting its injected executor. Invalid scope causes no query; read errors
+propagate without retry or a fabricated empty result. The static query receives
+fifteen bound values: the two scope IDs and the shared thirteen-resource inventory.
+No production caller, database client, writer, notice mutation or lease is wired.
+
+The query explicitly qualifies all three public tables and the resource enum.
+It scopes the tenant, then left-joins its connection and each expected resource,
+without filtering away failed, legacy or stale receipts. A missing tenant yields
+no rows and cannot pass validation; a missing connection or state stays visible
+as null evidence. The fixed expected-resource list bounds the projection to
+thirteen slots under the existing uniqueness constraints. One materialized
+statement observation supplies the database clock. Time predicates compare
+finite timestamps at database precision, and CASE guards restrict UTC formatting
+to AD years 0001–9999 before emitting six-decimal text. This avoids aliasing BC
+years through a year-only formatting template.
+
+Five hosted-only physical cases are registered in the existing disposable test
+inventory. They are prepared but unexecuted:
+
+- Real PostgreSQL query and mapping for all thirteen receipts with changed
+  session time zone, DateStyle and search path; exact microsecond text, one
+  observation and unchanged optional role/state rows.
+- All thirteen missing slots, unrelated sibling isolation, foreign/absent tenant,
+  absent or ineligible connection and suspended tenant.
+- One-microsecond attempt/epoch and retained-success/attempt inversions within
+  the same Date millisecond; future success/epoch; infinity, BC and out-of-range
+  transport rejection. The persisted-only inversion does not bypass storage's
+  completed-time constraint. Future-time cases use a far future instant, not a
+  deterministically scheduled one-microsecond boundary against the live clock.
+- Legacy success, old epoch, new running attempt retaining historical success
+  and failed persisted-only evidence, without falling back to old completion.
+- Two clients with a read-only reader: uncommitted replacement is invisible,
+  rollback preserves old facts, committed epoch replacement makes old resources
+  stale, and a previously returned snapshot remains merely historical evidence.
+  This does not schedule a commit during the SELECT, reserve notice authority,
+  or exercise actual producer, epoch-transition or takeover protocols.
+
+Five ordinary adapter tests and the existing mapper/validator tests pass locally;
+the five physical cases skip, and separate hosted-context/local-port probes
+reject execution before constructing a client. Source inventory and launcher
+checks, strict scoped types and lint pass. These are preparation evidence only:
+actual SQL execution, migrations, Prisma raw transport, restricted runtime roles,
+query plan/lock effects and all guarded mutation/recovery races remain unproved.
+Next is the real Prisma transport and remaining hosted precision/scope/race
+witnesses plus complete review before any exact-source CI handoff. Keep this
+candidate inactive and the migration uninstalled.
+
+The statement observation and single-query snapshot choices follow the
+[PostgreSQL time functions](https://www.postgresql.org/docs/16/functions-datetime.html)
+and [read-committed semantics](https://www.postgresql.org/docs/16/transaction-iso.html).
+UTC text uses the documented
+[formatting patterns](https://www.postgresql.org/docs/16/functions-formatting.html).
+
 ## Local strict mapper candidate — 16 November 2026
 
-The unused `validateInitialSyncCompletionProjection` helper now decodes a proposed
+The earlier unused `validateInitialSyncCompletionProjection` helper decodes a proposed
 single-statement rowset before invoking the existing pure validator. This step
 implements only the mapper and ordinary adversarial tests, not the SQL projection
 or a database adapter. It has no runtime callers, connection or write effects.
@@ -273,9 +330,10 @@ Any later schema rollback needs a separately reviewed compatibility plan.
 ## Required registered-CI evidence and next step
 
 The nullable schema, named row-shape checks and registered storage witness are
-now prepared locally. The strict mapper has also been prepared with ordinary
-adversarial tests. The next implementation is the unused single-statement SQL
-projection and adapter with registered precision/scope/transport tests. Storage upgrade and
+now prepared locally. The strict mapper and unused single-statement reader have
+also been prepared with ordinary tests and five registered PostgreSQL cases.
+Physical execution, actual Prisma transport and remaining role/race witnesses
+are still outstanding. Storage upgrade and
 restricted-role evidence remain prerequisites too. No runtime activation or
 source upload is authorized by this design. Required cases are:
 

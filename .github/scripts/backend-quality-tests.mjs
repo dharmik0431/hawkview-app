@@ -47,6 +47,7 @@ export const databaseTests = Object.freeze([
   'tenants/customer-reconsent-initial-notice.database-integration.test.ts',
   'tenants/directory-role-receipt-store.database-integration.test.ts',
   'tenants/existing-tenant-consent.database-integration.test.ts',
+  'tenants/initial-sync-proof-reader.database-integration.test.ts',
   'tenants/initial-sync-proof-storage.database-integration.test.ts',
   'tenants/scheduled-sync-cursor.database-integration.test.ts',
   'tenants/tenant-directory.database-integration.test.ts',
@@ -91,7 +92,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: '8d4e1699590f84da3df1d27e6ce3d75424bbadbd',
+    blob: '9e4f6645150dc0e09e85c4d3d1ce53e46efe0ea4',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });
