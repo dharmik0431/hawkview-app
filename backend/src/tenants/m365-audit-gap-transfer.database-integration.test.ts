@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
+import type { Prisma } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim, type StagedAuditGapTransfer } from './m365-audit-gap-transfer.js'
 
@@ -508,3 +509,116 @@ test('HAW-75 distinct first-gap transfers preserve both identities and advance o
     await waiter.query('COMMIT')
     assert.deepEqual(await snapshot(blocker, owner.tenantId), second, 'Both committed identities and generation are visible')
   }, { lockSourceBeforeRun: false, seedSecondSource: true }))
+
+test('HAW-75 real Prisma transactions preserve microseconds and large BIGINT generations through rollback and commit',
+  { ...options, timeout: 45_000 }, async () => {
+    // Both opt-ins and the hosted boundary apply before either client exists.
+    const url = assertDisposableTestDatabase()
+    assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    // Use the production adapter factory, including its UTC session setup.
+    // The helper receives the actual interactive transaction, with no proxy.
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    const organizationId = randomUUID()
+    const initialGeneration = 9_007_199_254_740_993n
+    const firstObserved = '2001-01-01T00:00:00.654321Z'
+    let connected = false
+    try {
+      await observer.connect()
+      connected = true
+      await observer.query("SET statement_timeout = '20s'")
+      await observer.query("SET lock_timeout = '5s'")
+      await observer.query('BEGIN')
+      const owner = await scope(observer, organizationId)
+      const sibling = await scope(observer, organizationId)
+      const claim = await source(observer, owner)
+      await source(observer, sibling)
+      const priorDigest = createHash('sha256').update(`prior-${randomUUID()}`).digest('hex')
+      await observer.query(`INSERT INTO public.m365_audit_coverage_gaps
+        (id, organization_id, customer_tenant_id, content_type, content_id_sha256,
+         source_status, reason, source_expired_at, first_observed_at)
+        VALUES ($1,$2,$3,'Audit.General',$4,'RETRY','LEDGER_EXPIRED',$5,$6)`,
+      [randomUUID(), organizationId, owner.tenantId, priorDigest, beforeAge, firstObserved])
+      await observer.query(`INSERT INTO public.m365_audit_coverage_states
+        (customer_tenant_id, organization_id, generation, incomplete_since, last_gap_at, has_purged_unrepaired_gap)
+        VALUES ($1,$2,$3,$4,$4,TRUE)`,
+      [owner.tenantId, organizationId, initialGeneration.toString(), firstObserved])
+      // Prisma uses another connection; it must see committed fixtures.
+      await observer.query('COMMIT')
+      const before = await snapshot(observer, owner.tenantId)
+      const siblingBefore = await snapshot(observer, sibling.tenantId)
+      const priorState = await coverageState(observer, owner.tenantId)
+      const transactionOptions = { isolationLevel: 'ReadCommitted' as const, maxWait: 5_000, timeout: 15_000 }
+      const stage = async (tx: Prisma.TransactionClient) => {
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'UTC' }])
+        await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+        await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+        await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'America/New_York'")
+        await tx.$executeRawUnsafe("SET LOCAL DateStyle = 'SQL, DMY'")
+        const states = await tx.$queryRawUnsafe<Array<{ generation: bigint }>>(`SELECT generation
+          FROM public.m365_audit_coverage_states WHERE customer_tenant_id = $1::uuid`, owner.tenantId)
+        assert.equal(states.length, 1)
+        assert.equal(typeof states[0]!.generation, 'bigint', 'The real Prisma decoder must return a BigInt')
+        assert.equal(states[0]!.generation, initialGeneration, 'No Number round trip above MAX_SAFE_INTEGER')
+        const selected = await tx.$queryRawUnsafe<SelectedAuditGapClaim[]>(`SELECT id::text,
+          organization_id::text AS "organizationId", customer_tenant_id::text AS "customerTenantId",
+          microsoft_content_id AS "microsoftContentId", content_type AS "contentType", status,
+          content_uri AS "contentUri", attempt_count AS "attemptCount",
+          to_char(updated_at AT TIME ZONE 'UTC', $2) AS "updatedAt",
+          to_char(discovered_at AT TIME ZONE 'UTC', $2) AS "discoveredAt",
+          to_char(ledger_expires_at AT TIME ZONE 'UTC', $2) AS "ledgerExpiresAt",
+          to_char(content_expires_at AT TIME ZONE 'UTC', $2) AS "contentExpiresAt"
+          FROM public.m365_activity_contents WHERE id = $1::uuid`, claim.id, format)
+        assert.deepEqual(selected, [claim], 'Prisma selection must preserve all six timestamp decimals')
+        assert.deepEqual(await stageExpiredAuditGapTransfer(tx, selected[0]!), { staged: true, reason: 'LEDGER_EXPIRED' })
+        const after = await tx.$queryRawUnsafe<Array<{ generation: bigint }>>(`SELECT generation
+          FROM public.m365_audit_coverage_states WHERE customer_tenant_id = $1::uuid`, owner.tenantId)
+        assert.equal(after[0]!.generation, initialGeneration + 1n, 'BigInt must survive helper read and parameter serialization')
+      }
+      const rollback = new Error('EXPECTED_PRISMA_TRANSFER_ROLLBACK')
+      await assert.rejects(prisma.$transaction(async tx => {
+        await stage(tx)
+        throw rollback
+      }, transactionOptions), error => error === rollback)
+      assert.deepEqual(await snapshot(observer, owner.tenantId), before, 'Actual Prisma rejection rolls back all staged SQL')
+      assert.deepEqual(await snapshot(observer, sibling.tenantId), siblingBefore)
+
+      await prisma.$transaction(stage, transactionOptions)
+      const committed = await snapshot(observer, owner.tenantId)
+      assert.deepEqual(committed.m365_activity_contents, [])
+      assert.equal(committed.m365_audit_coverage_gaps!.length, 2)
+      assert.ok(committed.m365_audit_coverage_gaps!.includes(before.m365_audit_coverage_gaps![0]!))
+      const digest = createHash('sha256').update(claim.microsoftContentId, 'utf8').digest('hex')
+      const newGap = committed.m365_audit_coverage_gaps!.map(row => JSON.parse(row)).find(row => row.content_id_sha256 === digest)
+      assert.ok(newGap)
+      assert.equal(newGap.reason, 'LEDGER_EXPIRED')
+      assert.ok(!JSON.stringify(committed).includes(claim.contentUri), 'Committed evidence contains no provider URL')
+      const committedState = await coverageState(observer, owner.tenantId)
+      assert.equal(committedState.generation, '9007199254740994')
+      assert.equal(committedState.incompleteSince, priorState.incompleteSince)
+      assert.equal(committedState.purged, true)
+      assert.deepEqual(await snapshot(observer, sibling.tenantId), siblingBefore)
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      // Every interactive transaction has settled before cleanup. On setup
+      // failure, roll back the observer before its scoped cascade deletion.
+      if (connected) {
+        await clean(() => observer.query('ROLLBACK'))
+        await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          }
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic Prisma transfer cleanup failed')
+    }
+  })
