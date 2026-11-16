@@ -6,6 +6,13 @@ not a migration or a working durable receipt implementation. It extends the
 The held same-millisecond witness remains red. A new connection UUID alone
 cannot make timestamp-only resource evidence authoritative.
 
+The [storage and projection contract](haw77-proof-storage-projection.md) refines
+the nullable field/check matrix and coherent reader mapping. It adds a proposed
+persisted source-kind field alongside the four identities so full Graph source
+is not inferred from timestamps, and pairs the connection epoch with a dedicated
+start rather than recomputing it from mutable consent timestamps. It remains
+design-only, without installed DDL.
+
 ## Inactive pure validator checkpoint
 
 An unused [validator](../src/tenants/initial-sync-completion-proof.ts) now models
@@ -224,8 +231,9 @@ Before activation, registered disposable-PostgreSQL CI must prove:
 The unused pure proof validator and identity/null/scope/time/status tests are
 now prepared locally, retaining the current held orchestration witnesses.
 It models proposed fields without wiring readers or creating migration authority.
-Next specify the additive storage checks and coherent projection mapping, then
-implement/prove the storage and writer integration as an inactive package. Pure tests cannot prove
+The companion storage/projection contract now specifies the additive checks and
+mapping; next implement/prove the nullable storage and registered witnesses,
+then writer integration as an inactive package. Pure tests cannot prove
 durability, lock order, current PostgreSQL visibility or tenant-wide fencing.
 
 No production behavior or schema change, physical database run, source publication,
