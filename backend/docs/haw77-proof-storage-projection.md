@@ -6,6 +6,46 @@ and its unused [validator](../src/tenants/initial-sync-completion-proof.ts).
 The local storage candidate below remains uninstalled and adds no runtime
 queries or callers. The held orchestration defects remain unresolved.
 
+## Local strict mapper candidate — 16 November 2026
+
+The unused `validateInitialSyncCompletionProjection` helper now decodes a proposed
+single-statement rowset before invoking the existing pure validator. This step
+implements only the mapper and ordinary adversarial tests, not the SQL projection
+or a database adapter. It has no runtime callers, connection or write effects.
+
+The raw boundary expects exactly thirteen `expectedResourceType` slots, including
+slots whose LEFT JOIN state is absent. Each slot repeats tenant and connection
+scope, eligibility, connection identity, paired epoch ID/start, statement
+observation time and a nullable `contextTimeValid` boolean. Joined state fields
+include their own identity/scope/resource, all five stored receipt fields, status,
+both error fields, attempt/success UTC text and nullable `proofTimeValid`. An
+absent state's fields must all be null and cannot carry a true time predicate.
+Every field must be present with its exact primitive type. Repeated context must
+agree exactly; duplicate, optional, foreign or relabeled slots fail closed.
+
+Only literal true database time predicates are accepted. The mapper also checks
+the full timestamp order independently, using canonical four-digit-year UTC
+six-decimal text and integer microseconds before invoking the Date-based validator. Invalid
+calendar dates, zero/out-of-range years, infinity, omitted precision, session
+date formats and offsets are rejected. The transport is deliberately limited to
+years 0001–9999. A one-microsecond epoch/order/future violation remains invalid
+even when all decoded Dates would have identical milliseconds. No rounded
+snapshot escapes: the helper returns validation only, not mutation authority.
+
+Stored source kind, current epoch, matching non-nil attempt/persisted/completed
+identities, terminal success and both null errors are mandatory to derive FULL.
+Legacy success, persisted-only attempts and limited/non-Graph sign-ins remain
+unproved. Caller-supplied coverage/authentication flags are ignored. Missing
+joined states remain missing rather than being populated from expected slots.
+
+Local tests cover these mapping boundaries and valid controls, including all
+thirteen missing/duplicate slot cases and same-millisecond microsecond errors.
+They do not prove the origin or coherence of the supplied facts. The actual
+single scoped query, database predicates, UTC formatting under non-default
+session settings, Prisma decoding, query plan, restricted-role visibility and
+concurrent replacement still need registered disposable-PostgreSQL witnesses.
+Do not wire this helper into notices or declare the coherent reader complete.
+
 ## Local storage candidate — 16 November 2026
 
 The subsequent inactive implementation now includes the seven nullable Prisma
@@ -233,8 +273,9 @@ Any later schema rollback needs a separately reviewed compatibility plan.
 ## Required registered-CI evidence and next step
 
 The nullable schema, named row-shape checks and registered storage witness are
-now prepared locally. The next implementation is an unused coherent projection
-and strict mapper with registered precision/scope tests. Storage upgrade and
+now prepared locally. The strict mapper has also been prepared with ordinary
+adversarial tests. The next implementation is the unused single-statement SQL
+projection and adapter with registered precision/scope/transport tests. Storage upgrade and
 restricted-role evidence remain prerequisites too. No runtime activation or
 source upload is authorized by this design. Required cases are:
 
