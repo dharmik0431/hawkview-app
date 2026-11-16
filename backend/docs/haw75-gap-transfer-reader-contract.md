@@ -1,0 +1,102 @@
+# HAW-75 atomic gap transfer and sticky-reader contract
+
+Status: inactive local design, 16 November 2026. This adds no executable writer, reader, test, schema change or deployment. It refines the [recovery order](haw75-gap-recovery-order.md) against protected main `a15951997b6734b9fc612717cf965c9f9651176c` and additive storage candidate `2a6abc8cfe3bdf268eb8260166d5b0c31d9215e7`. The three registered storage cases do not prove these application races and have not run physically on this candidate.
+
+## Verified source boundaries
+
+The following source remains unchanged from main. These are source findings, not observations of a live tenant or proof that a particular customer lost data.
+
+| Boundary | Current behavior | Required integration |
+| --- | --- | --- |
+| [Management Activity service](../src/tenants/m365-management-activity.service.ts), `discoverContent` | Stores a trimmed content ID truncated to 500 characters, inserts chunks with `createMany`/`skipDuplicates`, then separately updates subscription cursors. | Shared tenant serialization and retained-gap identity check before insertion; owner validation on cursor writes, including empty pages. |
+| Same service, `processContent` | Claims PENDING/RETRY by incrementing the attempt. Accepted audit rows, evidence, record/blob usage and a COMPLETED update share a transaction; completion matches only the ledger row ID. Download-byte reservation and unused-byte release occur separately before that transaction. | Revalidate the exact scoped claim before final record/evidence/record-blob charges can commit; reject a claim invalidated by transfer or takeover. Preserve legitimate download-byte accounting. |
+| Same service, abandoned-PROCESSING reset and `processContent` catch/retry write | Reset mutates aged PROCESSING rows; the catch handler changes status/retry and sometimes ledger expiry, without matching the selected attempt/revision. | Include both in the shared owner/serialization and conditional-claim contract. Neither may revive or overwrite a newer claim; do not alter retry cadence or permanent-error policy in this slice. |
+| Same service, `syncTenant`, cooldown return | Returns an empty change array when no work is due and the previous success is inside the polling interval. It does not read coverage state. | Read sticky coverage before admitting a complete outcome; skipping provider work must not imply complete coverage. |
+| Same service, final counts/cleanup | Computes `blocked` from content, subscription and discovery backlog, then deletes expired ledger rows and updates sync status in a transaction array. | Serialize transfer with the outcome calculation. Zero ordinary backlog cannot hide a retained coverage marker. |
+| [Tenant sync service](../src/tenants/tenant-sync.service.ts), tenant data response | Reads sync states and content counts; projects `m365Audit.outcomeProjection`, status, last success and backlog without coverage state. `syncM365AuditActivity` returns a collected-change count, not coverage proof. | Backend response must include the sticky coverage fact and prevent a stale SUCCEEDED state from yielding a complete audit outcome. |
+| [Tenants service](../src/tenants/tenants.service.ts), tenant selects and health/readiness projection | Selects sync states/subscriptions and feeds readiness, freshness and health derivation without coverage state. | Extend backend data selection and coverage-aware projection consistently. No frontend work belongs to this slice. |
+
+An expired unresolved row can therefore contribute to today's `blocked` count, disappear during cleanup, and be absent from the next visit's success calculation. Fixing only that final calculation also misses the early return and read-only health responses. A stored `lastSuccessfulAt` is historical evidence; it cannot override a subsequent gap.
+
+On activation, replace or restrict the existing broad expired-ledger deletion so **no unresolved row can bypass atomic transfer**. Adding a safe helper while leaving that cleanup active is insufficient. Any deletion of completed checkpoints requires its separately proved deduplication/retention contract.
+
+## Identity and operation inputs
+
+Gap identity is tenant plus lowercase SHA-256 of the **stored** `microsoftContentId`, after the existing trim/truncate behavior. Hashing the original unbounded provider ID would disagree with the ledger's uniqueness contract. Do not add content type to that identity: storage intentionally matches the ledger's tenant/content-ID uniqueness. Organization is a required scope check, not a substitute for tenant identity.
+
+The selected source descriptor includes tenant, organization, row ID, stored content ID, content type, status, URI, attempt count, revision (`updatedAt`), and the expiry/discovery fields used in eligibility. Treat it as stale until re-read under serialization. Do not include the URI or raw provider payload in gap storage, logs, exceptions, review evidence or API responses. Contradictory scope/content-type metadata for a retained identity must stop the transfer for explicit reconciliation rather than silently overwrite it.
+
+Only unresolved source statuses accepted by the storage constraint are eligible: PENDING, PROCESSING, RETRY, FAILED and INSUFFICIENT_CAPACITY. This list does not introduce a new runtime capacity policy. COMPLETED rows belong to the separately proved completed-ID retention/scrub path. Content unavailability must have a validated source result tied to the same claim; this design does not reclassify arbitrary errors as missing content.
+
+## Atomic transfer sequence
+
+This is a required contract for a future helper, not an implementation or a proposed replacement for HAW-21 ownership.
+
+1. Enter the real HAW-21 scoped owner-fenced transaction. Use its existing tenant/owner lock order, with the existing `(tenant ID, organization ID)` tenant row serialized before any optional coverage row. Validate the live owner after relevant waits and at the mutation boundary using that package's contract. A caller-provided boolean or no-op callback does not establish ownership. A missing tenant, wrong organization or stale owner aborts with no writes.
+2. After serialization, read the source and optional gap/state rows again. Use deterministic ordering for multiple contents and the same order across discovery, transfer, completion, purge and repair. Do not infer protection from locking a nonexistent gap or state row: row locks apply to returned rows. Keep provider requests outside this transaction. [PostgreSQL row locks](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-ROWS)
+3. Sample database `clock_timestamp()` after required waits for deadline comparisons and explicitly set new gap observation timestamps from that sample. `CURRENT_TIMESTAMP`/`now()` and the storage default use transaction-start time; they can predate a lock wait. If another required wait occurs, refresh the eligibility/owner check. This changes neither retention duration nor polling cadence. [PostgreSQL current-time semantics](https://www.postgresql.org/docs/16/functions-datetime.html#FUNCTIONS-DATETIME-CURRENT)
+4. Match the scoped row ID, stored identity, status, URI, attempt, revision and relevant deadline fields to the selected descriptor. Re-evaluate the approved earliest provider/ledger/immutable discovery-age deadline. Source missing, completed, changed, or no longer eligible produces no transfer and no accounting. A retry after an unknown commit result must re-read state; absence alone is not proof of either successful transfer or repair.
+5. For a new unresolved gap, insert URL-free evidence and create or update the sticky state in the same transaction. First creation uses generation 1. Each distinct newly recorded gap advances an existing generation once; a repeat of the same unresolved gap preserves its original `firstObservedAt`, does not extend retention, and does not increment the generation again. Preserve `incompleteSince`; maintain `lastGapAt` consistently for newly observed gaps. A resolved-identity conflict is outside this initial writer and fails closed pending the repair contract.
+6. Conditionally remove exactly the same unresolved source revision. If the affected-row count is not one, abort the transaction so the marker/gap cannot commit alone. Never use the current broad expired-content delete as this transfer. Any digest/constraint/generation-overflow/owner failure rolls back the entire operation. No accepted-record/blob usage increment belongs to transfer.
+7. Derive and persist any visit outcome only after the transfer's writes are visible in the same serialized transaction. Commit gap, state, source removal and that outcome together. Do not reuse counts obtained before the transaction to declare complete coverage.
+
+The intended transaction uses fresh reads after obtaining serialization, rather than relying on an earlier selection snapshot. PostgreSQL Read Committed permits successive commands to see different committed data; wrapping the present independent count queries in an arbitrary transaction does not establish this contract. Other isolation modes require their own demonstrated retry/snapshot behavior. [PostgreSQL isolation](https://www.postgresql.org/docs/16/transaction-iso.html#XACT-READ-COMMITTED)
+
+## Competing writes and repair limits
+
+| Competing action | Required result |
+| --- | --- |
+| Discovery commits before transfer | Transfer re-reads the current eligible revision. It cannot delete a newer claim or use pre-lock eligibility. |
+| Transfer commits before ordinary discovery | Discovery finds the retained gap identity and does not recreate its provider-URL row. Its empty-page and cursor branches still validate ownership. Ordinary discovery does not resolve the gap. |
+| Full-blob completion commits before transfer | Transfer observes COMPLETED and leaves its deduplication checkpoint intact. No gap and no extra charge are created. |
+| Transfer commits while a download is outside a transaction | Late completion fails the exact-claim recheck; records, evidence, record/blob charges and completion all roll back. Separately reserved/consumed download bytes are not refunded as if no transfer occurred. Error/retry handlers and lease reset cannot resurrect the removed claim or overwrite a newer one. |
+| Marker/gap or source-delete operation fails | All related writes roll back. A retry preserves identity and first-observed retention; an unknown result never becomes reported repair. |
+| Tenant deletion or owner takeover wins serialization | All stale scoped mutations are rejected; cascades cannot leave orphaned gap/state evidence. The owner-fencing proof belongs to HAW-21. |
+
+Read Committed readers need not block ordinary writers, but each response must combine coverage and sync outcome from a coherent database snapshot. Do not assemble a pre-gap marker read and post-gap success read using independent calls. A response may describe its snapshot; it must not claim protection against all future writes after that snapshot. Cache freshness and invalidation remain subject to HAW-70's reader contract rather than being invented here.
+
+The coverage `generation` is a gap-state version, not a tenant visit lease. It is not yet a complete repair token. Deleting a state row and recreating it with default generation 1 could reuse an older value. No state clearance is allowed in this initial transfer design. A future repair package must specify persistent version/incarnation or equivalent non-reused proof, atomic comparison and every competing writer before enabling clearance. Numeric overflow must abort rather than wrap or reset.
+
+Verified recollection would need the complete expected blob, valid scope, exact identity, accepted-record/accounting deduplication and owner-fenced atomic resolution. A successful poll, empty page, zero changed records, duplicate discovery or ordinary COMPLETED update is not that proof. No recollection or manual sync is authorized by this document.
+
+## Sticky-reader and retention behavior
+
+| Evidence at the response/outcome snapshot | Coverage meaning |
+| --- | --- |
+| No marker and no unresolved retained gap | This contract adds no coverage-gap block; ordinary failure, backlog and freshness rules still apply. Absence alone does not prove success. |
+| Marker exists, regardless of ordinary backlog | Audit coverage is incomplete, even if an older sync state says SUCCEEDED or the provider poll is skipped for cooldown. |
+| Unresolved gap exists but marker is missing | Invariant failure; fail closed as incomplete. Do not treat the missing marker as clearance. |
+| Marker exists with `hasPurgedUnrepairedGap = true` | Coverage remains incomplete even with zero retained gaps. No per-blob repair can identify the deleted gap solely from this storage. |
+| Coverage lookup fails or a mixed snapshot cannot be reconciled | Coverage is unproved; do not produce a complete audit outcome. Preserve ordinary error handling rather than manufacturing a successful empty result. |
+
+Apply these semantics to the service's early return, final success eligibility, tenant data outcome, and tenant list/detail readiness/freshness/health consumers. Retain historical last-success timestamps without presenting them as proof of current completeness. The exact existing status/reason mapping must be reconciled with HAW-77 before runtime integration; this document adds no new status enum, retry classification, scheduling trigger or failure-counter policy.
+
+URL-free gaps retain the owner-approved 720-hour lifetime from `firstObservedAt`; repeat transfer of a retained gap cannot reset it. Before deleting an expired unresolved gap, atomically set `hasPurgedUnrepairedGap` on the sticky state. Preserve that state after purge, including through empty visits. Purging a resolved gap never clears a marker. Re-read the resolution state under the same serialization to avoid treating a concurrent repair as unresolved or vice versa.
+
+After purge, the boolean retains incompleteness, not the deleted digest or source interval. It cannot certify a later individual blob repaired all missing evidence, nor identify that old content ID to suppress rediscovery by gap lookup. Any newly discovered URL still needs the approved independent URL-age/expiry checks; this storage alone cannot prove identity-specific URL suppression after purge. Keep the marker until a separately specified verified full-coverage proof exists. Do not block all future ordinary collection merely because that flag is set, and do not recreate deleted URL-bearing rows as a retention workaround. Completed-ID deduplication and its approved retention horizon require their separate proof.
+
+If legitimate later discovery produces new retained gap evidence after purge, the deleted first observation is unavailable. Treat that as new evidence with its own observation time, never as a preserved historical timestamp or proof that the purged gap was repaired. The purged-unrepaired marker remains set.
+
+## Required executable witnesses before activation
+
+These are acceptance cases to implement and register, not passing tests or additions to the current three-case storage suite. Run physical races only in authorized registered hosted disposable PostgreSQL CI with barriers that prove the intended overlap; timing sleeps alone are not evidence.
+
+| Case | Setup and required assertion |
+| --- | --- |
+| First gap, both discovery orders | Initially absent state/gap rows; same identity concurrently discovered/transferred. Shared tenant serialization prevents URL resurrection and leaves one gap/marker. |
+| Completion versus transfer, both orders | Hold a download outside the transaction. Completion-first leaves one completed dedup checkpoint and one record/blob accounting result; transfer-first rejects late completion and record/blob charges. Separately incurred download-byte reservations remain correctly accounted for. |
+| Atomic rollback and unknown result | Inject failure after marker creation and before conditional deletion, then lose an acknowledged commit result separately. Rollback leaves no partial transfer; retry does not refresh retention or double-advance generation. |
+| Stale source and post-wait deadline | Change URI, attempt, revision, status or expiry while transfer waits. Stale selection cannot delete; a lock wait crossing a deadline uses post-wait database time. |
+| Next empty visit and cooldown | Begin with a previous SUCCEEDED row, transfer one unresolved content, then zero ordinary backlog. Both the normal and cooldown branches remain incomplete without initiating extra provider work. |
+| Read-only response consistency | Exercise tenant data plus list/detail projections with old SUCCEEDED state and a marker; all refuse complete coverage. Force a gap commit between separate reads to verify the chosen snapshot contract. |
+| 720-hour purge and repeat transfer | Test just-before/exact/after boundary, preserved first observation, unresolved purge rollback, and subsequent empty reads. The marker and purged-unrepaired flag survive. |
+| Invalid repair and generation reuse | Empty/duplicate/failed recollection and stale repair generation cannot clear state. Recreated-generation reuse is rejected before any clearance path can be enabled. |
+| Scope, ownership and deletion | Wrong organization, stale owner, takeover, tenant/organization deletion and restricted roles cannot commit partial gap/content/outcome changes. Reuse HAW-21's actual fence rather than a fake callback. |
+
+The service negative control must demonstrate that the present cleanup/next-empty-visit path violates the new assertion. Catalog-only SQL tests and fake transaction tests cannot substitute for it.
+
+## Next step and fallback
+
+Implement one inactive transfer slice against this storage with synthetic argument/rollback checks, then add registered physical witnesses and the required discovery/completion/reader integration. Keep production callers absent until the full contract passes. This is not a complete HAW-75 package or a claim of tenant-wide SYNC protection.
+
+Protected main remains the release fallback. No destructive schema rollback or manual production repair is proposed. Public upload or Claude review of this new material still needs exact-source authorization; HAW-70 approval does not cover it. Complete authorized independent review, exact-head CI, protected merge, configured automatic release, actual health and authenticated canary remain release gates. Baseline remains incomplete.
