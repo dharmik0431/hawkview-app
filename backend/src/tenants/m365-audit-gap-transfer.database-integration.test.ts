@@ -3,10 +3,10 @@ import { createHash, randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
-import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim } from './m365-audit-gap-transfer.js'
+import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim, type StagedAuditGapTransfer } from './m365-audit-gap-transfer.js'
 
 // Actual helper SQL, hosted disposable service only. No provider, owner-fence,
-// production selection adapter, outcome reader or concurrent writer is exercised.
+// production selection adapter, outcome reader or production writer is exercised.
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
   && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
 const options = { skip: !enabled, timeout: 30_000 }
@@ -102,6 +102,106 @@ async function snapshot(client: pg.Client, tenantId: string) {
       WHERE customer_tenant_id = $1 ORDER BY to_jsonb(t)::text`, [tenantId])).rows.map(row => row.data)
   }
   return rows
+}
+
+type SourceRace = {
+  blocker: pg.Client
+  waiter: pg.Client
+  blockerPid: number
+  waiterPid: number
+  owner: Scope
+  claim: SelectedAuditGapClaim
+  start: () => Promise<StagedAuditGapTransfer>
+}
+
+// Committed synthetic fixtures are necessary for both connections to see them.
+// The real helper's transaction always rolls back; cleanup is scoped to the one
+// newly generated organization and happens only after in-flight work settles.
+async function sourceRace(
+  overrides: (client: pg.Client) => Promise<Partial<SelectedAuditGapClaim>>,
+  run: (race: SourceRace) => Promise<void>,
+) {
+  const url = assertDisposableTestDatabase()
+  assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+  const configuration = { connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 }
+  const blocker = new pg.Client(configuration)
+  const waiter = new pg.Client(configuration)
+  const organizationId = randomUUID()
+  const connected = new Set<pg.Client>()
+  let pending: Promise<StagedAuditGapTransfer> | undefined
+  try {
+    for (const client of [blocker, waiter]) {
+      await client.connect()
+      connected.add(client)
+      await client.query("SET statement_timeout = '20s'")
+      await client.query("SET lock_timeout = '18s'")
+      await client.query("SET TIME ZONE 'UTC'")
+      await client.query("SET DateStyle = 'ISO, MDY'")
+    }
+    const blockerPid = (await blocker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number
+    const waiterPid = (await waiter.query('SELECT pg_backend_pid() AS pid')).rows[0].pid as number
+    assert.notEqual(blockerPid, waiterPid)
+    await blocker.query('BEGIN ISOLATION LEVEL READ COMMITTED')
+    const owner = await scope(blocker, organizationId)
+    const claim = await source(blocker, owner, await overrides(blocker))
+    await blocker.query('COMMIT')
+    await blocker.query('BEGIN ISOLATION LEVEL READ COMMITTED')
+    assert.equal((await blocker.query('SELECT id FROM public.m365_activity_contents WHERE id = $1 FOR UPDATE', [claim.id])).rowCount, 1)
+    await waiter.query('BEGIN ISOLATION LEVEL READ COMMITTED')
+    await run({ blocker, waiter, blockerPid, waiterPid, owner, claim, start: () => {
+      assert.equal(pending, undefined, 'Start exactly one real helper call per race')
+      pending = stageExpiredAuditGapTransfer(adapter(waiter), claim)
+      // Attach immediately to prevent an unhandled rejection during observation;
+      // the original promise is still awaited by the assertion and by cleanup.
+      void pending.catch(() => undefined)
+      return pending
+    } })
+  } finally {
+    const failures: unknown[] = []
+    const clean = async (operation: () => Promise<unknown>) => {
+      try { await operation() } catch (error) { failures.push(error) }
+    }
+    if (connected.has(blocker)) await clean(() => blocker.query('ROLLBACK'))
+    if (pending) await pending.catch(() => undefined)
+    if (connected.has(waiter)) await clean(() => waiter.query('ROLLBACK'))
+    if (connected.has(blocker)) await clean(async () => {
+      // This UUID was created solely by this fixture; never a broad table delete.
+      await blocker.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+      for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+        assert.equal((await blocker.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+      }
+    })
+    await clean(() => waiter.end())
+    await clean(() => blocker.end())
+    if (failures.length) throw new AggregateError(failures, 'Synthetic source-race cleanup failed')
+  }
+}
+
+async function sourceWait(race: SourceRace) {
+  // A transaction can cache activity snapshots; explicitly refresh each poll.
+  await race.blocker.query('SELECT pg_stat_clear_snapshot()')
+  const result = await race.blocker.query(`SELECT state, wait_event_type, query,
+    pg_blocking_pids(pid) AS blockers, clock_timestamp() >= $2::timestamptz AS expired
+    FROM pg_stat_activity WHERE pid = $1 AND datname = current_database()`,
+  [race.waiterPid, race.claim.contentExpiresAt])
+  assert.equal(result.rowCount, 1, 'Owned waiter must still exist')
+  const row = result.rows[0]
+  const blocked = row.state === 'active' && row.wait_event_type === 'Lock'
+    && row.blockers.length === 1 && row.blockers[0] === race.blockerPid
+    && /^\s*SELECT id FROM public\.m365_activity_contents WHERE id = \$1::uuid[\s\S]+FOR UPDATE\s*$/.test(row.query)
+  return { blocked, expired: row.expired as boolean | null }
+}
+
+async function untilSourceWait(race: SourceRace, afterExpiry = false) {
+  const deadline = Date.now() + 12_000
+  while (Date.now() < deadline) {
+    const observation = await sourceWait(race)
+    if (observation.blocked && (!afterExpiry || observation.expired === true)) return observation
+    // Polling delay bounds work; only the server's blocker/query/clock evidence
+    // satisfies this barrier. Elapsed wall time alone never passes the test.
+    await new Promise(resolve => setTimeout(resolve, 25))
+  }
+  assert.fail('Expected exact source-row blocker/clock barrier was not observed')
 }
 
 test('HAW-75 transfer computes earliest microsecond deadline and tie precedence under nondefault session settings',
@@ -245,4 +345,63 @@ test('HAW-75 a real generation overflow rejects and rolls back the preceding gap
     assert.deepEqual(await snapshot(client, owner.tenantId), before)
     await client.query(`UPDATE public.m365_audit_coverage_states SET generation = 1 WHERE customer_tenant_id = $1`, [owner.tenantId])
     assert.equal((await stageExpiredAuditGapTransfer(adapter(client), claim)).staged, true)
+  }))
+
+test('HAW-75 source revision committed during an observed row wait invalidates the selected claim',
+  { ...options, timeout: 45_000 }, async () => sourceRace(async () => ({}), async race => {
+    const { blocker, waiter, owner, claim } = race
+    const pending = race.start()
+    assert.equal((await untilSourceWait(race)).blocked, true)
+    assert.equal((await blocker.query(`UPDATE public.m365_activity_contents
+      SET updated_at = updated_at + interval '1 microsecond' WHERE id = $1`, [claim.id])).rowCount, 1)
+    const replacement = await select(blocker, claim.id)
+    assert.equal(replacement.updatedAt, '2000-01-02T00:00:00.654322Z')
+    await blocker.query('COMMIT')
+    assert.deepEqual(await pending, { staged: false, reason: 'SOURCE_CHANGED_OR_ABSENT' })
+    assert.deepEqual(await select(waiter, claim.id), replacement)
+    const preserved = await snapshot(waiter, owner.tenantId)
+    assert.equal(preserved.m365_activity_contents!.length, 1)
+    assert.deepEqual(preserved.m365_audit_coverage_gaps, [])
+    assert.deepEqual(preserved.m365_audit_coverage_states, [])
+    // Positive control uses the fresh committed revision, still in the same
+    // real transaction. Its staged writes must disappear on full rollback.
+    assert.equal((await stageExpiredAuditGapTransfer(adapter(waiter), replacement)).staged, true)
+    await waiter.query('ROLLBACK')
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), preserved)
+  }))
+
+test('HAW-75 source expires during an observed row wait and uses post-wait database time',
+  { ...options, timeout: 45_000 }, async () => sourceRace(async client => {
+    const times = (await client.query(`WITH observed AS MATERIALIZED (SELECT clock_timestamp() AS at)
+      SELECT to_char(at AT TIME ZONE 'UTC', $1) AS discovered,
+        to_char((at + interval '24 hours') AT TIME ZONE 'UTC', $1) AS ledger,
+        to_char((at + interval '6 seconds') AT TIME ZONE 'UTC', $1) AS provider FROM observed`, [format])).rows[0]
+    return { discoveredAt: times.discovered, ledgerExpiresAt: times.ledger, contentExpiresAt: times.provider }
+  }, async race => {
+    const { blocker, waiter, owner, claim } = race
+    const original = await snapshot(blocker, owner.tenantId)
+    assert.equal((await waiter.query(`SELECT transaction_timestamp() < $1::timestamptz
+      AND clock_timestamp() < $1::timestamptz AS before_expiry`, [claim.contentExpiresAt])).rows[0].before_expiry, true)
+    const pending = race.start()
+    assert.equal((await untilSourceWait(race)).expired, false, 'Must observe the actual source wait before expiry')
+    assert.equal((await untilSourceWait(race, true)).expired, true, 'Same source wait must persist across the database deadline')
+    const releasedAfter = (await blocker.query(`SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', $1) AS at`, [format])).rows[0].at
+    // Release the source unchanged: only time advances, not its selected fields.
+    await blocker.query('COMMIT')
+    assert.deepEqual(await pending, { staged: true, reason: 'PROVIDER_URL_EXPIRED' })
+    assert.deepEqual((await waiter.query(`SELECT g.reason,
+      to_char(g.source_expired_at AT TIME ZONE 'UTC', $3) AS expiry,
+      g.first_observed_at >= $2::timestamptz AS after_release,
+      g.first_observed_at > transaction_timestamp() AS after_transaction_start,
+      s.generation::text, s.incomplete_since = g.first_observed_at AS same_start,
+      s.last_gap_at = g.first_observed_at AS same_end
+      FROM public.m365_audit_coverage_gaps g JOIN public.m365_audit_coverage_states s
+      USING (customer_tenant_id, organization_id) WHERE g.customer_tenant_id = $1`,
+    [owner.tenantId, releasedAfter, format])).rows,
+    [{ reason: 'PROVIDER_URL_EXPIRED', expiry: claim.contentExpiresAt, after_release: true,
+      after_transaction_start: true, generation: '1', same_start: true, same_end: true }])
+    assert.deepEqual((await snapshot(waiter, owner.tenantId)).m365_activity_contents, [])
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), original, 'Staging is not a visible commit')
+    await waiter.query('ROLLBACK')
+    assert.deepEqual(await snapshot(blocker, owner.tenantId), original, 'Full rollback restores the committed source')
   }))
