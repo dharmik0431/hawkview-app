@@ -1137,6 +1137,7 @@ function aggregateSyncFixture(options: {
   replaceCurrentSignInProof?: boolean
   reconsentedAt?: Date
   baselineSucceededAt?: Date
+  reflectUsersBaselineWrite?: boolean
 } = {}) {
   const tenant = {
     ...boundedTenant,
@@ -1155,6 +1156,8 @@ function aggregateSyncFixture(options: {
   const resolvedIncidents: string[] = []
   const stateWrites: string[] = []
   let baselineReads = 0
+  let lastBaselineRows: any[] = []
+  let usersLastAttemptAt: Date | null = null
   let persistedBaselineAt = options.baselineSucceededAt ?? new Date(Date.now() - 60_000)
   let currentSignInProof: { lastAttemptAt: Date; lastSuccessfulAt: Date } | null = null
   let usersLastSuccessfulAt = options.initial ? null : new Date()
@@ -1182,7 +1185,13 @@ function aggregateSyncFixture(options: {
   const prisma = utcTestDatabase({
     syncState: {
       findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: usersLastSuccessfulAt, deltaLink: 'previous-delta' }),
-      updateMany: async () => { stateWrites.push('USERS:RUNNING'); return { count: 1 } },
+      updateMany: async ({ data }: any) => {
+        if (options.reflectUsersBaselineWrite) {
+          assert.ok(data.lastAttemptAt instanceof Date)
+          usersLastAttemptAt = data.lastAttemptAt
+        }
+        stateWrites.push('USERS:RUNNING'); return { count: 1 }
+      },
       update: async ({ where, data }: any) => {
         assert.equal(where.customerTenantId_resourceType.resourceType, 'USERS')
         assert.equal(data.deltaLink, 'next-delta')
@@ -1202,17 +1211,22 @@ function aggregateSyncFixture(options: {
         const states = new Map<string, any>()
         if (options.completedInitialSyncResources !== false) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
           if (resourceType === options.missingRequiredResource) continue
-          const completedAt = resourceType === options.staleRequiredResource
+          const completedAt = baselineRead && resourceType === 'USERS' && options.reflectUsersBaselineWrite
+            ? usersLastSuccessfulAt
+            : resourceType === options.staleRequiredResource
             ? new Date('2025-01-01T00:00:00.000Z')
             : resourceType === options.futureRequiredResource || resourceType === options.futureSuccessOnlyResource
               ? new Date(Date.now() + 60 * 60_000)
               : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
                 ? currentSignInProof.lastSuccessfulAt
               : baselineRead ? persistedBaselineAt : new Date()
+          assert.ok(completedAt instanceof Date)
           states.set(resourceType, {
             resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
             lastSuccessfulAt: completedAt,
-            lastAttemptAt: resourceType === options.futureSuccessOnlyResource
+            lastAttemptAt: baselineRead && resourceType === 'USERS' && options.reflectUsersBaselineWrite
+              ? usersLastAttemptAt
+              : resourceType === options.futureSuccessOnlyResource
               ? new Date()
               : resourceType === options.invertedRequiredResource
                 ? new Date(completedAt.getTime() + 1000)
@@ -1241,9 +1255,11 @@ function aggregateSyncFixture(options: {
           const signIn = states.get('SIGN_INS')
           currentSignInProof = { lastAttemptAt: signIn.lastAttemptAt, lastSuccessfulAt: signIn.lastSuccessfulAt }
         }
-        return [...states.values()].filter((state) =>
+        const selected = [...states.values()].filter((state) =>
           (!where.resourceType?.in || where.resourceType.in.includes(state.resourceType)) &&
           (!where.lastAttemptAt?.gte || state.lastAttemptAt >= where.lastAttemptAt.gte))
+        if (baselineRead) lastBaselineRows = selected.map((state) => ({ ...state }))
+        return selected
       },
     },
     tenantConnection: {
@@ -1294,6 +1310,7 @@ function aggregateSyncFixture(options: {
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
   return { calls, messages, incidents, stateWrites, resolvedIncidents,
     baselineReadCount: () => baselineReads,
+    lastBaselineRows: () => lastBaselineRows,
     isIncidentOpen: (key: string) => openIncidents.has(key),
     openIncidentType: (key: string) => openIncidents.get(key),
     setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
@@ -1619,6 +1636,52 @@ test('reconsent keeps the initial warning open until every baseline source succe
   assert.equal(fixture.isIncidentOpen(key), false)
   assert.deepEqual(fixture.resolvedIncidents, [key])
   assert.equal(network.mock.callCount(), 0)
+})
+
+// This models old persisted resource timestamps; it does not call a consent
+// writer or establish physical ordering. The real incremental orchestrator and
+// readiness predicate decide whether the synthetic warning sink is cleared.
+test('same-millisecond reconsent cannot reuse old required-resource successes to clear a warning', {
+  skip: process.env.HAWKVIEW_HAW77_SAME_MILLISECOND_COVERAGE_WITNESS === '1'
+    ? false : 'held pending non-reusable epoch-bound resource completion proof',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const reconsentedAt = new Date(Date.now() - 30_000)
+  const key = 'tenant:tenant:initial-sync'
+  for (const [label, offset, shouldRemainOpen] of [
+    ['old evidence one millisecond before reconsent', -1, true],
+    ['old evidence in the reconsent millisecond', 0, true],
+    ['later-timestamp control', 1, false],
+  ] as const) await t.test(label, async () => {
+    const baselineAt = new Date(reconsentedAt.getTime() + offset)
+    const fixture = aggregateSyncFixture({
+      initial: true, completedInitialSyncResources: true,
+      persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+      reconsentedAt, baselineSucceededAt: baselineAt, reflectUsersBaselineWrite: true,
+    })
+    assert.equal((await fixture.run()).status, 'PARTIAL')
+    assert.equal(fixture.openIncidentType(key), 'tenant.initial_sync_in_progress')
+    fixture.setPersistedSignInReasonCode(undefined)
+    await fixture.run(true)
+
+    const rows = fixture.lastBaselineRows()
+    assert.equal(rows.length, INITIAL_SYNC_RESOURCE_TYPES.length)
+    const freshUsers = rows.find((row) => row.resourceType === 'USERS')
+    const freshSignIns = rows.find((row) => row.resourceType === 'SIGN_INS')
+    for (const row of [freshUsers, freshSignIns]) {
+      assert.ok(row.lastAttemptAt instanceof Date && row.lastSuccessfulAt instanceof Date)
+      assert.ok(row.lastAttemptAt.getTime() > reconsentedAt.getTime())
+      assert.ok(row.lastSuccessfulAt.getTime() >= row.lastAttemptAt.getTime())
+    }
+    for (const row of rows.filter((item) => !['USERS', 'SIGN_INS'].includes(item.resourceType))) {
+      assert.equal(row.lastAttemptAt.getTime(), baselineAt.getTime())
+      assert.equal(row.lastSuccessfulAt.getTime(), baselineAt.getTime())
+    }
+    assert.equal(network.mock.callCount(), 0)
+    assert.deepEqual({ open: fixture.isIncidentOpen(key), resolved: fixture.resolvedIncidents }, {
+      open: shouldRemainOpen, resolved: shouldRemainOpen ? [] : [key],
+    }, 'a fresh USERS and Graph pass cannot replace proof for other required resources')
+  })
 })
 
 test('a completed initial-sync notice stays open after a later clean full pass', async (t) => {

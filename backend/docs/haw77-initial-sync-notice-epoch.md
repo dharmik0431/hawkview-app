@@ -106,6 +106,34 @@ additive migration, writer rotations, visit capture, proof binding, guarded
 notice writes and reader truth should be reviewed as one inactive package;
 no schema-only step authorizes activation.
 
+### Held same-millisecond resource-proof regression
+
+The synthetic `tenant-sync-bounds.test.ts` witness named
+`same-millisecond reconsent cannot reuse old required-resource successes to clear a warning`
+is held behind `HAWKVIEW_HAW77_SAME_MILLISECOND_COVERAGE_WITNESS=1`.
+It calls the real full and incremental orchestrator with synthetic collectors,
+storage and notification boundaries. A limited first pass opens the warning;
+then a fresh Graph pass supplies current SIGN_INS evidence. The fixture also
+reflects the full pass's actual USERS claim/success in its baseline read, so
+that row is not incorrectly modeled as an old untouched success.
+
+Other required resources retain the modeled old success times. Evidence one
+millisecond before reconsent keeps the warning open, but evidence equal to
+the reconsent millisecond wrongly clears it. The held equality assertion fails
+at the warning sink; a separate positive control with later timestamps clears
+the warning. Assertions inspect the actual baseline read, including the fresh
+USERS/SIGN_INS rows and unchanged other resource timestamps, before checking
+that sink. The two controls pass on the current local candidate.
+
+This diagnoses timestamp-only reuse; it does not perform an actual consent
+write or prove that the modeled history occurred in PostgreSQL. The later-time
+control exercises existing timestamp behavior, not a new durable epoch receipt.
+Changing `>=` to `>` alone is not a complete repair: valid new-epoch attempts
+can also share the consent millisecond. The missing non-reusable identity and
+resource provenance must distinguish those histories. The witness remains
+held until that protocol exists; current schema, production behavior, consent
+policy, physical race proof, reader/count truth and HAW-21 ownership are unchanged.
+
 ## Reader and history contract
 
 The current notification list returns resolved rows and still sends their
