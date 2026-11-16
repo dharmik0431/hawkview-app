@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import pg from 'pg'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
@@ -30,6 +32,51 @@ function sqlState(expected: string) {
   return (error: unknown): boolean =>
     typeof error === 'object' && error !== null && 'code' in error && error.code === expected
 }
+
+function isNumericOverflow(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false
+  const value = error as { code?: unknown; meta?: { code?: unknown;
+    driverAdapterError?: { cause?: { kind?: unknown; code?: unknown; originalCode?: unknown } } } }
+  const cause = value.meta?.driverAdapterError?.cause
+  return value.code === '22003' || (value.code === 'P2010' && (value.meta?.code === '22003' ||
+    (cause?.kind === 'postgres' && (cause.code === '22003' || cause.originalCode === '22003')) ||
+    (cause?.kind === 'ValueOutOfRange' && cause.originalCode === '22003')))
+}
+
+test('HAW-70 overflow validator recognizes the installed Prisma transaction adapter without database access', async t => {
+  // An unconnected client routes the transaction query to a synthetic server
+  // error. Exercise the real adapter/client envelope without opening a database.
+  const pool = new pg.Pool()
+  const connection = Object.assign(new pg.Client(), { release: () => {} })
+  t.mock.method(connection, 'connect', async () => { throw new Error('Database connections are forbidden in this test') })
+  const statements: string[] = []
+  t.mock.method(connection, 'query', async (query: { text: string }) => {
+    statements.push(query.text)
+    if (query.text === 'SELECT 1') throw Object.assign(new Error('bigint out of range'), { code: '22003', severity: 'ERROR' })
+    assert.ok(['BEGIN', 'ROLLBACK'].includes(query.text), 'Only synthetic transaction control is permitted')
+    return { rows: [], rowCount: 0, fields: [], command: query.text, oid: 0 }
+  })
+  t.mock.method(pool, 'query', async () => { throw new Error('Pool queries are forbidden in this test') })
+  t.mock.method(pool, 'connect', async () => connection)
+  const client = new PrismaClient({ adapter: new PrismaPg(pool) })
+  try {
+    await assert.rejects(client.$transaction(tx => tx.$executeRawUnsafe('SELECT 1')), (error: unknown) => {
+      const value = error as { code: string; meta: { driverAdapterError: { cause: { kind: string } } } }
+      assert.equal(value.code, 'P2010', 'The real Prisma client must wrap the injected driver error')
+      assert.equal(value.meta.driverAdapterError.cause.kind, 'ValueOutOfRange')
+      return isNumericOverflow(error)
+    })
+    assert.deepEqual(statements, ['BEGIN', 'SELECT 1', 'ROLLBACK'])
+  } finally {
+    await client.$disconnect()
+    await pool.end()
+  }
+  for (const error of [null, new Error('bigint out of range'), { code: '57014' },
+    { code: 'P2010', meta: { code: '23505' } },
+    { code: 'P2010', meta: { driverAdapterError: { cause: { kind: 'ValueOutOfRange' } } } },
+    { code: 'P2010', meta: { driverAdapterError: { cause: { kind: 'ValueOutOfRange', originalCode: '57014' } } } },
+  ]) assert.equal(isNumericOverflow(error), false, 'Only an exact numeric-overflow SQLSTATE is accepted')
+})
 
 test('HAW-70 late receipt-lock contention defers after releasing earlier source locks',
   { skip: !RUN, timeout: 60_000 }, async () => {
@@ -239,16 +286,9 @@ for (const overflowStage of ['current-authority', 'orphan-tombstone'] as const) 
               return callback(transaction)
             }, options),
           } as unknown as Pick<PrismaService, '$transaction'>
-          await assert.rejects(reconcile(observing), (error: unknown) => {
-            // Require actual numeric overflow, not an unrelated prerequisite,
-            // timeout, connection, or synthetic observer assertion failure.
-            if (typeof error !== 'object' || error === null) return false
-            const value = error as { code?: unknown; meta?: { code?: unknown;
-              driverAdapterError?: { cause?: { kind?: unknown; code?: unknown; originalCode?: unknown } } } }
-            const cause = value.meta?.driverAdapterError?.cause
-            return value.code === '22003' || (value.code === 'P2010' && (value.meta?.code === '22003' ||
-              (cause?.kind === 'postgres' && (cause.code === '22003' || cause.originalCode === '22003'))))
-          })
+          // Require actual numeric overflow, not an unrelated prerequisite,
+          // timeout, connection, or synthetic observer assertion failure.
+          await assert.rejects(reconcile(observing), isNumericOverflow)
           assert.equal(currentUpsertCompleted, overflowStage === 'orphan-tombstone',
             'Late overflow must follow an observed successful real current-authority UPSERT')
           await probe.query('BEGIN')
