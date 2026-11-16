@@ -1,10 +1,40 @@
 # HAW-77 resource completion proof: inactive storage contract
 
 This is a design against source `6d4195b23f6e9c01fcfbc1ae9ec6b9a5c7c26063`,
-not a migration or a working receipt implementation. It extends the
+not a migration or a working durable receipt implementation. It extends the
 [initial-sync notice epoch design](haw77-initial-sync-notice-epoch.md).
 The held same-millisecond witness remains red. A new connection UUID alone
 cannot make timestamp-only resource evidence authoritative.
+
+## Inactive pure validator checkpoint
+
+An unused [validator](../src/tenants/initial-sync-completion-proof.ts) now models
+this baseline predicate with synthetic tests. It takes a required-only projection
+of thirteen scoped resources, the current scoped connection/epoch boundary,
+tenant eligibility status and an explicit observation time. It rejects missing,
+duplicate, foreign or unexpected resources; null/malformed/mismatched IDs;
+nonterminal, limited or unknown coverage; and invalid, inverted or future times.
+Valid same-millisecond completion is accepted only with matching epoch/attempt/
+persisted/completed identities. Different resources may have different attempts
+within the same epoch. SIGN_INS additionally requires full GRAPH_SIGN_INS.
+A retained non-null collection error also keeps a resource incomplete; the
+future guarded full-success write must clear that error atomically with proof.
+
+`coverage` and `authenticationSource` are proposed projection fields for this
+pure contract, not new persisted columns or proof derived from existing success
+timestamps. FULL must come from the complete guarded producer boundary described
+below, including an explicitly committed complete-empty result. An assertion
+from an in-memory callback alone cannot populate that authority. The future
+reader must project only the thirteen required resources and preserve their
+coherent connection/scope snapshot; optional collectors do not become required.
+
+Only the new test imports this validator. No current status/notice/collector
+reader calls it, no schema is installed and the held orchestration regressions
+remain unresolved. It does not authorize a full-run result or incremental warning
+clearance: those paths must additionally compare their returned current-attempt
+identities under write authority. Local predicate tests cannot establish durable
+source completeness, coherent PostgreSQL reads, timestamp microsecond transport,
+all-writer lock order, deployment compatibility or HAW-21 ownership.
 
 ## Proposed bounded storage
 
@@ -191,13 +221,13 @@ Before activation, registered disposable-PostgreSQL CI must prove:
   inversion, transactional rollback, HAW-21 takeover/recovery integration,
   and actual bundle/notification/count/unread/page truth after both commit orders.
 
-Next bounded implementation: build an unused pure proof validator and tests
-for the specified identity/null/scope/time/status matrix, retaining the current
-held orchestration witnesses. It may model the proposed fields but must not
-wire runtime readers or create migration authority. Then implement/prove the
-storage and writer integration as an inactive package. Pure tests cannot prove
+The unused pure proof validator and identity/null/scope/time/status tests are
+now prepared locally, retaining the current held orchestration witnesses.
+It models proposed fields without wiring readers or creating migration authority.
+Next specify the additive storage checks and coherent projection mapping, then
+implement/prove the storage and writer integration as an inactive package. Pure tests cannot prove
 durability, lock order, current PostgreSQL visibility or tenant-wide fencing.
 
-No runtime or schema change, physical database run, source publication, CI,
-merge or release is part of this design step. HAW-77 remains In Progress and
+No production behavior or schema change, physical database run, source publication,
+CI, merge or release is part of the unused-validator step. HAW-77 remains In Progress and
 inactive; complete authorized source review and exact-head CI are still absent.
