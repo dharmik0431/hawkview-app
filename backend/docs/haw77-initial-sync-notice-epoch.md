@@ -1,5 +1,9 @@
 # HAW-77 initial-sync notice epoch: inactive transaction design
 
+The companion [resource completion proof contract](haw77-resource-completion-proof.md)
+specifies proposed bounded storage, attempt transitions and reader requirements.
+Both documents remain inactive designs; neither supplies schema or runtime proof.
+
 The local held witness proves three stale-notice paths after customer-managed
 reconsent: an old visit can publish `tenant.initial_sync_completed`, and a later
 full or incremental visit can clear an incomplete warning using a connection
