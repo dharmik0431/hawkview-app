@@ -397,6 +397,106 @@ test('HAW-77 real collector window rollback preserves records and prior proof be
     })
   })
 
+test('HAW-77 committed Graph window survives a known pre-write terminal rejection and ordinary retry',
+  { skip: !enabled || process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES !== '1', timeout: 60_000 }, async () => {
+    // This is a synthetic rejection before terminal SQL, not a database error
+    // or lost acknowledgment. Only the records/window/state observations are physical.
+    const url = assertDisposableTestDatabase(process.env, { requireUtc: true })
+    assert.equal(url.port, '5432', 'Only registered hosted disposable PostgreSQL is permitted')
+    await fixture(async f => {
+      const scope = { organizationId: f.scope.organizationId, customerTenantId: f.scope.customerTenantId }
+      const params = [scope.organizationId, scope.customerTenantId]
+      const readWindow = async () => (await f.client.query(
+        `SELECT to_jsonb(snapshot) AS value FROM public.tenant_entra_snapshots AS snapshot
+         WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type='SIGN_INS'`, params,
+      )).rows
+      const readState = async () => {
+        const rows = (await f.client.query(
+          `SELECT to_jsonb(state) AS value FROM public.sync_states AS state
+           WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type='SIGN_INS'`, params,
+        )).rows
+        assert.equal(rows.length, 1)
+        return rows[0].value
+      }
+      const beforeWindow = await readWindow(), beforeState = await readState()
+      assert.equal(beforeWindow.length, 1); assert.equal(beforeState.status, 'SUCCEEDED')
+      const fresh = f.record(`terminal-rejection-${randomUUID()}`, 9)
+      const readFresh = async () => (await f.client.query(
+        `SELECT microsoft_sign_in_id AS id, raw FROM public.sign_in_logs
+         WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND microsoft_sign_in_id=$3`,
+        [...params, fresh.microsoftSignInId],
+      )).rows
+      assert.deepEqual(await readFresh(), [])
+      const injected = new Error('SYNTHETIC_TERMINAL_PREWRITE_REJECTED')
+      const updates: string[] = []
+      let injectedWrites = 0, recovered = 0, committedWindow: unknown
+      const client = new Proxy(f.prisma, {
+        get(target, key) {
+          if (key === 'syncState') return new Proxy(target.syncState, {
+            get(delegate, operation) {
+              if (operation === 'update') return async (args: any) => {
+                assert.deepEqual(args.where, { customerTenantId_resourceType: {
+                  customerTenantId: scope.customerTenantId, resourceType: 'SIGN_INS',
+                } })
+                updates.push(args.data.status)
+                if (args.data.status === 'SUCCEEDED') {
+                  // The previous transactions have committed. An independent
+                  // reader sees both the new window and record before terminal SQL.
+                  committedWindow = await readWindow()
+                  const window = (committedWindow as any[])[0]?.value
+                  assert.equal((committedWindow as any[]).length, 1)
+                  assert.equal(window.payload.source, 'GRAPH_SIGN_INS')
+                  assert.equal(window.payload.paginationComplete, true)
+                  assert.ok(Date.parse(window.payload.end) > Date.parse(beforeWindow[0].value.payload.end))
+                  assert.deepEqual(await readFresh(), [{ id: fresh.microsoftSignInId, raw: fresh.raw }])
+                  const running = await readState()
+                  assert.equal(running.status, 'RUNNING')
+                  assert.equal(running.last_successful_at, beforeState.last_successful_at)
+                  // Set only after every boundary assertion passes, so a caught
+                  // assertion failure cannot satisfy the deliberate rejection oracle.
+                  injectedWrites++
+                  throw injected
+                }
+                return delegate.update(args)
+              }
+              const value = Reflect.get(delegate, operation, delegate)
+              return typeof value === 'function' ? value.bind(delegate) : value
+            },
+          })
+          const value = Reflect.get(target, key, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+      const service = new TenantSyncService(client, {} as any, {} as any,
+        { resolveIncident: async () => { recovered++ }, publishIncident: async () => {} } as any,
+        { pruneExpired: async () => {} } as any, {} as any)
+      ;(service as any).signInEntitlement = async () => 'PREMIUM'
+      ;(service as any).fetchGraphCollection = async () => [fresh.raw]
+      const tenant = { id: scope.customerTenantId, organizationId: scope.organizationId, microsoftTenantId: f.scope.microsoftTenantId }
+      await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'synthetic-unused'), BadGatewayException)
+      assert.equal(injectedWrites, 1)
+      assert.deepEqual(updates, ['SUCCEEDED', 'FAILED'])
+      assert.deepEqual(await readWindow(), committedWindow, 'terminal rejection cannot roll back the earlier window commit')
+      assert.deepEqual(await readFresh(), [{ id: fresh.microsoftSignInId, raw: fresh.raw }])
+      const failed = await readState()
+      assert.equal(failed.status, 'FAILED')
+      assert.equal(failed.last_successful_at, beforeState.last_successful_at)
+      assert.equal(failed.consecutive_failures, beforeState.consecutive_failures + 1)
+      assert.notEqual(failed.last_error_code, null)
+      assert.equal(recovered, 0, 'a committed window alone does not resolve recovery')
+
+      // Ordinary retry through the original client, without injection or new policy.
+      ;(service as any).prisma = f.prisma
+      await (service as any).syncSignInLogs(tenant, 'synthetic-unused')
+      assert.deepEqual(await readFresh(), [{ id: fresh.microsoftSignInId, raw: fresh.raw }])
+      const succeeded = await readState()
+      assert.equal(succeeded.status, 'SUCCEEDED'); assert.equal(succeeded.last_error_code, null)
+      assert.equal(succeeded.consecutive_failures, 0); assert.equal(recovered, 1)
+      assert.ok(Date.parse(succeeded.last_successful_at) >= Date.parse(succeeded.last_attempt_at))
+      assert.deepEqual(updates, ['SUCCEEDED', 'FAILED']); assert.equal(injectedWrites, 1)
+    })
+  })
+
 test('actual Graph collector persists conflict gaps without hiding unrelated intact positive evidence',{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   const anotherApp=randomUUID()
   const unaffected=Array.from({length:10},(_,i)=>f.record(`unrelated-${i}`,i,false,{appId:anotherApp}))

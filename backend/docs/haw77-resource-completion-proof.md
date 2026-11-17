@@ -1,5 +1,39 @@
 # HAW-77 resource completion proof: inactive storage contract
 
+## Prepared committed-window / terminal-rejection witness — 17 November 2026 UTC
+
+The existing registered connected suite now also prepares the complementary
+boundary: actual Graph record and window transactions finish, then a scoped
+test proxy deliberately rejects the terminal SUCCEEDED update **before its
+SQL runs**. An independent PostgreSQL connection must observe the new complete
+Graph window, new record and RUNNING state retaining its prior success time
+before the injection is counted. This ensures an unrelated assertion failure
+cannot masquerade as the intended terminal rejection.
+
+The resulting FAILED state must retain that prior success time and increment
+failures once, while the already committed window and record stay intact and
+recovery remains unresolved. A matching ordinary retry uses the original
+Prisma client, deduplicates the same record, stores SUCCEEDED with errors cleared
+and zero failures, and resolves recovery exactly once. The existing per-test
+hosted-context/UTC guard runs before fixture client construction; port 55432 is
+rejected. No production, schema, inventory, retry or failure-policy change is made.
+
+This is **prepared and physically unexecuted**. Its injected failure is synthetic
+and definite: it proves neither a PostgreSQL terminal-write error nor a lost
+commit acknowledgment, process crash, competing owner or epoch/attempt receipt.
+Physical record/window/state observations require exact-head registered
+disposable-PostgreSQL CI. A committed authentication window alone is not an
+initial-sync completion receipt or recovery authority.
+
+Source review identifies a separate unresolved branch: if terminal success
+commits but its result is lost to the caller, the existing catch can rewrite
+SUCCEEDED to FAILED. Do not treat that overwrite as desired behavior or silently
+change failure policy. A separately reviewed held regression must distinguish
+pre-write rejection from post-commit result loss and establish exact-attempt
+readback/ownership semantics before repair. This step does not simulate a wire
+failure or test that uncertain branch. HAW-21 fencing remains separate; all
+producer/notice/release gates below remain open and the candidate stays inactive.
+
 ## Prepared real window-transaction rollback witness — 17 November 2026 UTC
 
 The registered connected database suite now contains a hosted-only HAW-77
