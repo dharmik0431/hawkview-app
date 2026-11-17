@@ -679,6 +679,110 @@ test('synthetic collector and pre-write terminal rejection retain the failure pa
   }
 })
 
+async function terminalResultFixture(mode: 'acknowledged' | 'pre-write' | 'lost-result') {
+  // In-memory durability model only. No real transaction, wire failure, Graph
+  // collection, current-attempt receipt, competing writer or database readback.
+  const tenant = { organizationId: 'org-1', id: 'tenant-1' }
+  const where = { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'SIGN_INS' } }
+  const initial = {
+    status: 'SUCCEEDED', lastAttemptAt: new Date('2026-01-01T00:00:00Z'),
+    lastSuccessfulAt: new Date('2026-01-01T00:00:01Z'),
+    lastErrorCode: null as string | null, lastErrorMessage: null as string | null,
+    consecutiveFailures: 2,
+  }
+  let stored = structuredClone(initial)
+  const committed: Array<typeof stored> = []
+  const attempted: string[] = []
+  const calls = { collected: 0, resolved: 0, published: 0, injected: 0 }
+  const sentinel = new Error('SYNTHETIC_TERMINAL_RESULT_UNAVAILABLE')
+  let committedBeforeLostResult: typeof stored | undefined
+  const prisma: any = {
+    syncState: {
+      upsert: async (args: any) => {
+        assert.deepEqual(args.where, where)
+        stored = { ...stored, ...structuredClone(args.update) }
+        committed.push(structuredClone(stored))
+        return structuredClone(stored)
+      },
+      update: async (args: any) => {
+        assert.deepEqual(args.where, where)
+        const data = structuredClone(args.data)
+        attempted.push(data.status)
+        if (data.status === 'SUCCEEDED' && mode === 'pre-write') {
+          calls.injected++
+          throw sentinel
+        }
+        const failures = typeof data.consecutiveFailures === 'object'
+          ? stored.consecutiveFailures + data.consecutiveFailures.increment
+          : data.consecutiveFailures ?? stored.consecutiveFailures
+        stored = { ...stored, ...data, consecutiveFailures: failures }
+        committed.push(structuredClone(stored))
+        if (data.status === 'SUCCEEDED' && mode === 'lost-result') {
+          // State is applied first; only the caller's result is withheld.
+          // Capture immutable evidence so a later FAILED write cannot hide it.
+          committedBeforeLostResult = structuredClone(stored)
+          calls.injected++
+          throw sentinel
+        }
+        return structuredClone(stored)
+      },
+    },
+  }
+  const service = new TenantSyncService(prisma, {} as any, {} as any,
+    { resolveIncident: async () => { calls.resolved++ }, publishIncident: async () => { calls.published++ } } as any,
+    { pruneExpired: async () => {} } as any, {} as any)
+  ;(service as any).logger = { warn: () => undefined }
+  let rejection: unknown
+  try {
+    await (service as any).runSnapshotSync(tenant, 'SIGN_INS', async () => { calls.collected++ })
+  } catch (error) { rejection = error }
+  return { initial, stored, committed, attempted, calls, rejection, committedBeforeLostResult }
+}
+
+test('HAW-77 terminal-result control acknowledges saved success once', async () => {
+  const f = await terminalResultFixture('acknowledged')
+  assert.equal(f.rejection, undefined)
+  assert.deepEqual(f.calls, { collected: 1, resolved: 1, published: 0, injected: 0 })
+  assert.deepEqual(f.attempted, ['SUCCEEDED'])
+  assert.deepEqual(f.committed.map(row => row.status), ['RUNNING', 'SUCCEEDED'])
+  assert.equal(f.stored.lastErrorCode, null); assert.equal(f.stored.consecutiveFailures, 0)
+  assert.ok(f.stored.lastSuccessfulAt > f.initial.lastSuccessfulAt)
+  assert.ok(f.stored.lastSuccessfulAt >= f.stored.lastAttemptAt)
+})
+
+test('HAW-77 terminal-result control rejects before saving success', async () => {
+  const f = await terminalResultFixture('pre-write')
+  assert.ok(f.rejection instanceof BadGatewayException)
+  assert.equal(f.calls.collected, 1); assert.equal(f.calls.injected, 1); assert.equal(f.calls.resolved, 0)
+  assert.deepEqual(f.attempted, ['SUCCEEDED', 'FAILED'])
+  assert.deepEqual(f.committed.map(row => row.status), ['RUNNING', 'FAILED'])
+  assert.deepEqual(f.stored.lastSuccessfulAt, f.initial.lastSuccessfulAt)
+  assert.equal(f.stored.consecutiveFailures, f.initial.consecutiveFailures + 1)
+  assert.notEqual(f.stored.lastErrorCode, null)
+})
+
+test('HAW-77 lost terminal result must not overwrite a saved success as failure', {
+  skip: process.env.HAWKVIEW_HAW77_TERMINAL_RESULT_LOSS_WITNESS === '1'
+    ? false : 'held pending exact-attempt unknown-outcome readback',
+}, async () => {
+  const f = await terminalResultFixture('lost-result')
+  assert.equal(f.calls.collected, 1); assert.equal(f.calls.injected, 1)
+  assert.ok(f.committedBeforeLostResult)
+  assert.equal(f.committedBeforeLostResult.status, 'SUCCEEDED')
+  assert.equal(f.committedBeforeLostResult.consecutiveFailures, 0)
+  assert.equal(f.committedBeforeLostResult.lastErrorCode, null)
+  assert.ok(f.committedBeforeLostResult.lastSuccessfulAt > f.initial.lastSuccessfulAt)
+  assert.ok(f.rejection instanceof Error, 'unknown outcome must remain visible to the caller')
+  assert.equal(f.calls.resolved, 0, 'no recovery authority is supplied by this fixture')
+  // Desired behavior, deliberately red today. Do not normalize FAILED as the
+  // expected result or infer authority from timestamps to make the test green.
+  assert.equal(f.stored.status, 'SUCCEEDED', 'committed terminal success must not be rewritten after result loss')
+  assert.deepEqual(f.committed.map(row => row.status), ['RUNNING', 'SUCCEEDED'])
+  assert.deepEqual(f.attempted, ['SUCCEEDED'])
+  assert.deepEqual(f.stored, f.committedBeforeLostResult)
+  assert.equal(f.calls.published, 0)
+})
+
 test('unknown SIGN_INS partial reasons fail closed without advancing selected-source success', async () => {
   for (const code of ['sign-ins-new-partial', 'sign-ins-non-premium-fallback-active-extra']) {
     const updates: Array<Record<string, unknown>> = []

@@ -1,5 +1,44 @@
 # HAW-77 resource completion proof: inactive storage contract
 
+## Held terminal-result-loss regression — 17 November 2026 UTC
+
+The sign-in provisioning suite now models three result boundaries using a
+stateful in-memory SyncState row and the real `runSnapshotSync` wrapper. The
+acknowledged-success control applies the successful update and returns it;
+recovery must resolve exactly once. The definite pre-write control rejects
+without applying success; the failure path retains the prior success time and
+increments failures once. These controls remain enabled in normal local runs.
+
+The held case first applies success, clears errors/failures and captures an
+immutable copy, then throws instead of returning the result. It asserts the
+desired invariant that the saved success is not subsequently overwritten by
+FAILED, that no new failure incident is published, and that uncertainty remains
+visible to the caller. It also forbids recovery resolution: the fixture supplies
+no exact-current-attempt receipt/readback or notice authority. Enable only with
+`HAWKVIEW_HAW77_TERMINAL_RESULT_LOSS_WITNESS=1`; it is deliberately held outside
+normal green runs until the unknown-outcome protocol is implemented.
+
+Local execution reproduces the intended held failure: the final stored status
+is FAILED where the invariant requires preserving SUCCEEDED. Both controls
+pass. The normal suite passes 28 cases with two explicit skips (this held case
+and the pre-existing physical case); full backend types, scoped lint and nine
+launcher checks pass. This records an unresolved defect, not a repaired one.
+
+This is a synthetic lost-result regression, not a PostgreSQL transaction or wire
+fault, actual Graph collection, durable readback, race or production observation.
+The captured in-memory row is test evidence only and cannot authorize a runtime
+recovery decision. A generic error, timestamp match or resource status is not
+proof that this attempt committed. The existing catch can rewrite the modeled
+saved success as failure; that overwrite is the defect, not desired acceptance.
+
+Next is the reviewed exact-attempt uncertainty/readback contract: distinguish
+known non-write, matching committed result, newer/replaced authority and still
+unknown outcome before choosing any state or notification effect. Include both
+commit orders and actual registered disposable-PostgreSQL adapter/wire evidence
+before activation; consume HAW-21 ownership without duplicating its fencing.
+No runtime, schema, failure/retry policy, source upload or release is changed.
+The candidate remains inactive; all physical and full-release gates remain open.
+
 ## Prepared committed-window / terminal-rejection witness — 17 November 2026 UTC
 
 The existing registered connected suite now also prepares the complementary
