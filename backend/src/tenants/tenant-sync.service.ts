@@ -2979,24 +2979,6 @@ export class TenantSyncService {
           consecutiveFailures: 0,
         },
       }))
-      await this.notifications.resolveIncident(
-        tenant.organizationId,
-        `tenant:${tenant.id}:sync:${resourceType}`,
-        {
-          customerTenantId: tenant.id,
-          eventType: 'tenant.sync_recovered',
-          category: 'success',
-          severity: 'info',
-          title: `${resourceType.replaceAll('_', ' ')} synchronization recovered`,
-          description: 'HawkView is receiving this Microsoft 365 data again.',
-          source: 'tenant-sync',
-          actionUrl: `/tenants/${tenant.id}`,
-          actionLabel: 'View tenant',
-        }
-      )
-      if (exchangePhase) {
-        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
-      }
     } catch (error) {
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
@@ -3140,6 +3122,28 @@ export class TenantSyncService {
       }
       throw new BadGatewayException(message)
     }
+
+    // Collection and its terminal update have both acknowledged success.
+    // Notification errors must still propagate, but cannot reclassify these
+    // stored collection facts or increment a Microsoft collection failure.
+    if (exchangePhase) {
+      logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
+    }
+    await this.notifications.resolveIncident(
+      tenant.organizationId,
+      `tenant:${tenant.id}:sync:${resourceType}`,
+      {
+        customerTenantId: tenant.id,
+        eventType: 'tenant.sync_recovered',
+        category: 'success',
+        severity: 'info',
+        title: `${resourceType.replaceAll('_', ' ')} synchronization recovered`,
+        description: 'HawkView is receiving this Microsoft 365 data again.',
+        source: 'tenant-sync',
+        actionUrl: `/tenants/${tenant.id}`,
+        actionLabel: 'View tenant',
+      }
+    )
   }
 
   private async syncLicenses(

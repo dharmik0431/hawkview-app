@@ -488,6 +488,79 @@ test('does not resolve a sign-in incident through limited and initializing passe
   assert.equal(refreshed.length, 3)
 })
 
+test('post-success recovery notification failures preserve accepted collection outcomes and propagate unchanged', async () => {
+  for (const resource of ['SIGN_INS', 'LICENSES', 'EXCHANGE_MAILBOX_CONFIGURATION']) {
+    const updates: Array<Record<string, unknown>> = []
+    const service = serviceWithState(updates, [])
+    const failure = new Error(`Synthetic ${resource} recovery notification failure`)
+    const calls = { collected: 0, resolved: 0, published: 0 }
+    const logs: string[] = []
+    ;(service as any).logger = { warn: (line: string) => logs.push(line), log: (line: string) => logs.push(line) }
+    ;(service as any).notifications.resolveIncident = async (organizationId: string, key: string) => {
+      calls.resolved++
+      assert.equal(organizationId, 'org-1')
+      assert.equal(key, `tenant:tenant-1:sync:${resource}`)
+      assert.equal(updates.at(-1)?.status, 'SUCCEEDED')
+      throw failure
+    }
+    ;(service as any).notifications.publishIncident = async () => { calls.published++ }
+    let rejection: unknown
+    try {
+      await (service as any).runSnapshotSync(
+        { id: 'tenant-1', organizationId: 'org-1' }, resource, async () => { calls.collected++ },
+      )
+    } catch (error) { rejection = error }
+    assert.deepEqual({ sameError: rejection === failure, outcomes: updates.map(row => row.status), ...calls },
+      { sameError: true, outcomes: ['SUCCEEDED'], collected: 1, resolved: 1, published: 0 })
+    assert.equal(updates.length, 1, 'No failure write after acknowledged terminal success')
+    assert.deepEqual(updates[0], {
+      status: 'SUCCEEDED', lastSuccessfulAt: updates[0]!.lastSuccessfulAt,
+      lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+    })
+    assert.ok(updates[0]!.lastSuccessfulAt instanceof Date)
+    assert.ok(logs.every(line => !line.includes('microsoft_collection_failed')))
+    if (resource === 'EXCHANGE_MAILBOX_CONFIGURATION') {
+      assert.ok(logs.some(line => line.includes('COMPLETED')))
+      assert.ok(logs.every(line => !line.includes('FAILED')))
+    }
+  }
+})
+
+test('synthetic collector and pre-write terminal rejection retain the failure path without recovery notification', async () => {
+  for (const resource of ['SIGN_INS', 'LICENSES']) for (const stage of ['collector', 'terminal-write']) {
+    const updates: Array<Record<string, unknown>> = []
+    const service = serviceWithState(updates, [])
+    const calls = { collected: 0, resolved: 0, published: 0, terminalWrites: 0 }
+    const failure = new Error('Synthetic persistence failure')
+    ;(service as any).logger = { warn: () => undefined }
+    ;(service as any).prisma.syncState.update = async ({ data }: { data: Record<string, unknown> }) => {
+      if (data.status === 'SUCCEEDED') {
+        calls.terminalWrites++
+        // Definite modeled non-write. A timeout after an unknown real commit
+        // needs separate receipt/readback proof and is not simulated here.
+        if (stage === 'terminal-write') throw failure
+      }
+      updates.push(data)
+      return { ...data, consecutiveFailures: 1 }
+    }
+    ;(service as any).notifications.resolveIncident = async () => { calls.resolved++ }
+    ;(service as any).notifications.publishIncident = async () => { calls.published++ }
+    await assert.rejects((service as any).runSnapshotSync(
+      { id: 'tenant-1', organizationId: 'org-1' }, resource, async () => {
+        calls.collected++
+        if (stage === 'collector') throw failure
+      },
+    ), BadGatewayException)
+    assert.equal(calls.collected, 1)
+    assert.equal(calls.resolved, 0)
+    assert.equal(calls.terminalWrites, stage === 'terminal-write' ? 1 : 0)
+    assert.equal(updates.length, 1)
+    assert.equal(updates[0]!.status, 'FAILED')
+    assert.deepEqual(updates[0]!.consecutiveFailures, { increment: 1 })
+    assert.equal(Object.hasOwn(updates[0]!, 'lastSuccessfulAt'), false)
+  }
+})
+
 test('unknown SIGN_INS partial reasons fail closed without advancing selected-source success', async () => {
   for (const code of ['sign-ins-new-partial', 'sign-ins-non-premium-fallback-active-extra']) {
     const updates: Array<Record<string, unknown>> = []

@@ -6,6 +6,35 @@ not a migration or a working durable receipt implementation. It extends the
 The held same-millisecond witness remains red. A new connection UUID alone
 cannot make timestamp-only resource evidence authoritative.
 
+## Local post-success notification boundary repair — 17 November 2026 UTC
+
+`runSnapshotSync` now completes its collection/terminal-state error handler
+before resolving a successful resource's recovery incident. Once collection
+and the terminal SUCCEEDED update have both acknowledged success, a later
+notification rejection propagates unchanged without rewriting the resource
+as FAILED, incrementing collection failures, publishing a new collection-failed
+incident or attributing the error to Microsoft. Exchange configuration's
+collection-completed memory event records that boundary before notification.
+No notification retry or error suppression is introduced. A caller may still
+report its overall visit incomplete when the notification rejects.
+
+The synthetic regression first reproduced SUCCEEDED followed by FAILED, a new
+failure incident and a replacement exception. It now verifies exact original
+error propagation and one unchanged successful terminal update for SIGN_INS,
+LICENSES and EXCHANGE_MAILBOX_CONFIGURATION. Separate collector and definite
+pre-write terminal rejection controls preserve the existing failure path for
+SIGN_INS and LICENSES. The existing limited/initializing/full-success tests
+still apply. These controls model a terminal rejection before a stored update;
+they do not prove rollback after an uncertain real database commit.
+
+This is only an error-origin repair in the inactive local candidate. It does
+not bind records, source windows and terminal state to one epoch/attempt, repair
+initial-sync notice races, wire the new proof reader, or establish HAW-21 owner
+authority. Unknown commit readback, all required-resource writers and atomic
+notice effects remain prerequisites. The held same-millisecond/reconsent
+witnesses remain unresolved. No schema, retry/backoff threshold, cadence, quota,
+provider permission or deployment change accompanies this step.
+
 The [storage and projection contract](haw77-proof-storage-projection.md) refines
 the nullable field/check matrix and coherent reader mapping. It adds a proposed
 persisted source-kind field alongside the four identities so full Graph source
