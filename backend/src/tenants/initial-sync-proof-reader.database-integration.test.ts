@@ -2,13 +2,15 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import pg from 'pg'
+import type { Prisma } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { INITIAL_SYNC_RESOURCE_TYPES } from './initial-sync-status.js'
 import { readInitialSyncProof, type InitialSyncProofScope } from './initial-sync-proof-reader.js'
 import { validateInitialSyncCompletionProjection } from './initial-sync-proof-projection.js'
 
 // Registered hosted PostgreSQL only. Fixtures assert stored facts, not producer
-// completeness, deployed-role access, Prisma transport or notice ownership.
+// completeness, deployed-role access or notice ownership. The final case uses
+// the real Prisma adapter; the preceding cases use pg directly.
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
   && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
 const options = { skip: !enabled, timeout: 45_000 }
@@ -47,8 +49,8 @@ async function transaction(run: (db: pg.Client) => Promise<void>) {
   }
 }
 
-async function fixture(db: pg.Client): Promise<Fixture> {
-  const scope = { organizationId: randomUUID(), customerTenantId: randomUUID() }
+async function fixture(db: pg.Client, organizationId: string = randomUUID()): Promise<Fixture> {
+  const scope = { organizationId, customerTenantId: randomUUID() }
   const connectionId = randomUUID(), epoch = randomUUID()
   await db.query(`INSERT INTO public.organizations (id, name, slug, updated_at)
     VALUES ($1, 'Synthetic proof projection fixture', $2, CURRENT_TIMESTAMP)`, [scope.organizationId, scope.organizationId])
@@ -83,6 +85,7 @@ async function read(db: pg.Client, scope: InitialSyncProofScope) {
     rows = (await db.query(sql, [...values])).rows
     return rows
   })
+
   assert.equal(calls, 1)
   return { rows, result }
 }
@@ -289,5 +292,159 @@ test('HAW-77 two-client reader sees committed snapshots and an old result never 
         if (writerBegan) await writer.query('ROLLBACK')
         if (owner) await writer.query('DELETE FROM public.organizations WHERE id = $1', [owner.scope.organizationId])
       } finally { await Promise.all([reader.end(), writer.end()]) }
+    }
+  })
+
+test('HAW-77 actual Prisma read-only transactions preserve scoped microsecond evidence and committed invalidation',
+  { ...options, timeout: 60_000 }, async () => {
+    // Refuse every nonregistered target before loading or constructing Prisma.
+    const url = assertDisposableTestDatabase(process.env, { requireUtc: true })
+    assert.equal(url.port, '5432', 'Only registered hosted disposable PostgreSQL is permitted')
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    // Keep cleanup identities even if fixture creation fails before returning.
+    const organizationIds = [randomUUID(), randomUUID()]
+    let connected = false, began = false
+    const snapshot = async (organizationId: string) => {
+      const output: Record<string, string[]> = {}
+      for (const table of ['customer_tenants', 'tenant_connections', 'sync_states']) {
+        output[table] = (await observer.query(`SELECT to_jsonb(t)::text AS data
+          FROM public.${table} t WHERE organization_id = $1 ORDER BY id`, [organizationId])).rows.map(row => row.data)
+      }
+      return output
+    }
+    const readPrisma = async (tx: Prisma.TransactionClient, scope: InitialSyncProofScope) => {
+      let calls = 0
+      let rows: Row[] = []
+      const result = await readInitialSyncProof(scope, async (sql, values) => {
+        calls++
+        // Execute the real query and return the real decoded array unchanged.
+        rows = await tx.$queryRawUnsafe<Row[]>(sql, ...values)
+        return rows
+      })
+      assert.equal(calls, 1)
+      return { rows, result }
+    }
+    const readOnly = (run: (tx: Prisma.TransactionClient) => Promise<void>) => prisma.$transaction(async tx => {
+      // Must precede the first query: a wrapper alone does not enforce read-only.
+      await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+      await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW transaction_read_only'), [{ transaction_read_only: 'on' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW transaction_isolation'), [{ transaction_isolation: 'read committed' }])
+      // This observes UTC; it does not independently prove the onConnect hook
+      // caused it, since the hosted database can also default to UTC.
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'UTC' }])
+      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'Asia/Kathmandu'")
+      await tx.$executeRawUnsafe("SET LOCAL DateStyle = 'SQL, DMY'")
+      await tx.$executeRawUnsafe('SET LOCAL search_path TO pg_catalog')
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'Asia/Kathmandu' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW DateStyle'), [{ DateStyle: 'SQL, DMY' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW search_path'), [{ search_path: 'pg_catalog' }])
+      await run(tx)
+    }, { isolationLevel: 'ReadCommitted', maxWait: 5_000, timeout: 20_000 })
+    try {
+      await observer.connect(); connected = true
+      await observer.query("SET statement_timeout = '5s'")
+      await observer.query("SET lock_timeout = '2s'")
+      await observer.query('BEGIN'); began = true
+      const owner = await fixture(observer, organizationIds[0]!)
+      const sibling = await fixture(observer, organizationIds[1]!)
+      await observer.query('COMMIT'); began = false
+      const before = await snapshot(owner.scope.organizationId)
+      const siblingBefore = await snapshot(sibling.scope.organizationId)
+      let afterObserverChanges: Record<string, string[]> | undefined
+      const rollback = new Error('EXPECTED_PRISMA_PROOF_READ_ROLLBACK')
+      await assert.rejects(readOnly(async tx => {
+        const first = await readPrisma(tx, owner.scope)
+        assert.equal(first.result.complete, true)
+        assert.deepEqual(first.rows.map(row => row.expectedResourceType), [...INITIAL_SYNC_RESOURCE_TYPES])
+        assert.equal(new Set(first.rows.map(row => row.observedAtUtc)).size, 1)
+        for (const row of first.rows) {
+          assert.equal(row.organizationId, owner.scope.organizationId)
+          assert.equal(row.customerTenantId, owner.scope.customerTenantId)
+          assert.equal(row.connectionId, owner.connectionId)
+          assert.equal(row.initialSyncEpochId, owner.epoch)
+          assert.equal(typeof row.stateId, 'string')
+          assert.equal(row.epochStartedAtUtc, start)
+          assert.equal(row.lastAttemptAtUtc, attempted)
+          assert.equal(row.lastSuccessfulAtUtc, succeeded)
+          assert.equal(typeof row.observedAtUtc, 'string')
+          assert.match(row.observedAtUtc as string, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+          assert.equal(row.contextTimeValid, true)
+          assert.equal(row.proofTimeValid, true)
+        }
+        assert.deepEqual(await snapshot(owner.scope.organizationId), before)
+        const foreign = await readPrisma(tx, { ...owner.scope, organizationId: sibling.scope.organizationId })
+        assert.deepEqual(foreign.rows, [])
+        assert.equal(foreign.result.complete, false)
+        const stateId = owner.states.get('SIGN_INS')!.id
+        // Autocommit through the separate observer. Each subsequent SELECT in
+        // this same ReadCommitted transaction must see the committed change.
+        assert.equal((await observer.query('UPDATE public.sync_states SET last_attempt_at = $1 WHERE id = $2',
+          [stamp('000099'), stateId])).rowCount, 1)
+        const inverted = await readPrisma(tx, owner.scope)
+        const invertedRow = inverted.rows.find(row => row.stateId === stateId)!
+        assert.equal(invertedRow.lastAttemptAtUtc, stamp('000099'))
+        assert.equal(new Date(invertedRow.lastAttemptAtUtc as string).getTime(), new Date(invertedRow.epochStartedAtUtc as string).getTime())
+        assert.equal(invertedRow.proofTimeValid, false)
+        assert.deepEqual(inverted.result.incompleteResources, ['SIGN_INS'])
+
+        assert.equal((await observer.query(`UPDATE public.sync_states SET last_attempt_at = $1,
+          initial_sync_completed_attempt_id = NULL, status = 'FAILED', last_error_message = 'Synthetic persisted-only failure'
+          WHERE id = $2`, [attempted, stateId])).rowCount, 1)
+        const failed = await readPrisma(tx, owner.scope)
+        const failedRow = failed.rows.find(row => row.stateId === stateId)!
+        assert.equal(failedRow.proofTimeValid, true, 'Valid times alone cannot certify a failed attempt')
+        assert.equal(failedRow.initialSyncCompletedAttemptId, null)
+        assert.equal(failedRow.status, 'FAILED')
+        assert.equal(failedRow.lastErrorMessage, 'Synthetic persisted-only failure')
+        assert.deepEqual(failed.result.incompleteResources, ['SIGN_INS'])
+
+        assert.equal((await observer.query('DELETE FROM public.sync_states WHERE id = $1', [stateId])).rowCount, 1)
+        const missing = await readPrisma(tx, owner.scope)
+        assert.equal(missing.rows.length, 13)
+        const missingRow = missing.rows.find(row => row.expectedResourceType === 'SIGN_INS')!
+        for (const field of ['stateId', 'stateOrganizationId', 'stateCustomerTenantId', 'stateResourceType',
+          'initialSyncAttemptEpochId', 'initialSyncAttemptId', 'initialSyncPersistedAttemptId',
+          'initialSyncCompletedAttemptId', 'initialSyncPersistedKind', 'status', 'lastAttemptAtUtc',
+          'lastSuccessfulAtUtc', 'lastErrorCode', 'lastErrorMessage']) assert.equal(missingRow[field], null, field)
+        assert.equal(missingRow.proofTimeValid, false)
+        assert.deepEqual(missing.result.incompleteResources, ['SIGN_INS'])
+        assert.equal((await readPrisma(tx, sibling.scope)).result.complete, true)
+        afterObserverChanges = await snapshot(owner.scope.organizationId)
+        throw rollback
+      }), error => error === rollback)
+      assert.ok(afterObserverChanges)
+      assert.deepEqual(await snapshot(owner.scope.organizationId), afterObserverChanges,
+        'Rolling back the read-only transaction cannot undo separately committed fixture changes')
+      await readOnly(async tx => {
+        assert.deepEqual((await readPrisma(tx, owner.scope)).result.incompleteResources, ['SIGN_INS'])
+        assert.equal((await readPrisma(tx, sibling.scope)).result.complete, true)
+      })
+      assert.deepEqual(await snapshot(owner.scope.organizationId), afterObserverChanges)
+      assert.deepEqual(await snapshot(sibling.scope.organizationId), siblingBefore)
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      // Prisma callbacks are awaited above before scoped cleanup. If setup
+      // failed, roll back any incomplete fixture transaction first.
+      if (connected) {
+        if (began) await clean(() => observer.query('ROLLBACK'))
+        for (const organizationId of organizationIds) await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'tenant_connections', 'sync_states']) {
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          }
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic Prisma proof-reader cleanup failed')
     }
   })

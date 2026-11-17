@@ -6,6 +6,46 @@ and its unused [validator](../src/tenants/initial-sync-completion-proof.ts).
 The local storage candidate below remains uninstalled and adds no runtime
 queries or callers. The held orchestration defects remain unresolved.
 
+## Prepared actual Prisma transport witness — 16 November 2026
+
+The existing registered reader suite now contains a sixth physical case using
+the real generated Prisma client and production adapter factory. Both hosted
+opt-ins, UTC process and the registered port/context boundary are checked before
+loading or constructing Prisma. The witness is prepared locally, not executed.
+No production adapter, query, caller, migration or activation flag changes here.
+
+Committed synthetic owner and sibling fixtures are read through an actual
+ReadCommitted interactive transaction. Its first callback statement requests
+READ ONLY, and the test verifies read-only and isolation settings. It observes
+the initial UTC session, then verifies deliberately changed Kathmandu time zone,
+SQL/DMY DateStyle and pg_catalog search path before querying. The initial UTC
+assertion does not independently establish that the adapter hook caused UTC.
+The real query's decoded row array goes unchanged into the strict mapper: all
+thirteen slots, scoped identifiers, literal booleans, exact six-decimal timestamp
+strings and common observation time are asserted without Date conversion.
+
+A separate pg observer commits a one-microsecond attempt-before-epoch inversion,
+a constraint-valid failed persisted-only receipt, then a missing SIGN_INS row.
+Successive statements in the same read-only ReadCommitted transaction must see
+each change and remain incomplete, while the sibling remains complete. The
+inversion remains rejected even when JavaScript Date milliseconds coincide;
+valid time booleans alone cannot validate the failed receipt. The missing row
+must retain its expected slot and explicit null joined facts. A foreign scope
+combination must return no rows. Callback rejection rolls back only its read-only
+transaction; a fresh successful read-only transaction sees the committed missing
+row. Scoped snapshots verify neither transaction changes the stored fixtures.
+The test has bounded connection/query/transaction waits and tracks fixture IDs
+before setup so scoped cleanup remains possible if fixture creation fails.
+
+This case does not coordinate a commit during a SELECT, prove restricted-role
+behavior, test a query plan, certify producer persistence or reserve notification
+authority. It contains no generated BigInt fields and makes no BigInt claim.
+All six physical reader cases remain unexecuted pending authorized exact-source
+hosted CI. Pure/local checks and guarded skips cannot close the transport gap.
+Migration compatibility/locks, real epoch/attempt writers, guarded notice effects,
+takeover/recovery and complete source review remain outstanding. Keep the whole
+candidate inactive and uninstalled.
+
 ## Local single-statement reader candidate — 16 November 2026
 
 The next unused component now supplies the mapper from one parameterized SELECT.
@@ -26,8 +66,8 @@ finite timestamps at database precision, and CASE guards restrict UTC formatting
 to AD years 0001–9999 before emitting six-decimal text. This avoids aliasing BC
 years through a year-only formatting template.
 
-Five hosted-only physical cases are registered in the existing disposable test
-inventory. They are prepared but unexecuted:
+The original five pg-based physical cases remain registered alongside the new
+Prisma case above. All are prepared but unexecuted:
 
 - Real PostgreSQL query and mapping for all thirteen receipts with changed
   session time zone, DateStyle and search path; exact microsecond text, one
@@ -48,13 +88,13 @@ inventory. They are prepared but unexecuted:
   or exercise actual producer, epoch-transition or takeover protocols.
 
 Five ordinary adapter tests and the existing mapper/validator tests pass locally;
-the five physical cases skip, and separate hosted-context/local-port probes
+the six physical cases skip, and separate hosted-context/local-port probes
 reject execution before constructing a client. Source inventory and launcher
 checks, strict scoped types and lint pass. These are preparation evidence only:
 actual SQL execution, migrations, Prisma raw transport, restricted runtime roles,
 query plan/lock effects and all guarded mutation/recovery races remain unproved.
-Next is the real Prisma transport and remaining hosted precision/scope/race
-witnesses plus complete review before any exact-source CI handoff. Keep this
+Next are remaining hosted role/plan/race witnesses and producer/notice integration
+plus complete review before any exact-source CI handoff. Keep this
 candidate inactive and the migration uninstalled.
 
 The statement observation and single-query snapshot choices follow the
@@ -331,9 +371,9 @@ Any later schema rollback needs a separately reviewed compatibility plan.
 
 The nullable schema, named row-shape checks and registered storage witness are
 now prepared locally. The strict mapper and unused single-statement reader have
-also been prepared with ordinary tests and five registered PostgreSQL cases.
-Physical execution, actual Prisma transport and remaining role/race witnesses
-are still outstanding. Storage upgrade and
+also been prepared with ordinary tests and six registered PostgreSQL cases,
+including an actual Prisma transport witness. Physical execution and remaining
+role/race witnesses are still outstanding. Storage upgrade and
 restricted-role evidence remain prerequisites too. No runtime activation or
 source upload is authorized by this design. Required cases are:
 
