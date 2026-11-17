@@ -7,6 +7,38 @@ retry/cadence, migration or activation change. This refines the
 lost-result regression is still failing. Source/independent design review is
 not physical evidence or release approval.
 
+## Local diagnostic implementation checkpoint
+
+The unused [`classifyInitialSyncTerminalEvidence`](../src/tenants/initial-sync-terminal-evidence.ts)
+now decodes one supplied raw observation against copied operation identity. It
+recognizes exact matching completion, persisted-only evidence with its observed
+status, or a coherent replacement connection/epoch/attempt; other evidence stays
+UNKNOWN. It checks scope, receipt shape and six-decimal UTC ordering without
+coercion or derived validity flags. Returned identity/provenance scalars are
+copied and frozen; there are no action permissions or authority booleans.
+After epoch rotation, retained resource rows keep their original attempt epoch
+and timestamp. The diagnostic preserves both observed epochs and recognizes
+the replaced connection boundary without relabeling the old row or comparing
+its historical attempt against the new epoch start. A current-epoch caller
+cannot reuse that old receipt as completion.
+
+This is only the stored-observation axis. It does not establish authoritative
+read provenance, owner identity/expiry, eligibility at mutation time, operation
+settlement or definite non-write. Superseded here means a valid replacement
+storage identity, not inferred ownership loss. Ineligible context stays UNKNOWN.
+HAW-21 must supply the separate authority protocol; even matching completion
+after owner loss cannot authorize a later effect. No query, caller, lifecycle,
+error handler or notification path uses the helper.
+
+The [local tests](../src/tenants/initial-sync-terminal-evidence.test.ts) inject
+synthetic rows to exercise all thirteen resources, copied identity, malformed or
+missing evidence, replacements, retained persistence, delayed-result ordering
+and microsecond boundaries. They do not model or verify database transactions,
+role visibility, actual late arrival, owner takeover or wire-result loss. The
+held wrapper regression remains unresolved. Next is real scoped adapter and
+producer integration, with settlement/ownership evidence and registered
+disposable-PostgreSQL proof before any runtime use.
+
 ## Observed defect and scope
 
 The real `runSnapshotSync` wrapper in
