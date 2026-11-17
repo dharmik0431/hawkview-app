@@ -1,5 +1,35 @@
 # HAW-77 resource completion proof: inactive storage contract
 
+## Prepared real window-transaction rollback witness — 17 November 2026 UTC
+
+The registered connected database suite now contains a hosted-only HAW-77
+producer-boundary witness. It calls the actual Graph sign-in collector and
+ingestion/window helpers through the real Prisma adapter. A scoped test proxy
+allows the SIGN_INS window upsert to execute, checks the proposed window inside
+that transaction, then deliberately throws before its callback can commit.
+An independent connection must still see the entire previous window row while
+already seeing the newly committed sign-in record from the earlier transaction.
+After rejection, the window must remain unchanged, the earlier record must
+remain, the terminal state must be FAILED with its previous success timestamp
+retained, and no recovery notification may resolve.
+
+The matching control uses the original client and identical event. It requires
+deduplication without changing the stored raw event, a newer complete Graph
+window, terminal success and exactly one recovery resolution. Injection must
+have occurred exactly once, and the actual Prisma transaction must reject with
+that sentinel; unrelated assertion errors cannot satisfy the rejection oracle.
+The test validates the exact hosted CI context and UTC before any fixture client
+is constructed. It is discovered in the existing physical phase without a new
+inventory exception, and is **prepared, not physically executed**.
+
+This is a known transaction-callback rejection, not a lost commit acknowledgment,
+crashed client, terminal-write rejection, competing owner or epoch proof. No
+runtime/failure policy, schema, trigger, provider or cadence change is involved.
+The prior synthetic tests do not substitute for this physical witness; this
+new test likewise cannot be claimed passed until exact-head registered
+disposable-PostgreSQL CI executes it. All producer receipt and notice gates
+below remain open.
+
 ## Sign-in producer boundary contract — 17 November 2026 UTC
 
 Collection pagination, authentication evidence integrity and initial-sync epoch

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
 import test from 'node:test'
+import { BadGatewayException } from '@nestjs/common'
 import pg from 'pg'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { IdentityRiskService } from './identity-risk.service.js'
@@ -290,6 +291,111 @@ test('actual window writer refuses older generations and incomplete chains witho
   await assert.rejects(()=>persistCompletedAuthenticationWindow(f.prisma,f.scope,'GRAPH_SIGN_INS',f.base,new Date(),false,{events:0,latestEventAt:null}),/INCOMPLETE/)
   assert.deepEqual(await f.prisma.tenantEntraSnapshot.findUnique({where}),before)
 }))
+
+test('HAW-77 real collector window rollback preserves records and prior proof before successful retry',
+  { skip: !enabled || process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES !== '1', timeout: 60_000 }, async () => {
+    // Guard before fixture constructs any client. This witness never permits
+    // the shared fixture's optional local-disposable database route.
+    const url = assertDisposableTestDatabase(process.env, { requireUtc: true })
+    assert.equal(url.port, '5432', 'Only registered hosted disposable PostgreSQL is permitted')
+    await fixture(async f => {
+      const scope = { organizationId: f.scope.organizationId, customerTenantId: f.scope.customerTenantId }
+      const where = { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'SIGN_INS' as const } }
+      const readWindow = async () => (await f.client.query(
+        `SELECT to_jsonb(snapshot) AS value FROM public.tenant_entra_snapshots AS snapshot
+         WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND resource_type='SIGN_INS'`,
+        [scope.organizationId, scope.customerTenantId],
+      )).rows
+      const beforeWindow = await readWindow()
+      assert.equal(beforeWindow.length, 1)
+      const beforeState = await f.prisma.syncState.findUniqueOrThrow({ where })
+      const fresh = f.record(`window-rejection-${randomUUID()}`, 9)
+      const readFresh = async () => (await f.client.query(
+        `SELECT microsoft_sign_in_id AS id, raw FROM public.sign_in_logs
+         WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND microsoft_sign_in_id=$3`,
+        [scope.organizationId, scope.customerTenantId, fresh.microsoftSignInId],
+      )).rows
+      assert.deepEqual(await readFresh(), [])
+      const injected = new Error('SYNTHETIC_WINDOW_TRANSACTION_REJECTED')
+      let injectedWrites = 0, callbackRejected = 0, recovered = 0
+      const transaction = f.prisma.$transaction.bind(f.prisma)
+      const client = new Proxy(f.prisma, {
+        get(target, key) {
+          if (key === '$transaction') return async (work: any, options: any) => {
+            assert.equal(typeof work, 'function')
+            try {
+              return await transaction(async (tx: any) => work(new Proxy(tx, {
+                get(realTx, property) {
+                  if (property === 'tenantEntraSnapshot') return new Proxy(realTx.tenantEntraSnapshot, {
+                    get(delegate, operation) {
+                      if (operation === 'upsert') return async (args: any) => {
+                        assert.equal(args.create.resourceType, 'SIGN_INS')
+                        assert.equal(args.create.organizationId, scope.organizationId)
+                        assert.equal(args.create.customerTenantId, scope.customerTenantId)
+                        const result = await delegate.upsert(args)
+                        injectedWrites++
+                        const proposed = await realTx.tenantEntraSnapshot.findUniqueOrThrow({ where })
+                        assert.deepEqual(proposed.payload, args.update.payload)
+                        assert.notDeepEqual(proposed.payload, beforeWindow[0].value.payload)
+                        assert.equal(proposed.payload.paginationComplete, true)
+                        // Independent connection: prior window is still visible,
+                        // but the earlier record transaction has already committed.
+                        assert.deepEqual(await readWindow(), beforeWindow)
+                        assert.deepEqual(await readFresh(), [{ id: fresh.microsoftSignInId, raw: fresh.raw }])
+                        assert.ok(result)
+                        throw injected
+                      }
+                      const value = Reflect.get(delegate, operation, delegate)
+                      return typeof value === 'function' ? value.bind(delegate) : value
+                    },
+                  })
+                  const value = Reflect.get(realTx, property, realTx)
+                  return typeof value === 'function' ? value.bind(realTx) : value
+                },
+              })), options)
+            } catch (error) {
+              if (error === injected) callbackRejected++
+              throw error
+            }
+          }
+          const value = Reflect.get(target, key, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+      const service = new TenantSyncService(client, {} as any, {} as any,
+        { resolveIncident: async () => { recovered++ }, publishIncident: async () => {} } as any,
+        { pruneExpired: async () => {} } as any, {} as any)
+      ;(service as any).signInEntitlement = async () => 'PREMIUM'
+      ;(service as any).fetchGraphCollection = async () => [fresh.raw]
+      const tenant = { id: scope.customerTenantId, organizationId: scope.organizationId, microsoftTenantId: f.scope.microsoftTenantId }
+      await assert.rejects(() => (service as any).syncSignInLogs(tenant, 'synthetic-unused'), BadGatewayException)
+      assert.equal(injectedWrites, 1); assert.equal(callbackRejected, 1)
+      assert.deepEqual(await readWindow(), beforeWindow, 'known callback failure rolls back the real window write')
+      const afterFailure = await f.prisma.syncState.findUniqueOrThrow({ where })
+      assert.equal(afterFailure.status, 'FAILED')
+      assert.deepEqual(afterFailure.lastSuccessfulAt, beforeState.lastSuccessfulAt)
+      assert.equal(afterFailure.consecutiveFailures, beforeState.consecutiveFailures + 1)
+      assert.equal(recovered, 0)
+      const committedFresh = await readFresh()
+      assert.deepEqual(committedFresh, [{ id: fresh.microsoftSignInId, raw: fresh.raw }])
+
+      // Ordinary unmodified client, same event: exact replay must retain data
+      // and commit a newer complete window before terminal success/notice.
+      ;(service as any).prisma = f.prisma
+      await (service as any).syncSignInLogs(tenant, 'synthetic-unused')
+      assert.deepEqual(await readFresh(), committedFresh)
+      const afterWindow = await readWindow()
+      assert.equal(afterWindow.length, 1)
+      assert.equal(afterWindow[0].value.payload.paginationComplete, true)
+      assert.equal(afterWindow[0].value.payload.source, 'GRAPH_SIGN_INS')
+      assert.ok(Date.parse(afterWindow[0].value.payload.end) > Date.parse(beforeWindow[0].value.payload.end))
+      const afterSuccess = await f.prisma.syncState.findUniqueOrThrow({ where })
+      assert.equal(afterSuccess.status, 'SUCCEEDED'); assert.equal(afterSuccess.lastErrorCode, null)
+      assert.equal(afterSuccess.consecutiveFailures, 0); assert.equal(recovered, 1)
+      assert.ok(afterSuccess.lastSuccessfulAt >= afterSuccess.lastAttemptAt)
+      assert.equal(injectedWrites, 1); assert.equal(callbackRejected, 1)
+    })
+  })
 
 test('actual Graph collector persists conflict gaps without hiding unrelated intact positive evidence',{skip:!enabled,timeout:60_000},()=>fixture(async f=>{
   const anotherApp=randomUUID()
