@@ -27,17 +27,49 @@ read provenance, owner identity/expiry, eligibility at mutation time, operation
 settlement or definite non-write. Superseded here means a valid replacement
 storage identity, not inferred ownership loss. Ineligible context stays UNKNOWN.
 HAW-21 must supply the separate authority protocol; even matching completion
-after owner loss cannot authorize a later effect. No query, caller, lifecycle,
-error handler or notification path uses the helper.
+after owner loss cannot authorize a later effect. No production caller,
+lifecycle, error handler or notification path uses the helper.
 
 The [local tests](../src/tenants/initial-sync-terminal-evidence.test.ts) inject
 synthetic rows to exercise all thirteen resources, copied identity, malformed or
 missing evidence, replacements, retained persistence, delayed-result ordering
 and microsecond boundaries. They do not model or verify database transactions,
 role visibility, actual late arrival, owner takeover or wire-result loss. The
-held wrapper regression remains unresolved. Next is real scoped adapter and
-producer integration, with settlement/ownership evidence and registered
-disposable-PostgreSQL proof before any runtime use.
+held wrapper regression remains unresolved. Scoped adapter and producer
+integration need settlement/ownership evidence and registered disposable-
+PostgreSQL proof before any runtime use.
+
+## Local readback adapter checkpoint
+
+The unused [`readInitialSyncTerminalEvidence`](../src/tenants/initial-sync-terminal-readback.ts)
+captures operation identity before awaiting one injected executor call. Its static
+SELECT binds only organization, tenant and resource, preserving current
+connection/epoch/attempt replacements and absent/failed rows for strict decoding.
+No success filter, row limit or duplicate suppression manufactures evidence.
+All timestamp projections distinguish a true null from invalid/nonfinite or
+out-of-range values; invalid values remain explicit rejected text. The proposed
+UTC microsecond transport follows PostgreSQL 16's
+[date/time functions](https://www.postgresql.org/docs/16/functions-datetime.html)
+and [formatting documentation](https://www.postgresql.org/docs/16/functions-formatting.html).
+
+Executor rejection produces sanitized UNKNOWN/READ_UNAVAILABLE once, without
+retry, empty-result substitution or reflecting raw errors. Decoding is outside
+that catch so programming defects remain visible. The caller must retain the
+original uncertain operation error. No classification permits failure writes,
+provider replay, new notification effects or a new failure policy.
+
+The [adapter tests](../src/tenants/initial-sync-terminal-readback.test.ts) use only
+injected synthetic rows/errors. They check operation mutation during an await,
+parameter scope, replacements, invalid versus null timestamps and error origin.
+SQL shape checks are not executed SQL or query-plan evidence. The future executor
+must enforce the existing remaining budget on a healthy, authoritative read-only
+path outside the uncertain transaction; this callback cannot verify those
+properties. No timeout extension, cancellation race, client or runtime caller is
+introduced. Actual PostgreSQL/Prisma transport, roles, query plan and controlled
+commit/rollback/late-arrival ordering remain unproved. Next is registering and
+executing those witnesses in approved disposable CI, then producer/owner/settled-
+operation integration. Both helpers remain inactive and the held wrapper defect
+is unresolved.
 
 ## Observed defect and scope
 

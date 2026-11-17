@@ -4,7 +4,7 @@ const operationKeys = [
   'organizationId', 'customerTenantId', 'connectionId', 'epochId', 'attemptId',
   'resourceType', 'persistedKind',
 ] as const
-type Operation = Readonly<Record<typeof operationKeys[number], string>>
+export type InitialSyncTerminalOperation = Readonly<Record<typeof operationKeys[number], string>>
 const rowKeys = [
   'organizationId', 'customerTenantId', 'tenantStatus', 'connectionId',
   'connectionOrganizationId', 'connectionCustomerTenantId', 'connectionStatus',
@@ -25,7 +25,7 @@ export type InitialSyncTerminalEvidence = Readonly<{
   reason: UnknownReason
 }> | Readonly<{
   kind: 'MATCHING_COMPLETION' | 'PERSISTED_ONLY' | 'SUPERSEDED'
-  operation: Operation
+  operation: InitialSyncTerminalOperation
   observed: Readonly<{
     connectionId: string
     epochId: string
@@ -45,6 +45,16 @@ const kindFor = (resource: string) => resource === 'SIGN_INS' ? 'GRAPH_SIGN_INS'
 const record = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v)
 const unknown = (reason: UnknownReason): InitialSyncTerminalEvidence => Object.freeze({ kind: 'UNKNOWN', reason })
+
+/** Capture identity before an asynchronous boundary; this grants no authority. */
+export function captureInitialSyncTerminalOperation(value: unknown): InitialSyncTerminalOperation | null {
+  if (!record(value) || !operationKeys.every(k => Object.hasOwn(value, k) && typeof value[k] === 'string')) return null
+  const op = Object.freeze(Object.fromEntries(operationKeys.map(k => [k, value[k]]))) as InitialSyncTerminalOperation
+  if (!['organizationId', 'customerTenantId', 'connectionId', 'epochId', 'attemptId'].every(k =>
+    validId(op[k as keyof InitialSyncTerminalOperation])) || !resources.has(op.resourceType) ||
+    op.persistedKind !== kindFor(op.resourceType)) return null
+  return op
+}
 
 // The future projection must use explicit six-decimal UTC text. No rounded
 // Date, coercion or caller-supplied validity flag can replace exact ordering.
@@ -68,14 +78,9 @@ export function classifyInitialSyncTerminalEvidence(
   capturedOperation: unknown,
   output: unknown,
 ): InitialSyncTerminalEvidence {
-  if (!record(capturedOperation) || !operationKeys.every(k =>
-    Object.hasOwn(capturedOperation, k) && typeof capturedOperation[k] === 'string')) {
-    return unknown('INVALID_OPERATION')
-  }
   // Copy only immutable scalar identity, never return a caller-owned object.
-  const op = Object.freeze(Object.fromEntries(operationKeys.map(k => [k, capturedOperation[k]]))) as Operation
-  if (!['organizationId', 'customerTenantId', 'connectionId', 'epochId', 'attemptId'].every(k => validId(op[k as keyof Operation])) ||
-      !resources.has(op.resourceType) || op.persistedKind !== kindFor(op.resourceType)) return unknown('INVALID_OPERATION')
+  const op = captureInitialSyncTerminalOperation(capturedOperation)
+  if (!op) return unknown('INVALID_OPERATION')
   if (!Array.isArray(output) || output.length !== 1 || !Object.hasOwn(output, 0)) return unknown('UNAVAILABLE_OR_AMBIGUOUS')
   const value: unknown = output[0]
   if (!record(value) || !rowKeys.every(k => Object.hasOwn(value, k) && (value[k] === null || typeof value[k] === 'string'))) {
