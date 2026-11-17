@@ -1,5 +1,20 @@
 # HAW-77 resource completion proof: inactive storage contract
 
+## Unknown terminal outcome contract — 17 November 2026 UTC
+
+The [uncertain-outcome contract](haw77-uncertain-terminal-outcome.md) separates
+definite non-write, exact saved completion, persisted-only state, superseded
+authority and unresolved result. An early missing receipt cannot prove rollback
+while the original operation may still execute. A current mutable proof slot
+cannot reconstruct a replaced attempt's history. Observing a saved outcome is
+distinct from current permission to mutate state or notices.
+
+This is design only: it specifies captured identity, post-wait guarded readback,
+caller uncertainty, notification boundaries and required falsifiers. No runtime,
+schema or failure/retry policy changes; the held lost-result regression remains
+red and all physical/release gates remain open. It consumes the separate HAW-21
+authority contract without implementing new fencing or recovery infrastructure.
+
 ## Held terminal-result-loss regression — 17 November 2026 UTC
 
 The sign-in provisioning suite now models three result boundaries using a
