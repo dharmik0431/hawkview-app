@@ -1,5 +1,61 @@
 # HAW-77 resource completion proof: inactive storage contract
 
+## Sign-in producer boundary contract — 17 November 2026 UTC
+
+Collection pagination, authentication evidence integrity and initial-sync epoch
+completion are three separate facts. `persistAuthenticationRecords` returns
+`hasConflicts` when it has retained a quarantined row, including sticky replay
+of an existing marker. That result is not a failed persistence transaction.
+The registered `risk-assessment-connected.database-integration.test.ts` case
+“actual Graph collector persists conflict gaps without hiding unrelated intact
+positive evidence” explicitly requires a completed page-chain window and a
+successful collector, while risk evidence stays PARTIAL and independent
+positive findings remain visible. This step reads that physical contract; it
+does not execute it or claim fresh physical proof.
+
+Do not convert `hasConflicts` alone into `CORE_AUTHENTICATION_PARTIAL` or a
+collection failure. That would change existing alert/failure behavior and
+could fail every replay indefinitely. The risk readiness mapper already
+excludes marked events, reports CONFLICTING_EVIDENCE and preserves independent
+usable evidence. Conversely, a successful collector or completed page-chain
+window cannot certify conflict-free evidence or a current initial-sync epoch.
+
+Two bounded synthetic tests now run the real collector, ingestion helper,
+window writer and readiness/rule functions over an explicit in-memory
+transaction seam. A conflicting Graph duplicate plus ten independent events
+keeps its first quarantine marker through replay, completes pagination and
+retains an independent positive finding while risk readiness remains PARTIAL.
+A 501-record control performs two batches; rejecting the second batch leaves
+the first modeled 500-row commit intact but writes no window and no terminal
+success. The matching successful control writes all 501 rows and the window.
+The seam models neither PostgreSQL locking nor JSONB size nor uncertain commits.
+Existing physical and epoch/takeover/recovery gates remain mandatory.
+
+The current producer has these separate durable boundaries:
+
+| Boundary | Existing fact | Missing HAW-77 proof |
+| --- | --- | --- |
+| Each bounded record batch | Ingestion transaction accepted, possibly with quarantined evidence | Current epoch/attempt/owner and every prior batch acknowledgment |
+| Completed source-window transaction | Complete requested page chain and observed count; a prior same-source window may be merged | Exact current attempt, rather than inference from the merged window |
+| Wrapper terminal update | Existing selected-source outcome and timestamp | Atomic consumption of the exact persisted-attempt receipt |
+| Recovery notification | Delivery after accepted terminal success | Current authority for notice effects and initial-sync completion |
+
+Before wiring a receipt producer, resolve the meaning of SIGN_INS FULL in the
+initial-sync contract explicitly: complete Graph collection under existing
+quarantine semantics, or an additional conflict-free integrity requirement.
+The latter would require separately scoped integrity proof at certificate
+creation and reader validation, not reclassification of the existing collector
+or hiding unrelated evidence. Neither choice is implemented by this test/design
+step. Missing or unknown epoch/attempt receipts remain ineligible under the
+unused validator, regardless of existing collection success.
+
+The next producer proof must cover clean/empty Graph, conflict plus independent
+positive evidence, sticky replay, valid limited-source envelopes, invalid rows,
+later batch/window/terminal rejection and unknown acknowledgments. Do not
+invent epoch receipts from callbacks or timestamps, loosen the existing risk
+readiness checks, or duplicate HAW-21 ownership fencing. No runtime, schema,
+failure policy, cadence or quota change is made here.
+
 This is a design against source `6d4195b23f6e9c01fcfbc1ae9ec6b9a5c7c26063`,
 not a migration or a working durable receipt implementation. It extends the
 [initial-sync notice epoch design](haw77-initial-sync-notice-epoch.md).

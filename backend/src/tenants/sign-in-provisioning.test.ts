@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { authenticationCollectorTransaction } from './authentication-collector.test-fixtures.js'
 import test from 'node:test'
 import { BadGatewayException } from '@nestjs/common'
 import { IpGeolocationService } from './ip-geolocation.service.js'
 import { deriveCollectionReadiness } from './collection-readiness.js'
+import { prepareAuthenticationEvaluation } from '../identity-risk/authentication-source-readiness.js'
+import { evaluateAuthenticationRules } from '../risky-users-auth/index.js'
+import { graphRecord } from '../risky-users-auth/fixtures.js'
 import {
   CollectionInitializingError,
   CollectionPartialError,
@@ -270,6 +273,121 @@ test('failed primary sign-in persistence cannot become optional success or launc
   assert.deepEqual(observations.takes, []); assert.equal(observations.updates, 0); assert.equal(observations.resolved, 0)
   assert.equal(JSON.stringify(observations.logs).includes('private@'), false)
   assert.equal(JSON.stringify(observations.states).includes('secret'), false)
+})
+
+/** Synthetic committed-boundary model only: the real collector, ingestion helper,
+ * window writer and readiness mapper run, but no PostgreSQL lock/commit is proved. */
+function graphPersistenceBoundaryFixture(input: any[], failBatch = 0) {
+  const { service, observations } = locationFixture(0)
+  let stored = new Map<string, any>(), window: any = null
+  let batches = 0, windowWrites = 0
+  ;(service as any).signInEntitlement = async () => 'PREMIUM'
+  ;(service as any).fetchGraphCollection = async () => input
+  ;(service as any).prisma.$transaction = async (work: any) => {
+    const pending = structuredClone(stored)
+    let pendingWindow = structuredClone(window)
+    const result = await work({
+      $executeRawUnsafe: async (sql: string, ...args: any[]) => {
+        if (sql.startsWith('UPDATE sign_in_logs')) {
+          assert.deepEqual(args.slice(0, 2), ['org-1', 'tenant-1'])
+          assert.ok(pending.has(args[2])); assert.match(sql, /\$4::jsonb/)
+          pending.get(args[2]).raw.hawkviewAuthenticationIntegrity = JSON.parse(args[3])
+        } else assert.ok(sql === "SET LOCAL TIME ZONE 'UTC'" || sql.includes('set_config') || sql.includes('pg_advisory_xact_lock'))
+        return 1
+      },
+      $queryRawUnsafe: async (sql: string, ...args: any[]) => {
+        if (sql.includes("current_setting('TimeZone')")) return [{ timezone: 'UTC' }]
+        assert.deepEqual(args.slice(0, 2), ['org-1', 'tenant-1'])
+        if (sql.includes('FROM tenant_entra_snapshots')) {
+          assert.match(sql, /FOR UPDATE/)
+          return pendingWindow ? [{ payload: pendingWindow, observedAt: new Date() }] : []
+        }
+        assert.match(sql, /FROM sign_in_logs/)
+        const selected = args[2].flatMap((id: string) => pending.has(id) ? [{ id, raw: pending.get(id).raw }] : [])
+        if (sql.includes('FOR UPDATE')) {
+          assert.ok(args[2].length <= 500)
+          return selected.length ? selected.map((row: any) => ({ ...row, bounded: true })) : [{ id: null, raw: null, bounded: true }]
+        }
+        // Tiny fixture payloads only; this does not model PostgreSQL JSONB size.
+        assert.match(sql, /octet_length/)
+        return [{ maxRow: 1024n, total: BigInt(selected.length * 1024) }]
+      },
+      signInLog: { createMany: async ({ data, skipDuplicates }: any) => {
+        assert.equal(skipDuplicates, false)
+        batches++
+        if (batches === failBatch) throw new Error('SYNTHETIC_LATER_BATCH_REJECTED')
+        for (const row of data) {
+          assert.equal(pending.has(row.microsoftSignInId), false)
+          pending.set(row.microsoftSignInId, structuredClone(row))
+        }
+        return { count: data.length }
+      } },
+      tenantEntraSnapshot: { upsert: async ({ create, update }: any) => {
+        assert.equal(create.resourceType, 'SIGN_INS')
+        assert.equal(update.payload.paginationComplete, true)
+        pendingWindow = structuredClone(update.payload); windowWrites++
+        return create
+      } },
+    })
+    stored = pending; window = pendingWindow
+    return result
+  }
+  return { service, observations, get stored() { return stored }, get window() { return window },
+    get batches() { return batches }, get windowWrites() { return windowWrites } }
+}
+
+test('complete Graph pagination preserves quarantined conflicts, partial risk evidence and independent positives on replay', { timeout: 5000 }, async () => {
+  const eventAt = new Date(Date.now() - 60_000).toISOString()
+  const disputed = graphRecord({ id: 'disputed', createdDateTime: eventAt })
+  assert.ok(typeof disputed.userId === 'string')
+  const intact = Array.from({ length: 10 }, (_, i) => graphRecord({ id: `intact-${i}`, createdDateTime: eventAt,
+    appId: '33333333-3333-4333-8333-333333333333' }))
+  assert.notEqual(intact[0]!.appId, disputed.appId)
+  const f = graphPersistenceBoundaryFixture([disputed, { ...disputed, status: { errorCode: 0 } }, ...intact])
+  let firstMarker: unknown
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await (f.service as any).syncSignInLogs(signInTenant, 'synthetic-unused')
+    assert.equal(f.stored.size, 11)
+    const marker = f.stored.get('disputed').raw.hawkviewAuthenticationIntegrity
+    assert.equal(marker.because, 'BATCH_DUPLICATE_MISMATCH')
+    if (attempt === 0) firstMarker = structuredClone(marker)
+    else assert.deepEqual(marker, firstMarker, 'replay preserves the first quarantine cause and time')
+    assert.equal(f.window.paginationComplete, true); assert.equal(f.window.source, 'GRAPH_SIGN_INS')
+    const state = f.observations.states.at(-1)
+    assert.equal(state.status, 'SUCCEEDED'); assert.equal(state.lastErrorCode, null)
+    assert.equal(f.observations.resolved, attempt + 1)
+    const result = await prepareAuthenticationEvaluation(
+      { organizationId: 'org-1', customerTenantId: 'tenant-1', microsoftTenantId: signInTenant.microsoftTenantId },
+      [...f.stored.values()], [{ organizationId: 'org-1', customerTenantId: 'tenant-1',
+        microsoftUserId: disputed.userId, userPrincipalName: 'synthetic.human@example.invalid', userType: 'Member' }],
+      { ...state, lastAttemptAt: f.observations.starts.at(-1).update.lastAttemptAt }, f.window, true, new Date(),
+      async (kind, ids) => `hvr1_${kind}_${createHash('sha256').update(JSON.stringify(ids)).digest('hex')}`,
+    )
+    assert.ok(result.input)
+    assert.equal(result.input.readiness.state, 'PARTIAL'); assert.equal(result.input.readiness.paginationComplete, true)
+    assert.deepEqual(result.input.events.map(event => event.eventId).sort(), intact.map(event => event.id).sort())
+    assert.deepEqual(result.disputedEventIds, ['disputed'])
+    assert.equal(result.sources.find(source => source.source === 'GRAPH_SIGN_INS')?.reasonCode, 'CONFLICTING_EVIDENCE')
+    assert.ok(evaluateAuthenticationRules(result.input).findings.some(finding => finding.ruleId === 'HV-ID-AUTH-010.v1'))
+  }
+  assert.equal(f.windowWrites, 2)
+})
+
+test('later sign-in batch rejection preserves earlier modeled commits without a completed window or success', { timeout: 5000 }, async () => {
+  const rows = Array.from({ length: 501 }, (_, i) => graphRecord({ id: `event-${i}`, createdDateTime: new Date(Date.now() - 60_000).toISOString() }))
+  for (const failBatch of [2, 0]) {
+    const f = graphPersistenceBoundaryFixture(rows, failBatch)
+    if (failBatch) await assert.rejects(() => (f.service as any).syncSignInLogs(signInTenant, 'synthetic-unused'), BadGatewayException)
+    else await (f.service as any).syncSignInLogs(signInTenant, 'synthetic-unused')
+    assert.equal(f.batches, 2)
+    assert.equal(f.stored.size, failBatch ? 500 : 501)
+    assert.equal(f.windowWrites, failBatch ? 0 : 1)
+    assert.equal(f.observations.states.at(-1).status, failBatch ? 'FAILED' : 'SUCCEEDED')
+    assert.equal(Object.hasOwn(f.observations.states.at(-1), 'lastSuccessfulAt'), !failBatch)
+    assert.equal(f.observations.resolved, failBatch ? 0 : 1)
+    if (failBatch) assert.equal(f.window, null)
+    else assert.equal(f.window.paginationComplete, true)
+  }
 })
 
 test('actual limited-login projection retains only safe diagnostic codes from all supported fields', async () => {
