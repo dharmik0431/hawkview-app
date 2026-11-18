@@ -2047,7 +2047,9 @@ export class TenantSyncService {
           failedResources: result.failedResources,
         })
       } catch (error) {
-      results.push({ status: 'FAILED', failureCode: 'TENANT_SYNC_FAILED' })
+        const failureCode = tenantVisitLeaseLoss(error) ? 'TENANT_VISIT_LEASE_LOST' : 'TENANT_SYNC_FAILED'
+        this.logger.warn(JSON.stringify({ event: 'scheduled_tenant_sync_failure', tenantId: tenant.id, failureCode }))
+        results.push({ tenantId: tenant.id, status: 'FAILED', failureCode })
       }
     }
 
