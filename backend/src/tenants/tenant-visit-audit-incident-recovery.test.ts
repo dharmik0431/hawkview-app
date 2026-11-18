@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { deriveAuditReconciliationResources } from './audit-change-reconciliation.js'
 import {
+  AUDIT_RECONCILIATION_RESOURCES,
+  deriveAuditReconciliationResources,
+  type AuditReconciliationResource,
+} from './audit-change-reconciliation.js'
+import {
+  AuditReconciliationIncompleteError,
   DIRECTORY_AUDIT_EVIDENCE_REPAIR_BATCH_LIMIT,
   DIRECTORY_AUDIT_NOTICE_REPAIR_BATCH_LIMIT,
   TenantSyncService,
@@ -20,22 +25,84 @@ const visitOwner = {
   expiresAt: new Date('2030-01-01T00:00:00.000Z'),
 }
 
+// A shared in-memory model of committed requests and modeled source completion
+// receipts. SQL, lease locks and transaction atomicity belong to the registered
+// database witnesses; this fixture exercises the real replay dispatcher.
+function createAuditLedger() {
+  const rows = new Map<AuditReconciliationResource, { requested: bigint; completed: bigint }>()
+  const failedAttempts = new Map<AuditReconciliationResource, Date>()
+  return {
+    request(resources: readonly AuditReconciliationResource[]) {
+      for (const resource of resources) {
+        const row = rows.get(resource) ?? { requested: 0n, completed: 0n }
+        row.requested += 1n
+        rows.set(resource, row)
+      }
+    },
+    complete(resource: AuditReconciliationResource, revision: bigint) {
+      const row = rows.get(resource)
+      assert.ok(row, `${resource} must have a durable request before completion`)
+      assert.equal(revision, row.requested, `${resource} must acknowledge the exact revision`)
+      assert.ok(row.completed < revision, `${resource} must not repeat a completion`)
+      row.completed = revision
+      failedAttempts.delete(resource)
+    },
+    fail(resource: AuditReconciliationResource) {
+      assert.ok(rows.get(resource), `${resource} must have a request before failure`)
+      failedAttempts.set(resource, new Date())
+    },
+    makeFailureRetryDue(resource: AuditReconciliationResource) {
+      assert.ok(failedAttempts.has(resource))
+      failedAttempts.set(resource, new Date(Date.now() - 25 * 60 * 60 * 1000))
+    },
+    retryStates(resources: readonly string[]) {
+      return resources.flatMap(resource => {
+        const failedAt = failedAttempts.get(resource as AuditReconciliationResource)
+        return failedAt ? [{ resourceType: resource, status: 'FAILED', lastAttemptAt: failedAt,
+          lastSuccessfulAt: null, lastErrorCode: 'SYNTHETIC_COLLECTION_FAILURE',
+          lastErrorMessage: 'synthetic inventory refresh failure', consecutiveFailures: 1 }] : []
+      })
+    },
+    pending() {
+      return AUDIT_RECONCILIATION_RESOURCES.flatMap(resource => {
+        const row = rows.get(resource)
+        return row && row.requested > row.completed
+          ? [{ resourceType: resource, requestedRevision: row.requested }] : []
+      })
+    },
+  }
+}
+
+type AuditLedger = ReturnType<typeof createAuditLedger>
+
 async function runAuditVisit(
   existingRaw: boolean,
   owner: typeof visitOwner | null = visitOwner,
   graphRepeatsEvent = true,
   reconcileChanges = false,
   failReconciliation = false,
+  ledger: AuditLedger = createAuditLedger(),
+  expectIncomplete = failReconciliation,
 ) {
   const operations: string[] = []
   const published: Array<{ dedupeKey: string; customerTenantId: string }> = []
   const projectedAuditIds: string[] = []
   const reconciliationResources: string[] = []
+  const offeredResources: string[] = []
   const prisma = {
     directoryAuditLog: {
       findMany: async () => {
         operations.push('prior-raw-row')
         return existingRaw ? [{ microsoftAuditId: auditId }] : []
+      },
+    },
+    syncState: {
+      findMany: async ({ where }: { where: { organizationId: string; customerTenantId: string;
+        resourceType: { in: string[] } } }) => {
+        assert.equal(where.organizationId, tenant.organizationId)
+        assert.equal(where.customerTenantId, tenant.id)
+        assert.deepEqual(where.resourceType.in, ledger.pending().map(item => item.resourceType))
+        return ledger.retryStates(where.resourceType.in)
       },
     },
   }
@@ -122,14 +189,52 @@ async function runAuditVisit(
       })
       await changeEvidence.projectDirectoryAudits(tenant, currentRecords, currentOwner, { synthetic: 'raw-write-transaction' })
     }
+    const requestedResources = currentOwner && enqueueReconciliation && !existingRaw
+      ? deriveAuditReconciliationResources(currentRecords) : []
+    if (requestedResources.length > 0) {
+      ledger.request(requestedResources)
+      operations.push('ledger-enqueue')
+    }
     return {
       count: existingRaw ? 0 : currentRecords.length,
-      requestedResources: currentOwner && enqueueReconciliation && !existingRaw
-        ? deriveAuditReconciliationResources(currentRecords)
-        : [],
+      requestedResources,
     }
   }
   service.pruneExpiredDirectoryAuditLogs = async () => undefined
+  service.pendingAuditReconciliationWork = async (
+    currentTenant: typeof tenant, currentOwner: typeof visitOwner,
+  ) => {
+    assert.equal(currentTenant, tenant)
+    assert.equal(currentOwner, visitOwner)
+    operations.push('ledger-select')
+    return ledger.pending()
+  }
+  service.syncAuthenticationRegistrations = async (
+    currentTenant: typeof tenant, token: string, currentOwner: typeof visitOwner, revision: bigint,
+  ) => {
+    assert.equal(currentTenant, tenant)
+    assert.equal(token, 'synthetic-token')
+    assert.equal(currentOwner, visitOwner)
+    reconciliationResources.push('AUTH_REGISTRATIONS')
+    if (failReconciliation) {
+      operations.push('authentication-registration-refresh-failed')
+      ledger.fail('AUTH_REGISTRATIONS')
+      throw new Error('synthetic inventory refresh failure')
+    }
+    ledger.complete('AUTH_REGISTRATIONS', revision)
+    operations.push('authentication-registration-refresh-succeeded')
+  }
+  service.syncAuthenticationMethodPolicy = async (
+    currentTenant: typeof tenant, token: string, currentOwner: typeof visitOwner, revision: bigint,
+  ) => {
+    assert.equal(currentTenant, tenant)
+    assert.equal(token, 'synthetic-token')
+    assert.equal(currentOwner, visitOwner)
+    reconciliationResources.push('AUTH_METHOD_POLICIES')
+    ledger.complete('AUTH_METHOD_POLICIES', revision)
+    operations.push('authentication-policy-refresh-succeeded')
+  }
+  service.logOperationalFailure = () => { operations.push('reconciliation-unavailable') }
   const reconcile = service.reconcileDirectoryAuditResources.bind(service)
   service.reconcileDirectoryAuditResources = async (
     currentTenant: typeof tenant,
@@ -137,24 +242,21 @@ async function runAuditVisit(
     resources: string[],
     currentOwner?: typeof visitOwner,
   ) => {
-    reconciliationResources.push(...resources)
-    if (failReconciliation && resources.length > 0) {
-      service.syncAuthenticationRegistrations = async () => {
-        operations.push('authentication-registration-refresh-failed')
-        throw new Error('synthetic inventory refresh failure')
-      }
-      service.syncAuthenticationMethodPolicy = async () => {
-        operations.push('authentication-policy-refresh-succeeded')
-      }
-      service.logOperationalFailure = () => {
-        operations.push('reconciliation-unavailable')
-      }
-      await reconcile(currentTenant, token, resources, currentOwner)
-    }
+    offeredResources.push(...resources)
+    await reconcile(currentTenant, token, resources, currentOwner)
   }
 
-  await service.syncDirectoryAuditLogs(tenant, 'synthetic-token', reconcileChanges, owner ?? undefined)
-  return { published, operations, projectedAuditIds, reconciliationResources }
+  let incomplete: AuditReconciliationIncompleteError | null = null
+  try {
+    await service.syncDirectoryAuditLogs(tenant, 'synthetic-token', reconcileChanges, owner ?? undefined)
+  } catch (error) {
+    if (!(error instanceof AuditReconciliationIncompleteError)) throw error
+    incomplete = error
+  }
+  if (expectIncomplete) assert.ok(incomplete, 'failed or deferred source must retain an incomplete request')
+  else assert.equal(incomplete, null, 'every selected source must have an acknowledged receipt')
+  return { published, operations, projectedAuditIds, reconciliationResources, offeredResources, incomplete,
+    pending: ledger.pending() }
 }
 
 test('first-seen directory security audit reaches the synthetic incident publisher', async () => {
@@ -187,15 +289,9 @@ test('a successor repairs a missing security incident after a prior raw audit co
   }], 'a committed raw row alone cannot establish that its separate incident was published')
 })
 
-// Hook witness: the predecessor committed the raw audit row and lost its
-// lease before publishing the notice, but the successor's Graph page no
-// longer contains that event. The stub models a bounded repair result; the
-// registered PostgreSQL suite must prove the real selector and write.
-test('a successor repairs a missing security incident when the Graph page no longer repeats its raw event', {
-  skip: process.env.HAWKVIEW_SYNC_AUDIT_ABSENT_PAGE_RECOVERY_WITNESS !== '1'
-    ? 'held pending registered disposable-PostgreSQL repair proof'
-    : false,
-}, async () => {
+// The predecessor committed a raw row but lost the notice. This checks the
+// empty-page orchestration; registered PostgreSQL must prove the real selector.
+test('a successor repairs a missing security incident when the Graph page no longer repeats its raw event', async () => {
   const { published, operations } = await runAuditVisit(true, visitOwner, false)
   assert.ok(operations.includes('graph-page'))
   assert.ok(!operations.includes('raw-upsert'))
@@ -217,50 +313,59 @@ test('ownerless audit reentry retains the existing first-seen notification rule'
   assert.ok(!repeat.operations.includes('repair-notice-scan'))
 })
 
-// Held recovery witness: A committed the raw audit event and AUDIT_LOGS success,
-// but its selected inventory refresh failed. B sees the same Graph event and
-// needs durable proof of reconciliation before treating that event as complete.
-// A raw-row existence check alone cannot supply that proof. Do not implement
-// an unconditional replay here: it would refresh inventories on every poll.
-test('a successor retries an unfinished audit-triggered inventory refresh', {
-  skip: process.env.HAWKVIEW_SYNC_AUDIT_REENTRY_RECOVERY_WITNESS !== '1'
-    ? 'held pending durable per-event reconciliation completion and bounded replay design'
-    : false,
-}, async () => {
-  const first = await runAuditVisit(false, visitOwner, true, true, true)
+// A raw row does not prove its selected refresh completed. Share the synthetic
+// committed ledger across visits; the dispatcher must retry only its unfinished
+// revision instead of replaying every resource on a duplicate provider event.
+test('a successor retries an unfinished audit-triggered inventory refresh', async () => {
+  const ledger = createAuditLedger()
+  const first = await runAuditVisit(false, visitOwner, true, true, true, ledger)
+  assert.deepEqual(first.offeredResources, ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES'])
   assert.deepEqual(first.reconciliationResources, ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES'])
   assert.ok(first.operations.includes('authentication-registration-refresh-failed'))
   assert.ok(first.operations.includes('reconciliation-unavailable'),
-    'the real audit reentry dispatcher records an ordinary collector failure and returns')
+    'the dispatcher records the collector failure before reporting incomplete work')
+  assert.deepEqual(first.incomplete?.failedResources, ['AUTH_REGISTRATIONS'])
+  assert.deepEqual(first.incomplete?.pendingResources, ['AUTH_REGISTRATIONS'])
+  assert.deepEqual(first.pending, [{ resourceType: 'AUTH_REGISTRATIONS', requestedRevision: 1n }])
 
-  const successor = await runAuditVisit(true, visitOwner, true, true)
+  const tooSoon = await runAuditVisit(true, visitOwner, true, true, false, ledger, true)
+  assert.deepEqual(tooSoon.offeredResources, [], 'a repeated event cannot create a new request')
+  assert.deepEqual(tooSoon.reconciliationResources, [], 'a recent failure retains its existing retry delay')
+  assert.deepEqual(tooSoon.incomplete?.pendingResources, ['AUTH_REGISTRATIONS'])
+  ledger.makeFailureRetryDue('AUTH_REGISTRATIONS')
+  const successor = await runAuditVisit(true, visitOwner, true, true, false, ledger)
   assert.ok(successor.operations.includes('prior-raw-row'))
   assert.ok(successor.operations.includes('graph-page'))
-  assert.deepEqual(successor.reconciliationResources, ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES'],
-    'a committed raw audit row does not prove its selected inventory refresh completed')
+  assert.deepEqual(successor.offeredResources, [], 'a repeated raw row cannot create another work request')
+  assert.deepEqual(successor.reconciliationResources, ['AUTH_REGISTRATIONS'],
+    'only the previously failed revision needs another collection')
+  assert.deepEqual(successor.pending, [])
 })
 
-// A provider page is not a durable work queue. The first visitor can commit
-// the raw row and security notice, then fail an audit-selected refresh. If
-// the next page is empty, the retained notice/evidence repair paths still run
-// but neither reconstructs the unfinished inventory resource selection.
-test('a successor retries an unfinished audit-selected refresh after an empty provider page', {
-  skip: process.env.HAWKVIEW_SYNC_AUDIT_REENTRY_EMPTY_PAGE_WITNESS !== '1'
-    ? 'held pending durable per-resource completion and bounded replay'
-    : false,
-}, async () => {
-  const first = await runAuditVisit(false, visitOwner, true, true, true)
+// An empty provider page cannot reconstruct the failed resource, but the
+// committed ledger can. Notice/evidence repair must not clear that request.
+test('a successor retries an unfinished audit-selected refresh after an empty provider page', async () => {
+  const ledger = createAuditLedger()
+  const first = await runAuditVisit(false, visitOwner, true, true, true, ledger)
   assert.deepEqual(first.reconciliationResources, ['AUTH_REGISTRATIONS', 'AUTH_METHOD_POLICIES'])
   assert.ok(first.operations.includes('authentication-registration-refresh-failed'))
   assert.ok(first.operations.includes('reconciliation-unavailable'))
+  assert.deepEqual(first.pending, [{ resourceType: 'AUTH_REGISTRATIONS', requestedRevision: 1n }])
 
-  const successor = await runAuditVisit(true, visitOwner, false, true)
+  const tooSoon = await runAuditVisit(true, visitOwner, false, true, false, ledger, true)
+  assert.deepEqual(tooSoon.reconciliationResources, [], 'an empty page cannot bypass the failure retry delay')
+  assert.deepEqual(tooSoon.incomplete?.pendingResources, ['AUTH_REGISTRATIONS'])
+  assert.deepEqual(tooSoon.pending, first.pending)
+  ledger.makeFailureRetryDue('AUTH_REGISTRATIONS')
+  const successor = await runAuditVisit(true, visitOwner, false, true, false, ledger)
   assert.ok(successor.operations.includes('graph-page'))
   assert.ok(!successor.operations.includes('raw-upsert'))
   assert.equal(successor.operations.filter((operation) => operation === 'repair-evidence-scan').length, 1)
   assert.equal(successor.operations.filter((operation) => operation === 'repair-notice-scan').length, 1)
+  assert.deepEqual(successor.offeredResources, [], 'an empty page offers no new resource request')
   assert.deepEqual(successor.reconciliationResources, ['AUTH_REGISTRATIONS'],
     'an empty page must not erase the failed refresh or needlessly repeat the completed one')
+  assert.deepEqual(successor.pending, [])
 })
 
 // Held historical-recovery witness: a pre-atomic raw audit row may still lack
