@@ -16,6 +16,8 @@ import type { AuthenticatedRequest } from '../auth/auth.types.js'
 import { Public } from '../auth/public.decorator.js'
 import { TenantsService } from './tenants.service.js'
 import { TenantSyncService } from './tenant-sync.service.js'
+import { syncDrainRegistry } from './sync-drain-registry.js'
+import { assertSyncAdmissionOpen } from './sync-admission-pause.js'
 import {
   DIRECTORY_ROLE_EXPORT_FILENAME,
   assertNoExportInputs,
@@ -204,14 +206,17 @@ export class TenantsController {
     @Req() request: AuthenticatedRequest,
     @Param('id') customerTenantId: string,
   ) {
-    await this.tenantsService.assertCanConfigureExchangeReadOnly(
-      request.auth,
-      customerTenantId,
-    )
-    return this.tenantSyncService.verifyExchangeReadOnlyForIdentity(
-      request.auth,
-      customerTenantId,
-    )
+    return syncDrainRegistry.run(async () => {
+      assertSyncAdmissionOpen()
+      await this.tenantsService.assertCanConfigureExchangeReadOnly(
+        request.auth,
+        customerTenantId,
+      )
+      return this.tenantSyncService.verifyExchangeReadOnlyForIdentity(
+        request.auth,
+        customerTenantId,
+      )
+    })
   }
 
   @Delete(':id')

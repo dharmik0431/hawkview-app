@@ -19,6 +19,7 @@ import {
 } from './tenant-visit-lifecycle.js'
 import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { assertSyncAdmissionOpen } from './sync-admission-pause.js'
+import { syncDrainRegistry } from './sync-drain-registry.js'
 import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type CapturedConnectionVerification } from './connection-verification-store.js'
 import { validatedLicenseRows } from './license-validation.js'
@@ -1901,20 +1902,24 @@ export class TenantSyncService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    assertSyncAdmissionOpen()
-    // Any active workspace member can refresh data for an existing tenant.
-    // Tenant creation and deletion remain restricted by TenantsService.
-    const tenant = await this.getReadableTenant(identity, customerTenantId)
-    const result = await this.syncConnectedTenant(tenant, true)
-    return result.bundle
+    return syncDrainRegistry.run(async () => {
+      assertSyncAdmissionOpen()
+      // Any active workspace member can refresh data for an existing tenant.
+      // Tenant creation and deletion remain restricted by TenantsService.
+      const tenant = await this.getReadableTenant(identity, customerTenantId)
+      const result = await this.syncConnectedTenant(tenant, true)
+      return result.bundle
+    })
   }
 
   async verifyExchangeReadOnlyForIdentity(
     identity: AuthenticatedIdentity,
     customerTenantId: string,
   ) {
-    assertSyncAdmissionOpen()
-    return runInSyncMemoryLane(() => this.verifyExchangeReadOnlyWithinMemoryLane(identity, customerTenantId))
+    return syncDrainRegistry.run(async () => {
+      assertSyncAdmissionOpen()
+      return runInSyncMemoryLane(() => this.verifyExchangeReadOnlyWithinMemoryLane(identity, customerTenantId))
+    })
   }
 
   private async verifyExchangeReadOnlyWithinMemoryLane(
@@ -1972,6 +1977,10 @@ export class TenantSyncService {
   }
 
   async syncDueTenants(admissionDeadlineAt?: number) {
+    return syncDrainRegistry.run(() => this.syncDueTenantsTracked(admissionDeadlineAt))
+  }
+
+  private async syncDueTenantsTracked(admissionDeadlineAt?: number) {
     assertSyncAdmissionOpen()
     const canAdmit = () => admissionDeadlineAt === undefined ||
       (Number.isSafeInteger(admissionDeadlineAt) && Date.now() < admissionDeadlineAt)

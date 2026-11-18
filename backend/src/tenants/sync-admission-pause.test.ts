@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { type TestContext } from 'node:test'
 import { ServiceUnavailableException } from '@nestjs/common'
 import { TenantSyncService } from './tenant-sync.service.js'
+import { TenantsController } from './tenants.controller.js'
 import { assertSyncAdmissionOpen, syncAdmissionPaused } from './sync-admission-pause.js'
 
 function env(t: TestContext, value: string | undefined) {
@@ -58,6 +59,16 @@ test('paused admission rejects all three production service entries before DB, p
       else process.env.HAWKVIEW_TENANT_VISIT_FENCING = previous
     }
   }
+  assert.deepEqual(calls, [])
+})
+
+test('paused Exchange verification rejects before the controller database preflight', async t => {
+  env(t, 'true')
+  const calls: string[] = []
+  const controller = new TenantsController({ assertCanConfigureExchangeReadOnly: async () => {
+    calls.push('controller-db')
+  } } as any, { verifyExchangeReadOnlyForIdentity: async () => { calls.push('collector') } } as any)
+  await assert.rejects(controller.verifyExchangeReadOnly({ auth: {} } as any, 'tenant'), paused)
   assert.deepEqual(calls, [])
 })
 
