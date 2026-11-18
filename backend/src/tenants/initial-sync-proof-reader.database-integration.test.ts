@@ -257,6 +257,125 @@ test('HAW-77 terminal readback transports invalid timestamps distinctly from nul
     assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION')
   }))
 
+test('HAW-77 terminal readback distinguishes pending rollback and committed completion without reserving attempt authority', options,
+  async () => {
+    const reader = client(), writer = client()
+    const organizationIds = [randomUUID(), randomUUID()]
+    let readerConnected = false, writerConnected = false, readerBegan = false, writerBegan = false
+    const beginWriter = async () => {
+      await writer.query('BEGIN'); writerBegan = true
+      await settings(writer)
+    }
+    try {
+      await reader.connect(); readerConnected = true
+      await writer.connect(); writerConnected = true
+      for (const db of [reader, writer]) {
+        await db.query("SET statement_timeout = '5s'")
+        await db.query("SET lock_timeout = '2s'")
+      }
+      assert.notEqual((await reader.query('SELECT pg_backend_pid() AS pid')).rows[0]!.pid,
+        (await writer.query('SELECT pg_backend_pid() AS pid')).rows[0]!.pid)
+      await beginWriter()
+      const owner = await fixture(writer, organizationIds[0]!)
+      const sibling = await fixture(writer, organizationIds[1]!)
+      const operation = terminalOperation(owner), stateId = owner.states.get('SIGN_INS')!.id
+      assert.equal((await writer.query(`UPDATE public.sync_states SET status = 'RUNNING',
+        initial_sync_completed_attempt_id = NULL, last_successful_at = NULL WHERE id = $1`, [stateId])).rowCount, 1)
+      await writer.query('COMMIT'); writerBegan = false
+      const snapshot = async (organizationId: string) => (await writer.query(`SELECT to_jsonb(s)::text AS row
+        FROM public.sync_states s WHERE organization_id = $1 ORDER BY id`, [organizationId])).rows
+      const baseline = await snapshot(owner.scope.organizationId), siblingBefore = await snapshot(sibling.scope.organizationId)
+      await reader.query('BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY'); readerBegan = true
+      await settings(reader)
+      assert.deepEqual((await reader.query('SHOW transaction_read_only')).rows, [{ transaction_read_only: 'on' }])
+      assert.deepEqual((await reader.query('SHOW transaction_isolation')).rows, [{ transaction_isolation: 'read committed' }])
+      const persistedOnly = async () => {
+        const actual = await readTerminal(reader, operation)
+        assert.equal(actual.rows.length, 1)
+        assert.equal(actual.rows[0]!.initialSyncAttemptId, operation.attemptId)
+        assert.equal(actual.rows[0]!.initialSyncPersistedAttemptId, operation.attemptId)
+        assert.equal(actual.rows[0]!.initialSyncCompletedAttemptId, null)
+        assert.equal(actual.rows[0]!.lastSuccessfulAtUtc, null)
+        assert.equal(actual.result.kind, 'PERSISTED_ONLY')
+        assert.equal(actual.result.observed.status, 'RUNNING')
+        return actual
+      }
+      const early = await persistedOnly()
+      // Fixture-only terminal update: no owner claim or production writer is
+      // exercised. Await RETURNING to prove it ran before the external read.
+      const completeFixture = async () => {
+        const pending = await writer.query(`UPDATE public.sync_states
+          SET initial_sync_completed_attempt_id = initial_sync_attempt_id,
+            status = 'SUCCEEDED', last_successful_at = $1,
+            last_error_code = NULL, last_error_message = NULL
+          WHERE id = $2 AND organization_id = $3 AND customer_tenant_id = $4
+            AND initial_sync_attempt_epoch_id = $5 AND initial_sync_attempt_id = $6
+            AND status = 'RUNNING' AND initial_sync_completed_attempt_id IS NULL
+          RETURNING initial_sync_completed_attempt_id::text AS completed, status::text AS status`,
+        [succeeded, stateId, owner.scope.organizationId, owner.scope.customerTenantId, owner.epoch, operation.attemptId])
+        assert.equal(pending.rowCount, 1)
+        assert.deepEqual(pending.rows, [{ completed: operation.attemptId, status: 'SUCCEEDED' }])
+      }
+      await beginWriter()
+      await completeFixture()
+      await persistedOnly() // Uncommitted completion is invisible on this other connection.
+      await writer.query('ROLLBACK'); writerBegan = false
+      await persistedOnly()
+      assert.deepEqual(await snapshot(owner.scope.organizationId), baseline, 'Acknowledged rollback restores the fixture')
+
+      await beginWriter()
+      await completeFixture()
+      await persistedOnly()
+      await writer.query('COMMIT'); writerBegan = false
+      const committed = await readTerminal(reader, operation)
+      assert.equal(committed.rows.length, 1)
+      assert.equal(committed.rows[0]!.initialSyncCompletedAttemptId, operation.attemptId)
+      assert.equal(committed.rows[0]!.lastSuccessfulAtUtc, succeeded)
+      assert.equal(committed.result.kind, 'MATCHING_COMPLETION')
+      assert.deepEqual(committed.result.operation, operation)
+      assert.equal(early.result.kind, 'PERSISTED_ONLY', 'The earlier observation did not predict rollback or stop the later commit')
+
+      const nextAttempt = randomUUID()
+      await beginWriter()
+      assert.equal((await writer.query(`UPDATE public.sync_states SET initial_sync_attempt_id = $1,
+        initial_sync_persisted_attempt_id = $1, initial_sync_completed_attempt_id = NULL,
+        status = 'RUNNING', last_attempt_at = $2 WHERE id = $3`, [nextAttempt, stamp('000900'), stateId])).rowCount, 1)
+      assert.equal((await readTerminal(reader, operation)).result.kind, 'MATCHING_COMPLETION',
+        'An uncommitted replacement cannot yet invalidate the reader snapshot')
+      await writer.query('COMMIT'); writerBegan = false
+      const afterReplacement = await snapshot(owner.scope.organizationId)
+      const superseded = await readTerminal(reader, operation)
+      assert.equal(superseded.rows[0]!.initialSyncAttemptId, nextAttempt)
+      assert.equal(superseded.rows[0]!.initialSyncCompletedAttemptId, null)
+      assert.equal(superseded.rows[0]!.lastSuccessfulAtUtc, succeeded, 'Retained old success cannot certify the new attempt')
+      assert.equal(superseded.result.kind, 'SUPERSEDED')
+      assert.equal(superseded.result.observed.attemptId, nextAttempt)
+      assert.equal((await readTerminal(reader, { ...operation, attemptId: nextAttempt })).result.kind, 'PERSISTED_ONLY')
+      assert.equal(committed.result.kind, 'MATCHING_COMPLETION', 'Saved observation is historical, not reserved authority')
+      assert.equal((await readTerminal(reader, terminalOperation(sibling))).result.kind, 'MATCHING_COMPLETION')
+      await reader.query('ROLLBACK'); readerBegan = false
+      assert.deepEqual(await snapshot(owner.scope.organizationId), afterReplacement,
+        'Read-only observation and rollback must not alter the independently committed attempt')
+      assert.deepEqual(await snapshot(sibling.scope.organizationId), siblingBefore)
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (run: () => Promise<unknown>) => {
+        try { await run() } catch (error) { failures.push(error) }
+      }
+      if (readerConnected && readerBegan) await clean(() => reader.query('ROLLBACK'))
+      if (writerConnected && writerBegan) await clean(() => writer.query('ROLLBACK'))
+      if (writerConnected) for (const organizationId of organizationIds) await clean(async () => {
+        await writer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+        for (const table of ['customer_tenants', 'tenant_connections', 'sync_states']) {
+          assert.equal((await writer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+        }
+      })
+      await clean(() => reader.end())
+      await clean(() => writer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic terminal-order fixture cleanup failed')
+    }
+  })
+
 test('HAW-77 coherent reader returns thirteen scoped precise receipts under non-default session settings', options,
   async () => transaction(async db => {
     const owner = await fixture(db)

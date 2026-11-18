@@ -115,6 +115,28 @@ delayed command arrival, original-operation settlement, authority, deployed
 executor health or a runtime failure-policy fix. Those remain separate gates;
 the held wrapper regression is unresolved and runtime integration stays inactive.
 
+## Prepared terminal commit-order witness
+
+A separate case in the same registered suite prepares two actual pg connections
+with an explicitly checked ReadCommitted, read-only reader. A committed fixture
+starts RUNNING with matching persisted evidence and no completion. An awaited
+writer update confirms that completion exists inside its open transaction, while
+the exact terminal query on the other connection must still see PERSISTED_ONLY.
+A confirmed rollback leaves that result intact. A repeated update followed by
+confirmed commit must instead produce MATCHING_COMPLETION in the same reader
+transaction. A later committed attempt replacement must supersede the old caller
+while the new attempt stays persisted-only despite its retained success time.
+Saved earlier results remain historical observations, not authority reservations.
+
+This case is **prepared and unexecuted**. It uses awaited command order, with no
+sleeps, wire interception or fabricated result loss. The SQL updates are fixture
+transitions, not production terminal writers or owner-guard integration. Even a
+future pass establishes only these acknowledged commit/rollback visibility
+orders. It does not prove unknown-commit handling, a delayed command arriving
+after cancellation, role visibility, operation settlement or stale-effect
+rejection. Scoped cleanup and unchanged sibling evidence are asserted; all
+remaining runtime and disposable-CI gates still apply.
+
 ## Observed defect and scope
 
 The real `runSnapshotSync` wrapper in
