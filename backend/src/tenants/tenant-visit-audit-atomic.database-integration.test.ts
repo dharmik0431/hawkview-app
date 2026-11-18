@@ -482,11 +482,11 @@ test('physical pending audit selection is tenant-scoped, revision-aware and owne
   ] })
 
   assert.deepEqual(await selectPendingAuditReconciliationWork(database, scope, owner, 1), [
-    { resourceType: 'AUTH_REGISTRATIONS', requestedRevision: 2n },
+    { resourceType: 'GROUPS', requestedRevision: 1n },
   ])
   assert.deepEqual(await selectPendingAuditReconciliationWork(database, scope, owner, 2), [
-    { resourceType: 'AUTH_REGISTRATIONS', requestedRevision: 2n },
     { resourceType: 'GROUPS', requestedRevision: 1n },
+    { resourceType: 'AUTH_REGISTRATIONS', requestedRevision: 2n },
   ])
 
   assert.equal(await advanceAuditReconciliationCompletion(
@@ -618,20 +618,20 @@ test('physical owner-bound audit insertion enqueues selected work once and rolls
   })).map(row => ({ ...row, requestedRevision: row.requestedRevision.toString(),
     completedRevision: row.completedRevision.toString() }))
   const expected = [
-    { resourceType: 'AUTH_METHOD_POLICIES', requestedRevision: '1', completedRevision: '0' },
     { resourceType: 'AUTH_REGISTRATIONS', requestedRevision: '1', completedRevision: '0' },
+    { resourceType: 'AUTH_METHOD_POLICIES', requestedRevision: '1', completedRevision: '0' },
   ]
 
   const insertedId = randomUUID()
-  await service().persistDirectoryAuditRows(scope, [auditRecord(insertedId)], owner, true)
+  await service().persistDirectoryAuditRows(tenant, [auditRecord(insertedId)], owner, true)
   assert.deepEqual(await work(), expected)
-  await service().persistDirectoryAuditRows(scope, [auditRecord(insertedId)], owner, true)
+  await service().persistDirectoryAuditRows(tenant, [auditRecord(insertedId)], owner, true)
   assert.deepEqual(await work(), expected, 'duplicate provider rows cannot advance work revisions')
 
   const rejectedId = randomUUID()
   await assert.rejects(
     service({ projectDirectoryAudits: async () => { throw new Error('synthetic projection rollback') } })
-      .persistDirectoryAuditRows(scope, [auditRecord(rejectedId)], owner, true),
+      .persistDirectoryAuditRows(tenant, [auditRecord(rejectedId)], owner, true),
     /synthetic projection rollback/,
   )
   assert.equal(await database.directoryAuditLog.count({
@@ -688,9 +688,9 @@ test('physical audit write commits raw, notice and evidence together or none aft
   ])
 
   const committedId = randomUUID()
-  await writer(first).persistDirectoryAuditRows(scope, [record(committedId)], owner)
+  await writer(first).persistDirectoryAuditRows(tenant, [record(committedId)], owner)
   assert.deepEqual(await counts(committedId), [1, 1, 1])
-  await writer(first).persistDirectoryAuditRows(scope, [record(committedId)], owner)
+  await writer(first).persistDirectoryAuditRows(tenant, [record(committedId)], owner)
   assert.deepEqual(await counts(committedId), [1, 1, 1], 'duplicate page must not duplicate any row')
   const notice = await first.notification.findUniqueOrThrow({ where: {
     organizationId_dedupeKey: { organizationId, dedupeKey: `security:directory-audit:${committedId}` },
@@ -702,7 +702,7 @@ test('physical audit write commits raw, notice and evidence together or none aft
     projectDirectoryAudits: async () => { throw new Error('synthetic projection failure after notice insert') },
   }
   await assert.rejects(
-    writer(first, failingEvidence).persistDirectoryAuditRows(scope, [record(rolledBackId)], owner),
+    writer(first, failingEvidence).persistDirectoryAuditRows(tenant, [record(rolledBackId)], owner),
     /synthetic projection failure after notice insert/,
   )
   assert.deepEqual(await counts(rolledBackId), [0, 0, 0], 'failed evidence must roll back raw and notice')
@@ -723,7 +723,7 @@ test('physical audit write commits raw, notice and evidence together or none aft
     },
   }
   const pausedId = randomUUID()
-  const pendingWrite = writer(first, heldEvidence).persistDirectoryAuditRows(scope, [record(pausedId)], owner)
+  const pendingWrite = writer(first, heldEvidence).persistDirectoryAuditRows(tenant, [record(pausedId)], owner)
   await Promise.race([
     projectionEntered,
     pendingWrite.then(() => { throw new Error('audit write committed before the evidence boundary') }),
@@ -757,11 +757,11 @@ test('physical audit write commits raw, notice and evidence together or none aft
   assert.notEqual(successor.generation, owner.generation)
   const takeoverId = randomUUID()
   await assert.rejects(
-    writer(first).persistDirectoryAuditRows(scope, [record(takeoverId)], owner),
+    writer(first).persistDirectoryAuditRows(tenant, [record(takeoverId)], owner),
     TenantVisitLeaseLostError,
   )
   assert.deepEqual(await counts(takeoverId), [0, 0, 0], 'old owner must not publish after takeover')
-  await writer(second).persistDirectoryAuditRows(scope, [record(takeoverId)], successor)
+  await writer(second).persistDirectoryAuditRows(tenant, [record(takeoverId)], successor)
   assert.deepEqual(await counts(takeoverId), [1, 1, 1], 'successor can publish the same event')
 })
 
@@ -832,7 +832,7 @@ test('physical empty audit page repairs a retained security row missing its noti
   assert.ok(successor)
   assert.notEqual(successor.generation, owner.generation)
   await assert.rejects(
-    service.repairRetainedDirectoryAuditNotices(scope, owner, 100),
+    service.repairRetainedDirectoryAuditNotices(tenant, owner, 100),
     TenantVisitLeaseLostError,
   )
   assert.equal(await database.notification.count({ where: {
@@ -840,7 +840,7 @@ test('physical empty audit page repairs a retained security row missing its noti
   } }), 0, 'the former owner must not create the retained notice')
   const successorService = new TenantSyncService(successorDatabase, {} as never, {} as never,
     new NotificationsService(successorDatabase), {} as never, {} as never) as any
-  assert.deepEqual(await successorService.repairRetainedDirectoryAuditNotices(scope, successor, 100), {
+  assert.deepEqual(await successorService.repairRetainedDirectoryAuditNotices(tenant, successor, 100), {
     attempted: 1, hasMore: false,
   })
   assert.equal(await database.notification.count({ where: {
@@ -1657,7 +1657,8 @@ async function physicalCollectorFixture(context: TestContext) {
     organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE',
   } })
   const scope = { organizationId, customerTenantId: tenant.id }
-  await database.tenantConnection.create({ data: { ...scope, status: 'CONNECTED', connectionMode: 'CUSTOMER_MANAGED' } })
+  await database.tenantConnection.create({ data: { ...scope, status: 'CONNECTED', connectionMode: 'CUSTOMER_MANAGED',
+    clientId: randomUUID(), credentialReference: 'synthetic-unused' } })
   const owner = await tryAcquireTenantVisitLease(database, scope, 300_000)
   assert.ok(owner)
   const userId = randomUUID(), groupId = randomUUID(), skuId = randomUUID(), siteId = randomUUID()

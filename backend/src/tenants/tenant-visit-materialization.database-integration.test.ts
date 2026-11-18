@@ -131,7 +131,8 @@ test('physical owned incident resolution and connection failure roll back their 
   assert.equal(observedBoth, true)
   assert.equal((await f.observer.notification.findUniqueOrThrow({ where: { id: incident.id } })).resolvedAt, null)
   assert.equal(await f.observer.notification.count({ where: { ...f.scope, eventType: recovery.eventType } }), 0)
-  await f.writer.tenantConnection.create({ data: { ...f.scope, status: 'CONNECTED', connectionMode: 'CUSTOMER_MANAGED' } })
+  await f.writer.tenantConnection.create({ data: { ...f.scope, status: 'CONNECTED', connectionMode: 'CUSTOMER_MANAGED',
+    clientId: randomUUID(), credentialReference: 'synthetic-unused' } })
   const target = { ...f.tenant, connection: { connectionMode: 'CUSTOMER_MANAGED' } }
   const failingNotices = new NotificationsService(f.writer)
   const originalPublish = failingNotices.publishIncidentInTransaction.bind(failingNotices)
