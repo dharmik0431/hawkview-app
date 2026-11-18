@@ -1,5 +1,9 @@
 # HAW-70: distinguish saved health inputs from neighboring response fields
 
+Follow-up: the [license participation contract](haw70-license-source-participation.md)
+specifies the next source boundary and an unresolved multi-SKU/authority lock
+cycle. It is design-only; no license trigger or new physical proof is implied.
+
 ## License dependency checkpoint — 18 November 2026
 
 This local test/documentation child starts at public candidate
