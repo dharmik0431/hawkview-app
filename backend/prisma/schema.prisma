@@ -1267,8 +1267,8 @@ model ScheduledSyncCursor {
   @@map("scheduled_sync_cursors")
 }
 
-// Inactive persistence contract for a future tenant-wide SYNC visit fence.
-// Admission and materialization paths do not read or write this model yet.
+// Tenant-wide SYNC visit ownership, used by admission and owned writes when
+// HAWKVIEW_TENANT_VISIT_FENCING=enabled. The deployment switch defaults off.
 model TenantSyncVisitLease {
   organizationId String @map("organization_id") @db.Uuid
   customerTenantId String @map("customer_tenant_id") @db.Uuid
@@ -1282,8 +1282,8 @@ model TenantSyncVisitLease {
   @@map("tenant_sync_visit_leases")
 }
 
-// Inactive, tenant-scoped completion ledger for audit-triggered inventory
-// refreshes. Runtime enqueue, replay and completion are not wired yet.
+// Tenant-scoped audit refresh ledger. Owned visits enqueue and replay requests;
+// authoritative inventory commits acknowledge their exact requested revision.
 model TenantAuditReconciliationWork {
   organizationId String @map("organization_id") @db.Uuid
   customerTenantId String @map("customer_tenant_id") @db.Uuid
