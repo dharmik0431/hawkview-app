@@ -107,11 +107,9 @@ test('ownerless scoped risk still treats an ordinary attempt failure as best eff
   })
 })
 
-// Held call-level negative control. A same-transaction database visit check is
-// also required before activation. Ordinary discovery must skip partial fencing.
-test('post-attempt key setup receives the exact visit owner', {
-  skip: process.env.HAWKVIEW_SYNC_VISIT_FAIL_FIRST !== '1',
-}, async () => {
+// Call-level ownership witness. A same-transaction database visit check is
+// also required before activation.
+test('post-attempt key setup receives the exact visit owner', async () => {
   await withRiskConfig(async () => {
     const attempts = RiskGlobalWorkStore.prototype as any
     const keys = WrappedRiskKeyStore.prototype as any
@@ -212,11 +210,9 @@ test('automatic risk key setup checks visit ownership on its transaction connect
   })
 })
 
-// Held call-level negative control for the evaluator handoff. Passing this
+// Call-level ownership witness for the evaluator handoff. Passing this
 // owner is necessary but does not fence evaluator claim/completion writes.
-test('post-attempt evaluation receives the exact visit owner', {
-  skip: process.env.HAWKVIEW_SYNC_VISIT_FAIL_FIRST !== '1',
-}, async () => {
+test('post-attempt evaluation receives the exact visit owner', async () => {
   await withRiskConfig(async () => {
     const attempts = RiskGlobalWorkStore.prototype as any
     const keys = WrappedRiskKeyStore.prototype as any

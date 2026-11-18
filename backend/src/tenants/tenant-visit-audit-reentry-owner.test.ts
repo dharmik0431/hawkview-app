@@ -30,11 +30,9 @@ test('audit reentry keeps an ordinary collector failure best effort', async () =
   }])
 })
 
-// Held call-level witness. Passing the owner is necessary, but each selected
+// Call-level witness. Passing the owner is necessary, but each selected
 // collector must also check it in its own write transaction before activation.
-test('audit-selected guarded collectors receive the exact visit owner', {
-  skip: process.env.HAWKVIEW_SYNC_VISIT_FAIL_FIRST !== '1',
-}, async () => {
+test('audit-selected guarded collectors receive the exact visit owner', async () => {
   const { service } = fixture()
   const calls = new Map<string, unknown[]>()
   service.syncLicenses = async (...args: unknown[]) => { calls.set('LICENSES', args) }
@@ -51,13 +49,15 @@ test('audit-selected guarded collectors receive the exact visit owner', {
 
 // An exact owner loss must abort its visitor instead of being logged as a
 // routine provider failure. This is independent of the pass-through witness.
-test('audit reentry propagates exact visit ownership loss', {
-  skip: process.env.HAWKVIEW_SYNC_VISIT_FAIL_FIRST !== '1',
-}, async () => {
+test('audit reentry propagates exact visit ownership loss', async () => {
   const { service, warnings } = fixture()
-  service.syncLicenses = async () => { throw new TenantVisitLeaseLostError() }
+  const lost = new TenantVisitLeaseLostError()
+  const calls: string[] = []
+  service.syncLicenses = async () => { calls.push('LICENSES'); throw lost }
+  service.syncDomains = async () => { calls.push('DOMAINS') }
   await assert.rejects(() => service.reconcileDirectoryAuditResources(
-    tenant, 'synthetic-token', ['LICENSES'], owner,
-  ), TenantVisitLeaseLostError)
+    tenant, 'synthetic-token', ['LICENSES', 'DOMAINS'], owner,
+  ), (error) => error === lost)
+  assert.deepEqual(calls, ['LICENSES'], 'owner loss must stop the next selected collector')
   assert.deepEqual(warnings, [])
 })

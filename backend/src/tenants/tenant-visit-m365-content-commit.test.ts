@@ -218,9 +218,7 @@ for (const stale of [true, false]) {
   })
 }
 
-test('M365 content failure after visit takeover cannot downgrade a successor completion', {
-  skip: process.env.HAWKVIEW_SYNC_M365_CATCH_FAIL_FIRST !== '1',
-}, async () => {
+test('M365 content failure after visit takeover cannot downgrade a successor completion', async () => {
   let ownerLive = true
   let ownerChecks = 0
   let status = 'PENDING'
@@ -356,9 +354,7 @@ test('M365 content rejects a cross-tenant owner before claiming a blob', async (
   )
 })
 
-test('M365 content GET retry refuses a superseded visitor before another provider request', {
-  skip: process.env.HAWKVIEW_SYNC_M365_RETRY_FAIL_FIRST !== '1',
-}, async () => {
+test('M365 content GET retry refuses a superseded visitor before another provider request', async () => {
   let ownerLive = true
   let ownerChecks = 0
   let providerRequests = 0
