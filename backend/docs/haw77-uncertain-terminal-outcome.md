@@ -92,6 +92,29 @@ Those witnesses and runtime integration remain separate gates. No production
 code, query, schema, activation, failure/retry policy or CI inventory changed in
 this test-preparation step.
 
+## Prepared Prisma terminal transport witness
+
+An additional case in the same registered suite prepares the exact terminal
+query through the actual Prisma adapter and an explicitly read-only interactive
+ReadCommitted transaction. A separate pg connection creates committed scoped
+fixtures and applies acknowledged changes. The real raw result array reaches
+the terminal classifier unchanged. Assertions cover all thirteen resource kinds,
+UTC microsecond text under non-default session settings, foreign scope, true null
+versus invalid timestamps, sub-millisecond epoch ordering, retained old-epoch
+receipts and replaced attempts. A forced read-only rollback and a fresh read
+check that independently committed changes remain visible and sibling fixture
+evidence is unchanged. These are fixture mutations, not a proposed epoch or
+attempt lifecycle implementation.
+
+This case is **prepared and unexecuted**, with the existing hosted-only guard
+before Prisma loading or client construction. Local checks cannot establish its
+physical assertions. Even a future pass would prove only the exercised Prisma
+transport, read-only transaction setting and acknowledged cross-connection
+visibility. It would not establish restricted-role access, uncertain commit,
+delayed command arrival, original-operation settlement, authority, deployed
+executor health or a runtime failure-policy fix. Those remain separate gates;
+the held wrapper regression is unresolved and runtime integration stays inactive.
+
 ## Observed defect and scope
 
 The real `runSnapshotSync` wrapper in
