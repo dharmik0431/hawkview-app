@@ -137,6 +137,34 @@ after cancellation, role visibility, operation settlement or stale-effect
 rejection. Scoped cleanup and unchanged sibling evidence are asserted; all
 remaining runtime and disposable-CI gates still apply.
 
+## Prepared restricted-visibility witness
+
+The existing public-schema lockdown migration enables deny-all row security on
+all three terminal-query tables without policies or FORCE. The new prepared
+case checks that catalog shape and uses a unique non-login, non-superuser,
+non-bypass role with SELECT privileges inside a rollback-only fixture
+transaction. It adds no policy and changes no existing role or RLS rule. Direct
+reads under the synthetic role must hide the fixture; the exact terminal query
+must return no rows and UNKNOWN/UNAVAILABLE_OR_AMBIGUOUS. Restoring the original
+role must still find the intact matching completion.
+
+The case then revokes the synthetic role's SELECT privilege on sync states,
+checks that no PUBLIC or inherited privilege defeats that control, and requires
+the actual query to reject with SQLSTATE 42501. The adapter must return only
+UNKNOWN/READ_UNAVAILABLE. A savepoint recovers the aborted statement before the
+original role's positive control. Outer rollback must remove the synthetic role,
+grants and fixture and leave the table security catalog unchanged.
+
+This is **prepared and unexecuted**, guarded before client construction. It
+follows PostgreSQL 16's documented [default-deny row security](https://www.postgresql.org/docs/16/ddl-rowsecurity.html)
+and [SET ROLE semantics](https://www.postgresql.org/docs/16/sql-set-role.html),
+not evidence about deployed credentials. Because the tenant itself is hidden,
+it does not demonstrate partially hidden connection/state joins. No production
+or Microsoft role change, new policy, executor authorization, read-only
+transaction, original-operation settlement or runtime reconciliation is proved.
+Physical execution still requires registered disposable CI and applicable
+exact-source authorization; runtime integration remains inactive.
+
 ## Observed defect and scope
 
 The real `runSnapshotSync` wrapper in

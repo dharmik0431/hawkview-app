@@ -376,6 +376,107 @@ test('HAW-77 terminal readback distinguishes pending rollback and committed comp
     }
   })
 
+test('HAW-77 terminal readback keeps role-hidden rows and permission-denied queries unproved', options,
+  async () => {
+    const db = client(), organizationId = randomUUID()
+    const role = `hv_haw77_visibility_${randomUUID().replaceAll('-', '')}`
+    assert.match(role, /^hv_haw77_visibility_[a-f0-9]{32}$/)
+    const tables = ['customer_tenants', 'tenant_connections', 'sync_states']
+    let connected = false, began = false
+    let originalUser: string | undefined, originalCatalog: Row[] | undefined
+    const catalog = async () => (await db.query(`SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+      c.relacl::text AS acl, (SELECT count(*)::integer FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND c.relname = ANY($1::text[]) ORDER BY c.relname`, [tables])).rows
+    const snapshot = async () => {
+      const output: Record<string, Row[]> = {}
+      for (const table of tables) output[table] = (await db.query(`SELECT to_jsonb(t)::text AS row
+        FROM public.${table} t WHERE organization_id = $1 ORDER BY id`, [organizationId])).rows
+      return output
+    }
+    try {
+      await db.connect(); connected = true
+      await db.query("SET statement_timeout = '5s'")
+      await db.query("SET lock_timeout = '2s'")
+      originalUser = (await db.query('SELECT current_user AS name')).rows[0]!.name as string
+      originalCatalog = await catalog()
+      assert.equal(originalCatalog.length, tables.length)
+      for (const row of originalCatalog) {
+        assert.equal(row.relrowsecurity, true)
+        assert.equal(row.relforcerowsecurity, false)
+        assert.equal(row.policies, 0, 'Exercise the existing deny-all boundary without adding a policy')
+      }
+      await db.query('BEGIN'); began = true
+      const owner = await fixture(db, organizationId), operation = terminalOperation(owner)
+      const before = await snapshot()
+      assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION')
+      // Synthetic disposable role only. Its creation, SELECT grants and fixture
+      // roll back together; existing roles, policies and RLS are not altered.
+      await db.query(`CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOBYPASSRLS NOINHERIT`)
+      await db.query(`GRANT USAGE ON SCHEMA public TO "${role}"`)
+      for (const table of tables) await db.query(`GRANT SELECT ON TABLE public.${table} TO "${role}"`)
+      await db.query(`SET LOCAL ROLE "${role}"`)
+      assert.deepEqual((await db.query('SELECT current_user AS name')).rows, [{ name: role }])
+      assert.deepEqual((await db.query(`SELECT rolcanlogin, rolsuper, rolbypassrls, rolinherit
+        FROM pg_roles WHERE rolname = current_user`)).rows,
+      [{ rolcanlogin: false, rolsuper: false, rolbypassrls: false, rolinherit: false }])
+      for (const table of tables) {
+        assert.deepEqual((await db.query(`SELECT has_table_privilege(current_user, $1, 'SELECT') AS allowed`,
+          [`public.${table}`])).rows, [{ allowed: true }])
+        assert.equal((await db.query(`SELECT id FROM public.${table} WHERE organization_id = $1`,
+          [organizationId])).rowCount, 0, 'SELECT privilege alone must not bypass deny-all row security')
+      }
+      const hidden = await readTerminal(db, operation)
+      assert.deepEqual(hidden.rows, [])
+      assert.deepEqual(hidden.result, { kind: 'UNKNOWN', reason: 'UNAVAILABLE_OR_AMBIGUOUS' })
+      await db.query('RESET ROLE')
+      assert.deepEqual((await db.query('SELECT current_user AS name')).rows, [{ name: originalUser }])
+      assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION')
+      assert.deepEqual(await snapshot(), before, 'Hidden evidence still exists and was not mutated')
+
+      await db.query(`REVOKE SELECT ON TABLE public.sync_states FROM "${role}"`)
+      assert.deepEqual((await db.query(`SELECT has_table_privilege($1::name, 'public.sync_states', 'SELECT') AS allowed`,
+        [role])).rows, [{ allowed: false }], 'PUBLIC or inherited grants must not defeat the permission-denied control')
+      await db.query(`SET LOCAL ROLE "${role}"`)
+      await savepoint(db, async () => {
+        let calls = 0, sqlState: string | undefined
+        const denied = await readInitialSyncTerminalEvidence(operation, async (sql, values) => {
+          calls++
+          try { return (await db.query(sql, [...values])).rows } catch (error) {
+            sqlState = (error as { code?: string }).code
+            throw error
+          }
+        })
+        assert.equal(calls, 1)
+        assert.equal(sqlState, '42501', 'The real query must fail for insufficient privilege')
+        assert.deepEqual(denied, { kind: 'UNKNOWN', reason: 'READ_UNAVAILABLE' },
+          'Transport failure must remain sanitized uncertainty, not an empty successful read')
+      }) // Recover the aborted statement before issuing RESET ROLE or another query.
+      await db.query('RESET ROLE')
+      assert.deepEqual((await db.query('SELECT current_user AS name')).rows, [{ name: originalUser }])
+      assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION')
+      assert.deepEqual(await snapshot(), before)
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (run: () => Promise<unknown>) => {
+        try { await run() } catch (error) { failures.push(error) }
+      }
+      if (connected) {
+        if (began) await clean(() => db.query('ROLLBACK'))
+        await clean(async () => {
+          if (originalUser) assert.deepEqual((await db.query('SELECT current_user AS name')).rows, [{ name: originalUser }])
+          assert.equal((await db.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role])).rowCount, 0)
+          assert.equal((await db.query('SELECT 1 FROM public.organizations WHERE id = $1', [organizationId])).rowCount, 0)
+          for (const table of tables) assert.equal((await db.query(`SELECT 1 FROM public.${table}
+            WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          if (originalCatalog) assert.deepEqual(await catalog(), originalCatalog, 'Role grants and security catalog must roll back unchanged')
+        })
+      }
+      await clean(() => db.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic terminal-visibility cleanup failed')
+    }
+  })
+
 test('HAW-77 coherent reader returns thirteen scoped precise receipts under non-default session settings', options,
   async () => transaction(async db => {
     const owner = await fixture(db)
