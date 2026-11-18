@@ -1,5 +1,8 @@
 import type { Prisma } from '../generated/prisma/client.js'
 import { SyncResourceType, SyncStateStatus } from '../generated/prisma/enums.js'
+import { DAILY_INVENTORY_REFRESH_MS, TWENTY_MINUTE_INVENTORY_REFRESH_MS } from './service-sync-freshness.js'
+
+export { DAILY_INVENTORY_REFRESH_MS, TWENTY_MINUTE_INVENTORY_REFRESH_MS }
 
 /**
  * Selection rules for the Render five-minute scheduler.
@@ -13,9 +16,6 @@ export const DAILY_INVENTORY_ANCHORS = [
   SyncResourceType.LICENSES,
   SyncResourceType.DOMAINS,
 ] as const
-export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
-/** Opt-in healthy full inventory interval; the scheduler defaults to daily. */
-export const TWENTY_MINUTE_INVENTORY_REFRESH_MS = 20 * 60 * 1000
 export type InventoryRefreshInterval =
   typeof DAILY_INVENTORY_REFRESH_MS | typeof TWENTY_MINUTE_INVENTORY_REFRESH_MS
 export const DAILY_INVENTORY_FAILURE_RETRY_MS = 60 * 60 * 1000
