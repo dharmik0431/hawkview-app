@@ -1,5 +1,62 @@
 # HAW-70: distinguish saved health inputs from neighboring response fields
 
+## License dependency checkpoint — 18 November 2026
+
+This local test/documentation child starts at public candidate
+`61c93a2a317759dbea1c450b57fe18eee8bc0d05`. Its recorded disposable-CI pass covers
+the existing lifecycle/audit/sync-state and selected snapshot slices, not license
+participation or this new test. The current-health protocol remains undeployed.
+
+The actual mapper and history writer now have frozen-clock synthetic controls
+for `tenant_licenses.service_plans`. Keeping the connection, all sync states,
+snapshot payloads and observation times unchanged, removing P2, disabling it,
+leaving its provisioning unresolved, supplying legacy null or malformed plans,
+an empty plan list, or removing the license row changes saved Microsoft risk
+availability from AVAILABLE with zero active risky identities to UNAVAILABLE
+with a null count. Restoring the original license input restores the exact saved
+projection. These are seven examples of the dependency, not an exhaustive
+entitlement-policy test.
+
+Separately, an explicitly Disabled SharePoint plan changes saved SHAREPOINT_SITES
+resource health from SUCCESS to NOT_LICENSED while the Microsoft risk summary
+stays identical. Absence of a recognized SharePoint plan is not equivalent to an
+explicitly disabled plan: the current applicability reducer reports UNVERIFIED
+for absence. The fixture uses the explicit disabled case and does not change
+that policy. Quantity-only changes (including zero) change the neighboring
+license-count field but preserve saved health; reordering identical plans also
+preserves the saved projection. These controls describe the current reducer,
+not permission to redefine entitlement from quantity or to assume every future
+model has the same dependencies.
+
+The source chain is `tenantSelect` selecting `servicePlans` ->
+`collectedLicenseServicePlans` -> readiness applicability, selected sign-in
+source and Microsoft risk eligibility -> `mapTenant` -> the actual
+`persistTenantHealthSnapshot` payload. The test still bypasses prior-history
+deduplication using a synthetic sink. It proves neither SQL selection/coherence,
+database invalidation, production behavior, lock ordering nor current-pointer
+admission. No database or provider call is made.
+
+At the inspected head, the normal writer is `syncLicenses` in
+[`tenant-sync.service.ts`](../src/tenants/tenant-sync.service.ts): inside the
+`saveSnapshot` inventory callback it upserts each validated SKU and deletes
+missing scoped SKUs, then the same transaction saves the LICENSES snapshot.
+RUNNING and terminal sync-state writes happen in separate wrapper transactions.
+The existing selected-snapshot invalidator includes only AUTH_REGISTRATIONS and
+RISKY_USERS; it does not include the LICENSES snapshot or `tenant_licenses`.
+Therefore the sync-state trigger and two-resource snapshot trigger cannot be
+treated as complete coverage of this input's intervening commit or direct
+correction/deletion paths. This is a source-coverage gap, not a newly reproduced
+physical stale-pointer race.
+
+The next justified source slice is a reviewed license-inventory invalidation
+contract, including ordinary SKU upsert/delete, bulk and zero-row statements,
+old/new scope, rollback, missing/dead authority, overflow, restricted identities,
+parent deletion and TRUNCATE. It must audit the whole `saveSnapshot` transaction,
+not only a stand-alone SKU statement, and retain HAW-21's separate ownership and
+the documented connection lock-order dependency. Installing another trigger or
+expanding the partial reconciliation receipt is not part of this step. All
+physical writer, reader/recovery, time/model and fleet gates remain open.
+
 ## Decision and scope
 
 Source audit is against `f25334fe5b19cee82519b030565aa62f21aca714`. Its registered

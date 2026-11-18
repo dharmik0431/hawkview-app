@@ -25,7 +25,7 @@ function fixture() {
     tenantLicenses: [{ enabledUnits: 1, servicePlans: [
       { servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' },
       { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' },
-    ] }],
+    ] }] as Array<{ enabledUnits: number; servicePlans?: unknown }>,
     syncStates: [...new Set([...TENANT_HEALTH_RESOURCE_REGISTRY.map(row => row.resourceType),
       'RISKY_USERS', 'AUTHENTICATION_STRENGTHS', 'NAMED_LOCATIONS', 'SECURITY_DEFAULTS'])].map(resourceType => ({
       resourceType, status: 'SUCCEEDED', lastAttemptAt: collected, lastSuccessfulAt: collected,
@@ -48,6 +48,7 @@ function fixture() {
 type Mapped = {
   tenantHealth: ReturnType<typeof deriveTenantHealth>; syncFreshness: TenantSyncFreshness;
   collectionReadiness: ReturnType<typeof deriveCollectionReadiness>; secureScore: number | null;
+  licenseCount: number | null;
 }
 type HistoryWrite = { organizationId: string; customerTenantId: string; payload: unknown }
 function harness(t: TestContext) {
@@ -165,4 +166,67 @@ test('HAW-70 score and policy snapshot payloads change neighboring evidence, not
     }
     assert.deepEqual(result.payload, baseline.payload, `${resource}: current saved projection stays unchanged`)
   }
+})
+
+test('HAW-70 license plan changes invalidate the saved Microsoft risk availability despite unchanged collection rows', async t => {
+  const record = harness(t), original = fixture(), baseline = await record(original)
+  assert.equal(baseline.mapped.tenantHealth.microsoftRiskSummary?.availability, 'AVAILABLE')
+  assert.equal(baseline.mapped.tenantHealth.riskyIdentityCount, 0)
+  const sharePoint = { servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Success' }
+  const p2 = { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }
+  const cases: Array<{ name: string; plans?: unknown; removeInventory?: boolean }> = [
+    { name: 'P2 plan removed', plans: [sharePoint] },
+    { name: 'P2 disabled', plans: [sharePoint, { ...p2, provisioningStatus: 'Disabled' }] },
+    { name: 'P2 provisioning unresolved', plans: [sharePoint, { ...p2, provisioningStatus: 'PendingActivation' }] },
+    { name: 'legacy null plans', plans: null },
+    { name: 'malformed plan record', plans: [sharePoint, { servicePlanName: 'AAD_PREMIUM_P2' }] },
+    { name: 'authoritative empty plans', plans: [] },
+    { name: 'license row removed', removeInventory: true },
+  ]
+  for (const { name, plans, removeInventory } of cases) await t.test(name, async () => {
+    const tenant = structuredClone(original)
+    if (removeInventory) tenant.tenantLicenses = []
+    else tenant.tenantLicenses[0].servicePlans = plans
+    const result = await record(tenant)
+    assert.deepEqual(tenant.syncStates, original.syncStates, 'No sync-state mutation supplies the changed result')
+    assert.deepEqual(tenant.entraSnapshots, original.entraSnapshots, 'Risk snapshot and observation time remain unchanged')
+    assert.equal(result.mapped.tenantHealth.microsoftRiskSummary?.availability, 'UNAVAILABLE')
+    assert.equal(result.mapped.tenantHealth.microsoftRiskSummary?.reasonCode, 'SOURCE_UNAVAILABLE')
+    assert.equal(result.mapped.tenantHealth.riskyIdentityCount, null, 'Unavailable risk cannot retain a certified zero')
+    assert.notDeepEqual(result.payload, baseline.payload, name)
+    const restored = await record(structuredClone(original))
+    assert.deepEqual(restored.payload, baseline.payload, 'Restoring the only changed input restores the saved projection')
+  })
+})
+
+test('HAW-70 SharePoint license applicability changes saved resource health without changing risk evidence', async t => {
+  const record = harness(t), original = fixture(), baseline = await record(original)
+  const resource = (value: Mapped) => value.tenantHealth.resourceHealth.find(row => row.resourceType === 'SHAREPOINT_SITES')
+  assert.equal(resource(baseline.mapped)?.classification, 'SUCCESS')
+  const tenant = structuredClone(original)
+  tenant.tenantLicenses[0].servicePlans = [
+    { servicePlanName: 'SHAREPOINTENTERPRISE', provisioningStatus: 'Disabled' },
+    { servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' },
+  ]
+  const result = await record(tenant)
+  assert.equal(resource(result.mapped)?.classification, 'NOT_LICENSED')
+  assert.deepEqual(result.mapped.tenantHealth.microsoftRiskSummary, baseline.mapped.tenantHealth.microsoftRiskSummary)
+  assert.notDeepEqual(result.payload, baseline.payload, 'Applicability is part of the saved projection, not only neighboring readiness')
+  assert.deepEqual((await record(structuredClone(original))).payload, baseline.payload)
+})
+
+test('HAW-70 license quantity and plan ordering controls do not change the current saved health projection', async t => {
+  const record = harness(t), original = fixture(), baseline = await record(original)
+  assert.equal(baseline.mapped.licenseCount, 1)
+  for (const enabledUnits of [0, 25]) {
+    const tenant = structuredClone(original)
+    tenant.tenantLicenses[0].enabledUnits = enabledUnits
+    const result = await record(tenant)
+    assert.equal(result.mapped.licenseCount, enabledUnits, 'Quantity must change the neighboring response field')
+    assert.deepEqual(result.payload, baseline.payload, 'Current saved health reads service plans, not quantity')
+  }
+  const reordered = structuredClone(original)
+  assert.ok(Array.isArray(reordered.tenantLicenses[0].servicePlans))
+  reordered.tenantLicenses[0].servicePlans.reverse()
+  assert.deepEqual((await record(reordered)).payload, baseline.payload)
 })
