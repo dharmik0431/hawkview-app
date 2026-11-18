@@ -8,6 +8,29 @@ remains inactive; installing its existing migrations would affect writers.
 
 ## Decision
 
+Follow-up test preparation: the existing registered
+[`tenant-health-source-authority.database-integration.test.ts`](../src/tenants/tenant-health-source-authority.database-integration.test.ts)
+now specifies one modeled multi-SKU/direct-writer cycle. It uses actual license
+and authority rows, with explicit client-side authority updates at the proposed
+AFTER-trigger position; it installs no trigger and calls no collector. A holds
+its resource advisory lock, changes SKU 1 and authority; B changes SKU 2 and must
+be observed waiting for A's authority. A savepoint/NOWAIT probe must independently
+show SKU 2 is locked, then A's second source write forms the cycle. Exactly one
+real deadlock SQLSTATE and one successful statement are required; either victim
+is accepted, while timeouts are failures. Both transactions roll back, including
+the survivor; complete fixture source/history/authority state, sibling isolation
+and released row/authority/advisory locks are checked. A serialized rollback-only
+control exercises the same updates without a competitor.
+
+This physical witness is PREPARED/UNEXECUTED. It does not reproduce an installed
+trigger or real `saveSnapshot` transaction and does not prove a correction,
+commit-loss recovery, parent deletion, permission boundary or collector outcome.
+Its explicit client-side invalidation is a model of proposed placement, not an
+application writer to ship. The existing fixture rejects nonregistered/local
+physical targets before constructing clients. No runtime/DDL/migration/workflow
+change or new fixture trigger is introduced. Full-collector and parent schedules
+below remain required after the modeled lock edge is executed and reviewed.
+
 Treat license inventory as a saved-health source, but do not copy the existing
 snapshot invalidator onto it without resolving the full transaction's lock order.
 This checkpoint specifies the desired mutation semantics and the acceptance

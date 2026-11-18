@@ -2170,6 +2170,138 @@ function captureSnapshotRaceQuery(query: Promise<pg.QueryResult>): Promise<{ res
   return query.then(result => ({ result }), error => ({ error }))
 }
 
+test('HAW-70 modeled license invalidation placement exposes the multi-row direct-writer lock cycle',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    // Explicit client-side simulation of a proposed AFTER-trigger position.
+    // Real source/authority locks, but no trigger installation, collector call,
+    // ordering correction, parent-deletion or production deadlock claim.
+    const f = await syncStateAuthorityFixture(context)
+    const direct = new pg.Client({ connectionString: URL!, statement_timeout: 25_000 })
+    const scope = f.scopes[0], rowIds = Array.from({ length: 4 }, () => randomUUID())
+    const organizations = [...new Set(f.scopes.map(s => s.organizationId))]
+    const advisoryKey = `hawkview:snapshot:${scope.tenantId}:LICENSES`
+    const licenseTriggers = async () => (await f.observer.query(`SELECT tgname, pg_get_triggerdef(oid) AS definition
+      FROM pg_trigger WHERE tgrelid = 'public.tenant_licenses'::regclass AND NOT tgisinternal ORDER BY tgname`)).rows
+    const read = async () => {
+      const authorities = []
+      for (let i = 0; i < f.scopes.length; i++) authorities.push(await f.authority(f.observer, i))
+      return {
+        licenses: (await f.observer.query(`SELECT to_jsonb(l) AS row FROM tenant_licenses l
+          WHERE organization_id = ANY($1::uuid[]) ORDER BY id`, [organizations])).rows,
+        histories: (await f.observer.query(`SELECT to_jsonb(h) AS row FROM tenant_health_snapshots h
+          WHERE organization_id = ANY($1::uuid[]) ORDER BY id`, [organizations])).rows,
+        authorities,
+      }
+    }
+    const updateLicense = (client: pg.Client, id: string, marker: string) => client.query(
+      'UPDATE tenant_licenses SET service_plans = $1::jsonb WHERE id = $2 AND organization_id = $3',
+      [JSON.stringify([{ witness: marker }]), id, scope.organizationId])
+    const invalidate = (client: pg.Client) => client.query(`UPDATE tenant_health_source_authorities
+      SET source_revision = source_revision + 1, current_snapshot_id = NULL, current_observation_sequence = 0
+      WHERE organization_id = $1 AND customer_tenant_id = $2 AND live`, [scope.organizationId, scope.tenantId])
+    const begin = async (client: pg.Client) => {
+      await client.query('BEGIN')
+      // Cover both 4s observation windows plus the <=5s detector and margin.
+      // Fixture timeouts bound failed synchronization; they are never acceptance.
+      await client.query("SET LOCAL statement_timeout = '25s'")
+      await client.query("SET LOCAL lock_timeout = '20s'")
+      const detector = (await client.query<{ milliseconds: number }>(
+        "SELECT (EXTRACT(epoch FROM current_setting('deadlock_timeout')::interval) * 1000)::float8 AS milliseconds"
+      )).rows[0].milliseconds
+      assert.ok(detector > 0 && detector <= 5_000, 'Deadlock detection must precede fixture timeouts')
+    }
+    let pendingDirect: ReturnType<typeof captureSnapshotRaceQuery> | undefined
+    let pendingCollector: ReturnType<typeof captureSnapshotRaceQuery> | undefined
+    await direct.connect()
+    try {
+      assert.deepEqual(await licenseTriggers(), [], 'This model assumes no installed license invalidator')
+      for (let i = 0; i < rowIds.length; i++) {
+        const rowScope = f.scopes[i < 2 ? 0 : i - 1]
+        await f.writer.query(`INSERT INTO tenant_licenses
+          (id, organization_id, customer_tenant_id, microsoft_sku_id, sku_part_number, service_plans, updated_at)
+          VALUES ($1, $2, $3, $4, 'HAW70_MODELED_CYCLE', '[{"witness":"baseline"}]'::jsonb, now())`,
+        [rowIds[i], rowScope.organizationId, rowScope.tenantId, randomUUID()])
+      }
+      const before = await read()
+      assert.equal(before.licenses.length, 4)
+      assert.ok(before.authorities.every(a => a.live && a.current_snapshot_id !== null))
+      const { writerPid: collectorPid, deleterPid: directPid } = await snapshotRacePids(f.writer, f.observer, direct)
+
+      await begin(f.writer)
+      await f.writer.query('SELECT pg_advisory_xact_lock(hashtext($1))', [advisoryKey])
+      assert.equal((await updateLicense(f.writer, rowIds[0], 'collector-first')).rowCount, 1)
+      assert.equal((await invalidate(f.writer)).rowCount, 1)
+      assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(before.authorities[0]))
+      assert.deepEqual(await read(), before, 'The first source and authority changes are not committed')
+
+      await begin(direct)
+      assert.equal((await direct.query<{ acquired: boolean }>(
+        'SELECT pg_try_advisory_xact_lock(hashtext($1)) AS acquired', [advisoryKey])).rows[0].acquired, false,
+      'A cooperating collector would wait; the direct DML path proceeds without this lock')
+      assert.equal((await updateLicense(direct, rowIds[1], 'direct-second')).rowCount, 1)
+      pendingDirect = captureSnapshotRaceQuery(invalidate(direct))
+      await assertSnapshotRaceBlocks(f.observer, collectorPid, directPid)
+
+      // Prove the second source-row edge before starting the detector race.
+      // Rolling back this savepoint preserves A's earlier source/authority locks.
+      await f.writer.query('SAVEPOINT second_license_probe')
+      await assert.rejects(f.writer.query('SELECT id FROM tenant_licenses WHERE id = $1 FOR UPDATE NOWAIT',
+        [rowIds[1]]), sqlState('55P03'))
+      await f.writer.query('ROLLBACK TO SAVEPOINT second_license_probe')
+      await f.writer.query('RELEASE SAVEPOINT second_license_probe')
+      await assertSnapshotRaceBlocks(f.observer, collectorPid, directPid)
+      assert.deepEqual(await read(), before)
+
+      pendingCollector = captureSnapshotRaceQuery(updateLicense(f.writer, rowIds[1], 'collector-second'))
+      const outcomes = await Promise.all([pendingCollector, pendingDirect])
+      const failed = outcomes.filter(outcome => outcome.error !== undefined)
+      const succeeded = outcomes.filter(outcome => outcome.error === undefined)
+      assert.equal(failed.length, 1, 'Exactly one cycle participant must be a deadlock victim')
+      assert.ok(sqlState('40P01')(failed[0].error), 'Lock/statement timeout is not deadlock evidence')
+      assert.equal(failed[0].result, undefined)
+      assert.equal(succeeded.length, 1)
+      assert.equal(succeeded[0].result?.rowCount, 1)
+      // PostgreSQL may choose either victim. Never commit the surviving attempt.
+      await Promise.all([f.writer.query('ROLLBACK'), direct.query('ROLLBACK')])
+      assert.deepEqual(await read(), before, 'Both attempts, including the survivor, leave no committed change')
+
+      await f.observer.query('BEGIN')
+      try {
+        assert.equal((await f.observer.query<{ acquired: boolean }>(
+          'SELECT pg_try_advisory_xact_lock(hashtext($1)) AS acquired', [advisoryKey])).rows[0].acquired, true)
+        assert.equal((await f.observer.query(`SELECT id FROM tenant_licenses
+          WHERE organization_id = ANY($1::uuid[]) ORDER BY id FOR UPDATE NOWAIT`, [organizations])).rowCount, 4)
+        assert.equal((await f.observer.query(`SELECT customer_tenant_id FROM tenant_health_source_authorities
+          WHERE organization_id = ANY($1::uuid[]) ORDER BY organization_id, customer_tenant_id FOR UPDATE NOWAIT`,
+        [organizations])).rowCount, 3)
+      } finally { await f.observer.query('ROLLBACK') }
+
+      // Positive control: the same source/authority operations work without a
+      // competitor. This remains rollback-only, not a successful collector.
+      await begin(f.writer)
+      for (const id of rowIds.slice(0, 2)) {
+        assert.equal((await updateLicense(f.writer, id, 'serialized-control')).rowCount, 1)
+        assert.equal((await invalidate(f.writer)).rowCount, 1)
+      }
+      assert.deepEqual(await f.authority(f.writer, 0), f.invalidated(f.invalidated(before.authorities[0])))
+      assert.deepEqual(await read(), before)
+      await f.writer.query('ROLLBACK')
+      assert.deepEqual(await read(), before)
+      assert.deepEqual(await licenseTriggers(), [])
+    } finally {
+      // Before A's second statement exists, A is the known blocker: release it
+      // first. Once both are queued, server timeouts bound failure cleanup;
+      // captured outcomes prevent an unhandled rejection from skipping rollback.
+      try {
+        if (!pendingCollector) await f.writer.query('ROLLBACK')
+        await Promise.all([pendingCollector, pendingDirect])
+      } finally {
+        try { await Promise.all([f.writer.query('ROLLBACK'), direct.query('ROLLBACK')]) }
+        finally { await direct.end() }
+      }
+    }
+  })
+
 for (const deleteTarget of ['tenant', 'organization'] as const) {
   test(`HAW-70 snapshot insert/upsert before ${deleteTarget} deletion preserves writer and deletion commit boundaries`,
     { skip: !RUN, timeout: 120_000 }, async context => {
