@@ -71,6 +71,27 @@ executing those witnesses in approved disposable CI, then producer/owner/settled
 operation integration. Both helpers remain inactive and the held wrapper defect
 is unresolved.
 
+## Prepared physical terminal-query witnesses
+
+Three cases in the existing registered
+[`initial-sync-proof-reader.database-integration.test.ts`](../src/tenants/initial-sync-proof-reader.database-integration.test.ts)
+now prepare execution of the exact terminal query through pg. They cover all
+thirteen resource kinds under non-default time zone/date/search-path settings,
+scoped and missing rows, an old resource receipt retained across a connection
+epoch rotation, replaced attempts, persisted-only RUNNING/FAILED, null versus
+invalid timestamp transport and microsecond epoch ordering. The cases observe
+real returned rows and classifier outcomes, with scoped fixture cleanup through
+transaction/savepoint rollback and positive controls after restoration.
+
+These cases are **prepared, not executed**. Local default loading skips them;
+the existing guard refuses nonregistered targets before constructing a client.
+They use rollback-only fixture transactions, so even a future pass will not
+prove committed-result loss, a separate read-only executor, Prisma transport,
+restricted-role visibility, actual delayed arrival, ownership or settlement.
+Those witnesses and runtime integration remain separate gates. No production
+code, query, schema, activation, failure/retry policy or CI inventory changed in
+this test-preparation step.
+
 ## Observed defect and scope
 
 The real `runSnapshotSync` wrapper in

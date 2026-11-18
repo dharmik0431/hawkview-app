@@ -7,10 +7,12 @@ import { assertDisposableTestDatabase } from '../prisma/native-alert-test-databa
 import { INITIAL_SYNC_RESOURCE_TYPES } from './initial-sync-status.js'
 import { readInitialSyncProof, type InitialSyncProofScope } from './initial-sync-proof-reader.js'
 import { validateInitialSyncCompletionProjection } from './initial-sync-proof-projection.js'
+import { readInitialSyncTerminalEvidence } from './initial-sync-terminal-readback.js'
+import type { InitialSyncTerminalOperation } from './initial-sync-terminal-evidence.js'
 
 // Registered hosted PostgreSQL only. Fixtures assert stored facts, not producer
-// completeness, deployed-role access or notice ownership. The final case uses
-// the real Prisma adapter; the preceding cases use pg directly.
+// completeness, deployed-role access or notice ownership. The aggregate Prisma
+// case uses the real adapter; other cases (including terminal readback) use pg.
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
   && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
 const options = { skip: !enabled, timeout: 45_000 }
@@ -97,6 +99,163 @@ async function savepoint(db: pg.Client, run: () => Promise<void>) {
     await db.query('RELEASE SAVEPOINT witness')
   }
 }
+
+function terminalOperation(owner: Fixture, resource = 'SIGN_INS'): InitialSyncTerminalOperation {
+  return { ...owner.scope, connectionId: owner.connectionId, epochId: owner.epoch,
+    attemptId: owner.states.get(resource)!.attempt, resourceType: resource,
+    persistedKind: resource === 'SIGN_INS' ? 'GRAPH_SIGN_INS' : 'FULL_RESOURCE' }
+}
+
+async function readTerminal(db: pg.Client, operation: InitialSyncTerminalOperation) {
+  let calls = 0
+  let rows: Row[] = []
+  const result = await readInitialSyncTerminalEvidence(operation, async (sql, values) => {
+    calls++
+    rows = (await db.query(sql, [...values])).rows
+    return rows
+  })
+  assert.equal(calls, 1)
+  return { rows, result }
+}
+
+// These terminal cases exercise the exact SQL/pg transport in rollback-only
+// fixture transactions. They do not exercise committed-result loss, a separate
+// read-only executor, Prisma transport, role visibility or ownership settlement.
+test('HAW-77 terminal readback selects exact scoped resources and preserves absent or foreign evidence', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), sibling = await fixture(db)
+    await db.query("SET LOCAL TIME ZONE 'Asia/Kathmandu'")
+    await db.query("SET LOCAL DateStyle = 'SQL, DMY'")
+    await db.query('SET LOCAL search_path TO pg_catalog')
+    const snapshot = async () => (await db.query(`SELECT to_jsonb(s) AS row FROM public.sync_states s
+      WHERE organization_id = $1 ORDER BY id`, [owner.scope.organizationId])).rows
+    const before = await snapshot()
+    for (const resource of INITIAL_SYNC_RESOURCE_TYPES) {
+      const operation = terminalOperation(owner, resource)
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.rows.length, 1)
+      const row = actual.rows[0]!
+      assert.equal(row.stateId, owner.states.get(resource)!.id)
+      assert.equal(row.expectedResourceType, resource)
+      assert.equal(row.stateResourceType, resource)
+      assert.equal(row.organizationId, owner.scope.organizationId)
+      assert.equal(row.customerTenantId, owner.scope.customerTenantId)
+      assert.equal(row.connectionId, owner.connectionId)
+      assert.equal(row.initialSyncEpochId, owner.epoch)
+      assert.equal(row.initialSyncAttemptId, operation.attemptId)
+      assert.equal(row.epochStartedAtUtc, start)
+      assert.equal(row.lastAttemptAtUtc, attempted)
+      assert.equal(row.lastSuccessfulAtUtc, succeeded)
+      assert.match(String(row.observedAtUtc), /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+      assert.equal(actual.result.kind, 'MATCHING_COMPLETION')
+      assert.deepEqual(actual.result.operation, operation)
+      assert.equal(actual.result.observed.atUtc, row.observedAtUtc)
+    }
+    assert.deepEqual(await snapshot(), before, 'Terminal readbacks must not mutate stored resource evidence')
+    for (const operation of [{ ...terminalOperation(owner), organizationId: sibling.scope.organizationId },
+      { ...terminalOperation(owner), customerTenantId: randomUUID() }]) {
+      const actual = await readTerminal(db, operation)
+      assert.deepEqual(actual.rows, [])
+      assert.equal(actual.result.kind, 'UNKNOWN')
+    }
+    await savepoint(db, async () => {
+      await db.query('DELETE FROM public.sync_states WHERE id = $1', [owner.states.get('SIGN_INS')!.id])
+      const actual = await readTerminal(db, terminalOperation(owner))
+      assert.equal(actual.rows.length, 1, 'Absent state remains an explicit left-joined row')
+      assert.equal(actual.rows[0]!.stateId, null)
+      assert.equal(actual.rows[0]!.initialSyncCompletedAttemptId, null)
+      assert.equal(actual.result.kind, 'UNKNOWN')
+      assert.equal((await readTerminal(db, terminalOperation(sibling))).result.kind, 'MATCHING_COMPLETION')
+    })
+    await savepoint(db, async () => {
+      await db.query('DELETE FROM public.tenant_connections WHERE id = $1', [owner.connectionId])
+      const actual = await readTerminal(db, terminalOperation(owner))
+      assert.equal(actual.rows.length, 1)
+      assert.equal(actual.rows[0]!.connectionId, null)
+      assert.equal(actual.result.kind, 'UNKNOWN')
+    })
+  }))
+
+test('HAW-77 terminal readback retains old epoch receipts and distinguishes replacement from current completion', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), operation = terminalOperation(owner), stateId = owner.states.get('SIGN_INS')!.id
+    const before = (await db.query('SELECT to_jsonb(s) AS row FROM public.sync_states s WHERE id = $1', [stateId])).rows
+    await savepoint(db, async () => {
+      const nextEpoch = randomUUID()
+      await db.query(`UPDATE public.tenant_connections SET initial_sync_epoch_id = $1,
+        initial_sync_epoch_started_at = $2 WHERE id = $3`, [nextEpoch, stamp('000850'), owner.connectionId])
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.rows[0]!.initialSyncEpochId, nextEpoch)
+      assert.equal(actual.rows[0]!.initialSyncAttemptEpochId, owner.epoch)
+      assert.equal(actual.rows[0]!.lastAttemptAtUtc, attempted)
+      assert.equal(actual.result.kind, 'SUPERSEDED')
+      assert.equal(actual.result.observed.epochId, nextEpoch)
+      assert.equal(actual.result.observed.attemptEpochId, owner.epoch)
+      assert.equal(actual.result.operation.epochId, owner.epoch)
+      assert.equal((await readTerminal(db, { ...operation, epochId: nextEpoch })).result.kind, 'UNKNOWN',
+        'Current-epoch callers cannot reuse retained old-epoch proof')
+      assert.deepEqual((await db.query('SELECT to_jsonb(s) AS row FROM public.sync_states s WHERE id = $1', [stateId])).rows, before)
+    })
+    await savepoint(db, async () => {
+      const nextAttempt = randomUUID()
+      await db.query(`UPDATE public.sync_states SET initial_sync_attempt_id = $1,
+        initial_sync_persisted_attempt_id = $1, initial_sync_completed_attempt_id = $1 WHERE id = $2`, [nextAttempt, stateId])
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.result.kind, 'SUPERSEDED')
+      assert.equal(actual.result.observed.attemptId, nextAttempt)
+      assert.equal(actual.result.operation.attemptId, operation.attemptId)
+      assert.equal((await readTerminal(db, { ...operation, attemptId: nextAttempt })).result.kind, 'MATCHING_COMPLETION')
+    })
+    for (const status of ['RUNNING', 'FAILED']) await savepoint(db, async () => {
+      await db.query(`UPDATE public.sync_states SET initial_sync_completed_attempt_id = NULL,
+        status = $1::public."SyncStateStatus", last_error_message = $2 WHERE id = $3`,
+      [status, status === 'FAILED' ? 'Synthetic persisted-only failure' : null, stateId])
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.rows[0]!.initialSyncPersistedAttemptId, operation.attemptId)
+      assert.equal(actual.rows[0]!.initialSyncCompletedAttemptId, null)
+      assert.equal(actual.result.kind, 'PERSISTED_ONLY')
+      assert.equal(actual.result.observed.status, status)
+    })
+    assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION', 'Savepoint cleanup restores original evidence')
+  }))
+
+test('HAW-77 terminal readback transports invalid timestamps distinctly from null and rejects microsecond violations', options,
+  async () => transaction(async db => {
+    const owner = await fixture(db), operation = terminalOperation(owner), stateId = owner.states.get('SIGN_INS')!.id
+    await savepoint(db, async () => {
+      await db.query(`UPDATE public.sync_states SET initial_sync_completed_attempt_id = NULL,
+        status = 'FAILED', last_error_message = 'Synthetic retained persistence', last_successful_at = NULL WHERE id = $1`, [stateId])
+      const absent = await readTerminal(db, operation)
+      assert.equal(absent.rows[0]!.lastSuccessfulAtUtc, null)
+      assert.equal(absent.result.kind, 'PERSISTED_ONLY')
+      for (const invalid of ['infinity', '-infinity', '0001-01-01 00:00:00+00 BC', '10000-01-01 00:00:00+00']) {
+        await db.query('UPDATE public.sync_states SET last_successful_at = $1 WHERE id = $2', [invalid, stateId])
+        const actual = await readTerminal(db, operation)
+        assert.equal(actual.rows[0]!.lastSuccessfulAtUtc, 'INVALID_TIMESTAMP', invalid)
+        assert.equal(actual.result.kind, 'UNKNOWN', invalid)
+      }
+    })
+    await savepoint(db, async () => {
+      await db.query('UPDATE public.sync_states SET last_attempt_at = $1 WHERE id = $2', [stamp('000099'), stateId])
+      const actual = await readTerminal(db, operation), row = actual.rows[0]!
+      assert.equal(row.lastAttemptAtUtc, stamp('000099'))
+      assert.equal(new Date(row.lastAttemptAtUtc as string).getTime(), new Date(row.epochStartedAtUtc as string).getTime())
+      assert.equal(actual.result.kind, 'UNKNOWN', 'Rounded milliseconds must not certify a pre-epoch attempt')
+    })
+    await savepoint(db, async () => {
+      await db.query('UPDATE public.sync_states SET last_successful_at = $1 WHERE id = $2', ['9999-12-31T23:59:59.999999Z', stateId])
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.rows[0]!.lastSuccessfulAtUtc, '9999-12-31T23:59:59.999999Z')
+      assert.equal(actual.result.kind, 'UNKNOWN', 'Representable future success is not current completion')
+    })
+    for (const invalid of ['0001-01-01 00:00:00+00 BC', '10000-01-01 00:00:00+00']) await savepoint(db, async () => {
+      await db.query('UPDATE public.tenant_connections SET initial_sync_epoch_started_at = $1 WHERE id = $2', [invalid, owner.connectionId])
+      const actual = await readTerminal(db, operation)
+      assert.equal(actual.rows[0]!.epochStartedAtUtc, 'INVALID_TIMESTAMP')
+      assert.equal(actual.result.kind, 'UNKNOWN')
+    })
+    assert.equal((await readTerminal(db, operation)).result.kind, 'MATCHING_COMPLETION')
+  }))
 
 test('HAW-77 coherent reader returns thirteen scoped precise receipts under non-default session settings', options,
   async () => transaction(async db => {
