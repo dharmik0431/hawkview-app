@@ -14,7 +14,11 @@ import { projectSyncOutcome } from './sync-outcome-projection.js'
 import { collectDirectoryRoles, DIRECTORY_ROLE_URL } from './directory-role-collector.js'
 import { captureConnectionVerification, publishConnectionVerification, publishCapturedConnectionRefresh, type CapturedConnectionVerification } from './connection-verification-store.js'
 import { validatedLicenseRows } from './license-validation.js'
-import { CORE_AUTHENTICATION_PARTIAL, isCoreAuthenticationPartial } from './authentication-collection-outcome.js'
+import {
+  CORE_AUTHENTICATION_PARTIAL,
+  isCoreAuthenticationPartial,
+  isRecognizedLimitedSignInCode,
+} from './authentication-collection-outcome.js'
 import {
   BadRequestException,
   BadGatewayException,
@@ -73,6 +77,10 @@ import { CURRENT_SECURE_SCORE_URL, currentSecureScoresFromResponse, SecureScoreR
 import { deriveTenantSyncFreshness } from './service-sync-freshness.js'
 import {
   deriveInitialSyncStatus,
+  initialSyncEpochStart,
+  INITIAL_SYNC_RESOURCE_TYPES,
+  initialSyncStateHasInitializingSignIns,
+  initialSyncStateHasLimitedSignIns,
   initialSyncStateRequiresAction,
 } from './initial-sync-status.js'
 import {
@@ -1134,6 +1142,20 @@ export async function parseBoundedGraphCollectionPage(
   response: Response,
   resourceLabel: string,
 ) {
+  // A valid JSON body does not establish complete collection coverage when
+  // Graph marks the transport as partial. Reject it before parsing or writing
+  // any rows; never include provider Warning text in the error.
+  const warning = response.headers.get('warning')
+  if (response.status !== 200 || warning !== null) {
+    await cancelBoundedStream(() => response.body?.cancel())
+    const warningCode = warning?.match(/^\s*(\d{3})(?:\s|$)/)?.[1]
+    const detail = warning !== null ? ` (Warning code ${warningCode ?? 'unclassified'})` : ''
+    const message = `Microsoft ${resourceLabel} returned an invalid response${detail}; collection was not advanced.`
+    if (response.status === 206 || (response.status === 200 && warning !== null)) {
+      throw new MicrosoftPartialResponseError(message, response.status)
+    }
+    throw new MicrosoftRequestError(message, response.status, null, null)
+  }
   try {
     const parsed = JSON.parse(
       await readBoundedResponseText(response, GRAPH_LOG_PAGE_MAX_BYTES),
@@ -2343,15 +2365,68 @@ export class TenantSyncService {
           customerTenantId: tenant.id,
           lastAttemptAt: { gte: now },
         },
-        select: { resourceType: true, status: true },
+        select: { resourceType: true, status: true, lastErrorCode: true, lastAttemptAt: true, lastSuccessfulAt: true },
       })
       const persistedFailedResources = attemptedStates
         .filter((state) => state.status === 'FAILED')
         .map((state) => state.resourceType)
-      const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
+      const incompleteSignIns = attemptedStates
+        .filter((state) => initialSyncStateHasLimitedSignIns(state) || initialSyncStateHasInitializingSignIns(state))
+        .map((state) => state.resourceType)
+      const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...incompleteSignIns])].sort()
+      const hasNonterminalAttempt = attemptedStates.some((state) =>
+        state.status !== 'SUCCEEDED' && state.status !== 'FAILED')
+      const proofReadAt = new Date()
+      // A later incremental Graph pass can finish an earlier incomplete first
+      // pass. Close its warning only after this visit proves SIGN_INS success
+      // and the persisted baseline still proves every required source.
+      const currentGraphSignIn = attemptedStates.find((state) =>
+        state.resourceType === 'SIGN_INS' && state.status === 'SUCCEEDED' &&
+        !state.lastErrorCode && Boolean(state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() >= now.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime()))
+      if (!capturedManaged && failedResources.length === 0 && !hasNonterminalAttempt && currentGraphSignIn) {
+        const baselineStates = await this.prisma.syncState.findMany({
+          where: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType: { in: [...INITIAL_SYNC_RESOURCE_TYPES] },
+          },
+          select: {
+            resourceType: true,
+            status: true,
+            lastAttemptAt: true,
+            lastSuccessfulAt: true,
+            lastErrorCode: true,
+            lastErrorMessage: true,
+          },
+        })
+        // Future or inverted timestamps cannot be evidence of a completed
+        // baseline, even if the status row says SUCCEEDED.
+        const baselineTimesValid = baselineStates.every((state) => Boolean(
+          state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime()))
+        const persistedGraphSignIn = baselineStates.find((state) => state.resourceType === 'SIGN_INS')
+        const sameGraphSignInProof = persistedGraphSignIn?.status === 'SUCCEEDED' &&
+          !persistedGraphSignIn.lastErrorCode &&
+          persistedGraphSignIn.lastAttemptAt?.getTime() === currentGraphSignIn.lastAttemptAt?.getTime() &&
+          persistedGraphSignIn.lastSuccessfulAt?.getTime() === currentGraphSignIn.lastSuccessfulAt?.getTime()
+        if (sameGraphSignInProof && baselineTimesValid && deriveInitialSyncStatus({
+          startedAt: initialSyncEpochStart(tenant.connection),
+          syncStates: baselineStates,
+        }).status === 'COMPLETE') {
+          await this.notifications.resolveIncidentIfEventType(
+            tenant.organizationId,
+            `tenant:${tenant.id}:initial-sync`,
+            ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required'],
+          )
+        }
+      }
       return {
         bundle: includeBundle ? await this.buildBundle(tenant) : null,
-        status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+        status: failedResources.length > 0 || hasNonterminalAttempt ? 'PARTIAL' : 'SUCCEEDED',
         failedResources,
       }
     }
@@ -2558,44 +2633,85 @@ export class TenantSyncService {
       (state) => state.status === 'FAILED',
     )
     const persistedFailedResources = new Set<string>(failedStates.map((state) => state.resourceType))
-    const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources])].sort()
-    const unclassifiedResources = failedResources.filter((resource) => !persistedFailedResources.has(resource))
+    const limitedResources = new Set<string>(attemptedStates
+      .filter(initialSyncStateHasLimitedSignIns)
+      .map((state) => state.resourceType))
+    const initializingResources = new Set<string>(attemptedStates
+      .filter(initialSyncStateHasInitializingSignIns)
+      .map((state) => state.resourceType))
+    const failedResources = [...new Set([...persistedFailedResources, ...rejectedResources, ...limitedResources, ...initializingResources])].sort()
+    // A collector can retain RUNNING to signal bounded backlog without
+    // rejecting or persisting FAILED. It did not complete this pass, so the
+    // aggregate run must not count as succeeded in scheduler results.
+    const hasNonterminalAttempt = attemptedStates.some((state) =>
+      state.status !== 'SUCCEEDED' && state.status !== 'FAILED')
+    const unclassifiedResources = failedResources.filter((resource) =>
+      !persistedFailedResources.has(resource) &&
+      (rejectedResources.has(resource) || (!limitedResources.has(resource) && !initializingResources.has(resource))))
     const actionRequiredResources = failedStates
       .filter(initialSyncStateRequiresAction)
       .map((state) => state.resourceType)
-    const retryingResources = failedStates
+    const retryingResources = [...new Set([...failedStates
       .filter((state) => !initialSyncStateRequiresAction(state))
-      .map((state) => state.resourceType)
+      .map((state) => state.resourceType),
+    ...[...initializingResources].filter((resource) => !rejectedResources.has(resource))])].sort()
     const initialSync = !existingState?.lastSuccessfulAt
+    const startedAt = initialSyncEpochStart(tenant.connection)
+    // A collector may return without persisting a state row. A full pass has
+    // not proved coverage unless every required source completed this attempt.
+    // Future or inverted timestamps cannot prove either the aggregate result
+    // or the initial-sync notice, even if the persisted status says SUCCEEDED.
+    const proofReadAt = new Date()
+    const requiredResourcesComplete = INITIAL_SYNC_RESOURCE_TYPES.every((resourceType) =>
+      attemptedStates.some((state) =>
+        state.resourceType === resourceType && state.status === 'SUCCEEDED' && Boolean(
+          state.lastAttemptAt && state.lastSuccessfulAt &&
+          state.lastAttemptAt.getTime() >= now.getTime() &&
+          state.lastAttemptAt.getTime() <= state.lastSuccessfulAt.getTime() &&
+          state.lastSuccessfulAt.getTime() <= proofReadAt.getTime(),
+        )))
+    const baselineComplete = failedResources.length === 0 &&
+      requiredResourcesComplete &&
+      deriveInitialSyncStatus({ startedAt, syncStates: attemptedStates }).status === 'COMPLETE'
     if (initialSync) {
       const unclassified = unclassifiedResources.length > 0
       const actionRequired = actionRequiredResources.length > 0
+      const limited = limitedResources.size > 0
       const retrying = !actionRequired && retryingResources.length > 0
+      const unproven = !baselineComplete && failedResources.length === 0
       if (!capturedManaged) await this.notifications.publishIncident({
         organizationId: tenant.organizationId,
         customerTenantId: tenant.id,
         eventType: actionRequired
           ? 'tenant.initial_sync_action_required'
-          : retrying || unclassified
+          : retrying || unclassified || limited || unproven
             ? 'tenant.initial_sync_in_progress'
             : 'tenant.initial_sync_completed',
-        category: unclassified || actionRequired ? 'warning' : retrying ? 'info' : 'success',
+        category: unclassified || actionRequired || limited ? 'warning' : retrying || unproven ? 'info' : 'success',
         severity: actionRequired ? 'medium' : 'info',
         title:
           unclassified
             ? 'Initial tenant sync incomplete'
             : actionRequired
               ? 'Initial tenant sync needs attention'
+              : limited
+                ? 'Initial tenant sync has limited coverage'
               : retrying
                 ? 'Initial tenant sync in progress'
+                : unproven
+                  ? 'Initial tenant sync in progress'
                 : 'Initial tenant sync completed',
         description:
           unclassified
             ? 'Some data sources did not finish collection. Review their sync status for available details.'
             : actionRequired
               ? `${actionRequiredResources.length} data source${actionRequiredResources.length === 1 ? '' : 's'} requires administrator action before collection can finish.`
+              : limited
+                ? 'Limited sign-in evidence is available, but full Microsoft Graph sign-in coverage is unconfirmed. Review the tenant sync status for the reason and next step.'
               : retrying
                 ? `HawkView is still collecting Microsoft 365 data and will automatically retry ${retryingResources.length} data source${retryingResources.length === 1 ? '' : 's'}. No action is required yet.`
+                : unproven
+                  ? 'Required data sources have not all confirmed completion. Review the tenant sync status for current progress.'
                 : 'HawkView finished collecting the tenant data required for monitoring.',
         dedupeKey: `tenant:${tenant.id}:initial-sync`,
         source: 'tenant-sync',
@@ -2605,13 +2721,30 @@ export class TenantSyncService {
           failedResources,
           unclassifiedResources,
           retryingResources,
+          limitedResources: [...limitedResources].sort(),
+          initializingResources: [...initializingResources].sort(),
           actionRequiredResources,
         },
       })
     }
+    // The first pass may have published an incomplete initial-sync incident
+    // before USERS established its successful baseline. A later full pass must
+    // close that warning only when every required source proves completion.
+    if (
+      !capturedManaged &&
+      !initialSync &&
+      !incrementalOnly &&
+      baselineComplete
+    ) {
+      await this.notifications.resolveIncidentIfEventType(
+        tenant.organizationId,
+        `tenant:${tenant.id}:initial-sync`,
+        ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required'],
+      )
+    }
     return {
       bundle: includeBundle ? await this.buildBundle(tenant) : null,
-      status: failedResources.length > 0 ? 'PARTIAL' : 'SUCCEEDED',
+      status: failedResources.length > 0 || hasNonterminalAttempt || !requiredResourcesComplete ? 'PARTIAL' : 'SUCCEEDED',
       failedResources,
     }
   }
@@ -2846,24 +2979,6 @@ export class TenantSyncService {
           consecutiveFailures: 0,
         },
       }))
-      await this.notifications.resolveIncident(
-        tenant.organizationId,
-        `tenant:${tenant.id}:sync:${resourceType}`,
-        {
-          customerTenantId: tenant.id,
-          eventType: 'tenant.sync_recovered',
-          category: 'success',
-          severity: 'info',
-          title: `${resourceType.replaceAll('_', ' ')} synchronization recovered`,
-          description: 'HawkView is receiving this Microsoft 365 data again.',
-          source: 'tenant-sync',
-          actionUrl: `/tenants/${tenant.id}`,
-          actionLabel: 'View tenant',
-        }
-      )
-      if (exchangePhase) {
-        logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
-      }
     } catch (error) {
       if (exchangePhase) {
         logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'FAILED', lastAttemptAt.getTime())
@@ -2887,18 +3002,23 @@ export class TenantSyncService {
             consecutiveFailures: 0,
           },
         }))
-        // A previous deployment could have published an incident for this
-        // normal provisioning state. Retire it without claiming collection
-        // success; readiness will continue to report INITIALIZING.
-        await this.notifications.resolveIncident(
-          tenant.organizationId,
-          `tenant:${tenant.id}:sync:${resourceType}`,
-        )
+        // SIGN_INS initialization does not prove recovery from an earlier
+        // collection failure. Keep that incident open until a full success.
+        if (resourceType === 'SIGN_INS') {
+          await this.notifications.refreshOpenSignInIncident(tenant.organizationId, tenant.id, 'INITIALIZING')
+        } else {
+          await this.notifications.resolveIncident(
+            tenant.organizationId,
+            `tenant:${tenant.id}:sync:${resourceType}`,
+          )
+        }
         return
       }
       const corePartial = error instanceof CollectionPartialError &&
         isCoreAuthenticationPartial(resourceType, error.code)
-      if (error instanceof CollectionPartialError && !corePartial) {
+      const acceptedPartial = error instanceof CollectionPartialError &&
+        (resourceType !== 'SIGN_INS' || isRecognizedLimitedSignInCode(resourceType, error.code))
+      if (acceptedPartial) {
         await this.withSnapshotUtc(resourceType, (transaction) => transaction.syncState.update({
           where: {
             customerTenantId_resourceType: {
@@ -2914,10 +3034,15 @@ export class TenantSyncService {
             consecutiveFailures: 0,
           },
         }))
-        await this.notifications.resolveIncident(
-          tenant.organizationId,
-          `tenant:${tenant.id}:sync:${resourceType}`,
-        )
+        // Limited sign-in evidence does not restore the selected Graph source.
+        if (resourceType === 'SIGN_INS') {
+          await this.notifications.refreshOpenSignInIncident(tenant.organizationId, tenant.id, 'LIMITED')
+        } else {
+          await this.notifications.resolveIncident(
+            tenant.organizationId,
+            `tenant:${tenant.id}:sync:${resourceType}`,
+          )
+        }
         return
       }
       // Core evidence loss follows the existing failure/incident lifecycle.
@@ -2997,6 +3122,28 @@ export class TenantSyncService {
       }
       throw new BadGatewayException(message)
     }
+
+    // Collection and its terminal update have both acknowledged success.
+    // Notification errors must still propagate, but cannot reclassify these
+    // stored collection facts or increment a Microsoft collection failure.
+    if (exchangePhase) {
+      logProcessMemoryPhase(this.logger, 'exchange_configuration_collection', 'COMPLETED', lastAttemptAt.getTime())
+    }
+    await this.notifications.resolveIncident(
+      tenant.organizationId,
+      `tenant:${tenant.id}:sync:${resourceType}`,
+      {
+        customerTenantId: tenant.id,
+        eventType: 'tenant.sync_recovered',
+        category: 'success',
+        severity: 'info',
+        title: `${resourceType.replaceAll('_', ' ')} synchronization recovered`,
+        description: 'HawkView is receiving this Microsoft 365 data again.',
+        source: 'tenant-sync',
+        actionUrl: `/tenants/${tenant.id}`,
+        actionLabel: 'View tenant',
+      }
+    )
   }
 
   private async syncLicenses(
@@ -6608,10 +6755,7 @@ export class TenantSyncService {
         : null
     const syncFreshness = deriveTenantSyncFreshness(syncStates)
     const initialSync = deriveInitialSyncStatus({
-      startedAt:
-        tenant.connection?.onboardingCompletedAt ??
-        tenant.connection?.consentedAt ??
-        null,
+      startedAt: initialSyncEpochStart(tenant.connection),
       syncStates,
     })
 

@@ -51,6 +51,118 @@ test('notification operational logs never include hostile caller event types on 
   }
 })
 
+test('typed incident resolution only closes an unresolved matching warning', async () => {
+  const rows = new Map([
+    ['warning', { eventType: 'tenant.initial_sync_in_progress', resolvedAt: null as Date | null }],
+    ['success', { eventType: 'tenant.initial_sync_completed', resolvedAt: null as Date | null }],
+  ])
+  const service = new NotificationsService({
+    notification: {
+      updateMany: async ({ where, data }: any) => {
+        assert.equal(where.organizationId, 'org')
+        assert.equal(where.resolvedAt, null)
+        const row = rows.get(where.dedupeKey)
+        if (!row || row.resolvedAt || !where.eventType.in.includes(row.eventType)) return { count: 0 }
+        row.resolvedAt = data.resolvedAt
+        return { count: 1 }
+      },
+    },
+  } as any)
+  ;(service as any).logger = { log: () => undefined, error: () => undefined }
+  const allowed = ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required']
+
+  assert.equal(await service.resolveIncidentIfEventType('org', 'success', allowed), false)
+  assert.equal(rows.get('success')?.resolvedAt, null)
+  assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), true)
+  assert.ok(rows.get('warning')?.resolvedAt instanceof Date)
+  assert.equal(await service.resolveIncidentIfEventType('org', 'warning', allowed), false)
+})
+
+test('republished initial-sync notice changes event type with its deduped status', async () => {
+  const key = 'tenant:tenant-1:initial-sync'
+  const row = {
+    id: 'notice-1', organizationId: 'org-1', dedupeKey: key,
+    eventType: 'tenant.initial_sync_in_progress', resolvedAt: null as Date | null,
+    occurrenceCount: 1,
+  }
+  const service = new NotificationsService({
+    notification: {
+      upsert: async ({ where, update }: any) => {
+        assert.deepEqual(where.organizationId_dedupeKey, { organizationId: 'org-1', dedupeKey: key })
+        Object.assign(row, update, { occurrenceCount: row.occurrenceCount + 1 })
+        return row
+      },
+      updateMany: async ({ where, data }: any) => {
+        assert.equal(where.organizationId, row.organizationId)
+        assert.equal(where.dedupeKey, row.dedupeKey)
+        if (row.resolvedAt || !where.eventType.in.includes(row.eventType)) return { count: 0 }
+        row.resolvedAt = data.resolvedAt
+        return { count: 1 }
+      },
+    },
+    notificationUserState: { deleteMany: async () => ({ count: 0 }) },
+  } as any)
+  ;(service as any).logger = { log: () => undefined, error: () => undefined }
+  const publish = (eventType: string) => service.publishIncident({
+    organizationId: 'org-1', customerTenantId: 'tenant-1', eventType,
+    category: 'info', title: eventType, description: 'Current status',
+    dedupeKey: key, source: 'tenant-sync',
+  })
+  const warningTypes = ['tenant.initial_sync_in_progress', 'tenant.initial_sync_action_required']
+
+  await publish('tenant.initial_sync_completed')
+  assert.equal(row.eventType, 'tenant.initial_sync_completed')
+  assert.equal(await service.resolveIncidentIfEventType('org-1', key, warningTypes), false)
+  assert.equal(row.resolvedAt, null)
+
+  await publish('tenant.initial_sync_in_progress')
+  assert.equal(row.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(await service.resolveIncidentIfEventType('org-1', key, warningTypes), true)
+  assert.ok((row.resolvedAt as Date | null) instanceof Date)
+})
+
+test('limited sign-in passes replace stale incident reason and action without republishing or resolving it', async () => {
+  const oldAction = '/tenants/tenant-1/settings'
+  const rows = [
+    { organizationId: 'org-1', customerTenantId: 'tenant-1', dedupeKey: 'tenant:tenant-1:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: null as Date | null, title: 'Sign ins require attention', description: 'Review Microsoft permissions.', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: { reasonCode: 'MICROSOFT_PERMISSION_DENIED' }, occurrenceCount: 3 },
+    { organizationId: 'other-org', customerTenantId: 'tenant-1', dedupeKey: 'tenant:tenant-1:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: null as Date | null, title: 'Foreign incident', description: 'Foreign', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: {}, occurrenceCount: 1 },
+    { organizationId: 'org-1', customerTenantId: 'tenant-2', dedupeKey: 'tenant:tenant-2:sync:SIGN_INS', eventType: 'tenant.sync_failed', resolvedAt: new Date(), title: 'Resolved incident', description: 'Old', actionUrl: oldAction, actionLabel: 'Review permissions', severity: 'high', metadata: {}, occurrenceCount: 1 },
+    { organizationId: 'org-1', customerTenantId: 'tenant-3', dedupeKey: 'tenant:tenant-3:sync:SIGN_INS', eventType: 'tenant.sync_recovered', resolvedAt: null as Date | null, title: 'Recovery notice', description: 'Recovered', actionUrl: oldAction, actionLabel: 'View tenant', severity: 'info', metadata: {}, occurrenceCount: 1 },
+  ]
+  const service = new NotificationsService({
+    notification: {
+      updateMany: async ({ where, data }: any) => {
+        const matching = rows.filter(row => row.organizationId === where.organizationId && row.customerTenantId === where.customerTenantId && row.dedupeKey === where.dedupeKey && row.eventType === where.eventType && row.resolvedAt === where.resolvedAt)
+        matching.forEach(row => Object.assign(row, data))
+        return { count: matching.length }
+      },
+      upsert: async () => { throw new Error('Refreshing must not republish') },
+    },
+    notificationUserState: { deleteMany: async () => { throw new Error('Refreshing must retain user state') } },
+  } as any)
+  ;(service as any).logger = { error: () => undefined }
+
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-1', 'LIMITED'), true)
+  assert.equal(rows[0]?.title, 'Sign in coverage limited')
+  assert.match(rows[0]?.description ?? '', /full Microsoft Graph sign in coverage is not yet verified/i)
+  assert.equal(rows[0]?.actionUrl, '/tenants/tenant-1')
+  assert.equal(rows[0]?.actionLabel, 'View synchronization')
+  assert.equal(rows[0]?.severity, 'medium')
+  assert.deepEqual(rows[0]?.metadata, { resourceType: 'SIGN_INS', coverageState: 'LIMITED', consecutiveFailures: 0 })
+  assert.equal(rows[0]?.occurrenceCount, 3)
+  assert.equal(rows[0]?.resolvedAt, null)
+
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-1', 'INITIALIZING'), true)
+  assert.equal(rows[0]?.title, 'Sign in collection initializing')
+  assert.match(rows[0]?.description ?? '', /Microsoft is preparing the sign in source/i)
+  assert.deepEqual(rows[0]?.metadata, { resourceType: 'SIGN_INS', coverageState: 'INITIALIZING', consecutiveFailures: 0 })
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-2', 'LIMITED'), false)
+  assert.equal(await service.refreshOpenSignInIncident('org-1', 'tenant-3', 'LIMITED'), false)
+  assert.equal(rows[1]?.title, 'Foreign incident')
+  assert.equal(rows[2]?.title, 'Resolved incident')
+  assert.equal(rows[3]?.title, 'Recovery notice')
+})
+
 const preferenceOrg = '00000000-0000-4000-8000-000000000041'
 const preferenceOtherOrg = '00000000-0000-4000-8000-000000000042'
 const preferenceUser = '00000000-0000-4000-8000-000000000043'

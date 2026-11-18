@@ -20,13 +20,16 @@ const paths = entries => entries.map(entry => entry.path);
 test('partition is the complete disjoint discovery, including the nonstandard real-PG file', () => {
   const entries = fixtureEntries();
   const plan = planTests(entries, paths(entries).reverse());
-  assert.equal(plan.database.length, 41);
+  assert.equal(plan.database.length, 44);
   assert.ok(plan.database.includes('src/notifications/notifications-mark-all-read.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/tenants/customer-connection-verification.database-integration.test.ts'));
+  assert.ok(plan.database.includes('src/tenants/customer-reconsent-initial-notice.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/auth/console-session.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/tenants/directory-role-receipt-store.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/microsoft/consent-operation-store.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/tenants/existing-tenant-consent.database-integration.test.ts'));
+  assert.ok(plan.database.includes('src/tenants/initial-sync-proof-storage.database-integration.test.ts'));
+  assert.ok(plan.database.includes('src/tenants/initial-sync-proof-reader.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/tenants/scheduled-sync-cursor.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/microsoft/managed-connector-authority.database-integration.test.ts'));
   assert.ok(plan.database.includes('src/microsoft/managed-connector-configuration.database-integration.test.ts'));

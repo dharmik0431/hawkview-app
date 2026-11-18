@@ -864,6 +864,12 @@ model SyncState {
   lastSuccessfulAt    DateTime?        @map("last_successful_at") @db.Timestamptz(6)
   lastErrorCode       String?          @map("last_error_code") @db.VarChar(100)
   lastErrorMessage    String?          @map("last_error_message") @db.Text
+  // Unwired initial-sync proof; NULL legacy rows carry no completion authority.
+  initialSyncAttemptEpochId   String? @map("initial_sync_attempt_epoch_id") @db.Uuid
+  initialSyncAttemptId        String? @map("initial_sync_attempt_id") @db.Uuid
+  initialSyncPersistedAttemptId String? @map("initial_sync_persisted_attempt_id") @db.Uuid
+  initialSyncCompletedAttemptId String? @map("initial_sync_completed_attempt_id") @db.Uuid
+  initialSyncPersistedKind    String? @map("initial_sync_persisted_kind") @db.VarChar(32)
   consecutiveFailures Int              @default(0) @map("consecutive_failures")
   createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
@@ -1510,6 +1516,9 @@ model TenantConnection {
   organizationId        String                  @map("organization_id") @db.Uuid
   customerTenantId      String                  @map("customer_tenant_id") @db.Uuid
   collectionIncarnation String? @map("collection_incarnation") @db.Uuid
+  // Separate from collection incarnation; no default or legacy success backfill.
+  initialSyncEpochId        String? @map("initial_sync_epoch_id") @db.Uuid
+  initialSyncEpochStartedAt DateTime? @map("initial_sync_epoch_started_at") @db.Timestamptz(6)
   status                TenantConnectionStatus  @default(PENDING_CONSENT)
   connectionMode        MicrosoftConnectionMode @default(HAWKVIEW_MANAGED) @map("connection_mode")
   clientId              String?                 @map("client_id") @db.Uuid

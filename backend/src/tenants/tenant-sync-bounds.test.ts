@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { utcTestDatabase } from '../identity-risk/risk-utc.test-fixtures.js'
 import { managedSyncTestDatabase, managedSyncTestToken } from './managed-sync.test-fixtures.js'
+import { INITIAL_SYNC_RESOURCE_TYPES } from './initial-sync-status.js'
 import { evaluateCheck } from '../security-requirements/security-requirements-evaluator.js'
 import {
   assertGraphCollectionBounds,
@@ -1041,7 +1042,8 @@ test('the actual full tenant sync uses the serialized heavy-collector schedule',
     safeStartedDuringSignIn = signInActive
   }
   const result = await (service as any).syncConnectedTenant(tenant, false, { includeBundle: false })
-  assert.equal(result.status, 'SUCCEEDED')
+  // This scheduling harness does not persist required resource states.
+  assert.equal(result.status, 'PARTIAL')
   assert.equal(safeStartedDuringSignIn, false)
   assert.equal(maximumGeneric, 1)
   assert.deepEqual(persistedResources, [
@@ -1124,46 +1126,173 @@ test('actual full sync continues from a failed sign-in collector to audit withou
 function aggregateSyncFixture(options: {
   rejected?: string[]
   persistedFailures?: Array<{ resourceType: string; lastErrorCode?: string }>
+  persistedSignInReasonCode?: string
   initial?: boolean
+  completedInitialSyncResources?: boolean
+  missingRequiredResource?: string
+  staleRequiredResource?: string
+  futureRequiredResource?: string
+  futureSuccessOnlyResource?: string
+  invertedRequiredResource?: string
+  replaceCurrentSignInProof?: boolean
+  reconsentedAt?: Date
+  baselineSucceededAt?: Date
+  reflectUsersBaselineWrite?: boolean
 } = {}) {
   const tenant = {
     ...boundedTenant,
-    connection: { ...boundedTenant.connection, connectionMode: 'CUSTOMER_MANAGED', exchangeReadOnlyEnabledAt: null },
+    connection: {
+      ...boundedTenant.connection,
+      connectionMode: 'CUSTOMER_MANAGED',
+      exchangeReadOnlyEnabledAt: null,
+      onboardingCompletedAt: new Date('2026-01-01T00:00:00.000Z'),
+      consentedAt: options.reconsentedAt ?? null,
+    },
   }
   const calls: string[] = []
   const messages: string[] = []
   const incidents: any[] = []
+  const openIncidents = new Map<string, string>()
+  const resolvedIncidents: string[] = []
   const stateWrites: string[] = []
+  let baselineReads = 0
+  let lastBaselineRows: any[] = []
+  let usersLastAttemptAt: Date | null = null
+  let persistedBaselineAt = options.baselineSucceededAt ?? new Date(Date.now() - 60_000)
+  let currentSignInProof: { lastAttemptAt: Date; lastSuccessfulAt: Date } | null = null
+  let usersLastSuccessfulAt = options.initial ? null : new Date()
+  let persistedConsentAt = tenant.connection.consentedAt
+  let advanceConsentOnNextNotice = false
+  let noticeBoundaryStartedAtMs: number | null = null
+  const advanceConsentAtNoticeBoundary = async () => {
+    if (advanceConsentOnNextNotice) {
+      // The database changes after the loaded connection was used for the
+      // coverage decision, immediately before the separate notice write.
+      noticeBoundaryStartedAtMs = Date.now()
+      for (let tick = 0; tick < 20 && Date.now() <= noticeBoundaryStartedAtMs; tick += 1) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 1))
+      }
+      assert.ok(Date.now() > noticeBoundaryStartedAtMs)
+      persistedConsentAt = new Date()
+      advanceConsentOnNextNotice = false
+    }
+  }
+  let rejected = options.rejected ?? []
+  let persistedFailures = options.persistedFailures ?? []
+  let persistedSignInReasonCode = options.persistedSignInReasonCode
+  let auditBacklogCode: string | undefined
+  let runningResources: string[] = []
   const prisma = utcTestDatabase({
     syncState: {
-      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: options.initial ? null : new Date(), deltaLink: 'previous-delta' }),
-      updateMany: async () => { stateWrites.push('USERS:RUNNING'); return { count: 1 } },
+      findUnique: async () => ({ id: 'users-state', lastSuccessfulAt: usersLastSuccessfulAt, deltaLink: 'previous-delta' }),
+      updateMany: async ({ data }: any) => {
+        if (options.reflectUsersBaselineWrite) {
+          assert.ok(data.lastAttemptAt instanceof Date)
+          usersLastAttemptAt = data.lastAttemptAt
+        }
+        stateWrites.push('USERS:RUNNING'); return { count: 1 }
+      },
       update: async ({ where, data }: any) => {
         assert.equal(where.customerTenantId_resourceType.resourceType, 'USERS')
         assert.equal(data.deltaLink, 'next-delta')
         stateWrites.push(`USERS:${data.status}`)
+        if (data.status === 'SUCCEEDED') usersLastSuccessfulAt = data.lastSuccessfulAt
         return {}
       },
-      findMany: async ({ where }: any) => {
+      findMany: async ({ where, select }: any) => {
         assert.equal(where.organizationId, tenant.organizationId)
         assert.equal(where.customerTenantId, tenant.id)
-        if (where.resourceType?.in) return [] // No hourly/retry work due in this fixture.
-        assert.ok(where.lastAttemptAt.gte instanceof Date)
-        return (options.persistedFailures ?? []).map((state) => ({ ...state, status: 'FAILED', lastErrorMessage: null }))
+        if (where.resourceType?.in && select?.consecutiveFailures) return [] // No hourly/retry work due.
+        const baselineRead = Boolean(where.resourceType?.in)
+        if (baselineRead) {
+          baselineReads += 1
+          assert.deepEqual([...where.resourceType.in].sort(), [...INITIAL_SYNC_RESOURCE_TYPES].sort())
+        } else assert.ok(where.lastAttemptAt.gte instanceof Date)
+        const states = new Map<string, any>()
+        if (options.completedInitialSyncResources !== false) for (const resourceType of INITIAL_SYNC_RESOURCE_TYPES) {
+          if (resourceType === options.missingRequiredResource) continue
+          const completedAt = baselineRead && resourceType === 'USERS' && options.reflectUsersBaselineWrite
+            ? usersLastSuccessfulAt
+            : resourceType === options.staleRequiredResource
+            ? new Date('2025-01-01T00:00:00.000Z')
+            : resourceType === options.futureRequiredResource || resourceType === options.futureSuccessOnlyResource
+              ? new Date(Date.now() + 60 * 60_000)
+              : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
+                ? currentSignInProof.lastSuccessfulAt
+              : baselineRead ? persistedBaselineAt : new Date()
+          assert.ok(completedAt instanceof Date)
+          states.set(resourceType, {
+            resourceType, status: 'SUCCEEDED', lastErrorCode: null, lastErrorMessage: null,
+            lastSuccessfulAt: completedAt,
+            lastAttemptAt: baselineRead && resourceType === 'USERS' && options.reflectUsersBaselineWrite
+              ? usersLastAttemptAt
+              : resourceType === options.futureSuccessOnlyResource
+              ? new Date()
+              : resourceType === options.invertedRequiredResource
+                ? new Date(completedAt.getTime() + 1000)
+                : baselineRead && resourceType === 'SIGN_INS' && currentSignInProof && !options.replaceCurrentSignInProof
+                  ? currentSignInProof.lastAttemptAt : completedAt,
+          })
+        }
+        for (const state of persistedFailures) states.set(state.resourceType, {
+          ...state, status: 'FAILED', lastErrorMessage: null,
+          lastSuccessfulAt: null, lastAttemptAt: new Date(),
+        })
+        for (const resourceType of runningResources) states.set(resourceType, {
+          resourceType, status: 'RUNNING', lastErrorCode: null, lastErrorMessage: null,
+          lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+        })
+        if (auditBacklogCode) states.set('M365_AUDIT', {
+          resourceType: 'M365_AUDIT', status: 'RUNNING', lastErrorCode: auditBacklogCode,
+          lastErrorMessage: 'Synthetic audit backlog', lastSuccessfulAt: null, lastAttemptAt: new Date(),
+        })
+        if (persistedSignInReasonCode) states.set('SIGN_INS', {
+            resourceType: 'SIGN_INS', status: 'RUNNING',
+            lastErrorCode: persistedSignInReasonCode, lastErrorMessage: 'Incomplete source',
+            lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
+          })
+        if (!baselineRead && states.get('SIGN_INS')?.status === 'SUCCEEDED') {
+          const signIn = states.get('SIGN_INS')
+          currentSignInProof = { lastAttemptAt: signIn.lastAttemptAt, lastSuccessfulAt: signIn.lastSuccessfulAt }
+        }
+        const selected = [...states.values()].filter((state) =>
+          (!where.resourceType?.in || where.resourceType.in.includes(state.resourceType)) &&
+          (!where.lastAttemptAt?.gte || state.lastAttemptAt >= where.lastAttemptAt.gte))
+        if (baselineRead) lastBaselineRows = selected.map((state) => ({ ...state }))
+        return selected
       },
     },
-    tenantConnection: { update: async () => ({}) },
+    tenantConnection: {
+      update: async () => ({}),
+      findUnique: async () => ({
+        consentedAt: persistedConsentAt,
+        onboardingCompletedAt: tenant.connection.onboardingCompletedAt,
+      }),
+    },
   })
   const service = new TenantSyncService(prisma as any,
     { getTenantAccessToken: async () => 'synthetic' } as any, {} as any,
-    { publishIncident: async (incident: any) => { incidents.push(incident) } } as any, {} as any, {} as any)
+    {
+      publishIncident: async (incident: any) => {
+        await advanceConsentAtNoticeBoundary()
+        incidents.push(incident)
+        if (!openIncidents.has(incident.dedupeKey)) openIncidents.set(incident.dedupeKey, incident.eventType)
+      },
+      resolveIncidentIfEventType: async (_organizationId: string, dedupeKey: string, eventTypes: string[]) => {
+        await advanceConsentAtNoticeBoundary()
+        if (eventTypes.includes(openIncidents.get(dedupeKey) ?? '')) {
+          resolvedIncidents.push(dedupeKey)
+          openIncidents.delete(dedupeKey)
+        }
+      },
+    } as any, {} as any, {} as any)
   ;(service as any).synchronizeUsers = async (_tenant: unknown, _token: string, delta: string) => {
     assert.equal(delta, 'previous-delta')
     return { deltaLink: 'next-delta' }
   }
   const collect = async (resource: string) => {
     calls.push(resource)
-    if (options.rejected?.includes(resource)) throw new Error('access_token=secret private@example.invalid')
+    if (rejected.includes(resource)) throw new Error('access_token=secret private@example.invalid')
   }
   for (const [method, resource] of Object.entries({
     syncLicenses: 'LICENSES', syncOrganizationConfiguration: 'ORGANIZATION_CONFIGURATION',
@@ -1179,10 +1308,86 @@ function aggregateSyncFixture(options: {
   ;(service as any).syncEntraCollection = (_tenant: unknown, _token: string, resource: string) => collect(resource)
   ;(service as any).refreshCollectionFieldStates = async () => undefined
   ;(service as any).logger = { warn: (message: string) => messages.push(message), log: () => undefined }
-  return { calls, messages, incidents, stateWrites,
+  return { calls, messages, incidents, stateWrites, resolvedIncidents,
+    baselineReadCount: () => baselineReads,
+    lastBaselineRows: () => lastBaselineRows,
+    isIncidentOpen: (key: string) => openIncidents.has(key),
+    openIncidentType: (key: string) => openIncidents.get(key),
+    setPersistedFailures: (failures: typeof persistedFailures) => { persistedFailures = failures },
+    setRejected: (resources: string[]) => { rejected = resources },
+    setPersistedSignInReasonCode: (code: string | undefined) => { persistedSignInReasonCode = code },
+    setRunningResources: (resources: string[]) => { runningResources = resources },
+    setAuditBacklog: (code: string | undefined) => { auditBacklogCode = code },
+    setPersistedBaselineAt: (value: Date) => { persistedBaselineAt = value },
+    advanceConsentBeforeNextNotice: () => { advanceConsentOnNextNotice = true },
+    advanceConsentAfterNotice: () => { persistedConsentAt = new Date() },
+    persistedConsentAt: () => persistedConsentAt,
+    noticeBoundaryStartedAtMs: () => noticeBoundaryStartedAtMs,
     run: (incrementalOnly = false) => (service as any).syncConnectedTenant(tenant, false, { incrementalOnly, includeBundle: false }),
   }
 }
+
+test('a reconsent at the notice-write boundary cannot publish or clear an old-epoch initial result', {
+  skip: process.env.HAWKVIEW_HAW77_RECONSENT_NOTICE_RACE_WITNESS === '1'
+    ? false : 'held pending an atomic connection-epoch and notice write',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const oldConsent = new Date(Date.now() - 60_000)
+
+  await t.test('initial completion notice', async () => {
+    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true,
+      reconsentedAt: oldConsent })
+    fixture.advanceConsentBeforeNextNotice()
+    await fixture.run()
+    assert.ok(fixture.persistedConsentAt() instanceof Date)
+    assert.ok(fixture.persistedConsentAt()!.getTime() > fixture.noticeBoundaryStartedAtMs()!)
+    assert.notEqual(fixture.incidents[0]?.eventType, 'tenant.initial_sync_completed')
+  })
+
+  for (const incremental of [false, true]) await t.test(
+    `${incremental ? 'incremental' : 'full'} warning clearance`, async () => {
+      const fixture = aggregateSyncFixture({
+        initial: true, completedInitialSyncResources: true,
+        persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+        reconsentedAt: oldConsent,
+      })
+      const key = 'tenant:tenant:initial-sync'
+      await fixture.run()
+      assert.equal(fixture.isIncidentOpen(key), true)
+      fixture.setPersistedSignInReasonCode(undefined)
+      fixture.advanceConsentBeforeNextNotice()
+      await fixture.run(incremental)
+      assert.ok(fixture.persistedConsentAt() instanceof Date)
+      assert.ok(fixture.persistedConsentAt()!.getTime() > fixture.noticeBoundaryStartedAtMs()!)
+      assert.equal(fixture.isIncidentOpen(key), true)
+      assert.deepEqual(fixture.resolvedIncidents, [])
+    },
+  )
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a reconsent after the initial completion notice cannot leave that notice current', {
+  skip: process.env.HAWKVIEW_HAW77_RECONSENT_AFTER_NOTICE_WITNESS === '1'
+    ? false : 'held pending epoch-bound notice invalidation',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const oldConsent = new Date(Date.now() - 60_000)
+  const fixture = aggregateSyncFixture({
+    initial: true, completedInitialSyncResources: true, reconsentedAt: oldConsent,
+  })
+  const key = 'tenant:tenant:initial-sync'
+
+  // The real sync orchestrator publishes the old-epoch completion to a mock
+  // notice sink. The fixture then models a later consent write. This only
+  // exposes the stale-notice symptom; it cannot prove consent-side invalidation
+  // or physical transaction ordering before the fix is activated.
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.openIncidentType(key), 'tenant.initial_sync_completed')
+  fixture.advanceConsentAfterNotice()
+  assert.ok(fixture.persistedConsentAt()!.getTime() > oldConsent.getTime())
+  assert.notEqual(fixture.openIncidentType(key), 'tenant.initial_sync_completed')
+  assert.equal(network.mock.callCount(), 0)
+})
 
 test('actual sync aggregates rejected collectors with current persisted failures', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
@@ -1211,6 +1416,35 @@ test('actual sync aggregates rejected collectors with current persisted failures
   assert.equal(network.mock.callCount(), 0)
 })
 
+test('a full pass with a missing required baseline row cannot report aggregate success', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const initial of [true, false]) await t.test(initial ? 'initial pass' : 'later full pass', async () => {
+    const fixture = aggregateSyncFixture({ initial, missingRequiredResource: 'SIGN_INS' })
+    const result = await fixture.run()
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, [])
+    assert.equal(fixture.incidents[0]?.eventType, initial ? 'tenant.initial_sync_in_progress' : undefined)
+    assert.equal(fixture.stateWrites.join(','), 'USERS:RUNNING,USERS:SUCCEEDED')
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a full pass cannot count future or inverted required success timestamps as completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const [name, option] of [
+    ['future attempt and success', { futureRequiredResource: 'GROUPS' }],
+    ['current attempt with future success', { futureSuccessOnlyResource: 'GROUPS' }],
+    ['inverted success', { invertedRequiredResource: 'GROUPS' }],
+  ] as const) for (const initial of [true, false]) await t.test(`${name}, ${initial ? 'initial' : 'later'} pass`, async () => {
+    const fixture = aggregateSyncFixture({ initial, completedInitialSyncResources: true, ...option })
+    const result = await fixture.run()
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, [])
+    if (initial) assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
 test('initial sync notifications distinguish unclassified rejections from persisted dispositions', async (t) => {
   const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
   for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`unclassified rejection with ${known ?? 'no persisted failure'}`, async () => {
@@ -1230,6 +1464,7 @@ test('initial sync notifications distinguish unclassified rejections from persis
   })
   for (const known of [undefined, 'HTTP_503', 'PERMISSION_REQUIRED']) await t.test(`persisted-only disposition ${known ?? 'clean success'}`, async () => {
     const fixture = aggregateSyncFixture({ initial: true,
+      completedInitialSyncResources: !known,
       persistedFailures: known ? [{ resourceType: 'GROUPS', lastErrorCode: known }] : [] })
     await fixture.run()
     assert.equal(fixture.incidents.length, 1)
@@ -1237,6 +1472,278 @@ test('initial sync notifications distinguish unclassified rejections from persis
       : known === 'HTTP_503' ? 'tenant.initial_sync_in_progress' : 'tenant.initial_sync_completed')
     assert.deepEqual(fixture.incidents[0].metadata.unclassifiedResources, [])
   })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('first-pass audit backlog or budget cannot publish a completed initial-sync notice', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const code of ['m365-audit-backlog', 'm365-audit-budget-exhausted']) await t.test(code, async () => {
+    const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+    const key = 'tenant:tenant:initial-sync'
+    fixture.setAuditBacklog(code)
+    const incomplete = await fixture.run()
+    assert.equal(incomplete.status, 'PARTIAL')
+    assert.deepEqual(incomplete.failedResources, [])
+    assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+    assert.equal(fixture.isIncidentOpen(key), true)
+    fixture.setAuditBacklog(undefined)
+    assert.equal((await fixture.run()).status, 'SUCCEEDED')
+    assert.equal(fixture.isIncidentOpen(key), false)
+    assert.deepEqual(fixture.resolvedIncidents, [key])
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('incremental audit backlog is not counted as a succeeded scheduler result', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ completedInitialSyncResources: true })
+  fixture.setAuditBacklog('m365-audit-backlog')
+  const result = await fixture.run(true)
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, [])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a first pass without persisted baseline evidence stays in progress', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: false })
+  await fixture.run()
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.incidents[0]?.category, 'info')
+  assert.equal(fixture.isIncidentOpen('tenant:tenant:initial-sync'), true)
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('first limited sign-in fallback cannot publish initial-sync completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  const result = await fixture.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['SIGN_INS'])
+  assert.equal(fixture.incidents.length, 1)
+  const incident = fixture.incidents[0]
+  assert.equal(incident.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(incident.title, 'Initial tenant sync has limited coverage')
+  assert.doesNotMatch(incident.description, /will automatically retry|No action is required/)
+  assert.deepEqual(incident.metadata.limitedResources, ['SIGN_INS'])
+  assert.deepEqual(incident.metadata.retryingResources, [])
+  assert.deepEqual(incident.metadata.unclassifiedResources, [])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('initial sign-in warning closes only after a later complete source pass', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  const key = 'tenant:tenant:initial-sync'
+
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedSignInReasonCode(undefined)
+  fixture.setPersistedFailures([{ resourceType: 'GROUPS', lastErrorCode: 'HTTP_503' }])
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedFailures([])
+  fixture.setRunningResources(['GROUPS'])
+  await fixture.run()
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setRunningResources([])
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), false)
+  assert.deepEqual(fixture.resolvedIncidents, [key])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('incremental Graph sign-in recovery closes an initial warning only with complete baseline evidence', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const key = 'tenant:tenant:initial-sync'
+  const complete = aggregateSyncFixture({
+    initial: true, completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  assert.equal((await complete.run()).status, 'PARTIAL')
+  assert.equal(complete.isIncidentOpen(key), true)
+  complete.setPersistedSignInReasonCode(undefined)
+  assert.equal((await complete.run(true)).status, 'SUCCEEDED')
+  assert.equal(complete.isIncidentOpen(key), false)
+  assert.deepEqual(complete.resolvedIncidents, [key])
+  assert.equal(complete.baselineReadCount(), 1)
+
+  for (const scenario of [
+    { name: 'missing audit row', missingRequiredResource: 'M365_AUDIT' },
+    { name: 'failed group', persistedFailures: [{ resourceType: 'GROUPS', lastErrorCode: 'HTTP_503' }] },
+    { name: 'running audit backlog', auditBacklog: 'm365-audit-backlog' },
+    { name: 'stale group success', staleRequiredResource: 'GROUPS' },
+    { name: 'future group success', futureRequiredResource: 'GROUPS' },
+    { name: 'future sign-in success', futureRequiredResource: 'SIGN_INS' },
+    { name: 'inverted group timestamps', invertedRequiredResource: 'GROUPS' },
+    { name: 'sign-in proof changed between reads', replaceCurrentSignInProof: true },
+    { name: 'rejected current sign-ins', rejectedSignIns: true },
+  ]) await t.test(scenario.name, async () => {
+    const fixture = aggregateSyncFixture({
+      initial: true, completedInitialSyncResources: true,
+      persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+      missingRequiredResource: scenario.missingRequiredResource,
+      staleRequiredResource: scenario.staleRequiredResource,
+      futureRequiredResource: scenario.futureRequiredResource,
+      invertedRequiredResource: scenario.invertedRequiredResource,
+      replaceCurrentSignInProof: scenario.replaceCurrentSignInProof,
+      persistedFailures: scenario.persistedFailures,
+    })
+    if (scenario.auditBacklog) fixture.setAuditBacklog(scenario.auditBacklog)
+    await fixture.run()
+    assert.equal(fixture.isIncidentOpen(key), true)
+    fixture.setPersistedSignInReasonCode(undefined)
+    if (scenario.rejectedSignIns) fixture.setRejected(['SIGN_INS'])
+    await fixture.run(true)
+    assert.equal(fixture.isIncidentOpen(key), true)
+    assert.deepEqual(fixture.resolvedIncidents, [])
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('reconsent keeps the initial warning open until every baseline source succeeds in the new consent cycle', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const reconsentedAt = new Date(Date.now() - 30_000)
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    completedInitialSyncResources: true,
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+    reconsentedAt,
+    baselineSucceededAt: new Date(reconsentedAt.getTime() - 60_000),
+  })
+  const key = 'tenant:tenant:initial-sync'
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  fixture.setPersistedSignInReasonCode(undefined)
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
+
+  fixture.setPersistedBaselineAt(new Date())
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), false)
+  assert.deepEqual(fixture.resolvedIncidents, [key])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+// This models old persisted resource timestamps; it does not call a consent
+// writer or establish physical ordering. The real incremental orchestrator and
+// readiness predicate decide whether the synthetic warning sink is cleared.
+test('same-millisecond reconsent cannot reuse old required-resource successes to clear a warning', {
+  skip: process.env.HAWKVIEW_HAW77_SAME_MILLISECOND_COVERAGE_WITNESS === '1'
+    ? false : 'held pending non-reusable epoch-bound resource completion proof',
+}, async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const reconsentedAt = new Date(Date.now() - 30_000)
+  const key = 'tenant:tenant:initial-sync'
+  for (const [label, offset, shouldRemainOpen] of [
+    ['old evidence one millisecond before reconsent', -1, true],
+    ['old evidence in the reconsent millisecond', 0, true],
+    ['later-timestamp control', 1, false],
+  ] as const) await t.test(label, async () => {
+    const baselineAt = new Date(reconsentedAt.getTime() + offset)
+    const fixture = aggregateSyncFixture({
+      initial: true, completedInitialSyncResources: true,
+      persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+      reconsentedAt, baselineSucceededAt: baselineAt, reflectUsersBaselineWrite: true,
+    })
+    assert.equal((await fixture.run()).status, 'PARTIAL')
+    assert.equal(fixture.openIncidentType(key), 'tenant.initial_sync_in_progress')
+    fixture.setPersistedSignInReasonCode(undefined)
+    await fixture.run(true)
+
+    const rows = fixture.lastBaselineRows()
+    assert.equal(rows.length, INITIAL_SYNC_RESOURCE_TYPES.length)
+    const freshUsers = rows.find((row) => row.resourceType === 'USERS')
+    const freshSignIns = rows.find((row) => row.resourceType === 'SIGN_INS')
+    for (const row of [freshUsers, freshSignIns]) {
+      assert.ok(row.lastAttemptAt instanceof Date && row.lastSuccessfulAt instanceof Date)
+      assert.ok(row.lastAttemptAt.getTime() > reconsentedAt.getTime())
+      assert.ok(row.lastSuccessfulAt.getTime() >= row.lastAttemptAt.getTime())
+    }
+    for (const row of rows.filter((item) => !['USERS', 'SIGN_INS'].includes(item.resourceType))) {
+      assert.equal(row.lastAttemptAt.getTime(), baselineAt.getTime())
+      assert.equal(row.lastSuccessfulAt.getTime(), baselineAt.getTime())
+    }
+    assert.equal(network.mock.callCount(), 0)
+    assert.deepEqual({ open: fixture.isIncidentOpen(key), resolved: fixture.resolvedIncidents }, {
+      open: shouldRemainOpen, resolved: shouldRemainOpen ? [] : [key],
+    }, 'a fresh USERS and Graph pass cannot replace proof for other required resources')
+  })
+})
+
+test('a completed initial-sync notice stays open after a later clean full pass', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true, completedInitialSyncResources: true })
+  const key = 'tenant:tenant:initial-sync'
+
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.incidents[0]?.eventType, 'tenant.initial_sync_completed')
+  assert.equal(fixture.isIncidentOpen(key), true)
+
+  assert.equal((await fixture.run()).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
+  assert.equal((await fixture.run(true)).status, 'SUCCEEDED')
+  assert.equal(fixture.isIncidentOpen(key), true)
+  assert.deepEqual(fixture.resolvedIncidents, [])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('initializing audit subscription cannot publish initial-sync completion', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({ initial: true,
+    persistedSignInReasonCode: 'sign-ins-audit-subscription-initializing' })
+  const result = await fixture.run()
+  assert.equal(result.status, 'PARTIAL')
+  assert.deepEqual(result.failedResources, ['SIGN_INS'])
+  assert.equal(fixture.incidents[0].eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(fixture.incidents[0].title, 'Initial tenant sync in progress')
+  assert.deepEqual(fixture.incidents[0].metadata.initializingResources, ['SIGN_INS'])
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('incremental limited or initializing sign-in state remains partial', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  for (const code of [
+    'sign-ins-non-premium-fallback-active',
+    'sign-ins-audit-subscription-initializing',
+  ]) await t.test(code, async () => {
+    const fixture = aggregateSyncFixture({ persistedSignInReasonCode: code })
+    const result = await fixture.run(true)
+    assert.equal(result.status, 'PARTIAL')
+    assert.deepEqual(result.failedResources, ['SIGN_INS'])
+    assert.equal(fixture.incidents.length, 0)
+  })
+  assert.equal(network.mock.callCount(), 0)
+})
+
+test('a rejected sign-in collector cannot hide behind a retained limited code', async (t) => {
+  const network = t.mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network request') })
+  const fixture = aggregateSyncFixture({
+    initial: true,
+    rejected: ['SIGN_INS'],
+    persistedSignInReasonCode: 'sign-ins-non-premium-fallback-active',
+  })
+  assert.equal((await fixture.run()).status, 'PARTIAL')
+  assert.equal(fixture.incidents.length, 1)
+  const incident = fixture.incidents[0]
+  assert.equal(incident.eventType, 'tenant.initial_sync_in_progress')
+  assert.equal(incident.title, 'Initial tenant sync incomplete')
+  assert.deepEqual(incident.metadata.unclassifiedResources, ['SIGN_INS'])
+  assert.deepEqual(incident.metadata.retryingResources, [])
   assert.equal(network.mock.callCount(), 0)
 })
 

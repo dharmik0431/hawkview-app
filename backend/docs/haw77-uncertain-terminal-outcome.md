@@ -1,0 +1,363 @@
+# HAW-77 uncertain terminal outcome: inactive recovery contract
+
+Design against `495afb5246021f19625700d8a83dc76b01c41f85`; no runtime, schema,
+retry/cadence, migration or activation change. This refines the
+[resource completion contract](haw77-resource-completion-proof.md) and
+[storage/projection contract](haw77-proof-storage-projection.md). The held
+lost-result regression is still failing. Source/independent design review is
+not physical evidence or release approval.
+
+## Local diagnostic implementation checkpoint
+
+The unused [`classifyInitialSyncTerminalEvidence`](../src/tenants/initial-sync-terminal-evidence.ts)
+now decodes one supplied raw observation against copied operation identity. It
+recognizes exact matching completion, persisted-only evidence with its observed
+status, or a coherent replacement connection/epoch/attempt; other evidence stays
+UNKNOWN. It checks scope, receipt shape and six-decimal UTC ordering without
+coercion or derived validity flags. Returned identity/provenance scalars are
+copied and frozen; there are no action permissions or authority booleans.
+After epoch rotation, retained resource rows keep their original attempt epoch
+and timestamp. The diagnostic preserves both observed epochs and recognizes
+the replaced connection boundary without relabeling the old row or comparing
+its historical attempt against the new epoch start. A current-epoch caller
+cannot reuse that old receipt as completion.
+
+This is only the stored-observation axis. It does not establish authoritative
+read provenance, owner identity/expiry, eligibility at mutation time, operation
+settlement or definite non-write. Superseded here means a valid replacement
+storage identity, not inferred ownership loss. Ineligible context stays UNKNOWN.
+HAW-21 must supply the separate authority protocol; even matching completion
+after owner loss cannot authorize a later effect. No production caller,
+lifecycle, error handler or notification path uses the helper.
+
+The [local tests](../src/tenants/initial-sync-terminal-evidence.test.ts) inject
+synthetic rows to exercise all thirteen resources, copied identity, malformed or
+missing evidence, replacements, retained persistence, delayed-result ordering
+and microsecond boundaries. They do not model or verify database transactions,
+role visibility, actual late arrival, owner takeover or wire-result loss. The
+held wrapper regression remains unresolved. Scoped adapter and producer
+integration need settlement/ownership evidence and registered disposable-
+PostgreSQL proof before any runtime use.
+
+## Local readback adapter checkpoint
+
+The unused [`readInitialSyncTerminalEvidence`](../src/tenants/initial-sync-terminal-readback.ts)
+captures operation identity before awaiting one injected executor call. Its static
+SELECT binds only organization, tenant and resource, preserving current
+connection/epoch/attempt replacements and absent/failed rows for strict decoding.
+No success filter, row limit or duplicate suppression manufactures evidence.
+All timestamp projections distinguish a true null from invalid/nonfinite or
+out-of-range values; invalid values remain explicit rejected text. The proposed
+UTC microsecond transport follows PostgreSQL 16's
+[date/time functions](https://www.postgresql.org/docs/16/functions-datetime.html)
+and [formatting documentation](https://www.postgresql.org/docs/16/functions-formatting.html).
+
+Executor rejection produces sanitized UNKNOWN/READ_UNAVAILABLE once, without
+retry, empty-result substitution or reflecting raw errors. Decoding is outside
+that catch so programming defects remain visible. The caller must retain the
+original uncertain operation error. No classification permits failure writes,
+provider replay, new notification effects or a new failure policy.
+
+The [adapter tests](../src/tenants/initial-sync-terminal-readback.test.ts) use only
+injected synthetic rows/errors. They check operation mutation during an await,
+parameter scope, replacements, invalid versus null timestamps and error origin.
+SQL shape checks are not executed SQL or query-plan evidence. The future executor
+must enforce the existing remaining budget on a healthy, authoritative read-only
+path outside the uncertain transaction; this callback cannot verify those
+properties. No timeout extension, cancellation race, client or runtime caller is
+introduced. Actual PostgreSQL/Prisma transport, roles, query plan and controlled
+commit/rollback/late-arrival ordering remain unproved. Next is registering and
+executing those witnesses in approved disposable CI, then producer/owner/settled-
+operation integration. Both helpers remain inactive and the held wrapper defect
+is unresolved.
+
+## Prepared physical terminal-query witnesses
+
+Three cases in the existing registered
+[`initial-sync-proof-reader.database-integration.test.ts`](../src/tenants/initial-sync-proof-reader.database-integration.test.ts)
+now prepare execution of the exact terminal query through pg. They cover all
+thirteen resource kinds under non-default time zone/date/search-path settings,
+scoped and missing rows, an old resource receipt retained across a connection
+epoch rotation, replaced attempts, persisted-only RUNNING/FAILED, null versus
+invalid timestamp transport and microsecond epoch ordering. The cases observe
+real returned rows and classifier outcomes, with scoped fixture cleanup through
+transaction/savepoint rollback and positive controls after restoration.
+
+These cases are **prepared, not executed**. Local default loading skips them;
+the existing guard refuses nonregistered targets before constructing a client.
+They use rollback-only fixture transactions, so even a future pass will not
+prove committed-result loss, a separate read-only executor, Prisma transport,
+restricted-role visibility, actual delayed arrival, ownership or settlement.
+Those witnesses and runtime integration remain separate gates. No production
+code, query, schema, activation, failure/retry policy or CI inventory changed in
+this test-preparation step.
+
+## Prepared Prisma terminal transport witness
+
+An additional case in the same registered suite prepares the exact terminal
+query through the actual Prisma adapter and an explicitly read-only interactive
+ReadCommitted transaction. A separate pg connection creates committed scoped
+fixtures and applies acknowledged changes. The real raw result array reaches
+the terminal classifier unchanged. Assertions cover all thirteen resource kinds,
+UTC microsecond text under non-default session settings, foreign scope, true null
+versus invalid timestamps, sub-millisecond epoch ordering, retained old-epoch
+receipts and replaced attempts. A forced read-only rollback and a fresh read
+check that independently committed changes remain visible and sibling fixture
+evidence is unchanged. These are fixture mutations, not a proposed epoch or
+attempt lifecycle implementation.
+
+This case is **prepared and unexecuted**, with the existing hosted-only guard
+before Prisma loading or client construction. Local checks cannot establish its
+physical assertions. Even a future pass would prove only the exercised Prisma
+transport, read-only transaction setting and acknowledged cross-connection
+visibility. It would not establish restricted-role access, uncertain commit,
+delayed command arrival, original-operation settlement, authority, deployed
+executor health or a runtime failure-policy fix. Those remain separate gates;
+the held wrapper regression is unresolved and runtime integration stays inactive.
+
+## Prepared terminal commit-order witness
+
+A separate case in the same registered suite prepares two actual pg connections
+with an explicitly checked ReadCommitted, read-only reader. A committed fixture
+starts RUNNING with matching persisted evidence and no completion. An awaited
+writer update confirms that completion exists inside its open transaction, while
+the exact terminal query on the other connection must still see PERSISTED_ONLY.
+A confirmed rollback leaves that result intact. A repeated update followed by
+confirmed commit must instead produce MATCHING_COMPLETION in the same reader
+transaction. A later committed attempt replacement must supersede the old caller
+while the new attempt stays persisted-only despite its retained success time.
+Saved earlier results remain historical observations, not authority reservations.
+
+This case is **prepared and unexecuted**. It uses awaited command order, with no
+sleeps, wire interception or fabricated result loss. The SQL updates are fixture
+transitions, not production terminal writers or owner-guard integration. Even a
+future pass establishes only these acknowledged commit/rollback visibility
+orders. It does not prove unknown-commit handling, a delayed command arriving
+after cancellation, role visibility, operation settlement or stale-effect
+rejection. Scoped cleanup and unchanged sibling evidence are asserted; all
+remaining runtime and disposable-CI gates still apply.
+
+## Prepared restricted-visibility witness
+
+The existing public-schema lockdown migration enables deny-all row security on
+all three terminal-query tables without policies or FORCE. The new prepared
+case checks that catalog shape and uses a unique non-login, non-superuser,
+non-bypass role with SELECT privileges inside a rollback-only fixture
+transaction. It adds no policy and changes no existing role or RLS rule. Direct
+reads under the synthetic role must hide the fixture; the exact terminal query
+must return no rows and UNKNOWN/UNAVAILABLE_OR_AMBIGUOUS. Restoring the original
+role must still find the intact matching completion.
+
+The case then revokes the synthetic role's SELECT privilege on sync states,
+checks that no PUBLIC or inherited privilege defeats that control, and requires
+the actual query to reject with SQLSTATE 42501. The adapter must return only
+UNKNOWN/READ_UNAVAILABLE. A savepoint recovers the aborted statement before the
+original role's positive control. Outer rollback must remove the synthetic role,
+grants and fixture and leave the table security catalog unchanged.
+
+This is **prepared and unexecuted**, guarded before client construction. It
+follows PostgreSQL 16's documented [default-deny row security](https://www.postgresql.org/docs/16/ddl-rowsecurity.html)
+and [SET ROLE semantics](https://www.postgresql.org/docs/16/sql-set-role.html),
+not evidence about deployed credentials. Because the tenant itself is hidden,
+it does not demonstrate partially hidden connection/state joins. No production
+or Microsoft role change, new policy, executor authorization, read-only
+transaction, original-operation settlement or runtime reconciliation is proved.
+Physical execution still requires registered disposable CI and applicable
+exact-source authorization; runtime integration remains inactive.
+
+## Observed defect and scope
+
+The real `runSnapshotSync` wrapper in
+[`tenant-sync.service.ts`](../src/tenants/tenant-sync.service.ts) admits RUNNING,
+calls collection, then writes SUCCEEDED separately. Its catch cannot distinguish
+collection failure, rejected terminal write and lost terminal result. The held
+case in [`sign-in-provisioning.test.ts`](../src/tenants/sign-in-provisioning.test.ts)
+saves modeled success before throwing; the catch overwrites it as FAILED.
+The pre-write and acknowledged-success controls pass. No real unknown commit
+or production occurrence was exercised.
+
+Limit this contract to interpreting an uncertain resource terminal operation.
+It supplies neither HAW-21 tenant ownership nor a new provider-retry strategy.
+Claim, batch, final-persistence and notification ambiguities have their own
+boundaries; terminal success cannot resolve an earlier uncertain batch or
+certify data whose producer marker is absent.
+
+## Immutable operation context
+
+Capture before the asynchronous operation, and never relabel after an error:
+
+- Organization, customer tenant, required resource and scoped connection ID.
+- Non-nil connection epoch E, resource attempt A, and expected persisted source
+  kind. A is created by the guarded claim, never by the error handler.
+- The HAW-21 owner/fence identity supplied by that protocol, plus the intended
+  terminal transition. Do not manufacture a second lease or reuse timestamps.
+- The operation boundary reached: not dispatched, dispatched/awaiting result,
+  definitively rejected, or acknowledged. These are local observations, not
+  certificates of commit; adapter evidence must justify stronger conclusions.
+
+No existing in-memory target or timestamp contains this complete context.
+The nullable storage candidate and unused reader are insufficient until all
+writers obey the attempt protocol. Legacy or missing identities stay unproved.
+
+## Evidence and permitted effects
+
+These are proposed internal decision names, not new database statuses or a
+public API. Each decision is scoped to the captured operation. Readback failure
+must never be replaced by a fabricated successful row or an empty result.
+
+| Decision | Required evidence | Permitted action |
+| --- | --- | --- |
+| DEFINITE_NON_WRITE | Operation was rejected before submission, or the exact terminal transaction is conclusively known to have rolled back and has no outstanding execution | Preserve genuine failure classification only under a fresh exact-attempt/owner guard with state still RUNNING, no completed marker, and no outstanding same-attempt terminal operation. Do not erase earlier committed source batches/window. |
+| MATCHING_COMPLETION | Coherent authoritative read shows captured scope/connection/E/A, matching persisted and completed A, correct kind, SUCCEEDED, cleared errors and valid full-precision times | Report the observed saved result with provenance. Do not issue another terminal update, refresh success time or reset counters. A later effect needs current guarded authority again. |
+| PERSISTED_ONLY | Exact current E/A and source marker exist but no matching completion marker | Does not prove success or non-write. Stop dependent completion/notices. Any later finalization needs a separately proved settled-operation rule and the normal guarded transition. |
+| SUPERSEDED | A current authoritative read proves connection/epoch/attempt replacement, tenant ineligibility or loss of caller's owner authority | No old-operation writes or notices. Do not claim that the historical operation either committed or failed. |
+| UNKNOWN | Read unavailable, timed out, malformed, hidden by role visibility, missing/legacy proof, incomplete context, ambiguous operation liveness, or insufficient remaining deadline | Preserve uncertainty for the caller. No compensating FAILED, counter increment, source deletion, synthesized success or recovery notice. |
+
+Positive completion evidence describes storage; it does not grant a lease.
+If the saved completion still matches but the caller's authority is gone,
+preserve that historical observation while the caller's effect decision is
+SUPERSEDED. Baseline readers may accept a valid current-epoch completion from a
+past owner, as the existing resource contract permits; they must not require
+that owner's lease to remain live forever. Conversely, this old invocation may
+not use that observation to mutate a notice or declare a new visit successful.
+
+Prior success, a complete merged authentication window, an equal timestamp,
+an error class/message, a zero-row conditional update, or a resolved callback
+alone is never sufficient evidence. A conditional update returning zero is
+not success and does not by itself identify which authority check failed.
+
+Evidence about one rejected invocation cannot override a matching completion
+already saved by another invocation of A. Always validate current authority
+and stored outcome before choosing an effect. Even with DEFINITE_NON_WRITE,
+an already completed A is not rewritten; an already terminal failed A is not
+counted as another failure. Partial/initializing states are not terminal failure
+certificates. Error persistence and counters need the same guarded, single-effect
+transition semantics as success; this design does not add a failure journal.
+After waits, the failure write must still match scope/E/A/owner, RUNNING and a
+null completed ID. Its zero-row result permits no increment or retry; require
+fresh readback or leave UNKNOWN. Settling one invocation is not proof that a
+concurrent invocation of A has settled; absent that proof no failure write is
+authorized, even if the first invocation was definitely rejected.
+
+PERSISTED_ONLY describes the absence of completed evidence, not a terminal
+status. The current shape permits retained persisted evidence on FAILED as
+well as RUNNING. Preserve those distinct observed statuses; infer neither
+terminal success nor failure from the persisted marker alone.
+
+## Fresh readback and transaction boundary
+
+1. Stop dependent terminal/notification effects when the operation becomes
+   uncertain. Preserve its captured identity and original sanitized error.
+   An arbitrary rejected promise after dispatch is UNKNOWN, not DEFINITE_NON_WRITE.
+   Do not infer server rollback from cancellation, timeout or connection loss.
+   Dispose/quarantine a broken transaction through the adapter's verified
+   lifecycle; no query is issued on an abandoned or aborted transaction.
+2. Read through a healthy authoritative database path using the existing
+   bounded execution budget. No provider call, manual sync, new scheduled job,
+   retry loop, longer deadline or new quota is authorized. If the existing
+   budget cannot support safe readback, leave UNKNOWN and surface it.
+3. For a read-only observation, use a coherent scoped snapshot and retain the
+   captured operation identity in the comparison. The existing
+   [`readInitialSyncProof`](../src/tenants/initial-sync-proof-reader.ts) returns
+   aggregate validation only: it neither exposes an exact terminal-operation
+   outcome nor holds mutation authority. Do not reuse its boolean as recovery
+   permission. A dedicated projection/adapter must retain the necessary facts
+   and distinguish unavailable visibility from a proved replacement.
+4. Before any permitted state/notice effect, acquire the shared authority and
+   parent locks, then connection and SyncState locks in the reconciled HAW-21
+   order. The earlier proposed ordering is not yet verified globally; existing
+   USERS/state-before-connection and resource-advisory paths remain blockers.
+   Scope and authority must be reread after waits, with a fresh statement under
+   the locked boundary, before comparing E/A and complete evidence. Recheck
+   eligibility and owner validity according to HAW-21, including expiry after
+   waits. Locking only an existing SyncState cannot serialize an absent row;
+   common parent authority and scoped uniqueness must cover first creation.
+5. Keep those guards through an allowed mutation and commit. No check-then-write
+   gap, SKIP LOCKED-as-success or writes from an old repeatable snapshot. No
+   transaction spans provider work. If this transaction's result also becomes
+   uncertain, surface UNKNOWN rather than starting recursive recovery.
+
+PostgreSQL Read Committed statements use snapshots taken when each statement
+starts; successive reads may observe different commits. Row-locking statements
+can wait and return an updated matching row. This motivates explicit post-wait
+checks rather than assuming one transaction implies one coherent earlier read.
+[PostgreSQL 16 isolation documentation](https://www.postgresql.org/docs/16/transaction-iso.html)
+and its [lock-order guidance](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-DEADLOCKS)
+describe the database behavior, not verification of this proposed integration.
+
+## Absence is not rollback; the original operation may still run
+
+A read showing RUNNING/no completed marker cannot prove that a dispatched
+terminal command will never commit. The command may still be executing or may
+arrive after that read. Even acquiring a row lock does not prove that no delayed
+request will later acquire it. Do not route PERSISTED_ONLY or absence into the
+failure handler merely because an early read saw no completion.
+
+Any future action from PERSISTED_ONLY needs proof that the original invocation
+has settled, or a separately reviewed idempotent conditional protocol that
+prevents a delayed invocation from conflicting. This step chooses neither an
+extra operation receipt nor a new replay mechanism. Until that proof exists,
+the safe action is no mutation/notice, with caller uncertainty retained. A
+definite pre-write rejection is local evidence for that invocation only; it
+cannot compensate for other outstanding writes or uncertain earlier batches.
+
+The current storage design has one mutable attempt slot, not an immutable
+outcome history. Once another attempt replaces it, an old caller cannot recover
+the old result by matching a success time, cached row or source contents.
+Classify it superseded/unproved and leave the new attempt untouched. Do not add
+an unbounded journal or retention policy. If future requirements need historical
+outcome reconstruction, stop for a separate bounded storage/retention design.
+
+## Notification and error-origin separation
+
+An acknowledged or correctly observed terminal success is never rewritten as
+collection failure because a later notice fails. The existing local notification
+boundary repair covers acknowledged success only; it does not solve lost results.
+A recovery notice still requires the exact current operation plus applicable
+baseline predicate under current guarded authority. Initial publication, full
+warning clearance and incremental clearance must keep their existing distinct
+resource/visit requirements. A matched resource alone cannot certify all thirteen.
+
+Notice persistence/recipient mutations must be atomic with their authority
+check, and an uncertain notice commit needs its own exact identity/idempotency
+proof. Do not blindly republish or resolve after an error; source success alone
+does not prove delivery or current notice visibility. A failed readback is an
+internal uncertainty, not evidence of a Microsoft collection failure. Preserve
+genuine collector-failure classification and configured backoff; do not swallow
+errors or introduce a new user-facing failure policy in this design step.
+
+## Required falsifiers before implementation can activate
+
+| Boundary/control | Required result |
+| --- | --- |
+| Acknowledged terminal success | Exact result once; no extra finalization/counter reset; ordinary notice path only with its authority |
+| Definite rejection before terminal submission | Existing genuine failure behavior guarded to the same attempt; earlier committed source evidence retained |
+| Same-A completion or failure already saved; concurrent same-A finalizer outstanding | Definite rejection of one invocation cannot overwrite success, increment an existing failure again or race the other invocation; zero-row update stays unproved |
+| Terminal rollback vs commit with result lost | Distinct physical transaction evidence; committed success never downgraded; unknown result stays visible until proved |
+| Delayed terminal operation, readback before/after its commit | Early absence cannot become failure; positive matching result recognized only after commit; no conflicting retry |
+| Same timestamps but different E/A, foreign scope, legacy/null or hidden row | No success/failure reconciliation from status/time or absence |
+| New attempt/epoch/owner wins before readback | Old caller produces no state or notice mutation; no historical outcome invented |
+| Valid readback followed by replacement before effect | Mutation guard blocks stale effect; opposite order leaves the later transition truthful |
+| Owner expires during lock wait, first-row creation and reversed lock path | No stale effect or unsupported missing-row success; bounded waits and consistent ordering |
+| Readback error, malformed output, missing budget or second uncertain result | UNKNOWN; no loop, false failure increment, manufactured success or provider replay |
+| Terminal success followed by notice failure/unknown notice commit | Source outcome preserved; no false failure or duplicate notice; current reader/count/unread/page semantics remain consistent |
+
+First implement an unused evidence classifier and adversarial local cases,
+without making it a runtime authority boundary. Its inputs must preserve the
+difference between observed completion and current mutation permission; boolean
+caller assertions must not masquerade as database certificates. Then build
+the real scoped projection/adapter and producer/owner integration with registered
+disposable-PostgreSQL tests. Keep the held regression explicit until a real
+protocol fixes it; a fake reader supplied with desired answers is not closure.
+
+## Inactive rollout and fallback
+
+All proof producers, lifecycle/error writes, consent/epoch changes and notice
+paths must participate before activation; mixed old/new writers can invalidate
+this reasoning. Restricted-role visibility, transport, migration/locks and both
+commit orders remain unproved. No SQL or physical test ran for this design.
+Protected main is the pre-activation fallback; preserve local candidates and
+evidence without manual recovery. Complete authorized source review, exact-head
+registered CI, normal protected merge, configured automatic API/cron release,
+actual health and authenticated canary remain required. Baseline/full SYNC are
+incomplete. HAW-70/75 prior approved CI is unchanged; HAW-21 remains separate.

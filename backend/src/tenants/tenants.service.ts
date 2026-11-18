@@ -870,6 +870,58 @@ export class TenantsService {
             || connections[0].mode !== 'CUSTOMER_MANAGED' || connections[0].status === 'CONNECTED' || scopes.some(row => row.scope !== null)) {
             throw new ConflictException('The tenant connection changed during onboarding.')
           }
+          // A completed notice belongs to the previous consent epoch. Retire
+          // its success claim and re-arm its recipients in the same transaction
+          // that advances consent. Lock the unique key and refuse any foreign
+          // row. An old in-flight sync publisher still needs its own epoch guard.
+          const noticeKey = `tenant:${existing.id}:initial-sync`
+          const notices = await transaction.$queryRawUnsafe<Array<{
+            id: string
+            customerTenantId: string | null
+            recipientUserId: string | null
+            eventType: string
+            source: string
+          }>>(`SELECT id::text AS id, customer_tenant_id::text AS "customerTenantId",
+            recipient_user_id::text AS "recipientUserId", event_type AS "eventType", source
+            FROM notifications WHERE organization_id=$1::uuid AND dedupe_key=$2 FOR UPDATE`,
+          organizationIds[0], noticeKey)
+          if (notices.length > 1 || (notices[0] && (
+            notices[0].customerTenantId !== existing.id || notices[0].recipientUserId !== null ||
+            notices[0].source !== 'tenant-sync' || ![
+              'tenant.initial_sync_completed', 'tenant.initial_sync_in_progress',
+              'tenant.initial_sync_action_required',
+            ].includes(notices[0].eventType)
+          ))) {
+            throw new ConflictException('The initial synchronization notice changed during onboarding.')
+          }
+          if (notices[0]?.eventType === 'tenant.initial_sync_completed') {
+            const updated = await transaction.notification.updateMany({
+              where: {
+                id: notices[0].id,
+                organizationId: organizationIds[0],
+                customerTenantId: existing.id,
+                eventType: 'tenant.initial_sync_completed',
+              },
+              data: {
+                eventType: 'tenant.initial_sync_in_progress',
+                category: 'info',
+                severity: 'info',
+                title: 'Initial tenant sync in progress',
+                description: 'HawkView is recollecting tenant data after reconnection. Current coverage is not yet verified.',
+                metadata: { reason: 'CUSTOMER_MANAGED_RECONSENT' },
+                lastOccurredAt: now,
+                resolvedAt: null,
+                expiresAt: null,
+                occurrenceCount: { increment: 1 },
+              },
+            })
+            if (updated.count !== 1) {
+              throw new ConflictException('The initial synchronization notice changed during onboarding.')
+            }
+            await transaction.notificationUserState.deleteMany({
+              where: { notificationId: notices[0].id },
+            })
+          }
           return transaction.customerTenant.update({
           where: { id: existing.id },
           data: {
