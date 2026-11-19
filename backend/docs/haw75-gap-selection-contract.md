@@ -8,6 +8,12 @@ The pre-CI implementation narrative below is retained as historical preparation 
 
 The [refused-row acceptance gate](haw75-refused-row-acceptance.md) specifies the missing safe diagnosis, durable resolution and resumed-progress obligations before activation. Refusing an oversized first row preserves evidence but can stop that tenant indefinitely. A diagnostic record, retry, cursor skip or manual deletion does not close this blocker. All diagnostic/resolution implementation and integration proofs remain absent; keep production callers inactive.
 
+## Actual-limit coupling guard — local follow-up
+
+The bounds suite now imports the unchanged discovery-response constant from the real service and the unchanged URI/page constants from the selector. It requires the fixed 6,291,456-byte URI envelope to cover three times the actual raw discovery limit and pins the separately qualified 8,388,608-byte serialized-page ceiling. It checks the limits before allocating large fixtures. Increasing the discovery constant beyond that relationship, or silently growing either selector cap, must fail this qualification rather than automatically raise an envelope. The existing decoder, overflow and serialization cases use those real values instead of copied limits.
+
+Only the service constant's export visibility changes; its 2 MiB value and all production callsites remain unchanged. There is no new runtime gate, environment setting, quota or policy change. These synthetic checks guard source-constant drift, not every possible future callsite change, legacy URI, database transport or memory cost. A future explicit limit/decoder change requires renewed boundary qualification and applicable authorization. This local follow-up has no new hosted CI or Claude review; the dated public evidence above remains version-specific. Refused-row resolution and production activation remain blocked.
+
 ## Historical preparation status
 
 Status: inactive local component and integration contract, 19 November 2026. Reference source is public inactive component `57177ee486211dcb205c6db1cf43ec848fddadfa`, tree `f09f1f63e8cd128e2ed012dbbda96b954212a06a`, based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. The read-only selector now exists locally with scripted-transport tests, following the four synthetic decoding/serialization qualification cases. It has no production caller; no physical database operation, schema or active policy change occurred. Parent CI/Claude proof covers the earlier components, not the new selector/tests or full production integration.
