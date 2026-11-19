@@ -1,5 +1,15 @@
 # HAW-75 bounded expired-content selection contract
 
+## Dated component evidence and activation hold — 19 November 2026
+
+The published selector `ccd5c33fe1e045749f2919ada67959b6411ccaf9`, tree `6d856fce21f2ce300ae9a1878f3256b8242de054`, passed [registered CI run 44540166566](https://github.com/dharmik0431/hawkview-app/actions/runs/44540166566) on a verified identical-tree merge. All eighteen HAW-75 physical cases and twenty-eight synthetic cases ran once without skips; both required jobs passed. Claude's completed direct source and execution review returned a component-scoped PASS with five retained follow-ups. Its supplemental adversarial workflow remained incomplete. The three new traversal, payload and live-clock cases now have run-specific component proof. They do not establish complete integration, query/memory cost, repeated timing stability or production protection.
+
+The pre-CI implementation narrative below is retained as historical preparation context: its statements that these component cases were unexecuted are superseded by the dated result above. The warning that older public-parent CI cannot prove newer source remains correct. This newer documentation is local only and has no new CI or Claude review; the successful run covers the frozen public source, not this design update.
+
+The [refused-row acceptance gate](haw75-refused-row-acceptance.md) specifies the missing safe diagnosis, durable resolution and resumed-progress obligations before activation. Refusing an oversized first row preserves evidence but can stop that tenant indefinitely. A diagnostic record, retry, cursor skip or manual deletion does not close this blocker. All diagnostic/resolution implementation and integration proofs remain absent; keep production callers inactive.
+
+## Historical preparation status
+
 Status: inactive local component and integration contract, 19 November 2026. Reference source is public inactive component `57177ee486211dcb205c6db1cf43ec848fddadfa`, tree `f09f1f63e8cd128e2ed012dbbda96b954212a06a`, based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. The read-only selector now exists locally with scripted-transport tests, following the four synthetic decoding/serialization qualification cases. It has no production caller; no physical database operation, schema or active policy change occurred. Parent CI/Claude proof covers the earlier components, not the new selector/tests or full production integration.
 
 ## Concrete missing seam
