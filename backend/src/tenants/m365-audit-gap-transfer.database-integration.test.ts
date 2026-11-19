@@ -6,6 +6,7 @@ import type { Prisma } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim, type StagedAuditGapTransfer } from './m365-audit-gap-transfer.js'
 import { selectExpiredAuditGapPage, AUDIT_GAP_SELECTION_URI_BYTES, AUDIT_GAP_SELECTION_PAGE_BYTES } from './m365-audit-gap-selection.js'
+import { observeAuditGapRowDiagnostic, AUDIT_GAP_DIAGNOSTIC_RESPONSE_BYTES, type AuditGapDiagnosticInput } from './m365-audit-row-diagnostic.js'
 
 // Actual helper SQL, hosted disposable service only. The final prepared cases
 // add the inactive selector; no provider, owner-fence, outcome reader or
@@ -1106,5 +1107,178 @@ test('HAW-75 selector uses earliest nullable expiry and a live clock within one 
       await clean(() => prisma.$disconnect())
       await clean(() => observer.end())
       if (failures.length) throw new AggregateError(failures, 'Synthetic selector-expiry cleanup failed')
+    }
+  })
+
+test('HAW-75 real diagnostic observes bounded current identities without resolving refused audit rows',
+  { ...options, timeout: 60_000 }, async () => {
+    // Both existing opt-ins and the hosted target guard precede client creation.
+    const url = assertDisposableTestDatabase()
+    assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+    assert.equal(AUDIT_GAP_DIAGNOSTIC_RESPONSE_BYTES, 1024)
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    const organizationIds = [randomUUID(), randomUUID()]
+    const prefix = randomUUID().slice(0, 24)
+    const orderedId = (n: number) => prefix + n.toString(16).padStart(12, '0')
+    const marker = 'SYNTHETIC_DIAGNOSTIC_PRIVATE:'
+    let connected = false
+    try {
+      await observer.connect()
+      connected = true
+      await observer.query("SET statement_timeout = '20s'")
+      await observer.query("SET lock_timeout = '5s'")
+      await observer.query("SET TIME ZONE 'UTC'")
+      await observer.query('BEGIN')
+      const owner = await scope(observer, organizationIds[0]!)
+      const sibling = await scope(observer, organizationIds[0]!)
+      const outside = await scope(observer, organizationIds[1]!)
+      const known: SelectedAuditGapClaim[] = []
+      for (const [index, status] of ['PENDING', 'PROCESSING', 'RETRY', 'FAILED', 'INSUFFICIENT_CAPACITY'].entries())
+        known.push(await source(observer, owner, { id: orderedId(index + 2), status, contentUri: marker + 'small' }))
+      const first = known[0]!
+      const tail = await source(observer, owner, { id: orderedId(7), contentUri: marker + 'tail' })
+      await source(observer, owner, { id: orderedId(8), status: 'COMPLETED', contentUri: marker + 'completed' })
+      await source(observer, owner, { id: orderedId(9), status: 'SYNTHETIC_UNKNOWN_STATUS', contentUri: marker + 'unknown' })
+      await source(observer, sibling, { contentUri: marker + 'sibling' })
+      await source(observer, outside, { contentUri: marker + 'outside' })
+      for (const [index, tenant] of [owner, sibling, outside].entries()) {
+        await observer.query(`INSERT INTO public.m365_audit_coverage_states
+          (customer_tenant_id, organization_id, generation, incomplete_since, last_gap_at, has_purged_unrepaired_gap)
+          VALUES ($1,$2,$3,'2000-02-01T00:00:00.123456Z','2000-02-02T00:00:00.123456Z',TRUE)`,
+        [tenant.tenantId, tenant.organizationId, (9_007_199_254_740_993n + BigInt(index)).toString()])
+        await observer.query(`INSERT INTO public.m365_audit_coverage_gaps
+          (id,organization_id,customer_tenant_id,content_type,content_id_sha256,source_status,reason,source_expired_at,first_observed_at)
+          VALUES ($1,$2,$3,'Audit.General',$4,'FAILED','LEDGER_EXPIRED',$5,'2000-02-01T00:00:00.123456Z')`,
+        [randomUUID(), tenant.organizationId, tenant.tenantId,
+          createHash('sha256').update(`synthetic-diagnostic-gap-${index}`).digest('hex'), beforeAge])
+      }
+      await observer.query('COMMIT')
+      const input: AuditGapDiagnosticInput = { organizationId: owner.organizationId, customerTenantId: owner.tenantId, afterId: null }
+      // Avoid snapshot(): it would transport the oversized source URI. Only
+      // server-side complete-row fingerprints leave these fixture tables.
+      const fingerprints = async () => {
+        const result: Record<string, unknown> = {}
+        for (const table of ['m365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states'])
+          result[table] = (await observer.query(`SELECT id_key, digest FROM (
+            SELECT customer_tenant_id::text AS id_key, md5(to_jsonb(t)::text) AS digest
+            FROM public.${table} t WHERE organization_id = ANY($1::uuid[])
+          ) AS fingerprint_rows ORDER BY id_key, digest`, [organizationIds])).rows
+        return result
+      }
+      const withRead = (run: (tx: Prisma.TransactionClient) => Promise<void>) => prisma.$transaction(async tx => {
+        await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+        await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+        await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+        await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'America/New_York'")
+        await tx.$executeRawUnsafe("SET LOCAL DateStyle = 'SQL, DMY'")
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW transaction_read_only'), [{ transaction_read_only: 'on' }])
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'America/New_York' }])
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW DateStyle'), [{ DateStyle: 'SQL, DMY' }])
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW server_encoding'), [{ server_encoding: 'UTF8' }])
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW client_encoding'), [{ client_encoding: 'UTF8' }])
+        await run(tx)
+      }, { isolationLevel: 'ReadCommitted', maxWait: 5_000, timeout: 20_000 })
+      const checked = async (tx: Prisma.TransactionClient, selected: AuditGapDiagnosticInput,
+        expectedId: string | null, exceeds = false, instrumented = false) => {
+        const before = await tx.$queryRawUnsafe<Array<{ at: string }>>(
+          `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', $1) AS at`, format)
+        assert.equal(before.length, 1)
+        let measured = 0
+        const transport: AuditGapTransferTransaction = instrumented ? {
+          async $queryRawUnsafe<T>(query: string, ...values: unknown[]): Promise<T> {
+            // A second, explicitly instrumented execution; the unproxied tx
+            // control remains separate. SQL and bound values are unchanged.
+            const rows = await tx.$queryRawUnsafe<Array<{ diagnostic: string; bytes: number; digest: string }>>(`
+              WITH diagnostic_measurement AS MATERIALIZED (${query})
+              SELECT diagnostic, octet_length(diagnostic) AS bytes, md5(diagnostic) AS digest FROM diagnostic_measurement`, ...values)
+            assert.equal(rows.length, 1)
+            const row = rows[0]!
+            assert.equal(typeof row.diagnostic, 'string')
+            assert.ok(row.bytes > 0 && row.bytes <= AUDIT_GAP_DIAGNOSTIC_RESPONSE_BYTES)
+            assert.equal(Buffer.byteLength(row.diagnostic, 'utf8'), row.bytes)
+            assert.equal(createHash('md5').update(row.diagnostic, 'utf8').digest('hex'), row.digest)
+            assert.equal(row.diagnostic.includes(marker), false, 'No raw synthetic source marker leaves the diagnostic projection')
+            measured++
+            return [{ diagnostic: row.diagnostic }] as T
+          },
+        } : tx
+        const result = await observeAuditGapRowDiagnostic(transport, selected)
+        assert.match(result.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+        const clock = await tx.$queryRawUnsafe<Array<{ bracketed: boolean }>>(`SELECT
+          $1::timestamptz >= $2::timestamptz AND $1::timestamptz <= clock_timestamp() AS bracketed`, result.observedAt, before[0]!.at)
+        assert.deepEqual(clock, [{ bracketed: true }])
+        assert.deepEqual(result, { observedAt: result.observedAt, row: expectedId === null ? null : {
+          id: expectedId, organizationId: selected.organizationId, customerTenantId: selected.customerTenantId, uriExceedsLimit: exceeds,
+        } })
+        assert.equal(measured, instrumented ? 1 : 0)
+      }
+      const refusedFirst = async (code: 'URI_LIMIT' | 'PAGE_LIMIT', exceeds: boolean) => {
+        const before = await fingerprints()
+        for (const instrumented of [false, true]) await withRead(async tx => {
+          await assert.rejects(selectExpiredAuditGapPage(tx, { ...input, limit: 1 }), error => {
+            assert.ok(error instanceof Error)
+            assert.equal(error.message, `M365_AUDIT_GAP_SELECTION_${code}`)
+            assert.equal(error.cause, undefined)
+            return true
+          })
+          await checked(tx, input, first.id, exceeds, instrumented)
+        })
+        assert.deepEqual(await fingerprints(), before, 'Refusal/diagnosis preserves source, populated gaps and sticky states in every fixture scope')
+      }
+      await observer.query(`UPDATE public.m365_activity_contents
+        SET content_uri = $2 || repeat('x', $3::integer) WHERE id = $1`,
+      [first.id, marker, AUDIT_GAP_SELECTION_URI_BYTES + 1 - Buffer.byteLength(marker)])
+      await refusedFirst('URI_LIMIT', true)
+      await observer.query(`UPDATE public.m365_activity_contents
+        SET content_uri = $2 || repeat(chr(1), 1400000) WHERE id = $1`, [first.id, marker])
+      assert.ok((await observer.query('SELECT octet_length(content_uri) AS bytes FROM public.m365_activity_contents WHERE id = $1', [first.id])).rows[0].bytes < AUDIT_GAP_SELECTION_URI_BYTES)
+      await refusedFirst('PAGE_LIMIT', false)
+
+      // Fixture mutations are not a recovery mechanism. READ COMMITTED later
+      // observations identify current rows, without attributing the prior error.
+      await withRead(async tx => {
+        await checked(tx, input, first.id, false)
+        await observer.query('UPDATE public.m365_activity_contents SET content_uri = $2 WHERE id = $1', [first.id, marker + 'revised'])
+        const lower = await source(observer, owner, { id: orderedId(1), contentUri: marker + 'new-first' })
+        const before = await fingerprints()
+        await checked(tx, input, lower.id, false)
+        // Explicit afterId reads qualify scan parity, not durable progress past
+        // an unresolved/refused row. No cursor is persisted anywhere here.
+        let afterId: string | null = null
+        for (const claim of [lower, ...known, tail]) {
+          const selected = { ...input, afterId }
+          await checked(tx, selected, claim.id)
+          const page = await selectExpiredAuditGapPage(tx, { ...selected, limit: 1 })
+          assert.equal(page.lastExaminedId, claim.id)
+          assert.equal(page.candidates.length, 1)
+          afterId = claim.id
+        }
+        await checked(tx, { ...input, afterId }, null)
+        for (const wrong of [
+          { organizationId: outside.organizationId, customerTenantId: owner.tenantId },
+          { organizationId: owner.organizationId, customerTenantId: outside.tenantId },
+        ]) await checked(tx, { ...wrong, afterId: null }, null)
+        assert.deepEqual(await fingerprints(), before)
+      })
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      if (connected) {
+        await clean(() => observer.query('ROLLBACK'))
+        for (const organizationId of organizationIds) await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states'])
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic diagnostic fixture cleanup failed')
     }
   })
