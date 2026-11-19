@@ -1,6 +1,6 @@
 # HAW-75 atomic gap transfer and sticky-reader contract
 
-Status: inactive component and integration contract, reconciled 19 November 2026. The [recovery order](haw75-gap-recovery-order.md) is based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. Neither helper has a production caller. This documentation follow-up changes no runtime behavior, schema, test, lock, retry policy, quota or cadence.
+Status: inactive component and integration contract, reconciled 19 November 2026. The [recovery order](haw75-gap-recovery-order.md) is based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. Neither helper has a production caller. The selection follow-up adds documentation and four synthetic bounds-qualification cases; it changes no runtime behavior, schema, lock, retry policy, quota or cadence.
 
 ## Exact component proof and its limits
 
@@ -10,7 +10,7 @@ The twelfth transfer case uses the generated Prisma client with the production a
 
 This closes the narrow Prisma transport proof gap. The selection query is test-local; no production descriptor loader or candidate selector exists. Observing UTC does not establish that the adapter's session hook caused UTC, because the initial setting could already be UTC. The sibling control lacks a populated coverage-state row, so it does not sharply test an overly broad state update against that row. One green run does not establish repeated-run stability. These limitations remain recorded, not silently promoted to stronger proof.
 
-Full physical phase: 442 passes, no failures/skips. Ordinary backend: 3,366 passes, no failures, two unrelated legacy skips. A standalone pre-image conditional skip was followed by three passing dedicated cron-image cases. CI and Claude conclusions apply to the exact public parent, not to future implementation. The present documentation-only follow-up has no new hosted result or Claude review.
+Full physical phase: 442 passes, no failures/skips. Ordinary backend: 3,366 passes, no failures, two unrelated legacy skips. A standalone pre-image conditional skip was followed by three passing dedicated cron-image cases. CI and Claude conclusions apply to the exact public parent, not to future implementation. The newer selection design and synthetic bounds-qualification follow-up have no hosted result or new Claude review.
 
 The next bounded implementation seam is specified in the [expired-content selection contract](haw75-gap-selection-contract.md). It proposes a scoped, lossless page read before cleanup, explicitly separating row traversal from future durable admission and fairness decisions. Production ownership/outcomes, deployed roles, discovery/completion/accounting, unknown-result recovery, readers, purge/repair and fleet fairness remain open.
 

@@ -1,6 +1,6 @@
 # HAW-75 bounded expired-content selection contract
 
-Status: local design only, 19 November 2026. Reference source is public inactive component `57177ee486211dcb205c6db1cf43ec848fddadfa`, tree `f09f1f63e8cd128e2ed012dbbda96b954212a06a`, based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. This design adds no runtime implementation, database operation, schema, caller or test. Parent CI/Claude proof covers the existing components, not the proposed selector or full production integration.
+Status: local design only, 19 November 2026. Reference source is public inactive component `57177ee486211dcb205c6db1cf43ec848fddadfa`, tree `f09f1f63e8cd128e2ed012dbbda96b954212a06a`, based on protected main `a15951997b6734b9fc612717cf965c9f9651176c`. The selector remains design-only. A later local qualification step adds four synthetic decoding/serialization tests, without a runtime selector, database operation, schema or caller. Parent CI/Claude proof covers the existing components, not these newer tests, the proposed selector or full production integration.
 
 ## Concrete missing seam
 
@@ -12,7 +12,7 @@ The next component is a read-only, scoped page selector for expired unresolved c
 
 ## Bounded selection proposal
 
-Inputs are explicit organization and tenant IDs, an optional continuation ID for that same scope and one positive, safe-integer read limit validated before SQL. Use fixed SQL and bound values, never caller-interpolated text. The implementation must reject a limit above an explicit finite safety cap; safe-integer validation alone is not a bound. The cap value and a total response-byte ceiling must be chosen and justified before implementing this component, then measured in registered CI before integration. No numeric production quota, new environment setting or extra capacity is selected here; the limits must fit existing approved admission/time budgets.
+Inputs are explicit organization and tenant IDs, an optional continuation ID for that same scope and one positive, safe-integer read limit validated before SQL. Use fixed SQL and bound values, never caller-interpolated text. The initial inactive qualification envelope below fixes the page ceiling at one examined row. Reject larger limits; safe-integer validation alone is not a bound. These internal component constants are not production quota, cadence, retry or tenant-turn decisions, and must be measured in registered CI before integration. No new environment setting or extra deployment capacity is selected.
 
 The logical page contains at most that limit of unresolved rows, ordered by immutable ledger ID after the continuation ID. This bounds row count only. It does not bound response bytes or physical scan cost; both need explicit qualification. It includes PENDING, PROCESSING, RETRY, FAILED and INSUFFICIENT_CAPACITY, independently of download retry eligibility. Advance through the examined rows, not just the expired matches. Otherwise an unexpired prefix could starve later expired rows. Return the last examined ID even when no examined row is currently expired. A short or empty examined page completes this scan pass; a full page may require another bounded read to establish its end.
 
@@ -36,11 +36,33 @@ Each descriptor contains the following values without trimming, normalization or
 | `updatedAt`, `discoveredAt`, `ledgerExpiresAt` | UTC strings retaining all six fractional digits from the database. |
 | `contentExpiresAt` | The same lossless UTC representation, or null when the stored value is null. |
 
-The schema permits unbounded `contentUri` text. Before returning URI content, the database projection must enforce a separately chosen finite URI-byte bound and overall page-byte ceiling. Oversized data must reject safely without transporting the oversized URI, truncating it, skipping the row or advancing the cursor. A check only after decoding the full result is insufficient to claim bounded transport/memory. Other projected field limits and framing overhead must fit the total ceiling; query-cost measurement is still separate. These bounds are unselected design prerequisites, not a deployed policy.
+The schema permits unbounded `contentUri` text. Before returning URI content, the database projection must enforce the URI-byte bound and serialized-page-text ceiling defined below. Oversized data must reject safely without transporting the oversized URI, truncating it, skipping the row or advancing the cursor. A check only after decoding the full result is insufficient to claim bounded transport/memory. The same complete serialized page value must pass the second gate; summed value lengths are not enough. Driver/protocol framing, JavaScript copies and query-cost measurement remain separate. These are inactive qualification choices, not deployed policy.
 
 A missing or mismatched scope yields no candidates. A malformed result, duplicate ID, out-of-scope or out-of-order row, excessive row count, driver error or invalid required field must reject without echoing raw parameters, URI or driver text. It must not be converted into “complete coverage,” a successful transfer or a new retry/failure classification. No URI, raw result or source payload belongs in logs, issue updates, gap storage or response metadata.
 
 The page read need not lock. Its expiry filter is advisory; it returns candidate descriptors, not durable claims. After any wait, the existing transfer body must still obtain tenant/state/gap/source serialization, compare all selected fields and decide expiry with its post-wait database observation. Do not replace that predicate or clock with JavaScript checks. Do not add `SKIP LOCKED`, change isolation or weaken locks in this slice. An empty page or stale-source result never clears a sticky marker or advances a durable fairness turn.
+
+## Initial inactive qualification envelope
+
+| Limit | Initial value | Rationale and limitation |
+| --- | --- | --- |
+| Examined rows per query | 1 | Smallest useful cursor/projection seam. It prevents combining many individually large URIs before transport. It does not reuse the download `maxBlobs` allowance or claim adequate production throughput. |
+| Stored URI UTF-8 bytes | 6 MiB (6,291,456 bytes) | Three times the current 2 MiB raw discovery response ceiling, accounting for the observed malformed-UTF-8 replacement expansion described below. This is a conservative design envelope to qualify, not a measured maximum from live data or proof every legacy/direct-written row fits. |
+| Exact complete serialized page text | 8 MiB (8,388,608 bytes) | Leaves room above one 6 MiB URI for fixed descriptor/page metadata while bounding the actual serialized field. Escaping can still exceed this limit; it must cause safe refusal. This is not a bound on total wire bytes or heap. |
+
+The [four synthetic qualification cases](../src/tenants/m365-audit-selection-bounds.test.ts) call the real `readBoundedJson` and `validateManagementUrl` exports with in-memory responses. At the current 2 MiB raw ceiling, an ASCII URI passes; a response containing malformed UTF-8 bytes inside a syntactically valid JSON URI decodes to replacement characters, producing a stored-string representation larger than 2 MiB and close to 6 MiB while still passing the URL host/path check. The original decoded string is what discovery stores; the parsed URL object is not substituted at that boundary. Raw overflow is still rejected. No network, database or full discovery invocation is exercised.
+
+The four cases passed locally under Node 24 with socket connections prohibited. This does not establish hosted Node 22 behavior, any physical database boundary or a selector implementation.
+
+This is an observed source-path counterexample to treating raw response bytes as a persisted-URI ceiling, not a claim that Microsoft emitted such data. A future strict UTF-8 rejection would require revisiting the qualification; the test is not a requirement to preserve permissive decoding. The 6 MiB choice is conservative reasoning from the current decoder plus this witness, not exhaustive compatibility proof.
+
+The fourth synthetic case uses legacy-shaped control-character text to show that a URI under the URI-byte limit can serialize above the 8 MiB page limit. It uses JavaScript JSON serialization only; that does not prove the future database serialization format or PostgreSQL transport behavior. Summing unescaped column bytes or checking only the post-decoded JavaScript object cannot stand in for the proposed database gate.
+
+The future query must inspect URI length before constructing or returning a URI-bearing descriptor. If that gate passes, construct one complete serialized page text value, including metadata, and measure that exact value's UTF-8 bytes before returning it as a single text field. Return the same measured text, not a separately reserialized representation. Any oversize or malformed result yields only a fixed non-URI refusal, with no candidates or continuation. Do not truncate, skip the source or advance the cursor. An empty successful page is distinct from refusal.
+
+One examined row avoids an oversized multi-row aggregate but does not bound server detoasting, serialization allocation, scan work, plan latency, driver buffers, JavaScript string/object copies or total memory. Legacy/raw rows can exceed either cap and must remain intact and unproved; no automatic deletion or policy-changing remediation is introduced. Before runtime integration, registered disposable CI must measure representative and boundary payload/query behavior through the actual adapter and verify that other tenants can still progress under the eventual admission policy.
+
+Required physical controls add exact/one-byte-over URI and serialized-text boundaries, escaped/control and multi-byte text, a complete page envelope, an oversized row before a later valid row, safe refusal without continuation or error-content leakage, and unchanged source/gap/state. The database-generated field and client-received field must agree byte-for-byte; a synthetic JSON test does not satisfy this requirement. There is no physical result for the new selector or these bounds yet.
 
 ## Integration boundaries still separate
 
@@ -79,6 +101,6 @@ Keep all new physical cases behind the registered hosted boundary before client 
 
 ## Delivery sequence and fallback
 
-First resolve the finite row, URI and total-response safety bounds with explicit rationale; their values are prerequisites to implementation, not implied by this document. Then implement the isolated read-only page selector and synthetic contract checks with no runtime caller. Prepare a registered real-adapter witness next; do not accumulate larger production integrations on unexecuted physical assumptions. Then obtain applicable exact-source sharing permission and independent review/CI. Keep the already reviewed public candidate frozen so its evidence remains attributable.
+Implement the isolated one-row read-only selector and synthetic contract checks within the explicit qualification envelope, with no runtime caller. Keep payload gating and refusal separate from future cursor/outcome writers. Prepare a registered real-adapter witness next; do not accumulate larger production integrations on unexecuted physical assumptions. Then obtain applicable exact-source sharing permission and independent review/CI. Keep the already reviewed public candidate frozen so its evidence remains attributable.
 
 Protected main remains operational and the candidate stays unmerged and undeployed. This design does not authorize publication, provider work, a migration, manual sync/recovery or release. Complete source review, exact-head CI, protected merge, configured automatic release, actual health and authenticated canary remain required. HAW-75, Baseline and full SYNC are incomplete.
