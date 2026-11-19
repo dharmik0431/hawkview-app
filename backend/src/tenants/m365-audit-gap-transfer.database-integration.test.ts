@@ -5,9 +5,11 @@ import pg from 'pg'
 import type { Prisma } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim, type StagedAuditGapTransfer } from './m365-audit-gap-transfer.js'
+import { selectExpiredAuditGapPage } from './m365-audit-gap-selection.js'
 
-// Actual helper SQL, hosted disposable service only. No provider, owner-fence,
-// production selection adapter, outcome reader or production writer is exercised.
+// Actual helper SQL, hosted disposable service only. The final prepared case
+// adds the inactive selector; no provider, owner-fence, outcome reader or
+// production writer is exercised. Public-parent CI does not cover new cases.
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
   && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
 const options = { skip: !enabled, timeout: 30_000 }
@@ -620,5 +622,175 @@ test('HAW-75 real Prisma transactions preserve microseconds and large BIGINT gen
       await clean(() => prisma.$disconnect())
       await clean(() => observer.end())
       if (failures.length) throw new AggregateError(failures, 'Synthetic Prisma transfer cleanup failed')
+    }
+  })
+
+test('HAW-75 real selector traverses scoped precise claims and preserves stale rejection, rollback and committed isolation',
+  { ...options, timeout: 45_000 }, async () => {
+    // Prepared only: both markers and the hosted guard precede either client.
+    const url = assertDisposableTestDatabase()
+    assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    const organizationIds = [randomUUID(), randomUUID()]
+    const generation = 9_007_199_254_740_993n
+    const firstObserved = '1999-01-01T00:00:00.123456Z'
+    const idPrefix = randomUUID().slice(0, 24)
+    const orderedId = (ordinal: number) => idPrefix + ordinal.toString(16).padStart(12, '0')
+    const transactionOptions = { isolationLevel: 'ReadCommitted' as const, maxWait: 5_000, timeout: 15_000 }
+    const settings = async (tx: Prisma.TransactionClient) => {
+      await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'America/New_York'")
+      await tx.$executeRawUnsafe("SET LOCAL DateStyle = 'SQL, DMY'")
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'America/New_York' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW DateStyle'), [{ DateStyle: 'SQL, DMY' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW client_encoding'), [{ client_encoding: 'UTF8' }])
+    }
+    let connected = false
+    try {
+      await observer.connect()
+      connected = true
+      await observer.query("SET statement_timeout = '20s'")
+      await observer.query("SET lock_timeout = '5s'")
+      await observer.query("SET TIME ZONE 'UTC'")
+      await observer.query('BEGIN')
+      const owner = await scope(observer, organizationIds[0]!)
+      const sibling = await scope(observer, organizationIds[0]!)
+      const outside = await scope(observer, organizationIds[1]!)
+      for (const [index, tenant] of [owner, sibling, outside].entries()) {
+        await observer.query(`INSERT INTO public.m365_audit_coverage_states
+          (customer_tenant_id, organization_id, generation, incomplete_since, last_gap_at, has_purged_unrepaired_gap)
+          VALUES ($1,$2,$3,$4,$4,TRUE)`,
+        [tenant.tenantId, tenant.organizationId, (generation + BigInt(index)).toString(), firstObserved])
+      }
+      const live = await source(observer, owner, { id: orderedId(1), status: 'PENDING',
+        discoveredAt: '2100-01-01T00:00:00.123456Z', ledgerExpiresAt: '2100-01-30T00:00:00.123457Z',
+        contentExpiresAt: '2100-01-29T00:00:00.123455Z' })
+      await source(observer, owner, { id: orderedId(2), status: 'COMPLETED' })
+      const expired: SelectedAuditGapClaim[] = []
+      for (const [index, status] of ['PENDING', 'PROCESSING', 'RETRY', 'FAILED', 'INSUFFICIENT_CAPACITY'].entries()) {
+        expired.push(await source(observer, owner, { id: orderedId(index + 3), status,
+          updatedAt: `2000-01-02T00:00:00.65432${index}Z`,
+          contentExpiresAt: index % 2 === 0 ? afterAge : null }))
+      }
+      await source(observer, owner, { id: orderedId(8), status: 'SYNTHETIC_UNKNOWN_STATUS' })
+      await source(observer, sibling)
+      await source(observer, outside)
+      await observer.query('COMMIT')
+      const before = await snapshot(observer, owner.tenantId)
+      const siblingBefore = await snapshot(observer, sibling.tenantId)
+      const outsideBefore = await snapshot(observer, outside.tenantId)
+      const priorState = await coverageState(observer, owner.tenantId)
+      const selectNext = (tx: Prisma.TransactionClient, afterId: string | null) =>
+        selectExpiredAuditGapPage(tx, { organizationId: owner.organizationId,
+          customerTenantId: owner.tenantId, afterId, limit: 1 })
+
+      // Actual query/decoder, no proxy or scripted rows. READ ONLY rejects any
+      // accidental write; candidate selection itself supplies no owner proof.
+      await prisma.$transaction(async tx => {
+        await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+        await settings(tx)
+        assert.deepEqual(await tx.$queryRawUnsafe('SHOW transaction_read_only'), [{ transaction_read_only: 'on' }])
+        const first = await selectNext(tx, null)
+        assert.match(first.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/)
+        assert.deepEqual({ ...first, observedAt: 'clock' }, {
+          observedAt: 'clock', examinedCount: 1, lastExaminedId: live.id, endOfPass: false, candidates: [],
+        })
+        let afterId = live.id
+        for (const expected of expired) {
+          const page = await selectNext(tx, afterId)
+          assert.equal(page.examinedCount, 1)
+          assert.equal(page.lastExaminedId, expected.id)
+          assert.equal(page.endOfPass, false)
+          assert.deepEqual(page.candidates, [expected], 'Actual selector retains every descriptor field and all six decimals')
+          afterId = expected.id
+        }
+        const end = await selectNext(tx, afterId)
+        assert.deepEqual({ ...end, observedAt: 'clock' }, {
+          observedAt: 'clock', examinedCount: 0, lastExaminedId: null, endOfPass: true, candidates: [],
+        })
+        // Populated other scopes cannot widen either half of the scope pair.
+        for (const wrong of [
+          { organizationId: outside.organizationId, customerTenantId: owner.tenantId },
+          { organizationId: owner.organizationId, customerTenantId: outside.tenantId },
+        ]) {
+          const page = await selectExpiredAuditGapPage(tx, { ...wrong, afterId: null, limit: 1 })
+          assert.deepEqual({ ...page, observedAt: 'clock' }, {
+            observedAt: 'clock', examinedCount: 0, lastExaminedId: null, endOfPass: true, candidates: [],
+          })
+        }
+      }, transactionOptions)
+      assert.deepEqual(await snapshot(observer, owner.tenantId), before, 'Read-only traversal does not mutate excluded or selected rows')
+
+      // Commit a one-microsecond revision change after selection. This is a
+      // sequential stale-descriptor control, not a concurrent writer race.
+      const selected = expired[0]!
+      await observer.query(`UPDATE public.m365_activity_contents
+        SET updated_at = updated_at + interval '1 microsecond' WHERE id = $1`, [selected.id])
+      const revised = await select(observer, selected.id)
+      assert.notEqual(revised.updatedAt, selected.updatedAt)
+      assert.equal(revised.updatedAt.slice(0, 23), selected.updatedAt.slice(0, 23), 'Revisions differ inside one millisecond')
+      const revisedBefore = await snapshot(observer, owner.tenantId)
+      await prisma.$transaction(async tx => {
+        await settings(tx)
+        assert.deepEqual(await stageExpiredAuditGapTransfer(tx, selected), {
+          staged: false, reason: 'SOURCE_CHANGED_OR_ABSENT',
+        })
+      }, transactionOptions)
+      assert.deepEqual(await snapshot(observer, owner.tenantId), revisedBefore)
+
+      const stageFresh = async (tx: Prisma.TransactionClient) => {
+        await settings(tx)
+        const page = await selectNext(tx, live.id)
+        assert.deepEqual(page.candidates, [revised])
+        assert.deepEqual(await stageExpiredAuditGapTransfer(tx, page.candidates[0]!), { staged: true, reason: 'LEDGER_EXPIRED' })
+        const states = await tx.$queryRawUnsafe<Array<{ generation: bigint }>>(`SELECT generation
+          FROM public.m365_audit_coverage_states WHERE customer_tenant_id = $1::uuid`, owner.tenantId)
+        assert.deepEqual(states, [{ generation: generation + 1n }])
+        assert.deepEqual(await snapshot(observer, owner.tenantId), revisedBefore, 'Independent reader cannot see uncommitted staged writes')
+      }
+      const rollback = new Error('EXPECTED_SELECTOR_TRANSFER_ROLLBACK')
+      await assert.rejects(prisma.$transaction(async tx => {
+        await stageFresh(tx)
+        throw rollback
+      }, transactionOptions), error => error === rollback)
+      assert.deepEqual(await snapshot(observer, owner.tenantId), revisedBefore, 'Selector-plus-transfer rollback preserves committed state')
+      await prisma.$transaction(stageFresh, transactionOptions)
+      const committed = await snapshot(observer, owner.tenantId)
+      assert.deepEqual(committed.m365_activity_contents,
+        revisedBefore.m365_activity_contents!.filter(row => JSON.parse(row).id !== selected.id),
+        'Only the fresh selected row is removed; completed, unknown and unvisited rows remain')
+      assert.equal(committed.m365_audit_coverage_gaps!.length, 1)
+      const gap = JSON.parse(committed.m365_audit_coverage_gaps![0]!)
+      assert.equal(gap.content_id_sha256, createHash('sha256').update(selected.microsoftContentId, 'utf8').digest('hex'))
+      assert.equal(gap.reason, 'LEDGER_EXPIRED')
+      assert.ok(!JSON.stringify(gap).includes(selected.contentUri))
+      const state = await coverageState(observer, owner.tenantId)
+      assert.equal(state.generation, (generation + 1n).toString())
+      assert.equal(state.incompleteSince, priorState.incompleteSince)
+      assert.equal(state.purged, true)
+      assert.deepEqual(await snapshot(observer, sibling.tenantId), siblingBefore, 'Populated same-organization sibling state is preserved')
+      assert.deepEqual(await snapshot(observer, outside.tenantId), outsideBefore, 'Populated outside-organization state is preserved')
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      if (connected) {
+        await clean(() => observer.query('ROLLBACK'))
+        for (const organizationId of organizationIds) await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          }
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic selector-transfer cleanup failed')
     }
   })
