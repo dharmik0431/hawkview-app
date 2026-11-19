@@ -965,3 +965,146 @@ test('HAW-75 selector enforces physical URI and exact serialized-page byte gates
       if (failures.length) throw new AggregateError(failures, 'Synthetic selector-payload cleanup failed')
     }
   })
+
+test('HAW-75 selector uses earliest nullable expiry and a live clock within one read-only transaction',
+  { ...options, timeout: 60_000 }, async () => {
+    const url = assertDisposableTestDatabase()
+    assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    const organizationId = randomUUID()
+    const futureDiscovery = '2100-01-01T00:00:00.123456Z'
+    const futureAge = '2100-01-31T00:00:00.123456Z'
+    const futureLedger = '2100-02-01T00:00:00.123457Z'
+    const cases: Array<{ name: string; discoveredAt: string; ledgerExpiresAt: string; contentExpiresAt: string | null; eligible: boolean }> = [
+      { name: 'provider alone elapsed', discoveredAt: futureDiscovery, ledgerExpiresAt: futureLedger, contentExpiresAt: beforeAge, eligible: true },
+      { name: 'ledger alone elapsed', discoveredAt: futureDiscovery, ledgerExpiresAt: beforeAge, contentExpiresAt: futureAge, eligible: true },
+      { name: 'age alone elapsed', discoveredAt: discovered, ledgerExpiresAt: futureLedger, contentExpiresAt: futureAge, eligible: true },
+      { name: 'null provider and ledger elapsed', discoveredAt: futureDiscovery, ledgerExpiresAt: beforeAge, contentExpiresAt: null, eligible: true },
+      { name: 'null provider and age elapsed', discoveredAt: discovered, ledgerExpiresAt: futureLedger, contentExpiresAt: null, eligible: true },
+      { name: 'null provider all future', discoveredAt: futureDiscovery, ledgerExpiresAt: futureLedger, contentExpiresAt: null, eligible: false },
+      { name: 'all nonnull future', discoveredAt: futureDiscovery, ledgerExpiresAt: futureLedger, contentExpiresAt: futureAge, eligible: false },
+      { name: 'provider-ledger past tie', discoveredAt: futureDiscovery, ledgerExpiresAt: beforeAge, contentExpiresAt: beforeAge, eligible: true },
+      { name: 'ledger-age past tie', discoveredAt: discovered, ledgerExpiresAt: ageDeadline, contentExpiresAt: futureAge, eligible: true },
+      { name: 'provider-age past tie', discoveredAt: discovered, ledgerExpiresAt: futureLedger, contentExpiresAt: ageDeadline, eligible: true },
+      { name: 'all past tie', discoveredAt: discovered, ledgerExpiresAt: ageDeadline, contentExpiresAt: ageDeadline, eligible: true },
+      { name: 'all future tie', discoveredAt: futureDiscovery, ledgerExpiresAt: futureAge, contentExpiresAt: futureAge, eligible: false },
+    ]
+    const settings = async (tx: Prisma.TransactionClient) => {
+      await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+      await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'America/New_York'")
+      await tx.$executeRawUnsafe("SET LOCAL DateStyle = 'SQL, DMY'")
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW transaction_read_only'), [{ transaction_read_only: 'on' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW TimeZone'), [{ TimeZone: 'America/New_York' }])
+      assert.deepEqual(await tx.$queryRawUnsafe('SHOW DateStyle'), [{ DateStyle: 'SQL, DMY' }])
+    }
+    type ClockOracle = { bracketed: boolean; eligible: boolean; providerReached: boolean | null; transactionStartedBeforeProvider: boolean | null }
+    const checkedRead = async (tx: Prisma.TransactionClient, claim: SelectedAuditGapClaim, afterId: string | null) => {
+      const before = await tx.$queryRawUnsafe<Array<{ at: string }>>(
+        `SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', $1) AS at`, format)
+      assert.equal(before.length, 1)
+      const page = await selectExpiredAuditGapPage(tx, { organizationId: claim.organizationId,
+        customerTenantId: claim.customerTenantId, afterId, limit: 1 })
+      // Same real transaction, unchanged source and exact returned UTC6 clock;
+      // no Date/Number rounding, clock override, SQL rewriting or response proxy.
+      const rows = await tx.$queryRawUnsafe<ClockOracle[]>(`SELECT
+        $2::timestamptz >= $3::timestamptz AND $2::timestamptz <= clock_timestamp() AS bracketed,
+        LEAST(ledger_expires_at, discovered_at + interval '720 hours', content_expires_at) <= $2::timestamptz AS eligible,
+        $2::timestamptz >= content_expires_at AS "providerReached",
+        transaction_timestamp() < content_expires_at AS "transactionStartedBeforeProvider"
+        FROM public.m365_activity_contents WHERE id = $1::uuid`, claim.id, page.observedAt, before[0]!.at)
+      assert.equal(rows.length, 1)
+      const oracle = rows[0]!
+      assert.equal(oracle.bracketed, true, 'Returned observation lies between real before/after database clocks')
+      assert.equal(page.examinedCount, 1)
+      assert.equal(page.lastExaminedId, claim.id)
+      assert.equal(page.endOfPass, false)
+      assert.deepEqual(page.candidates, oracle.eligible ? [claim] : [])
+      return oracle
+    }
+    let connected = false
+    try {
+      await observer.connect()
+      connected = true
+      await observer.query("SET statement_timeout = '20s'")
+      await observer.query("SET lock_timeout = '5s'")
+      await observer.query("SET TIME ZONE 'UTC'")
+      await observer.query('BEGIN')
+      const owner = await scope(observer, organizationId)
+      const clockOwner = await scope(observer, organizationId)
+      const prefix = randomUUID().slice(0, 24)
+      const claims: SelectedAuditGapClaim[] = []
+      for (const [index, fixture] of cases.entries()) claims.push(await source(observer, owner, {
+        id: prefix + (index + 1).toString(16).padStart(12, '0'), discoveredAt: fixture.discoveredAt,
+        ledgerExpiresAt: fixture.ledgerExpiresAt, contentExpiresAt: fixture.contentExpiresAt,
+      }))
+      const clockClaim = await source(observer, clockOwner, { discoveredAt: futureDiscovery,
+        ledgerExpiresAt: futureLedger, contentExpiresAt: futureAge })
+      for (const tenant of [owner, clockOwner]) await observer.query(`INSERT INTO public.m365_audit_coverage_states
+        (customer_tenant_id, organization_id, generation, incomplete_since, last_gap_at, has_purged_unrepaired_gap)
+        VALUES ($1,$2,9,'1999-01-01T00:00:00.123456Z','1999-01-01T00:00:00.123456Z',TRUE)`,
+      [tenant.tenantId, organizationId])
+      await observer.query('COMMIT')
+      const ownerBefore = await snapshot(observer, owner.tenantId)
+      const clockBefore = await snapshot(observer, clockOwner.tenantId)
+      await prisma.$transaction(async tx => {
+        await settings(tx)
+        let afterId: string | null = null
+        for (const [index, claim] of claims.entries()) {
+          const oracle = await checkedRead(tx, claim, afterId)
+          assert.equal(oracle.eligible, cases[index]!.eligible, cases[index]!.name)
+          afterId = claim.id
+        }
+      }, { isolationLevel: 'ReadCommitted', maxWait: 5_000, timeout: 20_000 })
+      assert.deepEqual(await snapshot(observer, owner.tenantId), ownerBefore)
+      assert.deepEqual(await snapshot(observer, clockOwner.tenantId), clockBefore)
+
+      await prisma.$transaction(async tx => {
+        await settings(tx)
+        // This separate connection commits a future deadline after the real
+        // read-only transaction has started. READ COMMITTED sees that revision.
+        await observer.query(`UPDATE public.m365_activity_contents
+          SET content_expires_at = clock_timestamp() + interval '3 seconds' WHERE id = $1`, [clockClaim.id])
+        const revised = await select(observer, clockClaim.id)
+        const revisedBefore = await snapshot(observer, clockOwner.tenantId)
+        let oracle = await checkedRead(tx, revised, null)
+        assert.equal(oracle.transactionStartedBeforeProvider, true)
+        assert.equal(oracle.providerReached, false, 'Initial sample must precede the deadline; do not silently skip a late fixture')
+        assert.equal(oracle.eligible, false)
+        // Wall-clock wait controls test liveness only. Actual expiry and clock
+        // advancement are decided by the observed database values above.
+        const stop = performance.now() + 7_000
+        while (!oracle.providerReached && performance.now() < stop) {
+          await new Promise(resolve => setTimeout(resolve, 100))
+          oracle = await checkedRead(tx, revised, null)
+          assert.equal(oracle.transactionStartedBeforeProvider, true)
+        }
+        assert.equal(oracle.providerReached, true, 'Database clock must cross the committed provider deadline')
+        assert.equal(oracle.eligible, true, 'Same transaction must now return the expired candidate')
+        assert.deepEqual(await snapshot(observer, clockOwner.tenantId), revisedBefore)
+      }, { isolationLevel: 'ReadCommitted', maxWait: 5_000, timeout: 20_000 })
+      assert.deepEqual(await snapshot(observer, owner.tenantId), ownerBefore, 'Other scope remains unchanged across the clock control')
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      if (connected) {
+        await clean(() => observer.query('ROLLBACK'))
+        await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          }
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic selector-expiry cleanup failed')
+    }
+  })
