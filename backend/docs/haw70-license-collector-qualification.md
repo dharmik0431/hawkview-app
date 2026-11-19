@@ -1,36 +1,53 @@
 # HAW-70: qualify the actual license transaction before choosing admission locks
 
-Prepared test/design checkpoint, 18 November 2026 (19 November UTC). Source reviewed at
-`6d254b0308b82d6b75d8fc2eec59f93407501bda`, tree
-`ae56b0d4e1ce7d98f9d9368712a421d0c9cfcf8f`, based on protected main
+Execution and review checkpoint, 18 November 2026 (19 November UTC). The approved
+public candidate `e000addb662714919d43052bf477907ff7917277`, tree
+`ba9462c1da98a64e9e618da751915bfa0205b2d6`, is based on protected main
 `a15951997b6734b9fc612717cf965c9f9651176c`. No runtime, migration, permission,
 test flag, retry or cadence changes are selected here.
 
-**PREPARED / UNEXECUTED:** the isolated child now adds one actual-collector
-transaction witness to the existing registered disposable-database suite. It
-has not run against PostgreSQL or passed exact-head CI. The witness covers an
-acknowledged inventory commit, a known precommit throw after staged inventory
-and evidence, the corresponding positive retry, complete empty deletion, and
-unchanged empty collection. It does not install a license invalidator or prove
-direct-writer, bulk, cascade, unknown-result or recovery races.
+**APPROVED PARENT EXECUTED; LOCAL FOLLOW-UP UNPROVED:**
+[registered run 44456717177](https://github.com/dharmik0431/hawkview-app/actions/runs/44456717177)
+passed at the exact approved parent and its identical-tree merge. The actual
+collector case passed in 310.514597 ms, with acknowledged commit, a known
+precommit throw after staged inventory/evidence, positive retry after that known
+rollback, complete empty deletion and unchanged empty collection. These are five
+sequential controls within one top-level case. Claude independently verified the
+exact source and matching execution evidence in the authorized review.
+
+This local follow-up protects early test setup with client cleanup and explicitly
+rejects unsupported transaction call forms. Those newer test changes have not
+run in hosted CI or received a new Claude review. The parent result must not be
+reported as exact-head execution of this revision. Neither version installs a
+license invalidator or proves direct-writer, bulk, cascade, unknown-result or
+recovery races.
 
 ## Evidence and decision
 
-The [approved hosted run](https://github.com/dharmik0431/hawkview-app/actions/runs/44396832428)
+The earlier [modeled-cycle run](https://github.com/dharmik0431/hawkview-app/actions/runs/44396832428)
 executed all 33 focused physical top-level cases and 70 nested cases without
 skips; the complete physical phase passed 531 cases. Its verified merge tree
-matches the reviewed head. In particular, the modeled license lock cycle ran:
+matches its approved `6d254b0308b82d6b75d8fc2eec59f93407501bda` parent.
+In particular, the modeled license lock cycle ran:
 one participant failed with an actual deadlock, both attempts rolled back, and
 serialized and lock-release controls passed. This is evidence against a naive
 AFTER-source authority lock. It neither installs a license trigger nor runs the
 real license collector in that cycle. The [existing contract](haw70-license-source-participation.md)
 still supplies mutation, role, truncation and eventual ordering acceptance.
 
-The prepared executable slice targets the **actual license collection
-transaction and its outcome boundary**, before experimenting with an admission
-lock. It must not introduce a production guard or label the existing deadlock
-model a correction. Its assertions distinguish source atomicity from wrapper
-state and from ordering proof, subject to actual registered CI execution.
+The newer approved run executed all 34 physical HAW-70 top-level cases and the
+same 70 nested cases without skips, plus the separate synthetic adapter case
+that forbids database connections. Its complete database phase passed 532 cases;
+ordinary tests passed 3,394 with two documented legacy skips. Migrations, builds,
+launcher and dedicated image checks passed. Existing warnings and the conditional
+pre-image smoke skip remain recorded; this is not a warning-free claim.
+
+This executable slice qualifies the **actual license collection transaction and
+its outcome boundary** at the approved parent, before experimenting with admission
+locks. Its measured CI timing is not a production latency or worst-case margin
+guarantee. The held observer assertions must still fit the unchanged interactive
+transaction lifetime on each tested revision. The modeled deadlock is not a
+correction or a production guard.
 
 ## Source boundaries to preserve
 
@@ -44,8 +61,8 @@ state and from ordering proof, subject to actual registered CI execution.
 
 The [existing synthetic license tests](../src/tenants/license-validation.test.ts)
 check incomplete inputs and a simulated commit failure, but their mutable storage
-double does not establish real database visibility or rollback. This new witness
-must close that narrow transport/transaction gap rather than repeat those tests.
+double does not establish real database visibility or rollback. The approved actual-collector witness closes that narrow transport/transaction
+gap for its tested controls; the local follow-up still needs exact-head execution.
 
 ## Why an early-lock shortcut is not selected
 
@@ -70,7 +87,7 @@ and [explicit locking](https://www.postgresql.org/docs/16/explicit-locking.html)
 The HawkView conclusions above are source-based inferences, not a new physical
 reproduction. No timeout or retry-policy change is a substitute for the proof.
 
-## Prepared registered witness and required execution
+## Registered witness contract
 
 Extend the already registered
 [authority suite](../src/tenants/tenant-health-source-authority.database-integration.test.ts).
@@ -119,6 +136,20 @@ test instead captures the real Prisma transaction's rejection before that
 translation and requires the exact injected cause, excluding a substitute
 transaction timeout or rollback error.
 
+The local follow-up enters `try/finally` immediately after successful Prisma
+client construction, so setup/validation failures also disconnect it. The held
+callback is declared outside that scope so cleanup can clear it on every exit.
+The transaction proxy explicitly refuses non-callback invocations before calling
+the real adapter. Current `saveSnapshot` uses the callback form; array-form calls
+elsewhere in the service are outside this witness's license path. A future change
+to that path requires a deliberate witness update, not a fabricated success.
+
+Evidence identity includes `baselineObservedAt.toISOString()`. Current application
+baselines and JavaScript `Date` reads use millisecond precision. Preserve that
+contract in this fixture; assess any future raw-SQL microsecond baseline before
+changing expected evidence IDs. No runtime timestamp or evidence-key change is
+part of this follow-up.
+
 Use barriers with bounded failure cleanup, not sleeps. A paused interactive
 transaction must fit its existing configured lifetime; finish observer queries
 promptly and release gates in `finally` before waiting for dependent work. Do not
@@ -136,16 +167,17 @@ protocol is selected. No additional whole-transaction lock order is proved here.
 
 ## Completion boundary and fallback
 
-This child adds only the bounded test above and design/status text. The witness
-is implemented but **not executed** against PostgreSQL; its prepared assertions
-are not evidence of a passing collector transaction. The approved public candidate
-and CI results stay unchanged; newer local material has not been uploaded or sent
-to Claude. No application or schema deployment has occurred.
+The approved public parent has actual collector component proof and independent
+review. This child adds only test cleanup/call-form safeguards and status notes;
+its newer physical test bytes remain unexecuted in registered CI. The public draft
+and approved evidence remain unchanged. This local revision has not been uploaded
+or sent to Claude, and no application or schema deployment has occurred.
 
-Before using the witness as proof, require exact-head registered disposable execution
-and authorized independent review before using its results. Full license/source
-participation, actual writer/parent ordering, reader/recovery, time/model aging,
-deployed identities and fleet cost remain separate release gates. Keep HAW-21
-ownership work separate. Preserve protected main, the public draft, parent branch
-and archives. Incomplete candidates remain unmerged; no manual database, sync or
+Require applicable exact-source approval before sharing this revision, then
+registered exact-head disposable execution and authorized independent review
+before extending the execution claim to it. Full license/source participation,
+actual writer/parent ordering, reader/recovery, time/model aging, deployed
+identities and fleet cost remain separate release gates. Keep HAW-21 ownership
+work separate. Preserve protected main, the public draft, parent branch and
+archives. Incomplete candidates remain unmerged; no manual database, sync or
 release recovery. HAW-70, Baseline and full SYNC are incomplete.

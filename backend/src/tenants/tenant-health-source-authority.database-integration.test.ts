@@ -2179,98 +2179,100 @@ test('HAW-70 actual LICENSES collector keeps inventory, evidence and baseline at
     // either pg client. The shared guard additionally verifies workflow/job,
     // host, database and role for 5432; local 55432 is refused here.
     const f = await syncStateAuthorityFixture(context)
-    const prisma = new PrismaService()
-    const scope = f.scopes[0], sibling = f.scopes[1]
-    const [skuA, skuB, skuC, skuD, servicePlanId] = Array.from({ length: 5 }, () => randomUUID())
-    const plan = { servicePlanId, servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }
-    const oldA = { skuId: skuA, skuPartNumber: 'HAW70_OLD', consumedUnits: 1,
-      prepaidUnits: { enabled: 2 }, capabilityStatus: 'Enabled', servicePlans: [plan] }
-    const oldB = { ...oldA, skuId: skuB, skuPartNumber: 'HAW70_REMOVED' }
-    const newA = { ...oldA, skuPartNumber: 'HAW70_CHANGED', prepaidUnits: { enabled: 3 } }
-    const newC = { ...oldA, skuId: skuC, skuPartNumber: 'HAW70_NEW' }
-    const newD = { ...oldA, skuId: skuD, skuPartNumber: 'HAW70_RETRY' }
-    const initialRows = validatedLicenseRows([oldA, oldB])
-    const responseOne = [newA, newC]
-    const responseTwo = [oldA, newD]
-    const evidenceBuilder = new ChangeEvidenceService(prisma)
-    type Query = (sql: string, values: string[]) => Promise<any[]>
-    const observerQuery: Query = async (sql, values) => (await f.observer.query(sql, values)).rows
-    const read = async (query: Query, tenantId: string) => {
-      const values = [scope.organizationId, tenantId]
-      const inventory = await query(`SELECT microsoft_sku_id::text AS sku, sku_part_number AS part,
-        consumed_units, enabled_units, warning_units, suspended_units, locked_out_units,
-        capability_status, service_plans::text AS service_plans, last_seen_at::text AS last_seen_at
-        FROM tenant_licenses WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-        ORDER BY microsoft_sku_id`, values)
-      const snapshot = await query(`SELECT id::text, payload::text, observed_at::text AS observed_at
-        FROM tenant_entra_snapshots WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-        AND resource_type = 'LICENSES'`, values)
-      const events = await query(`SELECT source_event_id, changed_fields::text AS changed_fields, target_id
-        FROM change_evidence_events WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-        AND source = 'SNAPSHOT_DIFFERENCE' AND target_type = 'LICENSES' ORDER BY source_event_id`, values)
-      const state = await query(`SELECT status::text, last_attempt_at::text AS last_attempt_at,
-        last_successful_at::text AS last_successful_at FROM sync_states
-        WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-        AND resource_type = 'LICENSES'`, values)
-      const authority = await query(`SELECT incarnation::text, source_revision::text,
-        current_snapshot_id::text, current_observation_sequence::text, live
-        FROM tenant_health_source_authorities WHERE organization_id = $1::uuid
-        AND customer_tenant_id = $2::uuid`, values)
-      assert.equal(snapshot.length, 1)
-      assert.equal(authority.length, 1)
-      return { inventory, snapshot, events, state, authority }
-    }
-    const readObserver = (tenantId = scope.tenantId) => read(observerQuery, tenantId)
-    const businessRows = (inventory: any[]) => inventory.map(row => ({
-      skuId: row.sku, skuPartNumber: row.part, consumedUnits: row.consumed_units,
-      capabilityStatus: row.capability_status,
-      prepaidUnits: { enabled: row.enabled_units, warning: row.warning_units,
-        suspended: row.suspended_units, lockedOut: row.locked_out_units },
-      servicePlans: row.service_plans === null ? null : JSON.parse(row.service_plans),
-    })).sort((left, right) => left.skuId.localeCompare(right.skuId))
     let beforeFinal: ((transaction: any) => Promise<void>) | undefined
-    let inventoryTransactionError: unknown
-    const serviceDb = new Proxy(prisma, {
-      get(target, property) {
-        if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: unknown) =>
-          target.$transaction(async transaction => work(new Proxy(transaction, {
-            get(client, field) {
-              if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
-                get(delegate, operation) {
-                  if (operation === 'upsert') return async (args: any) => {
-                    if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
-                      await beforeFinal(client)
-                    }
-                    return delegate.upsert(args)
-                  }
-                  const value = Reflect.get(delegate, operation, delegate)
-                  return typeof value === 'function' ? value.bind(delegate) : value
-                },
-              })
-              const value = Reflect.get(client, field, client)
-              return typeof value === 'function' ? value.bind(client) : value
-            },
-          })), options as any).catch(error => {
-            inventoryTransactionError = error
-            throw error
-          })
-        const value = Reflect.get(target, property, target)
-        return typeof value === 'function' ? value.bind(target) : value
-      },
-    }) as PrismaService
-    let resolved = 0
-    let payload: unknown[] = []
-    const service = new TenantSyncService(serviceDb, {} as any, {} as any,
-      { resolveIncident: async () => { resolved++ }, publishIncident: async () => undefined } as any,
-      evidenceBuilder, {} as any)
-    ;(service as any).fetchGraphPage = async (url: string, token: string, label: string) => {
-      assert.equal(url, 'https://graph.microsoft.com/v1.0/subscribedSkus')
-      assert.equal(token, 'synthetic-token')
-      assert.equal(label, 'license')
-      return new Response(JSON.stringify({ value: payload }), { status: 200 })
-    }
-    ;(service as any).logger = { log() {}, warn() {} }
+    const prisma = new PrismaService()
     try {
+      const scope = f.scopes[0], sibling = f.scopes[1]
+      const [skuA, skuB, skuC, skuD, servicePlanId] = Array.from({ length: 5 }, () => randomUUID())
+      const plan = { servicePlanId, servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }
+      const oldA = { skuId: skuA, skuPartNumber: 'HAW70_OLD', consumedUnits: 1,
+        prepaidUnits: { enabled: 2 }, capabilityStatus: 'Enabled', servicePlans: [plan] }
+      const oldB = { ...oldA, skuId: skuB, skuPartNumber: 'HAW70_REMOVED' }
+      const newA = { ...oldA, skuPartNumber: 'HAW70_CHANGED', prepaidUnits: { enabled: 3 } }
+      const newC = { ...oldA, skuId: skuC, skuPartNumber: 'HAW70_NEW' }
+      const newD = { ...oldA, skuId: skuD, skuPartNumber: 'HAW70_RETRY' }
+      const initialRows = validatedLicenseRows([oldA, oldB])
+      const responseOne = [newA, newC]
+      const responseTwo = [oldA, newD]
+      const evidenceBuilder = new ChangeEvidenceService(prisma)
+      type Query = (sql: string, values: string[]) => Promise<any[]>
+      const observerQuery: Query = async (sql, values) => (await f.observer.query(sql, values)).rows
+      const read = async (query: Query, tenantId: string) => {
+        const values = [scope.organizationId, tenantId]
+        const inventory = await query(`SELECT microsoft_sku_id::text AS sku, sku_part_number AS part,
+          consumed_units, enabled_units, warning_units, suspended_units, locked_out_units,
+          capability_status, service_plans::text AS service_plans, last_seen_at::text AS last_seen_at
+          FROM tenant_licenses WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+          ORDER BY microsoft_sku_id`, values)
+        const snapshot = await query(`SELECT id::text, payload::text, observed_at::text AS observed_at
+          FROM tenant_entra_snapshots WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+          AND resource_type = 'LICENSES'`, values)
+        const events = await query(`SELECT source_event_id, changed_fields::text AS changed_fields, target_id
+          FROM change_evidence_events WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+          AND source = 'SNAPSHOT_DIFFERENCE' AND target_type = 'LICENSES' ORDER BY source_event_id`, values)
+        const state = await query(`SELECT status::text, last_attempt_at::text AS last_attempt_at,
+          last_successful_at::text AS last_successful_at FROM sync_states
+          WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+          AND resource_type = 'LICENSES'`, values)
+        const authority = await query(`SELECT incarnation::text, source_revision::text,
+          current_snapshot_id::text, current_observation_sequence::text, live
+          FROM tenant_health_source_authorities WHERE organization_id = $1::uuid
+          AND customer_tenant_id = $2::uuid`, values)
+        assert.equal(snapshot.length, 1)
+        assert.equal(authority.length, 1)
+        return { inventory, snapshot, events, state, authority }
+      }
+      const readObserver = (tenantId = scope.tenantId) => read(observerQuery, tenantId)
+      const businessRows = (inventory: any[]) => inventory.map(row => ({
+        skuId: row.sku, skuPartNumber: row.part, consumedUnits: row.consumed_units,
+        capabilityStatus: row.capability_status,
+        prepaidUnits: { enabled: row.enabled_units, warning: row.warning_units,
+          suspended: row.suspended_units, lockedOut: row.locked_out_units },
+        servicePlans: row.service_plans === null ? null : JSON.parse(row.service_plans),
+      })).sort((left, right) => left.skuId.localeCompare(right.skuId))
+      let inventoryTransactionError: unknown
+      const serviceDb = new Proxy(prisma, {
+        get(target, property) {
+          if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: unknown) => {
+            assert.equal(typeof work, 'function', 'Collector witness requires callback-form transactions')
+            return target.$transaction(async transaction => work(new Proxy(transaction, {
+              get(client, field) {
+                if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
+                  get(delegate, operation) {
+                    if (operation === 'upsert') return async (args: any) => {
+                      if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
+                        await beforeFinal(client)
+                      }
+                      return delegate.upsert(args)
+                    }
+                    const value = Reflect.get(delegate, operation, delegate)
+                    return typeof value === 'function' ? value.bind(delegate) : value
+                  },
+                })
+                const value = Reflect.get(client, field, client)
+                return typeof value === 'function' ? value.bind(client) : value
+              },
+            })), options as any).catch(error => {
+              inventoryTransactionError = error
+              throw error
+            })
+          }
+          const value = Reflect.get(target, property, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as PrismaService
+      let resolved = 0
+      let payload: unknown[] = []
+      const service = new TenantSyncService(serviceDb, {} as any, {} as any,
+        { resolveIncident: async () => { resolved++ }, publishIncident: async () => undefined } as any,
+        evidenceBuilder, {} as any)
+      ;(service as any).fetchGraphPage = async (url: string, token: string, label: string) => {
+        assert.equal(url, 'https://graph.microsoft.com/v1.0/subscribedSkus')
+        assert.equal(token, 'synthetic-token')
+        assert.equal(label, 'license')
+        return new Response(JSON.stringify({ value: payload }), { status: 200 })
+      }
+      ;(service as any).logger = { log() {}, warn() {} }
       await f.writer.query('BEGIN')
       for (const tenantId of [scope.tenantId, sibling.tenantId]) {
         for (const row of initialRows) await f.writer.query(`INSERT INTO tenant_licenses

@@ -1,6 +1,6 @@
 # HAW-70: license inventory participation contract
 
-Design-only checkpoint, 18 November 2026. Reviewed parent:
+Design contract with updated component evidence, 18 November 2026. Original reviewed parent:
 `8623cf401f54e5497d01d287b278399b517115ea`, based on protected main
 `a15951997b6734b9fc612717cf965c9f9651176c`. No trigger, query, schema, permissions,
 receipt generation or runtime behavior changes here. The cumulative candidate
@@ -34,8 +34,15 @@ application writer to ship. The existing fixture rejects nonregistered/local
 physical targets before constructing clients. No runtime/DDL/migration/workflow
 change or new fixture trigger is introduced. Full-collector and parent schedules
 below remain required. The new [collector qualification decision](haw70-license-collector-qualification.md)
-defines the next smaller actual-adapter transaction witness before selecting an
-admission-lock implementation; that witness remains design only.
+records the smaller actual-adapter transaction witness before selecting an
+admission-lock implementation. That witness executed at approved
+`e000addb662714919d43052bf477907ff7917277` in
+[run 44456717177](https://github.com/dharmik0431/hawkview-app/actions/runs/44456717177),
+with all five sequential controls passing in one case. The run passed 34 physical
+HAW-70 top-level cases and 70 nested cases without skips, plus a separate synthetic
+adapter case. Claude verified that exact source and execution. The current local
+test-cleanup follow-up is newer than that evidence and requires its own exact-head
+CI/review. No license invalidator or complete collector/parent order is proved.
 
 Treat license inventory as a saved-health source, but do not copy the existing
 snapshot invalidator onto it without resolving the full transaction's lock order.
@@ -198,18 +205,20 @@ statement test is insufficient for the full collector graph.
 
 ## Next step and fallback
 
-The modeled cycle now has a passing registered execution. Before selecting a
-production trigger candidate, qualify the actual collector transaction using the
-[bounded witness specification](haw70-license-collector-qualification.md), then
-prove a complete compatible order with actual direct-writer and parent boundaries.
-Any experimental fixture must stay test-only and unpublished until exact-source
-approval; this design does not authorize public
-upload or Claude review. Do not extend the partial receipt or activate a reader.
+Both the modeled cycle and the bounded actual collector transaction now have
+passing registered execution at their approved heads. The local follow-up closes
+early setup cleanup and makes the callback-only test proxy contract explicit;
+its physical execution is still unproved. Before selecting a production trigger
+candidate, prove a complete compatible order with actual direct-writer and parent
+boundaries. Any experimental fixture must stay test-only and unpublished until
+applicable exact-source approval; this design does not authorize public upload
+or Claude review of newer source. Do not extend the partial receipt or activate
+a reader.
 
-Keep public draft PR #372 at approved `6d254b0308b82d6b75d8fc2eec59f93407501bda`;
-its green CI tests the modeled license cycle, not an installed license guard or
-complete collector/parent protocol. The newer qualification document is local only.
-Preserve this isolated child, its parent and archives. If the design fails review, revise
+Keep public draft PR #372 at approved `e000addb662714919d43052bf477907ff7917277`.
+Its green CI proves the modeled cycle and the bounded actual collector controls,
+not an installed license guard or complete collector/parent protocol. Preserve
+this isolated child, its parent and archives. If the design fails review, revise
 only the inactive child; protected main is the operational fallback. No manual
 database, migration-history or release recovery. Complete source participation,
 authorized independent source review, exact-head CI, protected merge, configured
