@@ -22,14 +22,20 @@ the survivor; complete fixture source/history/authority state, sibling isolation
 and released row/authority/advisory locks are checked. A serialized rollback-only
 control exercises the same updates without a competitor.
 
-This physical witness is PREPARED/UNEXECUTED. It does not reproduce an installed
-trigger or real `saveSnapshot` transaction and does not prove a correction,
-commit-loss recovery, parent deletion, permission boundary or collector outcome.
+Execution update, 18 November 2026: the exact reviewed candidate
+`6d254b0308b82d6b75d8fc2eec59f93407501bda` passed
+[registered disposable CI](https://github.com/dharmik0431/hawkview-app/actions/runs/44396832428),
+including this modeled cycle and its rollback/released-lock controls. The model
+does not reproduce an installed trigger or real `saveSnapshot` transaction and
+does not prove a correction, commit-loss recovery, parent deletion, permission
+boundary or collector outcome.
 Its explicit client-side invalidation is a model of proposed placement, not an
 application writer to ship. The existing fixture rejects nonregistered/local
 physical targets before constructing clients. No runtime/DDL/migration/workflow
 change or new fixture trigger is introduced. Full-collector and parent schedules
-below remain required after the modeled lock edge is executed and reviewed.
+below remain required. The new [collector qualification decision](haw70-license-collector-qualification.md)
+defines the next smaller actual-adapter transaction witness before selecting an
+admission-lock implementation; that witness remains design only.
 
 Treat license inventory as a saved-health source, but do not copy the existing
 snapshot invalidator onto it without resolving the full transaction's lock order.
@@ -129,7 +135,9 @@ The existing historical reconciliation receipt cannot authorize this added sourc
 ## Lock-order hold: an AFTER trigger alone is insufficient
 
 There is a concrete source-derived cycle to investigate before adopting the naive
-statement-trigger design. This is an inference, not an executed deadlock:
+statement-trigger design. The explicit client-side model of this cycle has now
+executed in registered CI; the corresponding installed-trigger/actual-collector
+schedule remains unproved:
 
 | Step | Collector transaction A | Direct writer B |
 | --- | --- | --- |
@@ -190,15 +198,18 @@ statement test is insufficient for the full collector graph.
 
 ## Next step and fallback
 
-Before a production trigger candidate, choose a complete compatible transaction
-ordering and prepare a focused disposable witness for the multi-SKU/direct-writer
-cycle and parent boundaries. Any experimental fixture must stay test-only and
-unpublished until exact-source approval; this design does not authorize public
+The modeled cycle now has a passing registered execution. Before selecting a
+production trigger candidate, qualify the actual collector transaction using the
+[bounded witness specification](haw70-license-collector-qualification.md), then
+prove a complete compatible order with actual direct-writer and parent boundaries.
+Any experimental fixture must stay test-only and unpublished until exact-source
+approval; this design does not authorize public
 upload or Claude review. Do not extend the partial receipt or activate a reader.
 
-Keep public PR #372 at approved `61c93a2a317759dbea1c450b57fe18eee8bc0d05`;
-its earlier green CI does not test this design or license invalidation. Preserve
-this isolated child, its parent and archives. If the design fails review, revise
+Keep public draft PR #372 at approved `6d254b0308b82d6b75d8fc2eec59f93407501bda`;
+its green CI tests the modeled license cycle, not an installed license guard or
+complete collector/parent protocol. The newer qualification document is local only.
+Preserve this isolated child, its parent and archives. If the design fails review, revise
 only the inactive child; protected main is the operational fallback. No manual
 database, migration-history or release recovery. Complete source participation,
 authorized independent source review, exact-head CI, protected merge, configured
