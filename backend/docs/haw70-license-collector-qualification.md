@@ -1,10 +1,18 @@
 # HAW-70: qualify the actual license transaction before choosing admission locks
 
-Design-only, 18 November 2026 (19 November UTC). Source reviewed at
+Prepared test/design checkpoint, 18 November 2026 (19 November UTC). Source reviewed at
 `6d254b0308b82d6b75d8fc2eec59f93407501bda`, tree
 `ae56b0d4e1ce7d98f9d9368712a421d0c9cfcf8f`, based on protected main
 `a15951997b6734b9fc612717cf965c9f9651176c`. No runtime, migration, permission,
 test flag, retry or cadence changes are selected here.
+
+**PREPARED / UNEXECUTED:** the isolated child now adds one actual-collector
+transaction witness to the existing registered disposable-database suite. It
+has not run against PostgreSQL or passed exact-head CI. The witness covers an
+acknowledged inventory commit, a known precommit throw after staged inventory
+and evidence, the corresponding positive retry, complete empty deletion, and
+unchanged empty collection. It does not install a license invalidator or prove
+direct-writer, bulk, cascade, unknown-result or recovery races.
 
 ## Evidence and decision
 
@@ -18,11 +26,11 @@ AFTER-source authority lock. It neither installs a license trigger nor runs the
 real license collector in that cycle. The [existing contract](haw70-license-source-participation.md)
 still supplies mutation, role, truncation and eventual ordering acceptance.
 
-The next executable slice should qualify the **actual license collection
+The prepared executable slice targets the **actual license collection
 transaction and its outcome boundary**, before experimenting with an admission
 lock. It must not introduce a production guard or label the existing deadlock
-model a correction. This document defines that smaller witness so the next test
-can distinguish source atomicity from wrapper state and from ordering proof.
+model a correction. Its assertions distinguish source atomicity from wrapper
+state and from ordering proof, subject to actual registered CI execution.
 
 ## Source boundaries to preserve
 
@@ -62,7 +70,7 @@ and [explicit locking](https://www.postgresql.org/docs/16/explicit-locking.html)
 The HawkView conclusions above are source-based inferences, not a new physical
 reproduction. No timeout or retry-policy change is a substitute for the proof.
 
-## Smallest next registered witness
+## Prepared registered witness and required execution
 
 Extend the already registered
 [authority suite](../src/tenants/tenant-health-source-authority.database-integration.test.ts).
@@ -106,7 +114,10 @@ assertions, not assumed transaction participants.
 Record that the intended injection boundary was reached after staged writes;
 an unrelated early rejection must not satisfy the rollback case. The outer
 wrapper may translate the error into a gateway exception, so do not require
-the caller's exception object to be identical to the injected one.
+the caller's exception object to be identical to the injected one. The prepared
+test instead captures the real Prisma transaction's rejection before that
+translation and requires the exact injected cause, excluding a substitute
+transaction timeout or rollback error.
 
 Use barriers with bounded failure cleanup, not sleeps. A paused interactive
 transaction must fit its existing configured lifetime; finish observer queries
@@ -117,7 +128,7 @@ migration/trigger catalogs and sibling/outside-scope state. Test fixture cleanup
 is not production recovery.
 
 A known throw before commit is **not** an unknown commit result, lost acknowledgement,
-late completion or retry witness. A successful single-collector run is **not** a
+late completion or uncertain-result retry witness. A successful single-collector run is **not** a
 concurrent collector/direct-writer/parent schedule. The later installed-fixture
 ordering experiment must still cover observed blocker edges, both parent orders,
 existing/fresh/conflict writes and zero/nonzero evidence before a production
@@ -125,12 +136,13 @@ protocol is selected. No additional whole-transaction lock order is proved here.
 
 ## Completion boundary and fallback
 
-This step adds only design and corrects stale status in the prior contract.
-The proposed witness is not implemented or executed. The approved public candidate
-and CI results stay unchanged; newer local text has not been uploaded or sent to
-Claude. No application or schema deployment has occurred.
+This child adds only the bounded test above and design/status text. The witness
+is implemented but **not executed** against PostgreSQL; its prepared assertions
+are not evidence of a passing collector transaction. The approved public candidate
+and CI results stay unchanged; newer local material has not been uploaded or sent
+to Claude. No application or schema deployment has occurred.
 
-After the witness is prepared, require exact-head registered disposable execution
+Before using the witness as proof, require exact-head registered disposable execution
 and authorized independent review before using its results. Full license/source
 participation, actual writer/parent ordering, reader/recovery, time/model aging,
 deployed identities and fleet cost remain separate release gates. Keep HAW-21
