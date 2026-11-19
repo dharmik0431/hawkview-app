@@ -607,6 +607,8 @@ model Organization {
   directoryAuditLogs DirectoryAuditLog[]
   m365ActivitySubscriptions M365ActivitySubscription[]
   m365ActivityContents M365ActivityContent[]
+  m365AuditCoverageGaps M365AuditCoverageGap[]
+  m365AuditCoverageStates M365AuditCoverageState[]
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
@@ -713,6 +715,8 @@ model CustomerTenant {
   directoryAuditLogs DirectoryAuditLog[]
   m365ActivitySubscriptions M365ActivitySubscription[]
   m365ActivityContents M365ActivityContent[]
+  m365AuditCoverageGaps M365AuditCoverageGap[]
+  m365AuditCoverageState M365AuditCoverageState?
   m365AuditRecords M365AuditRecord[]
   m365AuditDailyUsage M365AuditDailyUsage[]
   changeEvidenceEvents ChangeEvidenceEvent[]
@@ -1129,6 +1133,44 @@ model M365ActivityContent {
   @@index([organizationId, customerTenantId, status, nextRetryAt])
   @@index([ledgerExpiresAt])
   @@map("m365_activity_contents")
+}
+
+// Additive storage only; owner-fenced writers and sticky outcome readers are pending.
+model M365AuditCoverageGap {
+  id                 String         @id @default(uuid()) @db.Uuid
+  organizationId     String         @map("organization_id") @db.Uuid
+  customerTenantId   String         @map("customer_tenant_id") @db.Uuid
+  contentType        String         @map("content_type") @db.VarChar(80)
+  contentIdSha256    String         @map("content_id_sha256") @db.Char(64)
+  sourceStatus       String         @map("source_status") @db.VarChar(30)
+  reason             String         @db.VarChar(40)
+  sourceExpiredAt    DateTime       @map("source_expired_at") @db.Timestamptz(6)
+  firstObservedAt    DateTime       @default(now()) @map("first_observed_at") @db.Timestamptz(6)
+  resolvedAt         DateTime?      @map("resolved_at") @db.Timestamptz(6)
+  organization       Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade, map: "m365_audit_coverage_gaps_org_fkey")
+  customerTenant     CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "m365_audit_coverage_gaps_tenant_scope_fkey")
+
+  @@unique([customerTenantId, contentIdSha256], map: "m365_audit_coverage_gaps_tenant_digest_key")
+  @@index([organizationId, customerTenantId, firstObservedAt], map: "m365_audit_coverage_gaps_scope_observed_idx")
+  @@index([firstObservedAt], map: "m365_audit_coverage_gaps_observed_idx")
+  @@map("m365_audit_coverage_gaps")
+}
+
+// The marker is intentionally independent of the 30-day compact records. It
+// remains until a future exact-owner automatic recollection proves repair.
+model M365AuditCoverageState {
+  customerTenantId String         @id @map("customer_tenant_id") @db.Uuid
+  organizationId   String         @map("organization_id") @db.Uuid
+  generation       BigInt         @default(1)
+  incompleteSince  DateTime       @map("incomplete_since") @db.Timestamptz(6)
+  lastGapAt        DateTime       @map("last_gap_at") @db.Timestamptz(6)
+  hasPurgedUnrepairedGap Boolean   @default(false) @map("has_purged_unrepaired_gap")
+  organization     Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade, map: "m365_audit_coverage_states_org_fkey")
+  customerTenant   CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade, map: "m365_audit_coverage_states_tenant_scope_fkey")
+
+  @@unique([customerTenantId, organizationId], map: "m365_audit_coverage_states_tenant_scope_key")
+  @@index([organizationId, customerTenantId], map: "m365_audit_coverage_states_scope_idx")
+  @@map("m365_audit_coverage_states")
 }
 
 // Retain only genuine administrative/security/configuration events, not the
