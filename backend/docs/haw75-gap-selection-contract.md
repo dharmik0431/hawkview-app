@@ -75,7 +75,7 @@ Required physical controls add exact/one-byte-over URI and serialized-text bound
 | Fair-turn helper | It only ranks supplied ready tenants. There is no durable turn storage or advancement policy, and no proven integration with deployment capacity. |
 | HAW-21 lease/outcome boundary | Consume the separately qualified owner fence later; do not replace it with a callback, row read or this selector. |
 
-The bounded page proposal still requires a real implementation and database/query-cost proof. Deployment capacity, cross-tenant selection, durable turn storage and admission-time versus completed-turn advancement remain separate and unresolved. The download ordering, blob/byte ceilings, polling/cooldown, retention and failure policy stay unchanged. No three-tenant fairness bound is promised.
+The inactive bounded page implementation still requires database/transport/query-cost proof and production integration. Deployment capacity, cross-tenant selection, durable turn storage and admission-time versus completed-turn advancement remain separate and unresolved. The download ordering, blob/byte ceilings, polling/cooldown, retention and failure policy stay unchanged. No three-tenant fairness bound is promised.
 
 ## Cleanup must not bypass unvisited candidates
 
