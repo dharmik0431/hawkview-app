@@ -5,10 +5,10 @@ import pg from 'pg'
 import type { Prisma } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { stageExpiredAuditGapTransfer, type AuditGapTransferTransaction, type SelectedAuditGapClaim, type StagedAuditGapTransfer } from './m365-audit-gap-transfer.js'
-import { selectExpiredAuditGapPage } from './m365-audit-gap-selection.js'
+import { selectExpiredAuditGapPage, AUDIT_GAP_SELECTION_URI_BYTES, AUDIT_GAP_SELECTION_PAGE_BYTES } from './m365-audit-gap-selection.js'
 
-// Actual helper SQL, hosted disposable service only. The final prepared case
-// adds the inactive selector; no provider, owner-fence, outcome reader or
+// Actual helper SQL, hosted disposable service only. The final prepared cases
+// add the inactive selector; no provider, owner-fence, outcome reader or
 // production writer is exercised. Public-parent CI does not cover new cases.
 const enabled = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
   && process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1'
@@ -792,5 +792,176 @@ test('HAW-75 real selector traverses scoped precise claims and preserves stale r
       await clean(() => prisma.$disconnect())
       await clean(() => observer.end())
       if (failures.length) throw new AggregateError(failures, 'Synthetic selector-transfer cleanup failed')
+    }
+  })
+
+test('HAW-75 selector enforces physical URI and exact serialized-page byte gates without skipping or mutation',
+  { ...options, timeout: 60_000 }, async () => {
+    const url = assertDisposableTestDatabase()
+    assert.equal(url.port, '5432', 'Only the registered hosted disposable PostgreSQL service is permitted')
+    assert.equal(AUDIT_GAP_SELECTION_URI_BYTES, 6_291_456, 'Pin the reviewed inactive URI envelope')
+    assert.equal(AUDIT_GAP_SELECTION_PAGE_BYTES, 8_388_608, 'Pin the reviewed inactive page envelope')
+    const [{ PrismaClient }, { createAdapter }] = await Promise.all([
+      import('../generated/prisma/client.js'), import('../prisma/prisma.service.js'),
+    ])
+    const observer = new pg.Client({ connectionString: url.toString(), connectionTimeoutMillis: 5_000, query_timeout: 25_000 })
+    const prisma = new PrismaClient({ adapter: createAdapter(url.toString()) })
+    const organizationId = randomUUID()
+    const prefix = randomUUID().slice(0, 24)
+    const marker = 'SYNTHETIC_SELECTOR_PAYLOAD:'
+    const markerBytes = Buffer.byteLength(marker, 'utf8')
+    type Observation = { bytes: number; digest: string; refusal: string | null }
+    let connected = false
+    try {
+      await observer.connect()
+      connected = true
+      await observer.query("SET statement_timeout = '20s'")
+      await observer.query("SET lock_timeout = '5s'")
+      await observer.query("SET TIME ZONE 'UTC'")
+      await observer.query('BEGIN')
+      const owner = await scope(observer, organizationId)
+      const sibling = await scope(observer, organizationId)
+      // Keep source()'s exact-descriptor check small. Large synthetic strings
+      // are built in PostgreSQL later and never included in assertion output.
+      const first = await source(observer, owner, { id: prefix + '000000000001' })
+      await source(observer, owner, { id: prefix + '000000000002' })
+      await source(observer, sibling)
+      for (const tenant of [owner, sibling]) await observer.query(`INSERT INTO public.m365_audit_coverage_states
+        (customer_tenant_id, organization_id, generation, incomplete_since, last_gap_at, has_purged_unrepaired_gap)
+        VALUES ($1,$2,7,'1999-01-01T00:00:00.123456Z','1999-01-01T00:00:00.123456Z',TRUE)`,
+      [tenant.tenantId, organizationId])
+      await observer.query('COMMIT')
+      const input = { organizationId, customerTenantId: owner.tenantId, afterId: null, limit: 1 }
+      const fingerprints = async () => {
+        const result: Record<string, Array<{ digest: string }>> = {}
+        for (const table of ['m365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+          result[table] = (await observer.query(`SELECT md5(to_jsonb(t)::text) AS digest
+            FROM public.${table} t WHERE organization_id = $1 ORDER BY digest`, [organizationId])).rows
+        }
+        return result
+      }
+      const uriInfo = async () => {
+        const rows = (await observer.query(`SELECT octet_length(content_uri) AS bytes, md5(content_uri) AS digest
+          FROM public.m365_activity_contents WHERE id = $1`, [first.id])).rows
+        assert.equal(rows.length, 1)
+        return rows[0] as { bytes: number; digest: string }
+      }
+      const exercise = async (refusal: 'URI_LIMIT' | 'PAGE_LIMIT' | null, expectedPageBytes?: number) => {
+        const before = await fingerprints()
+        const expectedUri = await uriInfo()
+        let measured: Observation | undefined
+        for (const instrumented of [false, true]) {
+          const observations: Observation[] = []
+          await prisma.$transaction(async tx => {
+            await tx.$executeRawUnsafe('SET TRANSACTION READ ONLY')
+            await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '5s'")
+            await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+            assert.deepEqual(await tx.$queryRawUnsafe('SHOW server_encoding'), [{ server_encoding: 'UTF8' }])
+            assert.deepEqual(await tx.$queryRawUnsafe('SHOW client_encoding'), [{ client_encoding: 'UTF8' }])
+            // Direct Prisma is the acceptance control. A second execution
+            // embeds the unchanged selector SQL and parameters, adding only
+            // server measurements of the returned field. No rows are scripted.
+            const transport: AuditGapTransferTransaction = instrumented ? {
+              async $queryRawUnsafe<T>(query: string, ...values: unknown[]): Promise<T> {
+                const rows = await tx.$queryRawUnsafe<Array<{ page: string; bytes: number; digest: string }>>(`
+                  WITH selector_measurement AS MATERIALIZED (${query})
+                  SELECT page, octet_length(page) AS bytes, md5(page) AS digest FROM selector_measurement`, ...values)
+                assert.equal(rows.length, 1)
+                const row = rows[0]!
+                assert.equal(typeof row.page, 'string')
+                assert.equal(Buffer.byteLength(row.page, 'utf8'), row.bytes, 'Client/server returned-field byte lengths agree')
+                assert.equal(createHash('md5').update(row.page, 'utf8').digest('hex'), row.digest, 'Client/server returned-field digests agree')
+                assert.ok(row.bytes <= AUDIT_GAP_SELECTION_PAGE_BYTES)
+                if (refusal) {
+                  const expectedRefusal = JSON.stringify({ refused: refusal })
+                  assert.equal(row.bytes, Buffer.byteLength(expectedRefusal, 'utf8'), 'Refusal transports only the fixed code length')
+                  assert.equal(row.digest, createHash('md5').update(expectedRefusal, 'utf8').digest('hex'),
+                    'Refusal transports only the fixed code digest, without a row or cursor')
+                  assert.ok(!row.page.includes(marker))
+                }
+                observations.push({ bytes: row.bytes, digest: row.digest, refusal })
+                return [{ page: row.page }] as T
+              },
+            } : tx
+            if (refusal) {
+              await assert.rejects(selectExpiredAuditGapPage(transport, input), error => {
+                assert.ok(error instanceof Error)
+                assert.equal(error.message, `M365_AUDIT_GAP_SELECTION_${refusal}`)
+                assert.equal('cause' in error, false)
+                assert.equal('lastExaminedId' in error, false)
+                assert.equal('candidates' in error, false)
+                return true
+              })
+            } else {
+              const page = await selectExpiredAuditGapPage(transport, input)
+              assert.equal(page.examinedCount, 1)
+              assert.equal(page.endOfPass, false)
+              assert.equal(page.lastExaminedId, first.id)
+              assert.equal(page.candidates.length, 1)
+              const selected = page.candidates[0]!
+              assert.equal(selected.id, first.id)
+              assert.equal(Buffer.byteLength(selected.contentUri, 'utf8'), expectedUri.bytes)
+              assert.equal(createHash('md5').update(selected.contentUri, 'utf8').digest('hex'), expectedUri.digest)
+            }
+          }, { isolationLevel: 'ReadCommitted', maxWait: 5_000, timeout: 15_000 })
+          assert.equal(observations.length, instrumented ? 1 : 0)
+          if (instrumented) measured = observations[0]!
+          assert.deepEqual(await fingerprints(), before, 'Each read/refusal preserves every scoped source, gap and sticky-state fingerprint')
+        }
+        assert.ok(measured)
+        if (expectedPageBytes !== undefined) assert.equal(measured.bytes, expectedPageBytes)
+        return measured
+      }
+
+      // Exact URI edge, then +1 byte: a valid later row may not be substituted
+      // for the oversized low-ID row. Both direct and observed calls refuse.
+      await observer.query('UPDATE public.m365_activity_contents SET content_uri = $2 || repeat($3, $4::integer) WHERE id = $1',
+        [first.id, marker, 'x', AUDIT_GAP_SELECTION_URI_BYTES - markerBytes])
+      assert.equal((await uriInfo()).bytes, AUDIT_GAP_SELECTION_URI_BYTES)
+      await exercise(null)
+      await observer.query("UPDATE public.m365_activity_contents SET content_uri = content_uri || 'x' WHERE id = $1", [first.id])
+      assert.equal((await uriInfo()).bytes, AUDIT_GAP_SELECTION_URI_BYTES + 1)
+      await exercise('URI_LIMIT')
+
+      const room = AUDIT_GAP_SELECTION_URI_BYTES - markerBytes
+      await observer.query(`UPDATE public.m365_activity_contents
+        SET content_uri = $2 || repeat('é', $3::integer) || repeat('x', $4::integer) WHERE id = $1`,
+      [first.id, marker, Math.floor(room / 2), room % 2])
+      assert.equal((await uriInfo()).bytes, AUDIT_GAP_SELECTION_URI_BYTES)
+      await exercise(null)
+      await observer.query("UPDATE public.m365_activity_contents SET content_uri = content_uri || 'x' WHERE id = $1", [first.id])
+      await exercise('URI_LIMIT')
+
+      // PostgreSQL's real jsonb::text escaping determines the page envelope.
+      // Measure a safe base, then add ASCII bytes to reach the exact field cap.
+      // The clock's six-decimal UTC representation has constant width here.
+      await observer.query(`UPDATE public.m365_activity_contents
+        SET content_uri = $2 || repeat(chr(1), 1200000) WHERE id = $1`, [first.id, marker])
+      const base = await exercise(null)
+      const padding = AUDIT_GAP_SELECTION_PAGE_BYTES - base.bytes
+      assert.ok(Number.isInteger(padding) && padding > 0)
+      assert.ok((await uriInfo()).bytes + padding + 1 < AUDIT_GAP_SELECTION_URI_BYTES)
+      await observer.query("UPDATE public.m365_activity_contents SET content_uri = content_uri || repeat('x', $2::integer) WHERE id = $1", [first.id, padding])
+      await exercise(null, AUDIT_GAP_SELECTION_PAGE_BYTES)
+      await observer.query("UPDATE public.m365_activity_contents SET content_uri = content_uri || 'x' WHERE id = $1", [first.id])
+      assert.ok((await uriInfo()).bytes < AUDIT_GAP_SELECTION_URI_BYTES, 'Page overflow is distinct from URI overflow')
+      await exercise('PAGE_LIMIT')
+    } finally {
+      const failures: unknown[] = []
+      const clean = async (operation: () => Promise<unknown>) => {
+        try { await operation() } catch (error) { failures.push(error) }
+      }
+      if (connected) {
+        await clean(() => observer.query('ROLLBACK'))
+        await clean(async () => {
+          await observer.query('DELETE FROM public.organizations WHERE id = $1', [organizationId])
+          for (const table of ['customer_tenants', 'm365_activity_contents', 'm365_audit_coverage_gaps', 'm365_audit_coverage_states']) {
+            assert.equal((await observer.query(`SELECT 1 FROM public.${table} WHERE organization_id = $1`, [organizationId])).rowCount, 0)
+          }
+        })
+      }
+      await clean(() => prisma.$disconnect())
+      await clean(() => observer.end())
+      if (failures.length) throw new AggregateError(failures, 'Synthetic selector-payload cleanup failed')
     }
   })

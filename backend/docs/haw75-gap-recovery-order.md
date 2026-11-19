@@ -1,6 +1,6 @@
 # HAW-75 coverage-gap recovery order
 
-Status: inactive recovery design, reconciled 19 November 2026. The additive storage and transfer components at public head `57177ee486211dcb205c6db1cf43ec848fddadfa` passed registered CI and component-scoped Claude review. See the [exact proof and limits](haw75-gap-transfer-reader-contract.md#exact-component-proof-and-its-limits). The newer inactive selector, synthetic checks and prepared actual-adapter witness have no hosted result or new Claude review. No writer, reader, retention policy or deployment is activated by this document; installing the candidate DDL would change database behavior.
+Status: inactive recovery design, reconciled 19 November 2026. The additive storage and transfer components at public head `57177ee486211dcb205c6db1cf43ec848fddadfa` passed registered CI and component-scoped Claude review. See the [exact proof and limits](haw75-gap-transfer-reader-contract.md#exact-component-proof-and-its-limits). The newer inactive selector, synthetic checks and prepared actual-adapter/payload witnesses have no hosted result or new Claude review. No writer, reader, retention policy or deployment is activated by this document; installing the candidate DDL would change database behavior.
 
 ## Verified inputs
 
