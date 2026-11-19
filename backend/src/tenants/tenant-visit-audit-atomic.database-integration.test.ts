@@ -13,6 +13,7 @@ import {
   selectPendingAuditReconciliationWork,
 } from './tenant-audit-reconciliation-work.js'
 import {
+  AuditReconciliationIncompleteError,
   MicrosoftGraphCollectionError,
   NON_PREMIUM_AUTH_REGISTRATION_ERROR_CODE,
   claimTenantUsersLease,
@@ -1895,6 +1896,16 @@ test('physical GROUPS takeover after definitions preserves memberships and recei
   assert.ok(successor)
   // Represent the next normally eligible recovery visit; do not weaken the
   // production RUNNING cooldown simply to make the test retry immediately.
+  const providerCallsBeforeCooldown = f.providerCalls.length
+  const snapshotBeforeCooldown = await f.snapshot('GROUPS')
+  const receiptsBeforeCooldown = await f.receipts()
+  await assert.rejects(f.service.reconcileDirectoryAuditChanges(f.tenant, 'synthetic-token', [], successor),
+    AuditReconciliationIncompleteError)
+  assert.equal(f.providerCalls.length, providerCallsBeforeCooldown, 'recent RUNNING work cannot make another provider request')
+  assert.deepEqual(await f.snapshot('GROUPS'), snapshotBeforeCooldown)
+  assert.deepEqual(await f.receipts(), receiptsBeforeCooldown)
+  assert.deepEqual(await f.observer.directoryGroupMembership.findMany({ where: f.scope,
+    select: { directoryUserId: true } }), [{ directoryUserId: oldUser.id }])
   await f.database.syncState.updateMany({ where: { ...f.scope, resourceType: 'GROUPS' },
     data: { lastAttemptAt: new Date(Date.now() - 2 * 60 * 60_000) } })
   await f.service.reconcileDirectoryAuditChanges(f.tenant, 'synthetic-token', [], successor)

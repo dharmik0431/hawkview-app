@@ -3,6 +3,8 @@ import test from 'node:test'
 import { AuditReconciliationIncompleteError, TenantSyncService } from './tenant-sync.service.js'
 import { AUDIT_RECONCILIATION_RESOURCES, type AuditReconciliationResource } from './audit-change-reconciliation.js'
 import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
+import { HOURLY_INVENTORY_REFRESH_MS, shouldCollectInventoryInTwentyMinuteFullPass,
+  shouldRunHourlyInventoryRefresh } from './scheduled-sync-selection.js'
 
 const tenant = { id: 'tenant', organizationId: 'organization' }
 const owner = { customerTenantId: tenant.id, organizationId: tenant.organizationId,
@@ -198,6 +200,53 @@ test('durable retries retain targeted, anchor and daily failure intervals', asyn
   assert.equal(service.auditReconciliationRetryDue(failed('EXCHANGE_MAILBOX_RULES', 1440), now), true)
   assert.equal(service.auditReconciliationRetryDue(failed('SHAREPOINT_SITES', 60, 'MICROSOFT_PERMISSION_REQUIRED'), now), false)
   assert.equal(service.auditReconciliationRetryDue({ ...failed('GROUPS', 60), status: 'RUNNING' }, now), false)
+})
+
+test('durable pending replay recovers only clean abandoned attempts after the existing one-hour delay', () => {
+  const now = new Date('2026-11-19T20:00:00Z')
+  const { service } = fixture([])
+  for (const resourceType of AUDIT_RECONCILIATION_RESOURCES) {
+    const state = { resourceType, status: 'RUNNING' as const,
+      lastAttemptAt: new Date(now.getTime() - HOURLY_INVENTORY_REFRESH_MS),
+      lastSuccessfulAt: null, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 }
+    assert.equal(service.auditReconciliationRetryDue(state, now), true, resourceType)
+    assert.equal(service.auditReconciliationRetryDue({ ...state,
+      lastAttemptAt: new Date(state.lastAttemptAt.getTime() + 1) }, now), false, resourceType)
+    for (const badClock of [null, new Date(NaN), new Date(now.getTime() + 1)]) {
+      assert.equal(service.auditReconciliationRetryDue({ ...state, lastAttemptAt: badClock }, now), false)
+    }
+    for (const badClock of [new Date(NaN), new Date(now.getTime() + 1)]) {
+      assert.equal(service.auditReconciliationRetryDue({ ...state, lastSuccessfulAt: badClock }, now), false)
+    }
+    for (const marker of [{ lastErrorCode: 'PARTIAL_MICROSOFT_RESPONSE' },
+      { lastErrorCode: 'MICROSOFT_TRANSIENT' }, { lastErrorMessage: 'partial collection' }]) {
+      assert.equal(service.auditReconciliationRetryDue({ ...state, ...marker }, now), false)
+    }
+    if (resourceType === 'GROUPS') {
+      assert.equal(shouldRunHourlyInventoryRefresh(state, now), false,
+        'durable replay must not add GROUPS to ordinary hourly selection')
+      assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(state, now), false,
+        'the correction does not alter the general full-pass RUNNING policy')
+    }
+  }
+})
+
+test('owned empty-page replay leaves recent GROUPS pending and later dispatches the same revision', async () => {
+  const { service, states, writes } = fixture([{ resourceType: 'GROUPS', requestedRevision: '6' }])
+  states.push({ resourceType: 'GROUPS', status: 'RUNNING', lastAttemptAt: new Date(),
+    lastSuccessfulAt: null, lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 })
+  let calls = 0
+  service.syncGroups = async (target: unknown, token: string, visit: unknown, revision: bigint) => {
+    assert.equal(target, tenant); assert.equal(token, 'access'); assert.equal(visit, owner); assert.equal(revision, 6n)
+    calls++
+    service.pendingAuditReconciliationWork = async () => []
+  }
+  await assert.rejects(service.reconcileDirectoryAuditChanges(tenant, 'access', [], owner), AuditReconciliationIncompleteError)
+  assert.equal(calls, 0)
+  assert.deepEqual(writes, [])
+  states[0].lastAttemptAt = new Date(Date.now() - 2 * HOURLY_INVENTORY_REFRESH_MS)
+  await service.reconcileDirectoryAuditChanges(tenant, 'access', [], owner)
+  assert.equal(calls, 1)
 })
 
 test('new provider events preserve immediate collection while old failed work waits', async () => {

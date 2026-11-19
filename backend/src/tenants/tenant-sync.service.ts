@@ -151,6 +151,7 @@ import {
   shouldRunTargetedTransientRetry,
   TARGETED_TRANSIENT_RETRY_RESOURCES,
   HOURLY_INVENTORY_RESOURCES,
+  HOURLY_INVENTORY_REFRESH_MS,
   TENANT_SYNC_LEASE_MS,
 } from './scheduled-sync-selection.js'
 import {
@@ -5824,7 +5825,16 @@ export class TenantSyncService {
     for (const clock of [state.lastAttemptAt, state.lastSuccessfulAt]) {
       if (clock != null && (!Number.isFinite(clock.getTime()) || clock > now)) return false
     }
-    if (state.status === 'RUNNING') return shouldRunHourlyInventoryRefresh(state, now)
+    if (state.status === 'RUNNING') {
+      // This predicate is reached only for durable pending audit work selected
+      // under the current visit owner. A displaced collector can leave a clean
+      // RUNNING row even for resources outside healthy hourly inventory. Reuse
+      // the existing one-hour stale-attempt delay without adding those
+      // resources to hourly scheduling or accelerating error-bearing attempts.
+      if (state.lastErrorCode != null || state.lastErrorMessage != null) return false
+      return state.lastAttemptAt != null &&
+        now.getTime() - state.lastAttemptAt.getTime() >= HOURLY_INVENTORY_REFRESH_MS
+    }
     if (state.status !== 'FAILED' && state.lastSuccessfulAt) return true
     if (shouldRunTargetedTransientRetry(state, now)) return true
     if (DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])) {
