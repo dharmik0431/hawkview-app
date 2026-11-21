@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { type TestContext } from 'node:test'
-import { ServiceUnavailableException } from '@nestjs/common'
+import { Logger, ServiceUnavailableException } from '@nestjs/common'
 import { TenantSyncService } from './tenant-sync.service.js'
 import { TenantsController } from './tenants.controller.js'
 import { assertSyncAdmissionOpen, syncAdmissionPaused } from './sync-admission-pause.js'
@@ -139,4 +139,62 @@ test('forward and rollback gate transitions admit no new visit until the precedi
   ;(legacy as any).syncConnectedTenant = async () => { events.push('rollback:start'); return { bundle: 'rollback' } }
   assert.equal(await legacy.syncUsersForIdentity({} as any, 'tenant'), 'rollback')
   assert.deepEqual(events, ['old:start', 'old:finish', 'active:start', 'active:finish', 'rollback:start'])
+})
+
+/** Capture the real default witness path: the gate's own module logger, not an
+ * injected seam, so a production refusal is what is actually being observed. */
+function refusals(t: TestContext): string[] {
+  const captured: string[] = []
+  const original = Logger.prototype.log
+  Logger.prototype.log = function (message: unknown) {
+    if (typeof message === 'string' && message.includes('TENANT_SYNC_ADMISSION_PAUSED')) captured.push(message)
+  } as typeof Logger.prototype.log
+  t.after(() => { Logger.prototype.log = original })
+  return captured
+}
+
+test('a refused admission emits exactly one bounded witness carrying only the reason code', t => {
+  const captured = refusals(t)
+  assert.throws(() => assertSyncAdmissionOpen({ HAWKVIEW_SYNC_ADMISSION_PAUSED: 'true' }), paused)
+  assert.deepEqual(captured.map(entry => JSON.parse(entry)), [{
+    event: 'tenant_sync_admission', outcome: 'REFUSED', reasonCode: 'TENANT_SYNC_ADMISSION_PAUSED',
+  }], 'the witness carries no tenant identifier, caller detail, secret or response body')
+  // An open gate stays silent, so the witness cannot be mistaken for traffic.
+  assert.doesNotThrow(() => assertSyncAdmissionOpen({ HAWKVIEW_SYNC_ADMISSION_PAUSED: 'false' }))
+  assert.doesNotThrow(() => assertSyncAdmissionOpen({}))
+  assert.equal(captured.length, 1, 'only a refusal emits the witness')
+})
+
+test('a witness logging failure cannot admit a paused visit or change its refusal', t => {
+  const original = Logger.prototype.log
+  Logger.prototype.log = (() => { throw new Error('log transport unavailable') }) as typeof Logger.prototype.log
+  t.after(() => { Logger.prototype.log = original })
+  // `paused` pins the exact status and response, so a replaced or swallowed
+  // error fails here rather than silently becoming an admission.
+  assert.throws(() => assertSyncAdmissionOpen({ HAWKVIEW_SYNC_ADMISSION_PAUSED: 'true' }), paused)
+})
+
+test('a paused scheduled entry logs the refusal and does no collector or database work', async t => {
+  const captured = refusals(t)
+  env(t, 'true')
+  const calls: string[] = []
+  const sync = service()
+  ;(sync as any).readScheduledCandidateWindow = async () => { calls.push('scheduler-db'); throw Error('unreachable') }
+  ;(sync as any).syncConnectedTenant = async () => { calls.push('collector'); throw Error('unreachable') }
+  ;(sync as any).logger = { log: () => calls.push('summary'), warn: () => calls.push('warn') }
+  await assert.rejects(sync.syncDueTenants(Date.now() + 60_000), paused)
+  // Compare a copy: `deepEqual` is an `asserts actual is T` guard and would
+  // narrow `calls` to `never[]`, breaking the open-path arm below.
+  assert.deepEqual([...calls], [], 'a refused scheduled admission performs no collector or database work')
+  assert.equal(captured.length, 1, 'the refused scheduled admission emitted its witness')
+
+  // The same entry, admitted: the scheduler runs and emits no refusal witness,
+  // so a red cron run can be told apart from an open-but-idle scheduler.
+  process.env.HAWKVIEW_SYNC_ADMISSION_PAUSED = 'false'
+  ;(sync as any).readScheduledCandidateWindow = async () => {
+    calls.push('scheduler-db'); return { candidateTenants: [], firstSegmentLength: 0 }
+  }
+  assert.equal((await sync.syncDueTenants()).due, 0)
+  assert.deepEqual(calls, ['scheduler-db', 'summary'], 'the open path admits and reads the scheduler window')
+  assert.equal(captured.length, 1, 'the open path emits no refusal witness')
 })
