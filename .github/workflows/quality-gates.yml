@@ -54,6 +54,9 @@ jobs:
       HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS: '1'
       # This hosted backend job provisions the exact disposable loopback service.
       HAWKVIEW_CI_DISPOSABLE_POSTGRES: '1'
+      HAWKVIEW_HAW70_TENANT_DELETE_WITNESS: '1'
+      HAWKVIEW_HAW70_AUDIT_WRITER_WITNESS: '1'
+      HAWKVIEW_HAW70_DELETE_LOCK_ORDER_WITNESS: '1'
       TZ: UTC
     services:
       postgres:
