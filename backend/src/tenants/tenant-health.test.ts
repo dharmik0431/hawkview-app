@@ -440,6 +440,35 @@ function completeCurrentStates(now = new Date('2026-08-13T12:00:00.000Z')) {
   }))
 }
 
+test('full20 tenant health follows inventory eligibility while activity and failure classification remain independent', () => {
+  const saved = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+  const now = new Date('2026-11-14T16:00:00Z'), minute = 60000
+  const states = (age: number) => completeCurrentStates(now).map(state => state.resourceType === 'GROUPS'
+    ? { ...state, lastSuccessfulAt: new Date(now.getTime() - age) } : state)
+  try {
+    delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    assert.equal(deriveTenantHealth({ ...baseInput(), syncStates: states(23 * 60 * minute), now }).data.freshnessStatus, 'CURRENT')
+    process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = 'true'
+    for (const [age, freshness] of [[20 * minute, 'CURRENT'], [20 * minute + 1, 'AGING'],
+      [140 * minute, 'AGING'], [140 * minute + 1, 'STALE']] as const) {
+      const result = deriveTenantHealth({ ...baseInput(), syncStates: states(age), now })
+      assert.equal(result.data.freshnessStatus, freshness)
+      assert.equal(result.resourceHealth.find(item => item.resourceType === 'GROUPS')?.classification,
+        freshness === 'STALE' ? 'STALE' : 'SUCCESS')
+    }
+    const failed = states(21 * minute).map(state => state.resourceType === 'GROUPS'
+      ? { ...state, status: 'FAILED', lastErrorCode: 'MICROSOFT_THROTTLED', lastErrorMessage: 'Try later.', consecutiveFailures: 3 } : state)
+    const result = deriveTenantHealth({ ...baseInput(), syncStates: failed, now })
+    assert.equal(result.resourceHealth.find(item => item.resourceType === 'GROUPS')?.classification, 'FAILED')
+    const activity = completeCurrentStates(now).map(state => state.resourceType === 'AUDIT_LOGS'
+      ? { ...state, lastSuccessfulAt: new Date(now.getTime() - 16 * minute) } : state)
+    assert.equal(deriveTenantHealth({ ...baseInput(), syncStates: activity, now }).data.freshnessStatus, 'AGING')
+  } finally {
+    if (saved === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = saved
+  }
+})
+
 test('healthy connection, complete current data, and no findings is healthy', () => {
   const now = new Date('2026-08-13T12:00:00.000Z')
   const result = deriveTenantHealth({ ...baseInput(), syncStates: completeCurrentStates(now), now })

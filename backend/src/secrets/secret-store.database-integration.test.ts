@@ -11,6 +11,9 @@ import {
   PREVIOUS_KEY_VARIABLE,
 } from './secret-encryption-keys.js'
 import { PLATFORM_OWNED } from './secret-owner.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { releaseTenantVisitLease, tryAcquireTenantVisitLease } from '../tenants/tenant-visit-lease-store.js'
+import type { Prisma } from '../generated/prisma/client.js'
 
 /** The rotation, against a real database with the shipped migrations applied.
  *
@@ -32,6 +35,8 @@ import { PLATFORM_OWNED } from './secret-owner.js'
  */
 
 const skip = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS !== '1'
+const registeredVisitCi = process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1' &&
+  process.env.HAWKVIEW_CI_DISPOSABLE_POSTGRES === '1' && process.env.GITHUB_ACTIONS === 'true'
 
 const KEY_ONE = '11'.repeat(32)
 const KEY_TWO = '22'.repeat(32)
@@ -169,3 +174,83 @@ test('the database refuses a secret whose key version is not stated',
       await client.end()
     }
   })
+
+test('physical owned credential reseal rejects takeover after read and retains its lease lock through atomic rotation', {
+  skip: !registeredVisitCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  assert.equal(assertDisposableTestDatabase().port, '5432')
+  const savedKeys = Object.fromEntries([CURRENT_KEY_VARIABLE, KEY_VERSION_VARIABLE, PREVIOUS_KEY_VARIABLE]
+    .map(key => [key, process.env[key]]))
+  const writer = new PrismaService(), observer = new PrismaService()
+  const name = `test-visit-reseal-${randomUUID()}`
+  let organizationId: string | undefined
+  context.after(async () => {
+    try {
+      await observer.encryptedSecret.deleteMany({ where: { name } })
+      if (organizationId) await observer.organization.deleteMany({ where: { id: organizationId } })
+    } finally {
+      await Promise.all([writer.$disconnect(), observer.$disconnect()])
+      for (const [key, value] of Object.entries(savedKeys)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+  await Promise.all([writer.$connect(), observer.$connect()])
+  const organization = await writer.organization.create({ data: { name: 'Credential reseal visit CI', slug: name } })
+  organizationId = organization.id
+  const tenant = await writer.customerTenant.create({ data: { organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE' } })
+  const scope = { organizationId, customerTenantId: tenant.id }
+  const owner = await tryAcquireTenantVisitLease(writer, scope, 300_000)
+  assert.ok(owner)
+  useKeys({ current: KEY_ONE })
+  const service = new SecretStoreService(writer)
+  const reference = await service.store(name, 'synthetic-visit-credential', PLATFORM_OWNED)
+  const readSecret = () => observer.encryptedSecret.findUniqueOrThrow({ where: { name } })
+  const before = await readSecret()
+  useKeys({ current: KEY_TWO, version: '2', previous: KEY_ONE })
+  let successor: NonNullable<Awaited<ReturnType<typeof tryAcquireTenantVisitLease>>> | undefined
+  const displacedDatabase = new Proxy(writer, { get(target, property) {
+    if (property === 'encryptedSecret') return new Proxy(target.encryptedSecret, { get(delegate, method) {
+      if (method === 'findUnique') return async (args: Prisma.EncryptedSecretFindUniqueArgs) => {
+        const secret = await delegate.findUnique(args)
+        assert.equal(await releaseTenantVisitLease(observer, owner), true)
+        const acquired = await tryAcquireTenantVisitLease(observer, scope, 300_000)
+        assert.ok(acquired)
+        successor = acquired
+        return secret
+      }
+      const value = Reflect.get(delegate, method)
+      return typeof value === 'function' ? value.bind(delegate) : value
+    } })
+    const value = Reflect.get(target, property)
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  await assert.rejects(new SecretStoreService(displacedDatabase).access(reference, owner), TenantVisitLeaseLostError)
+  assert.deepEqual(await readSecret(), before, 'stale visit changes no seal bytes, version or update timestamp')
+  assert.ok(successor)
+  let observedReseal = false
+  const rollbackDatabase = new Proxy(writer, { get(target, property) {
+    if (property === '$transaction') return (work: (tx: Prisma.TransactionClient) => Promise<unknown>) =>
+      writer.$transaction(async transaction => {
+        await work(transaction)
+        assert.equal((await transaction.encryptedSecret.findUniqueOrThrow({ where: { name } })).keyVersion, 2)
+        assert.deepEqual(await readSecret(), before, 'reseal remains invisible until its guarded transaction commits')
+        await assert.rejects(observer.$transaction(tx => tx.$queryRawUnsafe(
+          'SELECT generation FROM tenant_sync_visit_leases WHERE customer_tenant_id=$1::uuid FOR UPDATE NOWAIT', tenant.id,
+        )), (error: unknown) => /55P03|could not obtain lock/i.test(String(error)))
+        observedReseal = true
+        throw new Error('Synthetic failure after guarded reseal')
+      }, { timeout: 20_000 })
+    const value = Reflect.get(target, property)
+    return typeof value === 'function' ? value.bind(target) : value
+  } })
+  assert.equal(await new SecretStoreService(rollbackDatabase).access(reference, successor), 'synthetic-visit-credential',
+    'ordinary storage failure preserves the existing successful-read policy')
+  assert.equal(observedReseal, true)
+  assert.deepEqual(await readSecret(), before, 'failed transaction rolls the ciphertext and version back together')
+  assert.equal(await service.access(reference, successor), 'synthetic-visit-credential')
+  assert.equal((await readSecret()).keyVersion, 2)
+  useKeys({ current: KEY_TWO, version: '2' })
+  assert.equal(await service.access(reference, successor), 'synthetic-visit-credential', 'the successor completes rotation without changing plaintext')
+})

@@ -1,6 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
 import { createHash } from 'node:crypto'
 import { retryAfterMilliseconds } from '../microsoft/microsoft-request.js'
+import { assertTenantVisitLifecycleActive } from './tenant-visit-lifecycle.js'
+import { deriveAuditReconciliationResources } from './audit-change-reconciliation.js'
+import { cancelBoundedStream } from './microsoft-collection-budget.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { redactSensitiveValues } from '../changes/change-evidence.service.js'
@@ -10,6 +13,8 @@ import {
 } from '../changes/m365-activity-classification.js'
 import { classifyEvidenceTrust } from '../changes/evidence-trust-catalog.js'
 import type { Prisma } from '../generated/prisma/client.js'
+import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
 
 export { classifyManagementActivity, managementActivityRoleFromEvidence } from '../changes/m365-activity-classification.js'
 
@@ -392,12 +397,28 @@ export class M365ManagementActivityService {
     private readonly microsoftConsent: MicrosoftConsentService
   ) {}
 
+  private async withVisitWrite<T>(
+    tenant: TenantTarget,
+    visitOwner: TenantVisitLeaseOwner | undefined,
+    write: (transaction: Prisma.TransactionClient) => Promise<T>,
+  ): Promise<T> {
+    if (!visitOwner) return write(this.prisma)
+    if (visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id) {
+      throw new TenantVisitLeaseLostError()
+    }
+    return this.prisma.$transaction(async transaction => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      return write(transaction)
+    })
+  }
+
   private async request(
     url: string,
     init: RequestInit,
     microsoftTenantId: string,
     publisherIdentifier: string,
-    deadlineAt: number
+    deadlineAt: number,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const requestUrl = validateManagementUrl(url, microsoftTenantId)
     requestUrl.searchParams.set('PublisherIdentifier', publisherIdentifier)
@@ -407,14 +428,33 @@ export class M365ManagementActivityService {
     // timeout; the durable subscription state schedules a later verification.
     const maximumAttempts = init.method?.toUpperCase() === 'POST' ? 1 : 3
     for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
-      const remaining = deadlineAt - Date.now()
+      assertTenantVisitLifecycleActive(visitOwner)
+      let remaining = deadlineAt - Date.now()
       if (!Number.isFinite(remaining) || remaining <= 0) throw new M365ActivityDeadlineError()
+      // A retry can begin after another visitor takes over. Check the exact
+      // owner before each provider request, outside the transport catch so
+      // lease loss cannot be mistaken for a retryable HTTP failure.
+      if (visitOwner) {
+        await this.prisma.$transaction(
+          (transaction) => assertTenantVisitLeaseOwner(transaction, visitOwner),
+          { timeout: 15_000 },
+        )
+        // The database check can wait on a lock. Do not start a provider
+        // request after the caller's deadline expires while it waits.
+        remaining = deadlineAt - Date.now()
+        if (!Number.isFinite(remaining) || remaining <= 0) throw new M365ActivityDeadlineError()
+      }
       try {
+        assertTenantVisitLifecycleActive(visitOwner)
         const response = await fetch(requestUrl, {
           ...init,
           redirect: 'error',
           signal: AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(30_000, remaining)))),
         })
+        try { assertTenantVisitLifecycleActive(visitOwner) } catch (error) {
+          await cancelBoundedStream(() => response.body?.cancel())
+          throw error
+        }
         if (response.ok) {
           if (Date.now() >= deadlineAt) {
             await response.body?.cancel().catch(() => undefined)
@@ -446,6 +486,9 @@ export class M365ManagementActivityService {
         )
         throw error
       } catch (error) {
+        const lost = tenantVisitLeaseLoss(error)
+        if (lost) throw lost
+        assertTenantVisitLifecycleActive(visitOwner)
         if (error instanceof ManagementActivityHttpError && error.status < 500 && error.status !== 429) throw error
         if (error instanceof M365ActivityDeadlineError) throw error
         lastError = error
@@ -504,9 +547,16 @@ export class M365ManagementActivityService {
   private async reserveSubscriptionStart(
     tenant: TenantTarget,
     enabled: ReadonlySet<string>,
-    now: Date
+    now: Date,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     return this.prisma.$transaction(async (transaction) => {
+      if (visitOwner) {
+        if (visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id) {
+          throw new TenantVisitLeaseLostError()
+        }
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      }
       await transaction.$executeRawUnsafe(
         'SELECT pg_advisory_xact_lock(hashtext($1))',
         `hawkview:m365-subscription-start:${tenant.id}`
@@ -577,7 +627,8 @@ export class M365ManagementActivityService {
     token: string,
     publisherIdentifier: string,
     now: Date,
-    deadlineAt: number
+    deadlineAt: number,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const stored = await this.prisma.m365ActivitySubscription.findMany({
       where: { organizationId: tenant.organizationId, customerTenantId: tenant.id },
@@ -598,7 +649,8 @@ export class M365ManagementActivityService {
       { headers: this.headers(token) },
       tenant.microsoftTenantId,
       publisherIdentifier,
-      deadlineAt
+      deadlineAt,
+      visitOwner,
     )
     const subscriptions = (await this.readMeteredJson(
       tenant,
@@ -621,7 +673,8 @@ export class M365ManagementActivityService {
     const contentTypeToStart = await this.reserveSubscriptionStart(
       tenant,
       enabled,
-      now
+      now,
+      visitOwner,
     )
     const startFailures = new Map<string, string>()
 
@@ -632,7 +685,8 @@ export class M365ManagementActivityService {
           { method: 'POST', headers: this.headers(token) },
           tenant.microsoftTenantId,
           publisherIdentifier,
-          deadlineAt
+          deadlineAt,
+          visitOwner,
         )
         enabled.add(contentTypeToStart)
       } catch (error) {
@@ -645,7 +699,8 @@ export class M365ManagementActivityService {
           { headers: this.headers(token) },
           tenant.microsoftTenantId,
           publisherIdentifier,
-          deadlineAt
+          deadlineAt,
+          visitOwner,
         )
         const current = (await this.readMeteredJson(
           tenant,
@@ -672,39 +727,41 @@ export class M365ManagementActivityService {
     const storedByContentType = new Map(
       stored.map((entry) => [entry.contentType, entry])
     )
-    for (const contentType of M365_ACTIVITY_CONTENT_TYPES) {
-      const isEnabled = enabled.has(contentType)
-      const startFailure = startFailures.get(contentType)
-      const previousFailure = storedByContentType.get(contentType)?.status === 'FAILED'
-        ? storedByContentType.get(contentType)?.lastError
-        : null
-      const failure = startFailure ?? previousFailure
-      await this.prisma.m365ActivitySubscription.upsert({
-        where: {
-          customerTenantId_contentType: {
+    await this.withVisitWrite(tenant, visitOwner, async transaction => {
+      for (const contentType of M365_ACTIVITY_CONTENT_TYPES) {
+        const isEnabled = enabled.has(contentType)
+        const startFailure = startFailures.get(contentType)
+        const previousFailure = storedByContentType.get(contentType)?.status === 'FAILED'
+          ? storedByContentType.get(contentType)?.lastError
+          : null
+        const failure = startFailure ?? previousFailure
+        await transaction.m365ActivitySubscription.upsert({
+          where: {
+            customerTenantId_contentType: {
+              customerTenantId: tenant.id,
+              contentType,
+            },
+          },
+          create: {
+            organizationId: tenant.organizationId,
             customerTenantId: tenant.id,
             contentType,
+            status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
+            lastVerifiedAt: now,
+            lastError: isEnabled
+              ? null
+              : failure ?? 'Subscription activation is pending Microsoft verification.',
           },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          contentType,
-          status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
-          lastVerifiedAt: now,
-          lastError: isEnabled
-            ? null
-            : failure ?? 'Subscription activation is pending Microsoft verification.',
-        },
-        update: {
-          status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
-          lastVerifiedAt: now,
-          lastError: isEnabled
-            ? null
-            : failure ?? 'Subscription activation is pending Microsoft verification.',
-        },
-      })
-    }
+          update: {
+            status: isEnabled ? 'ENABLED' : failure ? 'FAILED' : 'PENDING',
+            lastVerifiedAt: now,
+            lastError: isEnabled
+              ? null
+              : failure ?? 'Subscription activation is pending Microsoft verification.',
+          },
+        })
+      }
+    })
     return enabled
   }
 
@@ -715,7 +772,8 @@ export class M365ManagementActivityService {
     enabledContentTypes: ReadonlySet<string>,
     now: Date,
     deadline: number,
-    downloadBudget: { remainingBytes: number }
+    downloadBudget: { remainingBytes: number },
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
     const baseUrl = this.baseUrl(tenant)
     const ledgerExpiresAt = new Date(now.getTime() + CONTENT_LEDGER_RETENTION_MS)
@@ -773,7 +831,8 @@ export class M365ManagementActivityService {
           { headers: this.headers(token) },
           tenant.microsoftTenantId,
           publisherIdentifier,
-          deadline
+          deadline,
+          visitOwner,
         )
         const items = (await this.readMeteredJson(
           tenant,
@@ -801,43 +860,29 @@ export class M365ManagementActivityService {
             ledgerExpiresAt,
           })
         }
-        for (let offset = 0; offset < discovered.length; offset += 500) {
-          await this.prisma.m365ActivityContent.createMany({
-            data: discovered.slice(offset, offset + 500) as never,
-            skipDuplicates: true,
-          })
-        }
         const continuation = response.headers.get('NextPageUri')
         if (continuation) validateManagementUrl(continuation, tenant.microsoftTenantId)
-        if (continuation) {
-          state = await this.prisma.m365ActivitySubscription.update({
-            where: {
-              customerTenantId_contentType: { customerTenantId: tenant.id, contentType },
-            },
-            data: {
-              lastContentPollAt: new Date(),
-              discoveryWindowStart: windowStart,
-              discoveryWindowEnd: windowEnd,
-              discoveryNextPageUri: continuation,
-              lastError: null,
+        // Discovery metadata is owned sync state too. Persist the entire
+        // bounded page and its checkpoint together, after the body is read;
+        // an expired visitor cannot replace a successor's continuation.
+        state = await this.withVisitWrite(tenant, visitOwner, async transaction => {
+          for (let offset = 0; offset < discovered.length; offset += 500) {
+            await transaction.m365ActivityContent.createMany({
+              data: discovered.slice(offset, offset + 500) as never, skipDuplicates: true,
+            })
+          }
+          return transaction.m365ActivitySubscription.update({
+            where: { customerTenantId_contentType: { customerTenantId: tenant.id, contentType } },
+            data: continuation ? {
+              lastContentPollAt: new Date(), discoveryWindowStart: windowStart,
+              discoveryWindowEnd: windowEnd, discoveryNextPageUri: continuation, lastError: null,
+            } : {
+              lastContentPollAt: new Date(), lastSuccessfulPollAt: windowEnd,
+              discoveryWindowStart: null, discoveryWindowEnd: null, discoveryNextPageUri: null, lastError: null,
             },
           })
-          continue
-        }
-
-        state = await this.prisma.m365ActivitySubscription.update({
-          where: {
-            customerTenantId_contentType: { customerTenantId: tenant.id, contentType },
-          },
-          data: {
-            lastContentPollAt: new Date(),
-            lastSuccessfulPollAt: windowEnd,
-            discoveryWindowStart: null,
-            discoveryWindowEnd: null,
-            discoveryNextPageUri: null,
-            lastError: null,
-          },
         })
+        if (continuation) continue
         contiguousStart = windowEnd
         if (windowEnd >= now) break
       }
@@ -1040,9 +1085,14 @@ export class M365ManagementActivityService {
     publisherIdentifier: string,
     downloadBudget: { remainingBytes: number },
     content: any,
-    deadlineAt: number
+    deadlineAt: number,
+    visitOwner?: TenantVisitLeaseOwner,
   ) {
-    const claimed = await this.prisma.m365ActivityContent.updateMany({
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId ||
+      visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
+    const claimArgs = {
       where: {
         id: content.id,
         organizationId: tenant.organizationId,
@@ -1050,7 +1100,13 @@ export class M365ManagementActivityService {
         status: { in: ['PENDING', 'RETRY'] },
       },
       data: { status: 'PROCESSING', attemptCount: { increment: 1 }, lastError: null },
-    })
+    } satisfies Prisma.M365ActivityContentUpdateManyArgs
+    const claimed = visitOwner
+      ? await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          return transaction.m365ActivityContent.updateMany(claimArgs)
+        })
+      : await this.prisma.m365ActivityContent.updateMany(claimArgs)
     if (claimed.count !== 1) return [] as ManagementActivityChange[]
 
     try {
@@ -1059,7 +1115,8 @@ export class M365ManagementActivityService {
         { headers: this.headers(token) },
         tenant.microsoftTenantId,
         publisherIdentifier,
-        deadlineAt
+        deadlineAt,
+        visitOwner,
       )
       // Reserve the maximum possible body before reading it. Content-Length
       // is not trusted for enforcement because a lying or missing header could
@@ -1246,14 +1303,52 @@ export class M365ManagementActivityService {
           }
         })
 
-      await this.prisma.$transaction(async (transaction) => {
+      const committedPrimaryChanges = await this.prisma.$transaction(async (transaction) => {
+        if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
         let insertedRecordCount = 0
+        const insertedRecordIds = new Set<string>()
         for (let offset = 0; offset < rawRows.length; offset += 500) {
-          const inserted = await transaction.m365AuditRecord.createMany({
-            data: rawRows.slice(offset, offset + 500) as never,
-            skipDuplicates: true,
-          })
-          insertedRecordCount += inserted.count
+          const data = rawRows.slice(offset, offset + 500)
+          if (visitOwner) {
+            // An existence read above may race another blob. Only rows this
+            // transaction inserted may request a new authoritative refresh.
+            const inserted = await transaction.m365AuditRecord.createManyAndReturn({
+              data: data as never,
+              skipDuplicates: true,
+              select: { microsoftRecordId: true },
+            })
+            insertedRecordCount += inserted.length
+            for (const record of inserted) insertedRecordIds.add(record.microsoftRecordId)
+          } else {
+            const inserted = await transaction.m365AuditRecord.createMany({
+              data: data as never, skipDuplicates: true,
+            })
+            insertedRecordCount += inserted.count
+          }
+        }
+        const changes = primaryRecords
+          .filter((record) => !visitOwner || insertedRecordIds.has(boundedSourceEventId(text(record.Id)!)))
+          .map((record) => ({
+            activityDisplayName: text(record.Operation)!,
+            category: text(record.RecordType),
+            loggedByService: text(record.Workload),
+            targetResources: [{ id: text(record.ObjectId), type: text(record.Workload) }],
+          }))
+        if (visitOwner) {
+          // Raw evidence and the closed, at-most-22 resource request ledger
+          // commit together. A crash after this commit cannot lose refresh
+          // work even when a later feed poll returns no new records.
+          for (const resourceType of deriveAuditReconciliationResources(changes)) {
+            await transaction.tenantAuditReconciliationWork.upsert({
+              where: { organizationId_customerTenantId_resourceType: {
+                organizationId: tenant.organizationId,
+                customerTenantId: tenant.id,
+                resourceType,
+              } },
+              create: { organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType },
+              update: { requestedRevision: { increment: 1n } },
+            })
+          }
         }
         // Charge only records the database actually accepted. This remains in
         // the same transaction, so cross-blob duplicates count zero and any
@@ -1274,25 +1369,24 @@ export class M365ManagementActivityService {
           where: { id: content.id },
           data: { status: 'COMPLETED', processedAt: ingestedAt, nextRetryAt: null, lastError: null },
         })
+        return changes
       })
 
-      return primaryRecords.map((record) => ({
-        activityDisplayName: text(record.Operation)!,
-        category: text(record.RecordType),
-        loggedByService: text(record.Workload),
-        targetResources: [{ id: text(record.ObjectId), type: text(record.Workload) }],
-      }))
+      return committedPrimaryChanges
     } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       const attempts = Number(content.attemptCount ?? 0) + 1
       const permanent = error instanceof ManagementActivityHttpError && [400, 401, 403, 404].includes(error.status)
       const budgetLimited = error instanceof M365AuditBudgetError
       const serverRetryAt = error instanceof ManagementActivityHttpError || error instanceof M365ActivityDeadlineError
         ? error.retryAt : null
-      await this.prisma.m365ActivityContent.updateMany({
+      const failureDisposition = {
         where: {
           id: content.id,
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
+          ...(visitOwner ? { status: 'PROCESSING' as const, attemptCount: attempts } : {}),
         },
         data: {
           status: permanent ? 'FAILED' : 'RETRY',
@@ -1309,7 +1403,18 @@ export class M365ManagementActivityService {
             ? { ledgerExpiresAt: evidenceExpiration(new Date()) }
             : {}),
         },
-      })
+      } satisfies Prisma.M365ActivityContentUpdateManyArgs
+      if (visitOwner) {
+        const disposition = await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          return transaction.m365ActivityContent.updateMany(failureDisposition)
+        })
+        // A later claim (or completion) must not inherit this attempt's
+        // provider failure, even if an ownerless writer changed the row.
+        if (disposition.count !== 1) throw new TenantVisitLeaseLostError()
+      } else {
+        await this.prisma.m365ActivityContent.updateMany(failureDisposition)
+      }
       if (error instanceof ManagementActivityHttpError && [401, 403].includes(error.status)) throw error
       if (permanent) {
         this.logger.error(JSON.stringify({ event: 'm365_activity_content', phase: 'INGESTION', outcome: 'FAILED', reasonCode: 'CONTENT_UNAVAILABLE' }))
@@ -1320,7 +1425,11 @@ export class M365ManagementActivityService {
     }
   }
 
-  async syncTenant(tenant: TenantTarget) {
+  async syncTenant(tenant: TenantTarget, visitOwner?: TenantVisitLeaseOwner) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId ||
+      visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
     if (!tenant.connection) throw new Error('The Microsoft tenant connection is incomplete.')
     const now = new Date()
     const pollMinutes = boundedInt(process.env.M365_AUDIT_POLL_INTERVAL_MINUTES, 15, 60)
@@ -1357,7 +1466,7 @@ export class M365ManagementActivityService {
       now.getTime() - state.lastSuccessfulAt.getTime() < pollMinutes * 60_000
     ) return [] as ManagementActivityChange[]
 
-    await this.prisma.syncState.upsert({
+    const runningStateWrite = {
       where: {
         customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
       },
@@ -1369,7 +1478,15 @@ export class M365ManagementActivityService {
         lastAttemptAt: now,
       },
       update: { status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null },
-    })
+    } as const
+    if (visitOwner) {
+      await this.prisma.$transaction(async (transaction) => {
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        await transaction.syncState.upsert(runningStateWrite)
+      })
+    } else {
+      await this.prisma.syncState.upsert(runningStateWrite)
+    }
 
     try {
       const { accessToken: token, publisherIdentifier } =
@@ -1378,8 +1495,8 @@ export class M365ManagementActivityService {
         connectionMode: tenant.connection.connectionMode === 'CUSTOMER_MANAGED' ? 'CUSTOMER_MANAGED' : 'HAWKVIEW_MANAGED',
         clientId: tenant.connection.clientId,
         credentialReference: tenant.connection.credentialReference,
-        })
-      await this.prisma.m365ActivityContent.updateMany({
+        }, visitOwner)
+      const interruptedRecovery = {
         where: {
           organizationId: tenant.organizationId,
           customerTenantId: tenant.id,
@@ -1387,13 +1504,22 @@ export class M365ManagementActivityService {
           updatedAt: { lt: new Date(now.getTime() - PROCESSING_LEASE_MS) },
         },
         data: { status: 'RETRY', nextRetryAt: now, lastError: 'Recovered an interrupted processing lease.' },
-      })
+      } as const
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          await transaction.m365ActivityContent.updateMany(interruptedRecovery)
+        })
+      } else {
+        await this.prisma.m365ActivityContent.updateMany(interruptedRecovery)
+      }
       const enabledContentTypes = await this.ensureSubscriptions(
         tenant,
         token,
         publisherIdentifier,
         now,
-        processingDeadline
+        processingDeadline,
+        visitOwner,
       )
       const subscriptionStates = await this.prisma.m365ActivitySubscription.findMany({
         where: {
@@ -1415,7 +1541,8 @@ export class M365ManagementActivityService {
         enabledContentTypes,
         now,
         processingDeadline,
-        downloadBudget
+        downloadBudget,
+        visitOwner,
       )
       const pending = await this.prisma.m365ActivityContent.findMany({
         where: {
@@ -1443,7 +1570,8 @@ export class M365ManagementActivityService {
           publisherIdentifier,
           downloadBudget,
           content,
-          processingDeadline
+          processingDeadline,
+          visitOwner,
         )))
       }
       const [pendingBacklog, processingBacklog, retryBacklog, failedBacklog] = await Promise.all([
@@ -1485,17 +1613,18 @@ export class M365ManagementActivityService {
         failedBacklog +
         subscriptionBacklog +
         (discoveryBacklog ? 1 : 0)
-      await this.prisma.$transaction([
-        this.prisma.m365AuditRecord.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, expiresAt: { lte: now } } }),
-        this.prisma.m365ActivityContent.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, ledgerExpiresAt: { lte: now } } }),
-        this.prisma.m365AuditDailyUsage.deleteMany({
+      const terminalWrites = (database: Pick<Prisma.TransactionClient,
+        'm365AuditRecord' | 'm365ActivityContent' | 'm365AuditDailyUsage' | 'syncState'>) => [
+        () => database.m365AuditRecord.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, expiresAt: { lte: now } } }),
+        () => database.m365ActivityContent.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, ledgerExpiresAt: { lte: now } } }),
+        () => database.m365AuditDailyUsage.deleteMany({
           where: {
             organizationId: tenant.organizationId,
             customerTenantId: tenant.id,
             usageDate: { lt: new Date(m365AuditUsageDate(now).getTime() - 35 * 24 * 60 * 60 * 1000) },
           },
         }),
-        this.prisma.syncState.update({
+        () => database.syncState.update({
           where: {
             customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
           },
@@ -1528,11 +1657,21 @@ export class M365ManagementActivityService {
                 consecutiveFailures: 0,
               },
         }),
-      ])
+      ] as const
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          for (const write of terminalWrites(transaction)) await write()
+        })
+      } else {
+        await this.prisma.$transaction(terminalWrites(this.prisma).map((write) => write()))
+      }
       return changes
     } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       if (error instanceof M365AuditBudgetError) {
-        await this.prisma.syncState.update({
+        const budgetStateWrite = {
           where: {
             customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
           },
@@ -1542,7 +1681,15 @@ export class M365ManagementActivityService {
             lastErrorMessage: safeMessage(error),
             consecutiveFailures: 0,
           },
-        })
+        } as const
+        if (visitOwner) {
+          await this.prisma.$transaction(async (transaction) => {
+            await assertTenantVisitLeaseOwner(transaction, visitOwner)
+            await transaction.syncState.update(budgetStateWrite)
+          })
+        } else {
+          await this.prisma.syncState.update(budgetStateWrite)
+        }
         return [] as ManagementActivityChange[]
       }
       const code = error instanceof ManagementActivityHttpError
@@ -1552,7 +1699,7 @@ export class M365ManagementActivityService {
         : /does not exist|audit.*not.*enabled|unified audit/i.test(safeMessage(error))
           ? 'm365-audit-disabled'
           : 'm365-audit-sync-failed'
-      await this.prisma.syncState.update({
+      const failedStateWrite = {
         where: {
           customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
         },
@@ -1562,7 +1709,15 @@ export class M365ManagementActivityService {
           lastErrorMessage: safeMessage(error),
           consecutiveFailures: { increment: 1 },
         },
-      })
+      } as const
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          await transaction.syncState.update(failedStateWrite)
+        })
+      } else {
+        await this.prisma.syncState.update(failedStateWrite)
+      }
       throw error
     }
   }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 import test from 'node:test'
 import {
   collectGroupMemberships,
@@ -90,3 +91,31 @@ test('keeps group inventory usable when an optional owner lookup is denied', asy
   assert.equal(result.failures.length, 1)
   assert.equal(result.failures[0]?.groupId, 'restricted')
 })
+
+
+for (const collect of [collectGroupMemberships, collectGroupOwners]) {
+  test(`${collect.name} drains active peers and preserves lease loss before another batch`, async () => {
+    let finishPeer!: () => void
+    let peerStarted!: () => void
+    const peerReady = new Promise<void>(resolve => { peerStarted = resolve })
+    const peerMayFinish = new Promise<void>(resolve => { finishPeer = resolve })
+    const calls: string[] = []
+    const lost = new TenantVisitLeaseLostError()
+    let settled = false
+    const running = collect([{ id: 'lost' }, { id: 'peer' }, { id: 'queued' }], async group => {
+      calls.push(group.id)
+      if (group.id === 'lost') throw lost
+      if (group.id === 'queued') assert.fail('new provider batch started after lease loss')
+      peerStarted()
+      await peerMayFinish
+      return []
+    }, 2)
+    const rejected = assert.rejects(running, error => error === lost).then(() => { settled = true })
+    await peerReady
+    await Promise.resolve()
+    assert.equal(settled, false)
+    finishPeer()
+    await rejected
+    assert.deepEqual(calls, ['lost', 'peer'])
+  })
+}

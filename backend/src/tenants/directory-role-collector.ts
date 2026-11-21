@@ -1,12 +1,18 @@
 import type { AuthorityDatabase, ManagedAuthority } from '../microsoft/managed-connector-authority.js'
 import type { ChangeEvidenceService } from '../changes/change-evidence.service.js'
-import { captureRoleAttempt, completeRoleAttempt, finishRoleAttempt, type RoleIdentity } from './directory-role-receipt-store.js'
+import { captureRoleAttempt, completeRoleAttempt, finishRoleAttempt, assertDirectoryRoleAuditRequest, type RoleIdentity } from './directory-role-receipt-store.js'
 import { DirectoryRolePartialError, directoryRolePage, prepareDirectoryRoles, DIRECTORY_ROLE_MAX_ROWS } from './directory-role-collection-validation.js'
+
+import type { TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import { tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
+import { cancelBoundedStream } from './microsoft-collection-budget.js'
 
 export const DIRECTORY_ROLE_URL = 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=roleDefinition($select=id,displayName,templateId)'
 const MAX_PAGE_BYTES = 180000, MAX_WIRE_BYTES = 720000, MAX_PAGES = 100, COLLECTOR_MS = 120000
 type Dependencies = {
   db: AuthorityDatabase
+  visitOwner?: TenantVisitLeaseOwner
+  auditRequestedRevision?: bigint
   token: (authority: ManagedAuthority, microsoftTenantId: string, deadlineAt: number) => Promise<string>
   fetchPage: (url: string, token: string, deadlineAt: number) => Promise<Response>
   read: (response: Response, maximumBytes: number, failureMessage: string, deadlineAt: number) => Promise<string>
@@ -24,7 +30,10 @@ function checkedUrl(value: string): string {
  * to the receipt store; notification integration/production activation are deferred.
  */
 export async function collectDirectoryRoles(input: Omit<RoleIdentity, 'configurationRevision'>, deps: Dependencies) {
-  const captured = await captureRoleAttempt(deps.db, input)
+  const visitOwner = deps.visitOwner ? { ...deps.visitOwner } : undefined
+  const auditRequestedRevision = deps.auditRequestedRevision
+  assertDirectoryRoleAuditRequest(visitOwner, auditRequestedRevision)
+  const captured = await captureRoleAttempt(deps.db, input, visitOwner)
   if (captured.status === 'legacy') {
     await deps.legacy()
     return { status: 'legacy' as const }
@@ -45,6 +54,10 @@ export async function collectDirectoryRoles(input: Omit<RoleIdentity, 'configura
       seen.add(url)
       const response = await deps.fetchPage(url, token, deadlineAt)
       if (!response.ok) throw new Error('DIRECTORY_ROLE_PROVIDER_FAILED')
+      if (visitOwner && (response.status !== 200 || response.headers.get('warning') !== null)) {
+        await cancelBoundedStream(() => response.body?.cancel())
+        throw new DirectoryRolePartialError()
+      }
       const raw = await deps.read(response, MAX_PAGE_BYTES, 'DIRECTORY_ROLE_PAGE_TOO_LARGE', deadlineAt)
       wireBytes += Buffer.byteLength(raw, 'utf8')
       if (wireBytes > MAX_WIRE_BYTES || Date.now() >= deadlineAt) throw new DirectoryRolePartialError()
@@ -59,10 +72,12 @@ export async function collectDirectoryRoles(input: Omit<RoleIdentity, 'configura
     }
     collection = prepareDirectoryRoles(rows)
   } catch (error) {
+    const lost = visitOwner && tenantVisitLeaseLoss(error)
+    if (lost) throw lost
     // No generic status writer, connection mutation or notification on this branch.
-    return finishRoleAttempt(deps.db, attempt, error instanceof DirectoryRolePartialError ? 'PARTIAL' : 'FAILED')
+    return finishRoleAttempt(deps.db, attempt, error instanceof DirectoryRolePartialError ? 'PARTIAL' : 'FAILED', visitOwner)
   }
   // A DB/evidence failure rolls back atomically and propagates; do not convert an
   // uncertain commit into a second terminal mutation.
-  return completeRoleAttempt(deps.db, attempt, collection, deps.buildDifference)
+  return completeRoleAttempt(deps.db, attempt, collection, deps.buildDifference, visitOwner, auditRequestedRevision)
 }

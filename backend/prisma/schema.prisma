@@ -707,6 +707,8 @@ model CustomerTenant {
   tenantLicenses     TenantLicense[]
   tenantDomains      TenantDomain[]
   syncStates         SyncState[]
+  syncVisitLease     TenantSyncVisitLease?
+  auditReconciliationWork TenantAuditReconciliationWork[]
   collectionFieldStates TenantCollectionFieldState[]
   entraSnapshots     TenantEntraSnapshot[]
   signInLogs         SignInLog[]
@@ -1263,6 +1265,38 @@ model ScheduledSyncCursor {
   revision Int @default(0)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
   @@map("scheduled_sync_cursors")
+}
+
+// Tenant-wide SYNC visit ownership, used by admission and owned writes when
+// HAWKVIEW_TENANT_VISIT_FENCING=enabled. The deployment switch defaults off.
+model TenantSyncVisitLease {
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  ownerToken String? @map("owner_token") @db.Uuid
+  generation BigInt @default(0)
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @map("updated_at") @db.Timestamptz(6)
+  customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([customerTenantId, organizationId])
+  @@map("tenant_sync_visit_leases")
+}
+
+// Tenant-scoped audit refresh ledger. Owned visits enqueue and replay requests;
+// authoritative inventory commits acknowledge their exact requested revision.
+model TenantAuditReconciliationWork {
+  organizationId String @map("organization_id") @db.Uuid
+  customerTenantId String @map("customer_tenant_id") @db.Uuid
+  resourceType SyncResourceType @map("resource_type")
+  requestedRevision BigInt @default(1) @map("requested_revision")
+  completedRevision BigInt @default(0) @map("completed_revision")
+  lastCompletedAt DateTime? @map("last_completed_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  customerTenant CustomerTenant @relation(fields: [customerTenantId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@id([organizationId, customerTenantId, resourceType])
+  @@map("tenant_audit_reconciliation_work")
 }
 
 model IdentityRiskAttemptHead {

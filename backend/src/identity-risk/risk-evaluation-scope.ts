@@ -9,7 +9,7 @@ type Transaction = {
 }
 export async function lockRiskEvaluationScope(
   transaction: Transaction, scope: Scope,
-  tenantLock: 'SHARE' | 'UPDATE' = 'SHARE',
+  tenantLock: 'SHARE' | 'NO KEY UPDATE' | 'UPDATE' = 'SHARE',
   revalidate?: () => void,
 ): Promise<'ELIGIBLE' | 'STOPPED' | 'INELIGIBLE'> {
   // Match IdentityRiskSafetyService and the primary evaluator exactly. The

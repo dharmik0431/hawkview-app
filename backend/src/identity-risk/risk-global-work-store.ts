@@ -1,11 +1,34 @@
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
 import { isGlobalRiskConfig, riskRuntimeConfig } from './risk-runtime-config.js'
 import type { PseudonymScope } from './identity-risk-pseudonym.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { createHash, randomUUID } from 'node:crypto'
 
 export type RiskCycleLease = Readonly<{ environment: string; id: string }>
 export function riskTenantScopeOpaqueId(scope: Pick<PseudonymScope, 'organizationId' | 'customerTenantId'>) {
   return createHash('sha256').update(`identity-risk-control/v1\u0000${scope.organizationId}:${scope.customerTenantId}`).digest('hex').slice(0, 32)
+}
+
+interface RiskAttemptVisitQuery {
+  query(sql: string, values: unknown[]): Promise<{ rows: unknown[] }>
+}
+
+/** Use the risk transaction's own connection so a visit takeover cannot land
+ * between owner verification and the attempt-head reset. This optional path
+ * has no production caller until the whole post-sync flow is fenced. */
+export async function assertRiskAttemptVisitOwner(
+  client: RiskAttemptVisitQuery,
+  scope: Pick<PseudonymScope, 'organizationId' | 'customerTenantId'>,
+  owner: TenantVisitLeaseOwner,
+): Promise<void> {
+  if (scope.organizationId !== owner.organizationId || scope.customerTenantId !== owner.customerTenantId) {
+    throw new TenantVisitLeaseLostError()
+  }
+  await assertTenantVisitLeaseOwner({
+    $queryRawUnsafe: async <T = unknown>(sql: string, ...values: unknown[]): Promise<T> =>
+      (await client.query(sql, values)).rows as T,
+  }, owner)
 }
 
 /** Internal authenticated scheduler only; no HTTP/read-path enrollment. The
@@ -15,7 +38,8 @@ export class RiskGlobalWorkStore {
   /** Durable attempt BEFORE key/source work. A failed attempt cannot leave an
    * earlier successful empty evaluation looking like the latest check. Existing
    * operational-event expiry/maintenance applies; no identities or errors. */
-  async recordAttempt(scope: PseudonymScope, lease: RiskCycleLease, deadlineAt: number) {
+  async recordAttempt(scope: PseudonymScope, lease: RiskCycleLease, deadlineAt: number,
+    visitOwner?: TenantVisitLeaseOwner) {
     const config = riskRuntimeConfig()
     if (!isGlobalRiskConfig(config) || scope.environment !== config.environment || lease.environment !== config.environment)
       throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
@@ -28,6 +52,7 @@ export class RiskGlobalWorkStore {
         WHERE environment=$1 AND lease_id=$2::uuid AND lease_expires_at>statement_timestamp() FOR UPDATE`,
       [lease.environment, lease.id])
       if (owned.rowCount !== 1) throw new Error('IDENTITY_RISK_CYCLE_UNAVAILABLE')
+      if (visitOwner) await assertRiskAttemptVisitOwner(client, scope, visitOwner)
       const result = await client.query(`INSERT INTO identity_risk_operational_events
         (id,event_key,event_type,scope_type,scope_opaque_id,reason_code,correlation_id,actor_service_id,expires_at,created_at)
         SELECT $1::uuid,$2,'GLOBAL_RISK_ATTEMPT','TENANT',$3,'EVALUATION_REQUESTED',$4::uuid,

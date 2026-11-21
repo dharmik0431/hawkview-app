@@ -6,6 +6,39 @@ const now = new Date('2026-08-13T14:02:00.000Z')
 const success = (resourceType: string, at = '2026-08-13T14:00:00.000Z') => ({ resourceType, status: 'SUCCEEDED', lastAttemptAt: new Date(at), lastSuccessfulAt: new Date(at), lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 })
 const failed = (resourceType: string, lastSuccessfulAt: string | null = null, code = '500') => ({ resourceType, status: 'FAILED', lastAttemptAt: now, lastSuccessfulAt: lastSuccessfulAt ? new Date(lastSuccessfulAt) : null, lastErrorCode: code, lastErrorMessage: code === '403' ? 'Forbidden: consent required' : 'Microsoft API error', consecutiveFailures: 1 })
 
+test('full20 freshness follows the exact opt-in with inclusive eligibility and existing inventory grace', () => {
+  const saved = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+  const minute = 60000
+  const inventory = (age: number) => ['LICENSES', 'DOMAINS', 'ORGANIZATION_CONFIGURATION', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH']
+    .map(resource => success(resource, new Date(now.getTime() - age).toISOString()))
+  try {
+    for (const flag of [undefined, 'false', 'TRUE', '1']) {
+      if (flag === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+      else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = flag
+      assert.equal(deriveTenantSyncFreshness(inventory(23 * 60 * minute), now).services.office365.freshnessStatus, 'CURRENT')
+    }
+    process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = 'true'
+    for (const [age, freshness] of [[20 * minute, 'CURRENT'], [20 * minute + 1, 'AGING'],
+      [140 * minute, 'AGING'], [140 * minute + 1, 'STALE']] as const) {
+      const result = deriveTenantSyncFreshness(inventory(age), now).services.office365
+      assert.equal(result.freshnessStatus, freshness)
+      assert.equal(result.staleCollectors, freshness === 'STALE' ? 5 : 0)
+      assert.equal(result.nextScheduledAttemptAt, null)
+    }
+    const activity = deriveTenantSyncFreshness([success('SIGN_INS', new Date(now.getTime() - 16 * minute).toISOString())], now)
+    assert.equal(activity.services.signInLogs.freshnessStatus, 'AGING', 'activity keeps its existing 15-minute window')
+    const failure = failed('SHAREPOINT_USAGE', new Date(now.getTime() - 21 * minute).toISOString())
+    const before = structuredClone(failure)
+    const result = deriveTenantSyncFreshness([failure], now).services.sharePointOneDrive
+    assert.equal(result.failedCollectors, 1)
+    assert.equal(result.partialFailures.find(item => item.collector === 'SHAREPOINT_USAGE')?.nextRetryAt, null)
+    assert.deepEqual(failure, before, 'freshness must not mutate failure policy state')
+  } finally {
+    if (saved === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = saved
+  }
+})
+
 test('reports a fully successful service only when every expected collector succeeded', () => {
   const data = deriveTenantSyncFreshness(['LICENSES', 'DOMAINS', 'ORGANIZATION_CONFIGURATION', 'SECURITY_DEFAULTS', 'DOMAIN_DNS_HEALTH'].map((resourceType) => success(resourceType)), now)
   assert.equal(data.services.office365.status, 'SUCCESS')

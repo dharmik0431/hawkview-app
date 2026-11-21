@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
 import { authenticationFactFingerprint, integrityConflictMarker, persistAuthenticationRecords } from './authentication-ingestion-integrity.js'
 const MARKED_AT=new Date('2026-09-08T12:02:00Z')
 /** Written from measured PostgreSQL output, NOT imported from the module under
@@ -13,11 +14,13 @@ function pgTextBytes(value:any):number{
   for(let i=0;i<keys.length;i++)t+=(i?2:0)+Buffer.byteLength(JSON.stringify(keys[i]))+2+pgTextBytes(value[keys[i]])
   return t}
 const scope={organizationId:'11111111-1111-4111-8111-111111111111',customerTenantId:'22222222-2222-4222-8222-222222222222'}
+const visitOwner={...scope,token:'55555555-5555-4555-8555-555555555555',generation:7n,expiresAt:new Date('2026-09-08T12:05:00Z')}
 const record=(id='event',raw:any={})=>({...scope,microsoftSignInId:id,eventDateTime:new Date('2026-09-08T12:00:00Z'),ingestedAt:new Date('2026-09-08T12:01:00Z'),expiresAt:new Date('2026-12-07T12:00:00Z'),
   riskLevel:'high',raw:{id,createdDateTime:'2026-09-08T12:00:00Z',userId:'33333333-3333-4333-8333-333333333333',appId:'44444444-4444-4444-8444-444444444444',status:{errorCode:50126},ipAddress:'192.0.2.1',...raw}})
-function fixture(){
-  let rows=new Map<string,any>(),fail=false,maxBatch=0
+function fixture(leaseAllowedThroughTransaction=Infinity){
+  let rows=new Map<string,any>(),fail=false,maxBatch=0,transactions=0,leaseChecks=0
   const prisma:any={$transaction:async(work:any)=>{
+    const transactionNumber=++transactions
     const pending=structuredClone(rows)
     const result=await work({
       $executeRawUnsafe:async(sql:string,...args:any[])=>{
@@ -29,6 +32,13 @@ function fixture(){
         return 1
       },
       $queryRawUnsafe:async(sql:string,...args:any[])=>{
+        if(sql.includes('FROM organizations WHERE')){assert.deepEqual(args,[scope.organizationId]);return [{id:scope.organizationId}]}
+        if(sql.includes('FROM customer_tenants WHERE')){assert.deepEqual(args,[scope.customerTenantId,scope.organizationId]);return [{id:scope.customerTenantId}]}
+        if(sql.includes('FROM tenant_sync_visit_leases')){
+          assert.deepEqual(args,[scope.customerTenantId,scope.organizationId,visitOwner.token,visitOwner.generation.toString()])
+          leaseChecks++
+          return transactionNumber<=leaseAllowedThroughTransaction?[{generation:visitOwner.generation.toString()}]:[]
+        }
         if(sql.includes("current_setting('TimeZone')"))return [{timezone:'UTC'}]
         // The post-write verification. In production PostgreSQL answers this; here
         // pgTextBytes stands in for it, which is exactly why the authoritative
@@ -55,7 +65,7 @@ function fixture(){
     })
     rows=pending;return result
   }}
-  return {prisma,get rows(){return rows},get maxBatch(){return maxBatch},fail(){fail=true}}
+  return {prisma,get rows(){return rows},get maxBatch(){return maxBatch},get transactions(){return transactions},get leaseChecks(){return leaseChecks},fail(){fail=true}}
 }
 test('identical replay and optional geographic enrichment deduplicate without renewal or Microsoft-risk mutation',async()=>{
   const f=fixture(),original=record();await persistAuthenticationRecords(f.prisma,scope,[original],undefined,MARKED_AT)
@@ -87,6 +97,29 @@ test('scope, byte/row/deadline bounds fail closed and failed transaction rolls b
 test('501 records use bounded transactions and cross-chunk duplicates are still quarantined',async()=>{
   const f=fixture(),rows=Array.from({length:500},(_,i)=>record(`event-${i}`));rows.push(record('event-0',{status:{errorCode:0}}))
   assert.equal((await persistAuthenticationRecords(f.prisma,scope,rows,undefined,MARKED_AT)).hasConflicts,true);assert.equal(f.maxBatch,500);assert.equal(f.rows.size,500)
+})
+test('authentication ingestion rejects a mismatched visit owner before opening a transaction',async()=>{
+  const f=fixture()
+  await assert.rejects(()=>persistAuthenticationRecords(f.prisma,scope,[record()],undefined,MARKED_AT,
+    {...visitOwner,organizationId:'foreign'}),TenantVisitLeaseLostError)
+  assert.equal(f.transactions,0);assert.equal(f.rows.size,0)
+})
+test('authentication ingestion checks the exact owner before each chunk and stops after takeover',async()=>{
+  const rows=Array.from({length:501},(_,i)=>record(`visit-${i}`))
+  const accepted=fixture()
+  assert.deepEqual(await persistAuthenticationRecords(accepted.prisma,scope,[rows[0]],undefined,MARKED_AT,visitOwner),
+    {inserted:1,hasConflicts:false})
+  assert.equal(accepted.leaseChecks,1);assert.equal(accepted.rows.size,1)
+
+  const lostBeforeWrite=fixture(0)
+  await assert.rejects(()=>persistAuthenticationRecords(lostBeforeWrite.prisma,scope,[rows[0]],undefined,MARKED_AT,visitOwner),TenantVisitLeaseLostError)
+  assert.equal(lostBeforeWrite.leaseChecks,1);assert.equal(lostBeforeWrite.rows.size,0)
+
+  const lostAfterFirstChunk=fixture(1)
+  await assert.rejects(()=>persistAuthenticationRecords(lostAfterFirstChunk.prisma,scope,rows,undefined,MARKED_AT,visitOwner),TenantVisitLeaseLostError)
+  assert.equal(lostAfterFirstChunk.transactions,2);assert.equal(lostAfterFirstChunk.leaseChecks,2)
+  assert.equal(lostAfterFirstChunk.rows.size,500,'the committed first chunk remains, but a successor-owned chunk cannot write')
+  assert.equal(lostAfterFirstChunk.maxBatch,500)
 })
 test('fingerprint rejects hostile accessors/prototypes and tracks STS outcome rather than synthesized display status',()=>{
   const hostile=Object.defineProperty({},'status',{enumerable:true,get(){throw new Error('must not invoke')}})

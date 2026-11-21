@@ -20,6 +20,7 @@ export const databaseTests = Object.freeze([
   'alerts/suppressed-evidence-reader.database-integration.test.ts',
   'alerts/suppression-store.database-integration.test.ts',
   'auth/console-session.database-integration.test.ts',
+  'changes/directory-audit-evidence-repair.database-integration.test.ts',
   'identity-risk/authentication-ingestion-capacity.database-integration.test.ts',
   'identity-risk/identity-risk-key.database-integration.test.ts',
   'identity-risk/native-alert-retention.database-integration.test.ts',
@@ -48,6 +49,8 @@ export const databaseTests = Object.freeze([
   'tenants/existing-tenant-consent.database-integration.test.ts',
   'tenants/scheduled-sync-cursor.database-integration.test.ts',
   'tenants/tenant-directory.database-integration.test.ts',
+  'tenants/tenant-visit-audit-atomic.database-integration.test.ts',
+  'tenants/tenant-visit-materialization.database-integration.test.ts',
   'workspace/workspace-audit.database-integration.test.ts',
   // This older filename contains an explicitly opted-in real PostgreSQL test.
   'tenants/sign-in-provisioning.test.ts',
@@ -89,7 +92,7 @@ export const syntheticExceptions = Object.freeze({
     reason: 'Pure disposable-boundary parsing assertions; no connection is opened.',
   },
   'src/prisma/native-alert-test-database.inventory.test.ts': {
-    blob: '3447ed387f67149624460d81e092cd2e69b38361',
+    blob: '14676fe22b91cb5633916fe861e9b20c23587275',
     reason: 'Source/token inventory of database guards, not execution of database fixtures.',
   },
 });

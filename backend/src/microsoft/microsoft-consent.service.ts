@@ -12,6 +12,8 @@ import { decodeJwt, jwtVerify, SignJWT } from 'jose'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { SecretStoreService } from '../secrets/secret-store.service.js'
 import { PLATFORM_OWNED } from '../secrets/secret-owner.js'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
+import { tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
 import type { ClaimedConsent, ConsentOperationKey } from './consent-operation-store.js'
 import { captureManagedAuthority, publishManagedAuthority, upgradeLegacyManagedAuthority, type ManagedAuthority } from './managed-connector-authority.js'
 import {
@@ -207,7 +209,7 @@ export class MicrosoftConsentService {
     return { redirectUri, stateSecret }
   }
 
-  private async getManagedConnector() {
+  private async getManagedConnector(visitOwner?: TenantVisitLeaseOwner) {
     const connector = await this.prisma.platformMicrosoftConnector.findUnique({
       where: { id: 'default' },
     })
@@ -220,7 +222,7 @@ export class MicrosoftConsentService {
       clientId: connector.clientId,
       homeTenantId: connector.homeTenantId,
       clientSecret: await this.secretStore.access(
-        connector.credentialReference
+        connector.credentialReference, visitOwner
       ),
     }
   }
@@ -647,11 +649,11 @@ export class MicrosoftConsentService {
   }
 
   /** Directory adapter only: consume the captured immutable authority, never reload latest credentials. */
-  async getCapturedDirectoryRoleToken(authority: ManagedAuthority, microsoftTenantId: string, deadlineAt: number) {
+  async getCapturedDirectoryRoleToken(authority: ManagedAuthority, microsoftTenantId: string, deadlineAt: number, visitOwner?: TenantVisitLeaseOwner) {
     const captured = { ...authority }, tenantId = microsoftTenantId
     if (captured.credentialReference !== `encrypted-secret:${captured.configurationRevision}`
       || !Number.isFinite(deadlineAt) || Date.now() >= deadlineAt) throw new Error('INVALID_CAPTURED_DIRECTORY_AUTHORITY')
-    const clientSecret = await this.secretStore.access(captured.credentialReference)
+    const clientSecret = await this.secretStore.access(captured.credentialReference, visitOwner)
     if (!clientSecret || Date.now() >= deadlineAt) throw new Error('CAPTURED_DIRECTORY_CREDENTIAL_UNAVAILABLE')
     const result = await this.requestAccessToken(tenantId, { clientId: captured.clientId, clientSecret }, undefined, deadlineAt)
     const claims = decodeJwt(result.accessToken)
@@ -663,23 +665,27 @@ export class MicrosoftConsentService {
     return result.accessToken
   }
 
-  /** Bounded first-use compatibility before any sync lease or provider work. */
-  async upgradeLegacyManagedConnector() {
+  /** Bounded first-use compatibility before resource claims or provider work. */
+  async upgradeLegacyManagedConnector(visitOwner?: TenantVisitLeaseOwner) {
     const result = await upgradeLegacyManagedAuthority(this.prisma, (revision, source) =>
-      this.secretStore.prepareManagedRevisionFromStored(revision, source))
+      this.secretStore.prepareManagedRevisionFromStored(revision, source), visitOwner)
     if (result.status === 'unavailable') throw new CapturedVerificationCredentialsUnavailable()
   }
 
   /** Shared writer token seam: the operation owns the captured revision. */
-  async getCapturedManagedAccessToken(authority: ManagedAuthority, microsoftTenantId: string, exchange = false) {
+  async getCapturedManagedAccessToken(authority: ManagedAuthority, microsoftTenantId: string, exchange = false, visitOwner?: TenantVisitLeaseOwner) {
     const captured = { ...authority }, tenantId = microsoftTenantId
     let clientSecret: string
     try {
       if (!captured.configurationRevision || !captured.clientId
         || captured.credentialReference !== `encrypted-secret:${captured.configurationRevision}`) throw new CapturedVerificationCredentialsUnavailable()
-      clientSecret = await this.secretStore.access(captured.credentialReference)
+      clientSecret = await this.secretStore.access(captured.credentialReference, visitOwner)
       if (!clientSecret) throw new CapturedVerificationCredentialsUnavailable()
-    } catch { throw new CapturedVerificationCredentialsUnavailable() }
+    } catch (error) {
+      const lost = tenantVisitLeaseLoss(error)
+      if (lost) throw lost
+      throw new CapturedVerificationCredentialsUnavailable()
+    }
     const result = await this.requestAccessToken(tenantId, { clientId: captured.clientId, clientSecret },
       exchange ? 'https://outlook.office365.com/.default' : undefined)
     if (exchange && (!result.grantedPermissions.includes('Exchange.ManageAsAppV2') || (result.directoryRoleIds ?? []).length > 0)) {
@@ -693,16 +699,16 @@ export class MicrosoftConsentService {
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
     clientId: string | null
     credentialReference: string | null
-  }) {
+  }, visitOwner?: TenantVisitLeaseOwner) {
     const credentials =
       input.connectionMode === 'CUSTOMER_MANAGED'
         ? {
             clientId: input.clientId ?? '',
             clientSecret: input.credentialReference
-              ? await this.secretStore.access(input.credentialReference)
+              ? await this.secretStore.access(input.credentialReference, visitOwner)
               : '',
           }
-        : await this.getManagedConnector()
+        : await this.getManagedConnector(visitOwner)
 
     if (!credentials.clientId || !credentials.clientSecret) {
       throw new ServiceUnavailableException(
@@ -722,15 +728,15 @@ export class MicrosoftConsentService {
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
     clientId: string | null
     credentialReference: string | null
-  }) {
+  }, visitOwner?: TenantVisitLeaseOwner) {
     const credentials = input.connectionMode === 'CUSTOMER_MANAGED'
       ? {
           clientId: input.clientId ?? '',
           clientSecret: input.credentialReference
-            ? await this.secretStore.access(input.credentialReference)
+            ? await this.secretStore.access(input.credentialReference, visitOwner)
             : '',
         }
-      : await this.getManagedConnector()
+      : await this.getManagedConnector(visitOwner)
     if (!credentials.clientId || !credentials.clientSecret) {
       throw new ServiceUnavailableException('The Microsoft tenant connection is incomplete.')
     }
@@ -866,7 +872,9 @@ export class MicrosoftConsentService {
       }
       clientSecret = await this.secretStore.access(authority.credentialReference)
       if (!clientSecret) throw new CapturedVerificationCredentialsUnavailable()
-    } catch {
+    } catch (error) {
+      const lost = tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       // Do not expose secret-store details or publish unavailable credentials as
       // a Microsoft verification failure. Provider work starts below this catch.
       throw new CapturedVerificationCredentialsUnavailable()
@@ -888,7 +896,9 @@ export class MicrosoftConsentService {
         const clientSecret = await this.secretStore.access(credentialReference)
         if (!clientSecret) throw new CustomerVerificationCredentialsUnavailable()
         credentials = { clientId, clientSecret }
-      } catch {
+      } catch (error) {
+        const lost = tenantVisitLeaseLoss(error)
+        if (lost) throw lost
         // Secret-store errors are not Microsoft verdicts and must never expose storage details.
         throw new CustomerVerificationCredentialsUnavailable()
       }
@@ -910,8 +920,8 @@ export class MicrosoftConsentService {
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
     clientId: string | null
     credentialReference: string | null
-  }) {
-    const context = await this.getTenantManagementActivityContext(input)
+  }, visitOwner?: TenantVisitLeaseOwner) {
+    const context = await this.getTenantManagementActivityContext(input, visitOwner)
     return context.accessToken
   }
 
@@ -920,7 +930,7 @@ export class MicrosoftConsentService {
     connectionMode: 'HAWKVIEW_MANAGED' | 'CUSTOMER_MANAGED'
     clientId: string | null
     credentialReference: string | null
-  }) {
+  }, visitOwner?: TenantVisitLeaseOwner) {
     const credentials =
       input.connectionMode === 'CUSTOMER_MANAGED'
         ? {
@@ -930,10 +940,10 @@ export class MicrosoftConsentService {
             // its publisher tenant must become an explicit stored field.
             homeTenantId: input.microsoftTenantId,
             clientSecret: input.credentialReference
-              ? await this.secretStore.access(input.credentialReference)
+              ? await this.secretStore.access(input.credentialReference, visitOwner)
               : '',
           }
-        : await this.getManagedConnector()
+        : await this.getManagedConnector(visitOwner)
 
     if (!credentials.clientId || !credentials.clientSecret) {
       throw new ServiceUnavailableException(

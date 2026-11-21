@@ -1,5 +1,38 @@
 import type { SyncResourceType } from '../generated/prisma/enums.js'
 
+// Keep this established projection module free of runtime imports: existing
+// cross-layer consumers load it directly. Scheduler and policy facades share
+// these same definitions; interval values and opt-in evaluation stay unchanged.
+export const DAILY_INVENTORY_REFRESH_MS = 24 * 60 * 60 * 1000
+/** Opt-in healthy full inventory interval; the scheduler defaults to daily. */
+export const TWENTY_MINUTE_INVENTORY_REFRESH_MS = 20 * 60 * 1000
+
+/** Freshness describes stored evidence; it never changes retry eligibility. */
+export const LEGACY_SYNC_FRESHNESS_WINDOWS = {
+  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
+  dailyInventory: { currentMs: DAILY_INVENTORY_REFRESH_MS, agingMs: DAILY_INVENTORY_REFRESH_MS + 2 * 60 * 60 * 1000 },
+} as const
+
+const fullTwentyMinuteWindow = {
+  currentMs: TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  // Retain the existing two-hour inventory grace after healthy eligibility.
+  agingMs: TWENTY_MINUTE_INVENTORY_REFRESH_MS +
+    LEGACY_SYNC_FRESHNESS_WINDOWS.dailyInventory.agingMs - LEGACY_SYNC_FRESHNESS_WINDOWS.dailyInventory.currentMs,
+} as const
+const incrementalResources = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'])
+
+export function syncFreshnessWindow(cadence: 'incremental' | 'daily') {
+  if (cadence === 'incremental') return LEGACY_SYNC_FRESHNESS_WINDOWS.incremental
+  // Use the scheduler's exact opt-in value. Absent or malformed values retain
+  // the daily policy, and merely building the candidate cannot activate it.
+  return process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED === 'true'
+    ? fullTwentyMinuteWindow : LEGACY_SYNC_FRESHNESS_WINDOWS.dailyInventory
+}
+
+export function resourceFreshnessWindow(resourceType: string) {
+  return syncFreshnessWindow(incrementalResources.has(resourceType) ? 'incremental' : 'daily')
+}
+
 /**
  * Per-service synchronization freshness, derived from the persisted collector
  * SyncState rows. SyncState is deliberately the source of truth: it keeps a
@@ -170,18 +203,7 @@ type MustBeNever<T extends never> = T
  * Prisma generates from the schema. */
 export type EveryCollectorHasAnOwningService = MustBeNever<UnownedCollector>
 
-export const SERVICE_FRESHNESS_WINDOWS = {
-  incremental: { currentMs: 15 * 60 * 1000, agingMs: 2 * 60 * 60 * 1000 },
-  dailyInventory: { currentMs: 24 * 60 * 60 * 1000, agingMs: 26 * 60 * 60 * 1000 },
-} as const
-
-const INCREMENTAL_COLLECTORS = new Set(['USERS', 'SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'])
-
-function freshnessWindow(collector: string) {
-  return INCREMENTAL_COLLECTORS.has(collector)
-    ? SERVICE_FRESHNESS_WINDOWS.incremental
-    : SERVICE_FRESHNESS_WINDOWS.dailyInventory
-}
+export const SERVICE_FRESHNESS_WINDOWS = LEGACY_SYNC_FRESHNESS_WINDOWS
 
 
 function iso(date: Date | null | undefined) {
@@ -198,7 +220,7 @@ export function collectorStatus(resourceType: string, state: PersistedSyncState 
   if (state.status === 'FAILED') return authFailure(state) ? 'PERMISSION_REQUIRED' : 'FAILED'
   if (state.status === 'IDLE' && !state.lastAttemptAt && !state.lastSuccessfulAt) return 'PENDING'
   if (!state.lastSuccessfulAt) return 'PENDING'
-  return now.getTime() - state.lastSuccessfulAt.getTime() > freshnessWindow(resourceType).agingMs
+  return now.getTime() - state.lastSuccessfulAt.getTime() > resourceFreshnessWindow(resourceType).agingMs
     ? 'STALE'
     : 'SUCCESS'
 }
@@ -246,7 +268,7 @@ function buildService(
     const collectorFreshness = rows.map(({ collector, state }) => {
       if (!state?.lastSuccessfulAt) return 'STALE' as const
       const age = now.getTime() - state.lastSuccessfulAt.getTime()
-      const window = freshnessWindow(collector)
+      const window = resourceFreshnessWindow(collector)
       return age <= window.currentMs ? 'CURRENT' as const : age <= window.agingMs ? 'AGING' as const : 'STALE' as const
     })
     freshnessStatus = collectorFreshness.includes('STALE') ? 'STALE' : collectorFreshness.includes('AGING') ? 'AGING' : 'CURRENT'

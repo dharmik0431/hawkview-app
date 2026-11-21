@@ -4,6 +4,7 @@ import type {
   IdentitySignalRuleId as ApprovedIdentitySignalRuleId,
 } from './identity-signal-contract.js'
 import type { StoredRiskAssessment } from './risk-assessment-projection.js'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 
 export const IDENTITY_RISK_API_VERSION = 1 as const
 export const IDENTITY_RISK_ENGINE_VERSION = 'hawkview-identity-engine/1' as const
@@ -292,6 +293,8 @@ export type IdentityRiskEvaluationRequest = Readonly<{
   executionDeadlineAt?: number
   /** Internal durable scheduler attempt; never supplied by a customer route. */
   globalAttemptId?: string
+  /** Internal automatic tenant-visit owner; never supplied by a customer route. */
+  visitOwner?: TenantVisitLeaseOwner
   detectors: readonly IdentitySignalDetector[]
 }>
 

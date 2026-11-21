@@ -3,6 +3,8 @@ import { IdentityRiskPseudonymProvider, ManagedHmacPseudonymProvider, type Manag
 import { riskRuntimeConfig, riskScopeAllowed, isWrappedRiskConfig } from './risk-runtime-config.js'
 import { keyUnavailable, readRiskWrappingRoot, unwrapRiskKey, wrappedRiskName, WRAPPED_RISK_PROVIDER } from './wrapped-risk-crypto.js'
 import { WrappedRiskKeyStore } from './wrapped-risk-key-store.js'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
+import { tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
 
 export const IDENTITY_RISK_MANAGED_MAC_TRANSPORT = Symbol('IDENTITY_RISK_MANAGED_MAC_TRANSPORT')
 
@@ -12,14 +14,14 @@ export class WrappedRiskPseudonymProvider extends IdentityRiskPseudonymProvider 
   override allowsScope(scope: PseudonymScope) {
     return isWrappedRiskConfig(riskRuntimeConfig()) && riskScopeAllowed(scope)
   }
-  override async pin(key: PseudonymKeyVersion, requestedDeadline: number): Promise<PinnedPseudonymSession> {
+  override async pin(key: PseudonymKeyVersion, requestedDeadline: number, visitOwner?: TenantVisitLeaseOwner): Promise<PinnedPseudonymSession> {
     if (wrappedRiskName(key) !== key.immutableKeyId) throw keyUnavailable()
     if (!this.allowsScope(key) || key.provider !== WRAPPED_RISK_PROVIDER || !Number.isSafeInteger(requestedDeadline) || requestedDeadline <= Date.now()) throw keyUnavailable()
     const deadline = Math.min(requestedDeadline, Date.now() + 30000)
     const root = readRiskWrappingRoot()
     let material: Buffer | undefined
     try {
-      const row = await this.store.ciphertext(key, deadline)
+      const row = await this.store.ciphertext(key, deadline, visitOwner)
       material = unwrapRiskKey(key, row, root)
       if (Date.now() >= deadline) throw keyUnavailable()
       const pinned = Object.freeze({ ...key })
@@ -41,9 +43,11 @@ export class WrappedRiskPseudonymProvider extends IdentityRiskPseudonymProvider 
           finally { input.fill(0); mac?.fill(0) }
         },
       })
-    } catch {
+    } catch (error) {
       material?.fill(0)
-      await this.store.recordFailure(key, deadline)
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
+      await this.store.recordFailure(key, deadline, visitOwner)
       throw keyUnavailable()
     } finally { root.fill(0) }
   }
@@ -66,9 +70,9 @@ export function createPilotPseudonymProvider(transport: ManagedMacTransport | nu
       const current = riskRuntimeConfig()
       return current?.provider === config.provider && riskScopeAllowed(scope, current)
     }
-    override pin(key: PseudonymKeyVersion, deadline: number) {
+    override pin(key: PseudonymKeyVersion, deadline: number, visitOwner?: TenantVisitLeaseOwner) {
       if (!this.allowsScope(key)) return Promise.reject(keyUnavailable())
-      return configuredDelegate.pin(key, deadline)
+      return configuredDelegate.pin(key, deadline, visitOwner)
     }
   }()
 }

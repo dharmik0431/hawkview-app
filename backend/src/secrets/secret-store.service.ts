@@ -14,6 +14,9 @@ import { encryptionKeyRing, type EncryptionKeyRing } from './secret-encryption-k
 import { PLATFORM_OWNED, assertStorable, type SecretOwner } from './secret-owner.js'
 
 import { IMMUTABLE_MANAGED_SECRET_PREFIX } from '../microsoft/managed-connector-authority.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
+import { assertTenantVisitLifecycleActive, currentTenantVisitOwner } from '../tenants/tenant-visit-lifecycle.js'
+import { tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
 
 const DATABASE_REFERENCE_PREFIX = 'encrypted-secret:'
 const UUID_PATTERN =
@@ -141,12 +144,15 @@ export class SecretStoreService {
 
   /** Opens the secret and, when it was sealed with an older key, re-seals it.
    *
-   * RE-SEALING CAN NEVER FAIL THE READ. The caller already holds the plaintext by
+   * Ordinary re-sealing storage failure never fails the read. The caller holds the plaintext by
    * the time this runs, so turning a successful decryption into an error because
    * a follow-up write failed would convert a rotation convenience into an outage.
    * A row that fails to re-seal is retried on its next read, and the previous key
-   * stays necessary until it succeeds — which `rotationStatus()` reports. */
-  private async openAndReseal(secret: StoredSecret) {
+   * stays necessary until it succeeds — which `rotationStatus()` reports.
+   * Lost visit authority is different from a storage failure: its caller must
+   * stop rather than use the plaintext to begin more provider work. */
+  private async openAndReseal(secret: StoredSecret, visitOwner: TenantVisitLeaseOwner | undefined = currentTenantVisitOwner()) {
+    assertTenantVisitLifecycleActive(visitOwner)
     const value = this.decrypt(secret)
     const keys = this.keys
     if (secret.keyVersion === keys.currentVersion) return value
@@ -157,11 +163,19 @@ export class SecretStoreService {
       // row updates zero rows here rather than overwriting a newer seal, so two
       // simultaneous reads cannot leave a row labelled one version and sealed
       // with another.
-      await this.prisma.encryptedSecret.updateMany({
+      const reseal = {
         where: { id: secret.id, keyVersion: secret.keyVersion },
         data: { ...resealed, keyVersion: keys.currentVersion },
-      })
-    } catch {
+      }
+      if (visitOwner) {
+        await this.prisma.$transaction(async transaction => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          await transaction.encryptedSecret.updateMany(reseal)
+        })
+      } else await this.prisma.encryptedSecret.updateMany(reseal)
+    } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
       this.logger.warn(JSON.stringify({
         event: 'secret_reseal_deferred',
         name: secret.name,
@@ -206,7 +220,9 @@ export class SecretStoreService {
     return this.databaseReference(secret.id)
   }
 
-  async access(reference: string) {
+  async access(reference: string, visitOwner?: TenantVisitLeaseOwner) {
+    const owner = visitOwner ? { ...visitOwner } : currentTenantVisitOwner()
+    assertTenantVisitLifecycleActive(owner)
     if (reference.startsWith(DATABASE_REFERENCE_PREFIX)) {
       const id = reference.slice(DATABASE_REFERENCE_PREFIX.length)
       if (!UUID_PATTERN.test(id)) {
@@ -222,13 +238,13 @@ export class SecretStoreService {
           'The stored Microsoft credential is unavailable.'
         )
       }
-      return this.openAndReseal(secret)
+      return this.openAndReseal(secret, owner)
     }
 
     const migrated = await this.prisma.encryptedSecret.findUnique({
       where: { legacyReference: reference },
     })
-    if (migrated) return this.openAndReseal(migrated)
+    if (migrated) return this.openAndReseal(migrated, owner)
 
     if (!LEGACY_REFERENCE_PATTERN.test(reference)) {
       throw new ServiceUnavailableException(

@@ -1,4 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common'
+import type { TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
+import { tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
 import { createHash } from 'node:crypto'
 import { IdentityRiskPseudonymProvider, type PinnedPseudonymSession } from './identity-risk-pseudonym.js'
 import { IDENTITY_RISK_CATALOG_VERSION, IDENTITY_RISK_ENGINE_VERSION, type IdentityRiskSourceBatch } from './identity-risk.contract.js'
@@ -74,12 +76,12 @@ export async function projectMailboxAssessment(batch: IdentityRiskSourceBatch | 
 export class RiskAssessmentProjector {
   constructor(@Inject(IdentityRiskPseudonymProvider)private readonly provider:IdentityRiskPseudonymProvider,
     @Inject(MailboxRiskProjector)private readonly mailbox:MailboxRiskProjector){}
-  async load(scope:Scope,evaluationAt:Date,executionDeadlineAt=Date.now()+30_000):Promise<IdentityRiskSourceBatch>{
+  async load(scope:Scope,evaluationAt:Date,executionDeadlineAt=Date.now()+30_000,visitOwner?:TenantVisitLeaseOwner):Promise<IdentityRiskSourceBatch>{
     const environment=process.env.HAWKVIEW_IDENTITY_RISK_ENVIRONMENT
     if(!environment||!this.provider.configured||!this.provider.allowsScope({...scope,environment}))throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
     const keys=await readActiveMailboxKeys(scope,environment,evaluationAt,executionDeadlineAt)
     if(keys.length!==1)throw new Error('IDENTITY_RISK_KEY_UNAVAILABLE')
-    const session=await this.provider.pin(keys[0]!,executionDeadlineAt)
+    const session=await this.provider.pin(keys[0]!,executionDeadlineAt,visitOwner)
     try {
       const tenant=await withMailboxReadTransaction(executionDeadlineAt,1500,async client=>(await client.query<{microsoftTenantId:string}>(
         `SELECT microsoft_tenant_id AS "microsoftTenantId" FROM customer_tenants WHERE id=$1::uuid AND organization_id=$2::uuid AND status='ACTIVE' LIMIT 1`,
@@ -111,7 +113,11 @@ export class RiskAssessmentProjector {
         authenticationProof=undefined
       }
       let mailbox:IdentityRiskSourceBatch|null=null
-      try{mailbox=await this.mailbox.load(scope,evaluationAt,Math.min(executionDeadlineAt,Date.now()+7000))}catch{/* This source does not veto auth evidence. */}
+      try{mailbox=await this.mailbox.load(scope,evaluationAt,Math.min(executionDeadlineAt,Date.now()+7000),visitOwner)}catch(error){
+        const lost=visitOwner&&tenantVisitLeaseLoss(error)
+        if(lost)throw lost
+        /* This source does not veto auth evidence. */
+      }
       if(mailbox?.pseudonymKeyVersionId&&mailbox.pseudonymKeyVersionId!==session.keyVersion.id)throw new Error('IDENTITY_RISK_KEY_CHANGED')
       const mbx=await projectMailboxAssessment(mailbox,evaluationAt,reference)
       assessment={...assessment,sources:[assessment.sources[0]!,assessment.sources[1]!,mbx.source],rules:[assessment.rules[0]!,assessment.rules[1]!,mbx.rule],subjects:[...assessment.subjects,...mbx.subjects]}

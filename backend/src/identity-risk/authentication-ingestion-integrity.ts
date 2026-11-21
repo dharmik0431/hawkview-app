@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import type { Prisma } from '../generated/prisma/client.js'
 import type { PrismaService } from '../prisma/prisma.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { enforceRiskUtcTransaction } from './risk-utc-session.js'
 
 const MARKER = 'hawkviewAuthenticationIntegrity'
@@ -53,7 +55,11 @@ export function authenticationFactFingerprint(raw: unknown): string | null {
  * integrity field; never replace its Microsoft risk/identity/retention columns.
  * A failed later chunk cannot publish a complete collection-window assertion. */
 export async function persistAuthenticationRecords(prisma: PrismaService, scope: {organizationId:string;customerTenantId:string},
-  records: readonly Prisma.SignInLogCreateManyInput[], deadlineAt = Date.now() + 30_000, markedAt = new Date()) {
+  records: readonly Prisma.SignInLogCreateManyInput[], deadlineAt = Date.now() + 30_000, markedAt = new Date(),
+  visitOwner?: TenantVisitLeaseOwner) {
+  if (visitOwner && (visitOwner.organizationId !== scope.organizationId || visitOwner.customerTenantId !== scope.customerTenantId)) {
+    throw new TenantVisitLeaseLostError()
+  }
   if (records.length > 100_000) throw new Error('IDENTITY_AUTH_CAPACITY')
   let inserted = 0, hasConflicts = false
   for (let offset = 0; offset < records.length; offset += 500) {
@@ -75,6 +81,7 @@ export async function persistAuthenticationRecords(prisma: PrismaService, scope:
       else unique.set(row.microsoftSignInId,{row,fingerprint,because})
     }
     await prisma.$transaction(async transaction => {
+      if (visitOwner) await assertTenantVisitLeaseOwner(transaction, visitOwner)
       await enforceRiskUtcTransaction(transaction)
       await transaction.$executeRawUnsafe("SELECT set_config('statement_timeout',$1,true)",String(Math.max(1,Math.min(4500,deadlineAt-Date.now()))))
       await transaction.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))',`hawkview:auth-ingestion:${scope.organizationId}:${scope.customerTenantId}`)

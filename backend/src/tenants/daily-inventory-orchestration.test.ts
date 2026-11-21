@@ -52,6 +52,9 @@ function fixture() {
     tenantDomain: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
     customerTenant: { update: async () => tenant, findMany: async (args: any) => {
       query.push(args)
+      const idRange = args.where.AND[1]?.id
+      if (idRange?.gt && tenant.id <= idRange.gt) return []
+      if (idRange?.lte && tenant.id > idRange.lte) return []
       const included = new Set(args.select.syncStates.where.resourceType.in)
       return [{ ...tenant, syncStates: [...rows.values()].filter(r => included.has(r.resourceType)) }]
     } },
@@ -110,4 +113,66 @@ test('real failing daily collector creates a failure row and does not recur as m
   assert.equal(rows.get('DOMAIN_DNS_HEALTH').status, 'FAILED')
   assert.equal(rows.get('DOMAIN_DNS_HEALTH').lastAttemptAt.getTime(), NOW.getTime())
   assert.equal(requiresDailyInventoryRefresh([...rows.values()], NOW), false)
+})
+
+
+test('scheduled twenty-minute rollout uses one interval for database selection and actual full dispatch', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('No network allowed') })
+  const original = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+  try {
+    for (const scenario of [
+      { flag: undefined, ageMinutes: 20, expected: null },
+      { flag: 'false', ageMinutes: 20, expected: null },
+      { flag: 'TRUE', ageMinutes: 20, expected: null },
+      { flag: 'true', ageMinutes: 19, expected: null },
+      { flag: 'true', ageMinutes: 20, expected: 'FULL' },
+      { flag: 'true', ageMinutes: 21, expected: 'FULL' },
+    ]) {
+      if (scenario.flag === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+      else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = scenario.flag
+      const { service, rows, query } = fixture()
+      rows.set('GROUPS', state('GROUPS', scenario.ageMinutes * 60_000))
+      const dispatches: any[] = []
+      service.syncConnectedTenant = async (_tenant: unknown, _busy: boolean, options: unknown) => {
+        dispatches.push(options)
+        return { status: 'SUCCEEDED', failedResources: [] }
+      }
+      const result = await service.syncDueTenants()
+      assert.equal(result.succeeded, scenario.expected ? 1 : 0, JSON.stringify(scenario))
+      assert.equal(dispatches.length, scenario.expected ? 1 : 0)
+      if (scenario.expected) assert.deepEqual(dispatches[0], {
+        incrementalOnly: false, includeBundle: false, evaluateRiskAfterSync: process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined, forceFullUsers: true, preserveInventoryFailureCooldowns: true,
+      })
+      const queryText = JSON.stringify(query[0].where)
+      if (scenario.flag === 'true') assert.match(queryText, /2026-10-12T11:40:00.000Z/)
+      else assert.doesNotMatch(queryText, /2026-10-12T11:40:00.000Z/)
+      assert.match(queryText, /2026-10-11T12:00:00.000Z/, 'the existing failed-resource daily guard is retained')
+    }
+  } finally {
+    if (original === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = original
+  }
+})
+
+test('twenty-minute rollout keeps between-inventory users incremental and failure-only cooldown unchanged', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: NOW })
+  const original = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+  process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = 'true'
+  try {
+    const { service, rows } = fixture()
+    rows.set('AUTH_REGISTRATIONS', { ...state('AUTH_REGISTRATIONS', 20 * 60_000), status: 'FAILED' })
+    const dispatches: any[] = []
+    service.syncConnectedTenant = async (_tenant: unknown, _busy: boolean, options: unknown) => {
+      dispatches.push(options)
+      return { status: 'SUCCEEDED', failedResources: [] }
+    }
+    assert.equal((await service.syncDueTenants()).succeeded, 0, 'a failure alone must not become a twenty-minute retry')
+    rows.set('USERS', state('USERS', 6 * 60_000))
+    assert.equal((await service.syncDueTenants()).succeeded, 1)
+    assert.deepEqual(dispatches, [{ incrementalOnly: true, includeBundle: false, evaluateRiskAfterSync: process.env.HAWKVIEW_IDENTITY_RISK_ROLLOUT === undefined, forceFullUsers: false, preserveInventoryFailureCooldowns: false }])
+  } finally {
+    if (original === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = original
+  }
 })

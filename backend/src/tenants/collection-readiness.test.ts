@@ -48,6 +48,34 @@ function row(result: ReturnType<typeof deriveCollectionReadiness>, key: string) 
   return value
 }
 
+test('full20 readiness uses the healthy inventory clock without changing activity or failure policy', () => {
+  const saved = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+  const minute = 60000
+  const group = (age: number, status = 'SUCCEEDED') => {
+    const result = deriveCollectionReadiness(input({ syncStates: allResources.map(resource => sync(resource,
+      resource === 'GROUPS' ? { status, lastSuccessfulAt: new Date(now.getTime() - age) } : {})) }))
+    return row(result, 'entra_directory').components!.find(component => component.key === 'GROUPS')!
+  }
+  try {
+    delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    assert.equal(group(23 * 60 * minute).freshness, 'CURRENT')
+    process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = 'true'
+    for (const [age, freshness] of [[20 * minute, 'CURRENT'], [20 * minute + 1, 'AGING'],
+      [140 * minute, 'AGING'], [140 * minute + 1, 'STALE']] as const) {
+      const result = group(age)
+      assert.equal(result.freshness, freshness)
+      assert.equal(result.state, freshness === 'STALE' ? 'STALE' : 'READY')
+    }
+    assert.equal(group(21 * minute, 'FAILED').state, 'FAILED_TRANSIENT')
+    const activity = deriveCollectionReadiness(input({ syncStates: allResources.map(resource => sync(resource,
+      resource === 'AUDIT_LOGS' ? { lastSuccessfulAt: new Date(now.getTime() - 16 * minute) } : {})) }))
+    assert.equal(row(activity, 'entra_directory_audit').freshness, 'AGING')
+  } finally {
+    if (saved === undefined) delete process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED
+    else process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED = saved
+  }
+})
+
 test('does not report a connected tenant as ready when collection has never succeeded', () => {
   const result = deriveCollectionReadiness(input({ syncStates: [] }))
   assert.equal(result.permissionVerifiedAt, current.toISOString())

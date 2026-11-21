@@ -1,6 +1,9 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
 import { createHash } from 'node:crypto'
+import type { Prisma } from '../generated/prisma/client.js'
 import { PrismaService } from '../prisma/prisma.service.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 import { legacyCategory } from './change-classification.js'
 import { DIRECTORY_AUDIT_METADATA_KEY, directoryAuditMetadata } from './directory-audit-projection-metadata.js'
 import { verifiedDomain } from '../identity-risk/mailbox-source-attestation.js'
@@ -206,10 +209,69 @@ export class ChangeEvidenceService {
 
   constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
 
+  /**
+   * Inactive recovery primitive. Select missing evidence before applying the
+   * batch limit so an old page of already-projected rows cannot starve a gap.
+   * Admission, scheduling, and proof that recovery finished are separate work.
+   */
+  async projectRetainedDirectoryAuditsMissingEvidence(
+    tenant: { id: string; organizationId: string },
+    visitOwner: TenantVisitLeaseOwner,
+    limit: number,
+  ): Promise<{ attempted: number; hasMore: boolean }> {
+    if (visitOwner.organizationId !== tenant.organizationId ||
+        visitOwner.customerTenantId !== tenant.id) throw new TenantVisitLeaseLostError()
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new Error('DIRECTORY_AUDIT_EVIDENCE_REPAIR_LIMIT_INVALID')
+    }
+
+    return this.prisma.$transaction(async (transaction) => {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      const missing = await transaction.$queryRawUnsafe<Array<{ id: string }>>(`
+        SELECT d.id::text AS id
+        FROM directory_audit_logs d
+        WHERE d.organization_id=$1::uuid AND d.customer_tenant_id=$2::uuid
+          AND d.expires_at > clock_timestamp()
+          AND NOT EXISTS (
+            SELECT 1 FROM change_evidence_events e
+            WHERE e.organization_id=d.organization_id
+              AND e.customer_tenant_id=d.customer_tenant_id
+              AND e.source='DIRECTORY_AUDIT'
+              AND e.source_event_id=d.microsoft_audit_id
+          )
+        ORDER BY d.event_date_time ASC, d.id ASC
+        LIMIT $3::int`, tenant.organizationId, tenant.id, limit + 1)
+      const ids = missing.slice(0, limit).map((row) => row.id)
+      if (ids.length === 0) return { attempted: 0, hasMore: false }
+
+      const records = await transaction.directoryAuditLog.findMany({
+        where: { id: { in: ids }, organizationId: tenant.organizationId, customerTenantId: tenant.id },
+      })
+      // A concurrent retention/delete must not turn a partial batch into a
+      // claimed completion. A retry can select the remaining rows afresh.
+      if (records.length !== ids.length) throw new Error('DIRECTORY_AUDIT_EVIDENCE_REPAIR_ROW_CHANGED')
+      const recordsById = new Map(records.map((record) => [record.id, record]))
+      await this.projectDirectoryAudits(
+        tenant,
+        ids.map((id) => recordsById.get(id)!),
+        visitOwner,
+        transaction,
+      )
+      return { attempted: ids.length, hasMore: missing.length > limit }
+    })
+  }
+
   async projectDirectoryAudits(
     tenant: { id: string; organizationId: string },
-    records: Array<Record<string, any>>
+    records: Array<Record<string, any>>,
+    visitOwner?: TenantVisitLeaseOwner,
+    /** Caller-owned transaction for a future atomic raw/notice/evidence write. */
+    transaction?: Prisma.TransactionClient,
   ) {
+    if (visitOwner && (
+      visitOwner.organizationId !== tenant.organizationId || visitOwner.customerTenantId !== tenant.id
+    )) throw new TenantVisitLeaseLostError()
+    if (transaction && !visitOwner) throw new Error('TENANT_VISIT_OWNER_REQUIRED')
     if (records.length === 0) return
     const data = records.map((record) => {
       const target = targetState(record.targetResources)
@@ -259,10 +321,21 @@ export class ChangeEvidenceService {
         expiresAt: record.expiresAt,
       }
     })
-    await this.prisma.changeEvidenceEvent.createMany({
-      data: data as never,
-      skipDuplicates: true,
-    })
+    const persist = (database: Pick<PrismaService, 'changeEvidenceEvent'>) =>
+      database.changeEvidenceEvent.createMany({ data: data as never, skipDuplicates: true })
+    if (transaction && visitOwner) {
+      await assertTenantVisitLeaseOwner(transaction, visitOwner)
+      await persist(transaction)
+      return
+    }
+    if (visitOwner) {
+      await this.prisma.$transaction(async (transaction) => {
+        await assertTenantVisitLeaseOwner(transaction, visitOwner)
+        await persist(transaction)
+      })
+    } else {
+      await persist(this.prisma)
+    }
   }
 
   /**
@@ -377,12 +450,23 @@ export class ChangeEvidenceService {
     return output
   }
 
-  async pruneExpired(customerTenantId: string, expiresAt: Date) {
+  async pruneExpired(customerTenantId: string, expiresAt: Date, visitOwner?: TenantVisitLeaseOwner) {
     try {
-      await this.prisma.changeEvidenceEvent.deleteMany({
-        where: { customerTenantId, expiresAt: { lte: expiresAt } },
-      })
+      if (visitOwner && visitOwner.customerTenantId !== customerTenantId) throw new TenantVisitLeaseLostError()
+      const prune = (database: Pick<PrismaService, 'changeEvidenceEvent'>) =>
+        database.changeEvidenceEvent.deleteMany({
+          where: { customerTenantId, expiresAt: { lte: expiresAt } },
+        })
+      if (visitOwner) {
+        await this.prisma.$transaction(async (transaction) => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          await prune(transaction)
+        })
+      } else {
+        await prune(this.prisma)
+      }
     } catch (error) {
+      if (error instanceof TenantVisitLeaseLostError) throw error
       // Projection cleanup must not make a tenant's source-data sync fail.
       this.logger.warn(`Unable to prune expired change evidence: ${error instanceof Error ? error.message : String(error)}`)
     }

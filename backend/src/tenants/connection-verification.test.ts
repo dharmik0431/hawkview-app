@@ -5,6 +5,7 @@ import { BadGatewayException, ConflictException, ForbiddenException, NotFoundExc
 import { TenantsService } from './tenants.service.js'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { captureConnectionVerification, publishCapturedConnectionRefresh } from './connection-verification-store.js'
+import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 import { MicrosoftRequestError } from '../microsoft/microsoft-request.js'
 
@@ -126,6 +127,60 @@ test('sync timestamp returns its own updated context without rotating C/S', asyn
   assert.equal(db.connection.incarnation,old.connection.incarnation); assert.deepEqual(db.roles,old.roles)
   assert.equal((await publishCapturedConnectionRefresh(db as any,captured.context,'sync-timestamp')).status,'superseded')
 })
+test('owner-bearing sync timestamp checks the exact live visit before connection publication', async () => {
+  for (const variant of ['live', 'expired', 'superseded', 'foreign-lease-org', 'wrong-scope'] as const) {
+    const db = new Database()
+    const captured = await captureConnectionVerification(db as any, {
+      customerTenantId: db.tenant.id, organizationId: db.organizationId,
+      microsoftTenantId: db.tenant.microsoftTenantId,
+    }, true)
+    assert.equal(captured.status, 'captured')
+    if (captured.status !== 'captured') continue
+    const owner = {
+      organizationId: variant === 'wrong-scope' ? randomUUID() : db.organizationId,
+      customerTenantId: db.tenant.id, token: randomUUID(), generation: 4n,
+      expiresAt: new Date(Date.now() + 60_000),
+    }
+    db.visitLease = {
+      ...owner, organizationId: variant === 'foreign-lease-org' ? randomUUID() : db.organizationId,
+      token: variant === 'superseded' ? randomUUID() : owner.token,
+      expiresAt: variant === 'expired' ? new Date(Date.now() - 1_000) : owner.expiresAt,
+    }
+    db.trace.length = 0
+    if (variant === 'live') {
+      const result = await publishCapturedConnectionRefresh(db as any, captured.context, 'sync-timestamp', owner)
+      assert.equal(result.status, 'applied')
+      assert.equal(db.connectionWrites, 1)
+      assert.deepEqual(db.trace.slice(0, 7), [
+        'G-lock', 'G-row', 'visit-org', 'visit-tenant', 'visit-lease', 'T', 'C',
+      ])
+    } else {
+      await assert.rejects(
+        publishCapturedConnectionRefresh(db as any, captured.context, 'sync-timestamp', owner),
+        TenantVisitLeaseLostError,
+      )
+      assert.equal(db.connectionWrites, 0)
+      assert.equal(db.trace.includes('C'), false)
+      if (variant === 'wrong-scope') assert.deepEqual(db.trace, [])
+    }
+  }
+})
+test('the separate Exchange-consent refresh rejects a supplied visit owner', async () => {
+  const db = new Database()
+  const captured = await captureConnectionVerification(db as any, {
+    customerTenantId: db.tenant.id, organizationId: db.organizationId,
+    microsoftTenantId: db.tenant.microsoftTenantId,
+  }, true)
+  assert.equal(captured.status, 'captured')
+  if (captured.status !== 'captured') return
+  db.trace.length = 0
+  await assert.rejects(publishCapturedConnectionRefresh(db as any, captured.context, 'exchange-consent', {
+    organizationId: db.organizationId, customerTenantId: db.tenant.id,
+    token: randomUUID(), generation: 4n, expiresAt: new Date(Date.now() + 60_000),
+  }), /INVALID_CAPTURED_REFRESH/)
+  assert.deepEqual(db.trace, [])
+  assert.equal(db.connectionWrites, 0)
+})
 test('actual sync failure writer ignores stale C/G/S and preserves current authentication-failure policy', async () => {
   for (const changed of ['none','G','C','S'] as const) {
     const db = new Database()
@@ -157,6 +212,7 @@ class Database {
   roles: any = { id: randomUUID(), role_scope_incarnation: randomUUID(), role_scope_version: 'scope-v1', role_attempt_id: randomUUID(),
     role_attempt_outcome: 'RUNNING', role_complete_id: randomUUID(), role_complete_digest: 'historical', role_complete_count: 5 }
   observations = [{ id: 'stored-before-verification', payload: ['historical'] }]
+  visitLease: { organizationId: string; customerTenantId: string; token: string; generation: bigint; expiresAt: Date } | null = null
   trace: string[] = []
   statements: string[] = []
   active = false
@@ -209,6 +265,22 @@ class Database {
     if (query === "SELECT current_setting('TimeZone') AS timezone") return [{ timezone: 'UTC' }]
     if (query.includes('pg_advisory_xact_lock_shared')) { this.trace.push('G-lock'); return [{ locked: 1 }] }
     if (query.includes('FROM platform_microsoft_connectors')) { this.trace.push('G-row'); return this.authority ? [copy(this.authority)] : [] }
+    if (query.includes('FROM organizations')) {
+      this.trace.push('visit-org')
+      return v[0] === this.organizationId ? [{ id: this.organizationId }] : []
+    }
+    if (query.includes('FROM customer_tenants') && !query.includes('verification:tenant')) {
+      this.trace.push('visit-tenant')
+      return v[0] === this.tenant.id && v[1] === this.tenant.organizationId
+        ? [{ id: this.tenant.id }] : []
+    }
+    if (query.includes('FROM tenant_sync_visit_leases')) {
+      this.trace.push('visit-lease')
+      const lease = this.visitLease
+      return lease && v[0] === this.tenant.id && v[1] === lease.organizationId
+        && v[2] === lease.token && v[3] === lease.generation.toString()
+        && lease.expiresAt.getTime() > Date.now() ? [{ generation: lease.generation.toString() }] : []
+    }
     if (query.includes('verification:tenant')) {
       this.trace.push('T'); assert.match(query, /organization_id=\$2::uuid AND microsoft_tenant_id=\$3::uuid FOR NO KEY UPDATE/)
       const { id, organizationId, microsoftTenantId, status, revision } = this.tenant

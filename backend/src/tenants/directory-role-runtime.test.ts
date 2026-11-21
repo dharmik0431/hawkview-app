@@ -8,7 +8,9 @@ import { TenantSyncService } from './tenant-sync.service.js'
 test('all three checked-in dispatch closures invoke the directory boundary, not generic snapshot sync', async () => {
   const file = ts.createSourceFile('tenant-sync.service.ts', readFileSync(new URL('./tenant-sync.service.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
   const closures: any[] = []
+  let revisionArguments: any
   const visit = (node: any) => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'revisionArguments') revisionArguments = node
     if (ts.isPropertyAssignment(node) && node.name.getText(file) === 'DIRECTORY_ROLES' && ts.isArrowFunction(node.initializer)) closures.push(node.initializer)
     if (ts.isObjectLiteralExpression(node) && node.properties.some((p: any) => ts.isPropertyAssignment(p) && p.name.getText(file) === 'resource' && p.initializer.getText(file) === "'DIRECTORY_ROLES'")) {
       const sync = node.properties.find((p: any) => ts.isPropertyAssignment(p) && p.name.getText(file) === 'synchronize')
@@ -17,14 +19,26 @@ test('all three checked-in dispatch closures invoke the directory boundary, not 
     ts.forEachChild(node, visit)
   }
   visit(file); assert.equal(closures.length, 3)
-  const tenant = { id: 'tenant' }, calls: unknown[][] = []
+  assert.ok(revisionArguments, 'The audit dispatcher revision helper disappeared')
+  assert.equal(closures.filter(arrow => arrow.parameters.length > 0).length, 1, 'Only audit dispatch receives a revision')
+  const tenant = { id: 'tenant' }, calls: unknown[][] = [], expected: unknown[][] = []
   const service = { syncDirectoryRoles: async (...args: unknown[]) => { calls.push(args) },
     syncEntraCollection: () => { throw Error('generic directory dispatch') } }
   for (const arrow of closures) {
-    const invoke = new Function('tenant', 'accessToken', 'snapshotAccessToken', `return (${arrow.getText(file)})()`)
-    await invoke.call(service, tenant, 'legacy-token', 'legacy-token')
+    // Execute the checked-in helper and closure, including the explicit audit
+    // revision, rather than substituting a test-only spread implementation.
+    const body = ts.transpileModule(`const ${revisionArguments.getText(file)}; return (${arrow.getText(file)})(requestedRevision)`,
+      { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText
+    const invoke = new Function('tenant', 'accessToken', 'snapshotAccessToken', 'visitOwner', 'requestedRevision', body)
+    for (const visitOwner of [undefined, { token: 'visit-token' }]) {
+      for (const requestedRevision of [undefined, 7n]) {
+        await invoke.call(service, tenant, 'legacy-token', 'legacy-token', visitOwner, requestedRevision)
+        expected.push([tenant, 'legacy-token', visitOwner,
+          ...(arrow.parameters.length > 0 && requestedRevision !== undefined ? [requestedRevision] : [])])
+      }
+    }
   }
-  assert.deepEqual(calls, Array.from({ length: 3 }, () => [tenant, 'legacy-token']))
+  assert.deepEqual(calls, expected)
 })
 
 test('runtime rejects revoked activated scope without generic terminal/notification effects', async () => {

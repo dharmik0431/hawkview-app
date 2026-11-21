@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { assertTenantVisitLifecycleActive } from '../tenants/tenant-visit-lifecycle.js'
+import { tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
+import { cancelBoundedStream } from '../tenants/microsoft-collection-budget.js'
 
 export type MicrosoftFailureClass =
   | 'AUTHENTICATION_REQUIRED'
@@ -340,14 +343,17 @@ export async function fetchMicrosoftWithRetry(
     `${options.label} reached its bounded collection deadline.`, null, null, null,
   )
   const waitWithinBudget = async (delay: number) => {
+    assertTenantVisitLifecycleActive()
     // A retry needs time after the sleep too. Never shorten a server's wait.
     if (delay >= remainingBudget()) throw deadlineError()
     await wait(delay)
+    assertTenantVisitLifecycleActive()
   }
   const { signal: _discardedSignal, ...stableInit } = init
   let lastError: unknown
 
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    assertTenantVisitLifecycleActive()
     const remaining = remainingBudget()
     if (remaining <= 0) throw deadlineError()
     const timeoutMs = Math.max(1, Math.ceil(Math.min(options.timeoutMs ?? 30_000, remaining)))
@@ -361,11 +367,18 @@ export async function fetchMicrosoftWithRetry(
         signal: AbortSignal.timeout(timeoutMs),
       })
     } catch (error) {
+      const lost = tenantVisitLeaseLoss(error)
+      if (lost) throw lost
+      assertTenantVisitLifecycleActive()
       lastError = error
       if (remainingBudget() <= 0) throw deadlineError()
       if (attempt === attempts - 1) break
       await waitWithinBudget((attempt + 1) * 500)
       continue
+    }
+    try { assertTenantVisitLifecycleActive() } catch (error) {
+      await cancelBoundedStream(() => response.body?.cancel())
+      throw error
     }
     if (remainingBudget() <= 0) {
       await response.body?.cancel().catch(() => undefined)

@@ -6,6 +6,8 @@ import { alertTierFor } from '../alerts/finding-pipeline.js'
 import { NOTIFICATION_SEVERITIES as severities, notificationSeveritiesAtOrAbove } from './notification-severity.js'
 import { alertPreferenceCapabilities } from '../alerts/alert-type-reach.js'
 import { UUID } from '../alerts/email-release-config.js'
+import { TenantVisitLeaseLostError } from '../tenants/tenant-visit-lease-error.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
 
 const preferenceFields = [
   'securityEnabled',
@@ -373,54 +375,198 @@ export class NotificationsService {
     return preferences
   }
 
-  async publishIncident(input: NotificationIncident) {
+  private async persistIncident(
+    input: NotificationIncident,
+    database: Pick<Prisma.TransactionClient, 'notification' | 'notificationUserState'>,
+    owned = false,
+  ) {
     const now = new Date()
+    const row = await database.notification.upsert({
+      where: { organizationId_dedupeKey: { organizationId: input.organizationId, dedupeKey: input.dedupeKey } },
+      create: {
+        ...input,
+        recipientUserId: input.recipientUserId ?? null,
+        customerTenantId: input.customerTenantId ?? null,
+        actionUrl: input.actionUrl ?? null,
+        actionLabel: input.actionLabel ?? null,
+        metadata: input.metadata as Prisma.InputJsonValue | undefined,
+        severity: input.severity ?? 'info',
+        firstOccurredAt: now,
+        lastOccurredAt: now,
+      },
+      update: {
+        category: input.category,
+        severity: input.severity ?? 'info',
+        title: input.title,
+        description: input.description,
+        metadata: input.metadata as Prisma.InputJsonValue | undefined,
+        actionUrl: input.actionUrl ?? null,
+        actionLabel: input.actionLabel ?? null,
+        lastOccurredAt: now,
+        resolvedAt: null,
+        expiresAt: input.expiresAt ?? null,
+        occurrenceCount: { increment: 1 },
+      },
+    })
+    // The unique key is organization-scoped, so a caller-controlled dedupe key
+    // alone does not prove the existing row belongs to this tenant and recipient.
+    // Check the actual persisted identity inside the transaction; on collision
+    // the upsert and any caller effects roll back before read states are reset.
+    if (owned && (row.customerTenantId !== input.customerTenantId ||
+      row.recipientUserId !== (input.recipientUserId ?? null))) {
+      throw new Error('TENANT_VISIT_NOTIFICATION_DEDUPE_COLLISION')
+    }
+    await database.notificationUserState.deleteMany({ where: { notificationId: row.id } })
+    return row
+  }
+
+  /** Preserve incident semantics inside a caller's owner-guarded transaction.
+   * Persistence errors propagate so the caller cannot commit partial effects. */
+  async publishIncidentInTransaction(
+    input: NotificationIncident,
+    visitOwner: TenantVisitLeaseOwner,
+    transaction: Prisma.TransactionClient,
+  ) {
+    if (input.organizationId !== visitOwner.organizationId ||
+      input.customerTenantId !== visitOwner.customerTenantId) throw new TenantVisitLeaseLostError()
+    await assertTenantVisitLeaseOwner(transaction, visitOwner)
+    return this.persistIncident(input, transaction, true)
+  }
+
+  async publishIncident(input: NotificationIncident, visitOwner?: TenantVisitLeaseOwner) {
     try {
-      const row = await this.prisma.notification.upsert({
-        where: { organizationId_dedupeKey: { organizationId: input.organizationId, dedupeKey: input.dedupeKey } },
-        create: {
-          ...input,
-          recipientUserId: input.recipientUserId ?? null,
-          customerTenantId: input.customerTenantId ?? null,
-          actionUrl: input.actionUrl ?? null,
-          actionLabel: input.actionLabel ?? null,
-          metadata: input.metadata as Prisma.InputJsonValue | undefined,
-          severity: input.severity ?? 'info',
-          firstOccurredAt: now,
-          lastOccurredAt: now,
-        },
-        update: {
-          category: input.category,
-          severity: input.severity ?? 'info',
-          title: input.title,
-          description: input.description,
-          metadata: input.metadata as Prisma.InputJsonValue | undefined,
-          actionUrl: input.actionUrl ?? null,
-          actionLabel: input.actionLabel ?? null,
-          lastOccurredAt: now,
-          resolvedAt: null,
-          expiresAt: input.expiresAt ?? null,
-          occurrenceCount: { increment: 1 },
-        },
-      })
-      await this.prisma.notificationUserState.deleteMany({ where: { notificationId: row.id } })
+      if (visitOwner && (
+        input.organizationId !== visitOwner.organizationId ||
+        input.customerTenantId !== visitOwner.customerTenantId
+      )) throw new TenantVisitLeaseLostError()
+
+      // A visit-scoped notice and its read-state reset share the lease lock
+      // and one commit. Legacy/non-visit publishers retain their old path.
+      const row = visitOwner
+        ? await this.prisma.$transaction(async transaction => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          return this.persistIncident(input, transaction, true)
+        })
+        : await this.persistIncident(input, this.prisma)
       this.logger.log(JSON.stringify({ event: 'notification.published', outcome: 'COMPLETED', occurrenceCount: Math.min(1000000, Math.max(0, row.occurrenceCount)) }))
       return row
     } catch (error) {
+      if (error instanceof TenantVisitLeaseLostError) throw error
       this.logger.error(JSON.stringify({ event: 'notification.publish_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
       return null
     }
   }
 
-  async resolveIncident(organizationId: string, dedupeKey: string, recovery?: Omit<NotificationIncident, 'organizationId' | 'dedupeKey'>) {
+  /** Inactive recovery primitive. Replays an already persisted visit event without
+   * changing an existing incident or its per-user read/dismissed state.
+   * A supplied completion runs after insert/validation while the lease lock and
+   * notification write are still in the same transaction. */
+  async publishIncidentIfMissing(
+    input: NotificationIncident & { customerTenantId: string },
+    visitOwner: TenantVisitLeaseOwner,
+    completion?: (transaction: Prisma.TransactionClient) => Promise<void>,
+  ) {
+    if (input.organizationId !== visitOwner.organizationId ||
+      input.customerTenantId !== visitOwner.customerTenantId) {
+      throw new TenantVisitLeaseLostError()
+    }
+
+    return this.prisma.$transaction(async transaction => {
+      const row = await this.publishIncidentIfMissingInTransaction(input, visitOwner, transaction)
+      if (completion) await completion(transaction)
+      return row
+    })
+  }
+
+  /** Use only with a caller-owned active transaction so the source row and its
+   * incident share one commit. The exact visit owner is checked in that transaction. */
+  async publishIncidentIfMissingInTransaction(
+    input: NotificationIncident & { customerTenantId: string },
+    visitOwner: TenantVisitLeaseOwner,
+    transaction: Prisma.TransactionClient,
+  ) {
+    if (input.organizationId !== visitOwner.organizationId ||
+      input.customerTenantId !== visitOwner.customerTenantId) {
+      throw new TenantVisitLeaseLostError()
+    }
+    await assertTenantVisitLeaseOwner(transaction, visitOwner)
+    const now = new Date()
+    await transaction.notification.createMany({
+        data: [{
+          organizationId: input.organizationId,
+          customerTenantId: input.customerTenantId,
+          recipientUserId: input.recipientUserId ?? null,
+          eventType: input.eventType,
+          category: input.category,
+          severity: input.severity ?? 'info',
+          title: input.title,
+          description: input.description,
+          dedupeKey: input.dedupeKey,
+          source: input.source,
+          actionUrl: input.actionUrl ?? null,
+          actionLabel: input.actionLabel ?? null,
+          metadata: input.metadata as Prisma.InputJsonValue | undefined,
+          expiresAt: input.expiresAt ?? null,
+          firstOccurredAt: now,
+          lastOccurredAt: now,
+        }],
+        skipDuplicates: true,
+    })
+    const row = await transaction.notification.findUnique({
+      where: { organizationId_dedupeKey: {
+        organizationId: input.organizationId, dedupeKey: input.dedupeKey,
+      } },
+    })
+    if (!row) throw new Error('TENANT_VISIT_NOTIFICATION_PERSISTENCE_INCONSISTENT')
+    if (row.customerTenantId !== input.customerTenantId ||
+      row.recipientUserId !== (input.recipientUserId ?? null) ||
+      row.eventType !== input.eventType || row.source !== input.source) {
+      throw new Error('TENANT_VISIT_NOTIFICATION_DEDUPE_COLLISION')
+    }
+    return row
+  }
+
+  async resolveIncident(
+    organizationId: string,
+    dedupeKey: string,
+    recovery?: Omit<NotificationIncident, 'organizationId' | 'dedupeKey'>,
+    visitOwner?: TenantVisitLeaseOwner,
+  ) {
     try {
-      const incident = await this.prisma.notification.findUnique({ where: { organizationId_dedupeKey: { organizationId, dedupeKey } } })
-      if (!incident || incident.resolvedAt) return null
-      await this.prisma.notification.update({ where: { id: incident.id }, data: { resolvedAt: new Date() } })
-      if (recovery) await this.publishIncident({ ...recovery, organizationId, dedupeKey: `${dedupeKey}:recovered:${incident.occurrenceCount}` })
+      if (visitOwner && (
+        organizationId !== visitOwner.organizationId ||
+        (recovery && recovery.customerTenantId !== visitOwner.customerTenantId)
+      )) throw new TenantVisitLeaseLostError()
+
+      const resolve = async (database: Pick<Prisma.TransactionClient, 'notification'>) => {
+        const incident = await database.notification.findUnique({ where: { organizationId_dedupeKey: { organizationId, dedupeKey } } })
+        if (!incident || incident.resolvedAt) return null
+        if (visitOwner && incident.customerTenantId !== visitOwner.customerTenantId) {
+          throw new TenantVisitLeaseLostError()
+        }
+        await database.notification.update({ where: { id: incident.id }, data: { resolvedAt: new Date() } })
+        return incident
+      }
+      const incident = visitOwner
+        ? await this.prisma.$transaction(async transaction => {
+          await assertTenantVisitLeaseOwner(transaction, visitOwner)
+          const row = await resolve(transaction)
+          if (row && recovery) await this.persistIncident({
+            ...recovery, organizationId, dedupeKey: `${dedupeKey}:recovered:${row.occurrenceCount}`,
+          }, transaction, true)
+          return row
+        })
+        : await resolve(this.prisma)
+      if (!incident) return null
+      // Owned resolution and recovery share one commit. Ownerless publishers
+      // retain their existing separate best-effort recovery behavior.
+      if (recovery && !visitOwner) await this.publishIncident({
+        ...recovery, organizationId, dedupeKey: `${dedupeKey}:recovered:${incident.occurrenceCount}`,
+      }, visitOwner)
       this.logger.log(JSON.stringify({ event: 'notification.resolved', outcome: 'COMPLETED' }))
       return incident
     } catch (error) {
+      if (error instanceof TenantVisitLeaseLostError) throw error
       this.logger.error(JSON.stringify({ event: 'notification.resolve_failed', outcome: 'FAILED', reasonCode: 'PERSISTENCE_UNAVAILABLE' }))
       return null
     }

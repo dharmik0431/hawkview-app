@@ -1,7 +1,10 @@
 import { lockRiskEvaluationScope } from './risk-evaluation-scope.js'
+import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from '../tenants/tenant-visit-lease-store.js'
+import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from '../tenants/tenant-visit-lease-error.js'
 import { randomBytes, randomUUID } from 'node:crypto'
 import type pg from 'pg'
 import { withRiskKeyTransaction } from './mailbox-read-transaction.js'
+import { assertRiskAttemptVisitOwner } from './risk-global-work-store.js'
 import type { PseudonymKeyVersion, PseudonymScope } from './identity-risk-pseudonym.js'
 import { RISK_UUID } from './pilot-risk-config.js'
 import { riskRuntimeConfig, riskScopeAllowed, isWrappedRiskConfig, isGlobalRiskConfig } from './risk-runtime-config.js'
@@ -49,16 +52,18 @@ export class WrappedRiskKeyStore {
   /** Scheduler only. A missing ACTIVE row is not permission to recreate a key.
    * Existing history, including damaged ciphertext and revocation tombstones,
    * requires controlled operator reconciliation, never automatic rotation. */
-  async ensureVersion(scope: PseudonymScope, deadlineAt: number, ineligible?: () => void): Promise<PseudonymKeyVersion> {
+  async ensureVersion(scope: PseudonymScope, deadlineAt: number, ineligible?: () => void,
+    visitOwner?: TenantVisitLeaseOwner): Promise<PseudonymKeyVersion> {
     if (!isGlobalRiskConfig(riskRuntimeConfig())) throw keyUnavailable()
-    return this.createOrLoad(scope, randomUUID(), deadlineAt, true, ineligible)
+    return this.createOrLoad(scope, randomUUID(), deadlineAt, true, ineligible, visitOwner)
   }
 
-  private async assertAutomaticScope(client: pg.Client, scope: PseudonymScope, ineligible?: () => void) {
+  private async assertAutomaticScope(client: pg.Client, scope: PseudonymScope, ineligible?: () => void,
+    visitOwner?: TenantVisitLeaseOwner) {
     const eligibility = await lockRiskEvaluationScope({
       lock: async key => { await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]) },
       query: async (sql, values) => (await client.query(sql, [...values])).rows,
-    }, scope, 'SHARE', () => {
+    }, scope, visitOwner ? 'NO KEY UPDATE' : 'SHARE', () => {
       this.allowed(scope)
       if (!isGlobalRiskConfig(riskRuntimeConfig())) throw keyUnavailable()
     })
@@ -66,16 +71,28 @@ export class WrappedRiskKeyStore {
       try { ineligible?.() } catch { /* Diagnostic observers cannot affect admission. */ }
     }
     if (eligibility !== 'ELIGIBLE') throw keyUnavailable()
+    if (visitOwner) {
+      if (scope.organizationId !== visitOwner.organizationId || scope.customerTenantId !== visitOwner.customerTenantId) {
+        throw new TenantVisitLeaseLostError()
+      }
+      // The stronger tenant lock was acquired before this lease-row check, so
+      // concurrent key setup cannot deadlock by upgrading a SHARE lock.
+      await assertTenantVisitLeaseOwner({
+        $queryRawUnsafe: async <T = unknown>(sql: string, ...values: unknown[]): Promise<T> =>
+          (await client.query(sql, values)).rows as T,
+      }, visitOwner)
+    }
   }
 
-  private async createOrLoad(scope: PseudonymScope, versionId: string, deadlineAt: number, automatic: boolean, ineligible?: () => void): Promise<PseudonymKeyVersion> {
+  private async createOrLoad(scope: PseudonymScope, versionId: string, deadlineAt: number, automatic: boolean,
+    ineligible?: () => void, visitOwner?: TenantVisitLeaseOwner): Promise<PseudonymKeyVersion> {
     this.allowed(scope)
     if (!RISK_UUID.test(versionId)) throw keyUnavailable()
     const root = readRiskWrappingRoot()
     let material: Buffer | undefined
     try {
       return await withRiskKeyTransaction(deadlineAt, async (client) => {
-        if (automatic) await this.assertAutomaticScope(client, scope, ineligible)
+        if (automatic) await this.assertAutomaticScope(client, scope, ineligible, visitOwner)
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`risk-key:${scope.environment}:${scope.organizationId}:${scope.customerTenantId}`])
         const existing = await client.query<PseudonymKeyVersion>(`SELECT ${columns} FROM identity_risk_pseudonym_key_versions
           WHERE organization_id=$1::uuid AND customer_tenant_id=$2::uuid AND environment=$3 AND status='ACTIVE'`,
@@ -107,30 +124,38 @@ export class WrappedRiskKeyStore {
         await this.event(client, registered.id, 'CREATED')
         return registered
       })
-    } catch { throw keyUnavailable() }
+    } catch (error) { throw tenantVisitLeaseLoss(error) ?? keyUnavailable() }
     finally { material?.fill(0); root.fill(0) }
   }
 
-  async ciphertext(key: PseudonymKeyVersion, deadlineAt: number): Promise<WrappedRiskCiphertext> {
+  async ciphertext(key: PseudonymKeyVersion, deadlineAt: number, visitOwner?: TenantVisitLeaseOwner): Promise<WrappedRiskCiphertext> {
     this.allowed(key)
     try {
       return await withRiskKeyTransaction(deadlineAt, async (client) => {
+        if (visitOwner) await assertRiskAttemptVisitOwner(client, key, visitOwner)
         await this.lockKey(client, key)
         const rows = await client.query<WrappedRiskCiphertext>('SELECT name,ciphertext,iv,tag FROM identity_risk_wrapped_keys WHERE key_version_id=$1::uuid AND name=$2', [key.id, wrappedRiskName(key)])
         if (rows.rows.length !== 1) throw keyUnavailable()
         await this.event(client, key.id, 'SESSION_OPENED')
         return rows.rows[0]!
       })
-    } catch { throw keyUnavailable() }
+    } catch (error) { throw (visitOwner && tenantVisitLeaseLoss(error)) || keyUnavailable() }
   }
 
   async assertActive(key: PseudonymKeyVersion, deadlineAt: number) {
     try { await withRiskKeyTransaction(deadlineAt, (client) => this.lockKey(client, key)) }
     catch { throw keyUnavailable() }
   }
-  async recordFailure(key: PseudonymKeyVersion, deadlineAt: number) {
-    try { await withRiskKeyTransaction(deadlineAt, async (client) => { await this.lockKey(client, key); await this.event(client, key.id, 'SESSION_FAILED') }) }
-    catch { /* Evidence unavailable. Never log raw errors or bypass failure. */ }
+  async recordFailure(key: PseudonymKeyVersion, deadlineAt: number, visitOwner?: TenantVisitLeaseOwner) {
+    try { await withRiskKeyTransaction(deadlineAt, async (client) => {
+      if (visitOwner) await assertRiskAttemptVisitOwner(client, key, visitOwner)
+      await this.lockKey(client, key)
+      await this.event(client, key.id, 'SESSION_FAILED')
+    }) } catch (error) {
+      const lost = visitOwner && tenantVisitLeaseLoss(error)
+      if (lost) throw lost
+      /* Evidence unavailable. Never log raw errors or bypass failure. */
+    }
   }
   /** Existing authorized maintenance invokes this with the explicit pilot scope.
    * Includes retired versions, but cannot cross org/tenant/environment boundaries. */

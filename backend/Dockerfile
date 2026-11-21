@@ -41,4 +41,4 @@ EXPOSE 8080
 # Apply committed Prisma migrations before accepting requests. Container hosts
 # may start more than one instance at a time; Prisma serializes migrations with
 # a PostgreSQL advisory lock, so concurrent starts remain safe.
-CMD ["sh", "-c", "node scripts/prepare-geolite.mjs && npm run db:migrate:deploy && npm start"]
+CMD ["sh", "-c", "node scripts/prepare-geolite.mjs && npm run db:migrate:deploy && exec node dist/main.js"]

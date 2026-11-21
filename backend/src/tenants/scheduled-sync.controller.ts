@@ -12,6 +12,8 @@ import { RiskCycleDiagnostic } from '../identity-risk/risk-operational-diagnosti
 import { AlertIntakeService } from '../alerts/alert-intake.service.js'
 import { EmailAlertReleaseService } from '../alerts/email-alert-release.service.js'
 import { emailAfterCollection } from '../alerts/email-after-collection.js'
+import { assertSyncAdmissionOpen } from './sync-admission-pause.js'
+import { syncDrainRegistry } from './sync-drain-registry.js'
 
 @Controller('api/internal/sync')
 export class ScheduledSyncController {
@@ -37,6 +39,11 @@ export class ScheduledSyncController {
     // Authentication, maintenance and risk all consume this same request clock.
     const admissionDeadlineAt = startedAt + 240_000
     await this.schedulerTokenVerifier.verify(request.headers.authorization)
+    return syncDrainRegistry.run(() => this.runAuthenticatedSync(admissionDeadlineAt, startedAt))
+  }
+
+  private async runAuthenticatedSync(admissionDeadlineAt: number, startedAt: number) {
+    assertSyncAdmissionOpen()
     const riskDiagnostic = new RiskCycleDiagnostic()
     logProcessMemoryPhase(this.logger, 'scheduled_sync', 'STARTED', startedAt)
     try {
