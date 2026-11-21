@@ -1,5 +1,12 @@
 -- Inactive persistence contract for a future tenant-wide SYNC visit fence.
 -- No application path acquires or publishes a visit lease in this candidate.
+-- Bound the lock wait like the two later ledger migrations: the foreign key
+-- below takes a ShareRowExclusive lock on customer_tenants, and an unbounded
+-- wait behind a long-running transaction would queue every write to it.
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '15s';
+
 CREATE TABLE "tenant_sync_visit_leases" (
   "customer_tenant_id" UUID NOT NULL,
   "organization_id" UUID NOT NULL,
@@ -30,3 +37,4 @@ BEGIN
   END LOOP;
 END
 $$;
+COMMIT;
