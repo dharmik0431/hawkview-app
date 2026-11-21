@@ -51,16 +51,30 @@ export async function runScheduledSync({
   if (!sharedSecret || sharedSecret.length < 32) throw new Error('SCHEDULER_SHARED_SECRET must be at least 32 characters.')
 
   let response
+  let budgetSignal
   try {
+    // Constructed inside this boundary so an invalid budget keeps the existing
+    // fixed safe transport failure rather than surfacing a raw setup error.
+    budgetSignal = AbortSignal.timeout(timeoutMs)
     response = await fetchImpl(parsedTarget, {
       method: 'POST',
       headers: { Accept: 'application/json', Authorization: `Bearer ${sharedSecret}` },
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: budgetSignal,
     })
   } catch {
     // A second request could overlap a still-running first request. The
     // durable next cron is the safe recovery mechanism until a global
     // scheduler-operation lease exists.
+    //
+    // Our own budget expiring is not a reachability failure: an admitted
+    // collector continues past this window by design, so API completion is
+    // unknown. This still throws and the cron still fails closed; only the
+    // reported diagnosis differs. Decide from OUR signal's state, never from a
+    // rejection's shape, and emit fixed text only, never an error, body or
+    // token value. An unset signal means setup failed, which is not our expiry.
+    if (budgetSignal?.aborted) {
+      throw new Error('Scheduled synchronization completion is unknown; its transport budget expired and API work may still be running.')
+    }
     throw new Error('Scheduled synchronization could not reach the API.')
   }
   const responseText = await readSafeResponse(response)

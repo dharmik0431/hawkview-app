@@ -80,3 +80,59 @@ test('declared oversized cron response preserves its stable outcome when cancell
     },
   )
 })
+
+test('our own expired transport budget reports unknown completion, not an unreachable API', async () => {
+  let calls = 0
+  let passedSignal
+  // AbortSignal.timeout unrefs its timer, so hold the loop open with a ref'd
+  // timer that is always cleared. No elapsed-time assertion is made.
+  const keepAlive = setTimeout(() => {}, 5_000)
+  try {
+    await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async (_target, init) => {
+      calls += 1
+      passedSignal = init.signal
+      // Stay pending until the caller's own budget aborts, like a slow API that
+      // is still completing an admitted collector.
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true })
+      })
+    } }), (error) => {
+      assert.equal(String(error), 'Error: Scheduled synchronization completion is unknown; its transport budget expired and API work may still be running.')
+      assert.equal(String(error).includes(options.sharedSecret), false)
+      return true
+    })
+  } finally { clearTimeout(keepAlive) }
+  assert.equal(calls, 1)
+  assert.equal(passedSignal?.aborted, true)
+})
+
+test('a TimeoutError-shaped rejection before our budget expires stays an unreachable-API failure', async () => {
+  let calls = 0
+  await assert.rejects(() => runScheduledSync({ ...options, fetchImpl: async (_target, init) => {
+    calls += 1
+    // The control is only meaningful while our own budget is still live.
+    assert.equal(init.signal.aborted, false)
+    const shaped = new Error('synthetic transport fault')
+    shaped.name = 'TimeoutError'
+    throw shaped
+  } }), (error) => {
+    assert.equal(String(error), 'Error: Scheduled synchronization could not reach the API.')
+    assert.equal(String(error).includes('synthetic transport fault'), false)
+    assert.equal(String(error).includes(options.sharedSecret), false)
+    return true
+  })
+  assert.equal(calls, 1)
+})
+
+test('an invalid transport budget keeps the fixed safe transport failure and makes no request', async () => {
+  let calls = 0
+  await assert.rejects(() => runScheduledSync({ ...options, timeoutMs: -1, fetchImpl: async () => {
+    calls += 1
+    return new Response('{}', { status: 200 })
+  } }), (error) => {
+    assert.equal(String(error), 'Error: Scheduled synchronization could not reach the API.')
+    assert.equal(String(error).includes(options.sharedSecret), false)
+    return true
+  })
+  assert.equal(calls, 0)
+})
