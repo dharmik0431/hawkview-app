@@ -21,7 +21,7 @@ import {
 } from './tenant-sync.service.js'
 import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, releaseTenantVisitLease, renewTenantVisitLease, tryAcquireTenantVisitLease } from './tenant-visit-lease-store.js'
-import { M365ManagementActivityService } from './m365-management-activity.service.js'
+import { M365AuditBudgetError, M365ManagementActivityService } from './m365-management-activity.service.js'
 import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { assertTenantVisitLifecycleActive, runTenantVisitLifecycle } from './tenant-visit-lifecycle.js'
 import { AUDIT_RECONCILIATION_RESOURCES, type AuditReconciliationResource } from './audit-change-reconciliation.js'
@@ -2226,3 +2226,168 @@ for (const kind of ['directory-audit', 'change-evidence'] as const) {
     assert.deepEqual((await readRows(f.observer)).map(row => row.id).sort(), [retained, foreign].sort())
   })
 }
+
+// Byte accounting is deliberately ownerless: the reservation brackets a real
+// provider download, so fencing it would drop actual egress from the ceiling,
+// and fencing the refund would strand a whole reservation. This witness pins
+// that exception instead of changing it. The existing stage-body witnesses
+// above observe the ledger only after readMeteredJson has already settled its
+// refund, so none of them exercise a takeover inside that window.
+test('physical displaced visitor refund cannot erase a successor charge or release real downloaded bytes', {
+  skip: !registeredCi, concurrency: false, timeout: 90_000,
+}, async context => {
+  assertDisposableTestDatabase()
+  const writer = new PrismaService()
+  const observer = new PrismaService()
+  let organizationId: string | null = null
+  const configuredDailyMb = process.env.M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB
+  context.after(async () => {
+    // Restore the deployment's real quota value; this witness must not leak one.
+    if (configuredDailyMb === undefined) delete process.env.M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB
+    else process.env.M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB = configuredDailyMb
+    try { if (organizationId) await observer.organization.deleteMany({ where: { id: organizationId } }) }
+    finally { await Promise.all([writer.$disconnect(), observer.$disconnect()]) }
+  })
+  await Promise.all([writer.$connect(), observer.$connect()])
+  const organization = await writer.organization.create({
+    data: { name: 'M365 reservation settlement CI', slug: `m365-settlement-${randomUUID()}` },
+  })
+  organizationId = organization.id
+  const tenant = await writer.customerTenant.create({
+    data: { organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE' },
+  })
+  const scope = { organizationId, customerTenantId: tenant.id }
+  const displaced = await tryAcquireTenantVisitLease(writer, scope, 300_000)
+  assert.ok(displaced)
+
+  const createContent = () => writer.m365ActivityContent.create({ data: {
+    ...scope, contentType: 'Audit.Exchange', microsoftContentId: randomUUID(),
+    contentUri: 'https://manage.office.com/synthetic-content',
+    ledgerExpiresAt: new Date(Date.now() + 86_400_000),
+  } })
+  const blob = (id: string) => JSON.stringify([{
+    Id: id, OrganizationId: tenant.microsoftTenantId, CreationTime: '2030-01-01T00:00:00.000Z',
+    Operation: 'Set-Mailbox', Workload: 'Exchange', ResultStatus: 'Succeeded',
+    UserId: 'admin@example.test', ObjectId: 'mailbox@example.test',
+  }])
+  // Each visitor reserves its whole remaining budget before reading, so the
+  // refund it still owes is exactly `budget - body`. Both budgets stay under
+  // MAX_CONTENT_RESPONSE_BYTES so the reservation equals the budget exactly.
+  const displacedBody = blob(randomUUID())
+  const successorBody = blob(randomUUID())
+  const displacedBudget = 4_096
+  const successorBudget = 2_048
+  const displacedBytes = Buffer.byteLength(displacedBody)
+  const successorBytes = Buffer.byteLength(successorBody)
+  assert.ok(displacedBytes > 0 && displacedBytes < displacedBudget,
+    'the displaced body must leave an unused reservation to refund')
+  assert.ok(successorBytes > 0 && successorBytes < successorBudget,
+    'the successor body must leave an unused reservation to refund')
+
+  const visitor = (body: string) => {
+    const service = new M365ManagementActivityService(writer, {} as never) as any
+    service.request = async () => new Response(body)
+    return service
+  }
+  const ledgerBytes = async () => (await observer.m365AuditDailyUsage.aggregate({
+    where: scope, _sum: { downloadedBytes: true },
+  }))._sum.downloadedBytes ?? 0n
+
+  const displacedContent = await createContent()
+  const successorContent = await createContent()
+  const displacedService = visitor(displacedBody)
+  let atReservation = 0n
+  let afterSuccessor = 0n
+
+  // Only the interleaving point is synthetic. Both accounting writes stay the
+  // production helpers: the reservation already committed untouched, and the
+  // real refund still runs through `settleRefund` at the end of this hook.
+  const settleRefund = displacedService.releaseUnusedDownloadReservation.bind(displacedService)
+  displacedService.releaseUnusedDownloadReservation = async (...args: unknown[]) => {
+    atReservation = await ledgerBytes()
+    // Expire the old visit and let a successor win the lease, exactly between
+    // the displaced visitor's reservation and the refund it still owes.
+    await writer.$executeRawUnsafe(
+      `UPDATE tenant_sync_visit_leases SET expires_at = clock_timestamp() - interval '1 second'
+       WHERE customer_tenant_id=$1::uuid AND organization_id=$2::uuid`,
+      scope.customerTenantId, scope.organizationId)
+    const nextOwner = await tryAcquireTenantVisitLease(writer, scope, 300_000)
+    assert.ok(nextOwner, 'an expired visit must admit a successor')
+    assert.equal(nextOwner.generation, displaced.generation + 1n,
+      'the successor must win a new lease generation')
+    await visitor(successorBody).processContent(
+      tenant, 'synthetic-token', nextOwner.token, { remainingBytes: successorBudget },
+      successorContent, Date.now() + 60_000, nextOwner)
+    afterSuccessor = await ledgerBytes()
+    return settleRefund(...args)
+  }
+
+  await assert.rejects(
+    displacedService.processContent(
+      tenant, 'synthetic-token', displaced.token, { remainingBytes: displacedBudget },
+      displacedContent, Date.now() + 60_000, displaced),
+    TenantVisitLeaseLostError,
+    'the displaced visitor must lose its materialization to the successor')
+
+  // Charged is never below actually downloaded, at every observation.
+  assert.equal(atReservation, BigInt(displacedBudget),
+    'the displaced visitor charges its whole reservation before reading the body')
+  assert.equal(afterSuccessor, BigInt(displacedBudget + successorBytes),
+    'the successor settles into the same tenant/day ledger while the old reservation is outstanding')
+  const settled = await ledgerBytes()
+  assert.equal(settled, BigInt(displacedBytes + successorBytes),
+    'the old refund returns only its own unused reservation')
+  assert.equal(settled - BigInt(successorBytes), BigInt(displacedBytes),
+    'the rejected visitor still accounts for every byte it actually downloaded')
+  assert.ok(settled >= BigInt(successorBytes),
+    'a displaced refund can never erase the successor charge')
+
+  // The rejected materialization stored nothing, yet its egress stayed charged.
+  assert.equal(await observer.m365AuditRecord.count({ where: scope }), 1,
+    'only the successor materialized a record')
+  const stored = await observer.m365AuditDailyUsage.aggregate({
+    where: scope, _sum: { recordsStored: true, blobsProcessed: true },
+  })
+  assert.equal(stored._sum.recordsStored, 1, 'rolled-back record accounting stays uncommitted')
+  assert.equal(stored._sum.blobsProcessed, 1, 'rolled-back blob accounting stays uncommitted')
+
+  const dayRows = await observer.m365AuditDailyUsage.findMany({ where: scope })
+  assert.equal(dayRows.length, 1, 'both visitors settled into one UTC day ledger row')
+  const usageDate = dayRows[0].usageDate
+
+  // The counterfactual must isolate the displaced visitor's retained bytes. A
+  // control ledger is seeded with exactly the successor charge, and the request
+  // is sized so that it lands precisely on a one-megabyte ceiling there. The
+  // two arms then differ only by `displacedBytes`.
+  const controlTenant = await writer.customerTenant.create({
+    data: { organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE' },
+  })
+  const controlLedger = () => observer.m365AuditDailyUsage.findUniqueOrThrow({
+    where: { customerTenantId_usageDate: { customerTenantId: controlTenant.id, usageDate } },
+  })
+  await displacedService.reserveDailyUsage(controlTenant, { bytes: successorBytes }, usageDate)
+  assert.equal((await controlLedger()).downloadedBytes, BigInt(successorBytes),
+    'the control ledger holds the successor charge and nothing else')
+
+  const ceilingBytes = 1024 * 1024
+  const probeBytes = ceilingBytes - successorBytes
+  assert.ok(probeBytes > 0, 'the probe must request a positive byte count')
+  process.env.M365_AUDIT_TENANT_DAILY_DOWNLOAD_MB = '1'
+
+  // The overlap ledger holds displacedBytes + successorBytes, so this request
+  // exceeds the ceiling by exactly displacedBytes. Requesting a whole megabyte
+  // would be refused by the successor charge alone and would prove nothing.
+  await assert.rejects(
+    displacedService.reserveDailyUsage(tenant, { bytes: probeBytes }, usageDate),
+    (error: unknown) => error instanceof M365AuditBudgetError && /daily/.test(error.message),
+    'the displaced visitor retained bytes alone must refuse this reservation')
+  assert.equal(await ledgerBytes(), BigInt(displacedBytes + successorBytes),
+    'a refused reservation leaves the overlap ledger unchanged')
+
+  // Control arm: the identical request against a ledger holding only the
+  // successor charge lands exactly on the ceiling and is admitted, so the
+  // refusal above cannot be attributed to the limit or the successor charge.
+  await displacedService.reserveDailyUsage(controlTenant, { bytes: probeBytes }, usageDate)
+  assert.equal((await controlLedger()).downloadedBytes, BigInt(ceilingBytes),
+    'the identical request is admitted at exactly the ceiling without the displaced bytes')
+})

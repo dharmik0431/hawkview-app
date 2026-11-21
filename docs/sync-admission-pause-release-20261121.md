@@ -1,6 +1,6 @@
 # SYNC admission-pause release record
 
-This record prepares stage 2 of the staged cutover in `sync-full-inventory-release.md`. It is a release candidate until its protected merge and automatic deployments are verified. It changes no application code, provider limits, cron schedule, resource plan or Blueprint configuration.
+This record prepares stage 2 of the staged cutover in `sync-full-inventory-release.md`. It is a release candidate until its protected merge and automatic deployments are verified. The candidate also adds one physical regression case to an existing registered database suite. It changes no runtime application code, provider limits, cron schedule, resource plan or Blueprint configuration.
 
 ## Preparation evidence
 
@@ -11,6 +11,8 @@ This record prepares stage 2 of the staged cutover in `sync-full-inventory-relea
 - One current instrumented API instance was observed. Its startup event identifies the preparation revision and Node running as process 1. The prior pre-instrumentation instance is absent from the current instance selector. The private operational record retains the exact boot and instance identifiers for stage-2 reconciliation.
 
 ## Stage-2 intent and release gate
+
+Independent activation-source review has covered tenant materialization, M365 reconciliation, risk continuity, renewal, takeover and recovery. Download-byte accounting is a separate additive ledger: bytes already downloaded remain charged even when a visit loses ownership, and unused reservation settlement must preserve successor charges. The added physical case forces a takeover before the old refund, runs and settles a successor download, verifies the exact remaining byte charge and rejected old materialization, and tests the daily ceiling against a control ledger containing only the successor charge. Its quota override is confined to the disposable test process and restored during cleanup. Require this case to pass in registered disposable PostgreSQL CI at the final candidate head; a local typecheck is not execution evidence.
 
 After remaining activation-source qualification, save only these API settings through the authorized configuration process, preserving all other settings:
 
