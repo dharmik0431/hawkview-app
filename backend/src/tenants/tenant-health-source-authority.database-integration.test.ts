@@ -10,6 +10,8 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 import { validatedLicenseRows } from './license-validation.js'
+import { releaseTenantVisitLease, tryAcquireTenantVisitLease, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import { TENANT_VISIT_DURATION_MS } from './tenant-visit-lifecycle.js'
 import {
   attemptHistoricalHealthReconciliation as reconcile,
   HISTORICAL_RECONCILIATION_GENERATION as repairGeneration,
@@ -2173,219 +2175,267 @@ function captureSnapshotRaceQuery(query: Promise<pg.QueryResult>): Promise<{ res
   return query.then(result => ({ result }), error => ({ error }))
 }
 
-test('HAW-70 actual LICENSES collector keeps inventory, evidence and baseline atomic across commit and known rollback',
-  { skip: !RUN, timeout: 60_000 }, async context => {
-    // This fixture checks the exact registered hosted port before constructing
-    // either pg client. The shared guard additionally verifies workflow/job,
-    // host, database and role for 5432; local 55432 is refused here.
-    const f = await syncStateAuthorityFixture(context)
-    let beforeFinal: ((transaction: any) => Promise<void>) | undefined
-    const prisma = new PrismaService()
-    try {
-      const scope = f.scopes[0], sibling = f.scopes[1]
-      const [skuA, skuB, skuC, skuD, servicePlanId] = Array.from({ length: 5 }, () => randomUUID())
-      const plan = { servicePlanId, servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }
-      const oldA = { skuId: skuA, skuPartNumber: 'HAW70_OLD', consumedUnits: 1,
-        prepaidUnits: { enabled: 2 }, capabilityStatus: 'Enabled', servicePlans: [plan] }
-      const oldB = { ...oldA, skuId: skuB, skuPartNumber: 'HAW70_REMOVED' }
-      const newA = { ...oldA, skuPartNumber: 'HAW70_CHANGED', prepaidUnits: { enabled: 3 } }
-      const newC = { ...oldA, skuId: skuC, skuPartNumber: 'HAW70_NEW' }
-      const newD = { ...oldA, skuId: skuD, skuPartNumber: 'HAW70_RETRY' }
-      const initialRows = validatedLicenseRows([oldA, oldB])
-      const responseOne = [newA, newC]
-      const responseTwo = [oldA, newD]
-      const evidenceBuilder = new ChangeEvidenceService(prisma)
-      type Query = (sql: string, values: string[]) => Promise<any[]>
-      const observerQuery: Query = async (sql, values) => (await f.observer.query(sql, values)).rows
-      const read = async (query: Query, tenantId: string) => {
-        const values = [scope.organizationId, tenantId]
-        const inventory = await query(`SELECT microsoft_sku_id::text AS sku, sku_part_number AS part,
-          consumed_units, enabled_units, warning_units, suspended_units, locked_out_units,
-          capability_status, service_plans::text AS service_plans, last_seen_at::text AS last_seen_at
-          FROM tenant_licenses WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-          ORDER BY microsoft_sku_id`, values)
-        const snapshot = await query(`SELECT id::text, payload::text, observed_at::text AS observed_at
-          FROM tenant_entra_snapshots WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-          AND resource_type = 'LICENSES'`, values)
-        const events = await query(`SELECT source_event_id, changed_fields::text AS changed_fields, target_id
-          FROM change_evidence_events WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-          AND source = 'SNAPSHOT_DIFFERENCE' AND target_type = 'LICENSES' ORDER BY source_event_id`, values)
-        const state = await query(`SELECT status::text, last_attempt_at::text AS last_attempt_at,
-          last_successful_at::text AS last_successful_at FROM sync_states
-          WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
-          AND resource_type = 'LICENSES'`, values)
-        const authority = await query(`SELECT incarnation::text, source_revision::text,
-          current_snapshot_id::text, current_observation_sequence::text, live
-          FROM tenant_health_source_authorities WHERE organization_id = $1::uuid
-          AND customer_tenant_id = $2::uuid`, values)
-        assert.equal(snapshot.length, 1)
-        assert.equal(authority.length, 1)
-        return { inventory, snapshot, events, state, authority }
-      }
-      const readObserver = (tenantId = scope.tenantId) => read(observerQuery, tenantId)
-      const businessRows = (inventory: any[]) => inventory.map(row => ({
-        skuId: row.sku, skuPartNumber: row.part, consumedUnits: row.consumed_units,
-        capabilityStatus: row.capability_status,
-        prepaidUnits: { enabled: row.enabled_units, warning: row.warning_units,
-          suspended: row.suspended_units, lockedOut: row.locked_out_units },
-        servicePlans: row.service_plans === null ? null : JSON.parse(row.service_plans),
-      })).sort((left, right) => left.skuId.localeCompare(right.skuId))
-      let inventoryTransactionError: unknown
-      const serviceDb = new Proxy(prisma, {
-        get(target, property) {
-          if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: unknown) => {
-            assert.equal(typeof work, 'function', 'Collector witness requires callback-form transactions')
-            return target.$transaction(async transaction => work(new Proxy(transaction, {
-              get(client, field) {
-                if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
-                  get(delegate, operation) {
-                    if (operation === 'upsert') return async (args: any) => {
-                      if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
-                        await beforeFinal(client)
-                      }
-                      return delegate.upsert(args)
-                    }
-                    const value = Reflect.get(delegate, operation, delegate)
-                    return typeof value === 'function' ? value.bind(delegate) : value
-                  },
-                })
-                const value = Reflect.get(client, field, client)
-                return typeof value === 'function' ? value.bind(client) : value
-              },
-            })), options as any).catch(error => {
-              inventoryTransactionError = error
-              throw error
-            })
-          }
-          const value = Reflect.get(target, property, target)
-          return typeof value === 'function' ? value.bind(target) : value
-        },
-      }) as PrismaService
-      let resolved = 0
-      let payload: unknown[] = []
-      const service = new TenantSyncService(serviceDb, {} as any, {} as any,
-        { resolveIncident: async () => { resolved++ }, publishIncident: async () => undefined } as any,
-        evidenceBuilder, {} as any)
-      ;(service as any).fetchGraphPage = async (url: string, token: string, label: string) => {
-        assert.equal(url, 'https://graph.microsoft.com/v1.0/subscribedSkus')
-        assert.equal(token, 'synthetic-token')
-        assert.equal(label, 'license')
-        return new Response(JSON.stringify({ value: payload }), { status: 200 })
-      }
-      ;(service as any).logger = { log() {}, warn() {} }
-      await f.writer.query('BEGIN')
-      for (const tenantId of [scope.tenantId, sibling.tenantId]) {
-        for (const row of initialRows) await f.writer.query(`INSERT INTO tenant_licenses
-          (id, organization_id, customer_tenant_id, microsoft_sku_id, sku_part_number,
-           consumed_units, enabled_units, capability_status, service_plans, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, now())`,
-        [randomUUID(), scope.organizationId, tenantId, row.skuId, row.skuPartNumber,
-          row.consumedUnits, row.prepaidUnits.enabled, row.capabilityStatus,
-          JSON.stringify(row.servicePlans)])
-        await f.writer.query(`INSERT INTO tenant_entra_snapshots
-          (id, organization_id, customer_tenant_id, resource_type, payload, observed_at, updated_at)
-          VALUES ($1, $2, $3, 'LICENSES', $4::jsonb, '2026-11-01T00:00:00Z', now())`,
-        [randomUUID(), scope.organizationId, tenantId, JSON.stringify(initialRows)])
-      }
-      await f.writer.query(`INSERT INTO sync_states
-        (id, organization_id, customer_tenant_id, resource_type, status,
-         last_attempt_at, last_successful_at, updated_at)
-        VALUES ($1, $2, $3, 'LICENSES', 'SUCCEEDED', '2026-11-01T00:00:00Z',
-          '2026-11-01T00:00:00Z', now())`, [randomUUID(), scope.organizationId, scope.tenantId])
-      await f.writer.query('COMMIT')
-      await f.tag(0)
-      const siblingBefore = await readObserver(sibling.tenantId)
-      const outsideAuthorityBefore = await f.authority(f.observer, 2)
-      assert.equal((await readObserver()).authority[0].current_snapshot_id === null, false)
-      const observerPid = (await f.observer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
-
-      const run = async (name: string, graphRows: unknown[], expectedNewEvents: number, abort = false) => {
-        const before = await readObserver()
-        const normalized = validatedLicenseRows(graphRows)
-        const expected = evidenceBuilder.buildSnapshotDifferenceEvidence({
-          tenant: { id: scope.tenantId, organizationId: scope.organizationId },
-          resourceType: 'LICENSES', previousPayload: JSON.parse(before.snapshot[0].payload),
-          currentPayload: normalized, observedAt: new Date(),
-          baselineObservedAt: new Date(before.snapshot[0].observed_at),
-          expiresAt: new Date('2030-01-01T00:00:00Z'),
-        })
-        assert.equal(expected.length, expectedNewEvents, `${name}: the real builder must produce the intended evidence`)
-        const expectedEventIds = [...before.events.map((row: any) => row.source_event_id),
-          ...expected.map(row => row.sourceEventId)].sort()
-        const resolvedBefore = resolved
-        const injectedError = new Error('HAW70_KNOWN_PRECOMMIT_LICENSE_ABORT')
-        inventoryTransactionError = undefined
-        let boundaryHits = 0
-        let injected = false
-        payload = graphRows
-        beforeFinal = async transaction => {
-          boundaryHits++
-          const transactionPid = (await transaction.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'))[0].pid
-          assert.notEqual(transactionPid, observerPid, 'The held writer and observer must be separate sessions')
-          const inside = await read((sql, values) => transaction.$queryRawUnsafe(sql, ...values), scope.tenantId)
-          const outside = await readObserver()
-          assert.deepEqual(outside.inventory, before.inventory, `${name}: uncommitted SKU changes are hidden`)
-          assert.deepEqual(outside.snapshot, before.snapshot, `${name}: old baseline remains visible`)
-          assert.deepEqual(outside.events, before.events, `${name}: uncommitted evidence is hidden`)
-          assert.equal(outside.state[0].status, 'RUNNING')
-          assert.equal(outside.state[0].last_successful_at, before.state[0].last_successful_at)
-          assert.equal(BigInt(outside.authority[0].source_revision),
-            BigInt(before.authority[0].source_revision) + 1n, `${name}: RUNNING changed authority separately`)
-          assert.equal(outside.authority[0].current_snapshot_id, null)
-          assert.deepEqual(inside.authority, outside.authority,
-            `${name}: there is no installed license invalidator at this head`)
-          assert.deepEqual(inside.snapshot, before.snapshot, `${name}: held before final baseline upsert`)
-          assert.deepEqual(inside.events.map((row: any) => row.source_event_id), expectedEventIds)
-          assert.deepEqual(businessRows(inside.inventory),
-            [...normalized].sort((left, right) => left.skuId.localeCompare(right.skuId)))
-          assert.ok(inside.inventory.every((row: any) => Number.isFinite(new Date(row.last_seen_at).getTime())))
-          assert.equal(resolved, resolvedBefore, `${name}: recovery cannot precede collection commit`)
-          if (abort) { injected = true; throw injectedError }
-        }
-        if (abort) await assert.rejects((service as any).syncLicenses(
-          { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token'))
-        else await (service as any).syncLicenses(
-          { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token')
-        beforeFinal = undefined
-        assert.equal(boundaryHits, 1, `${name}: actual saveSnapshot reached the final upsert once`)
-        assert.equal(injected, abort, `${name}: only the intended precommit boundary caused failure`)
-        assert.equal(inventoryTransactionError, abort ? injectedError : undefined,
-          `${name}: Prisma must preserve the known precommit cause before the wrapper translates it`)
-        const after = await readObserver()
-        assert.deepEqual(await readObserver(sibling.tenantId), siblingBefore)
-        assert.deepEqual(await f.authority(f.observer, 2), outsideAuthorityBefore)
-        assert.equal(BigInt(after.authority[0].source_revision),
-          BigInt(before.authority[0].source_revision) + 2n,
-          `${name}: RUNNING and terminal state, not inventory, advanced authority`)
-        assert.equal(after.authority[0].current_snapshot_id, null)
-        if (abort) {
-          assert.deepEqual(after.inventory, before.inventory)
-          assert.deepEqual(after.snapshot, before.snapshot)
-          assert.deepEqual(after.events, before.events)
-          assert.equal(after.state[0].status, 'FAILED')
-          assert.equal(after.state[0].last_successful_at, before.state[0].last_successful_at)
-          assert.equal(resolved, resolvedBefore)
-        } else {
-          assert.deepEqual(businessRows(after.inventory),
-            [...normalized].sort((left, right) => left.skuId.localeCompare(right.skuId)))
-          assert.ok(after.inventory.every((row: any) => Number.isFinite(new Date(row.last_seen_at).getTime())))
-          assert.deepEqual(JSON.parse(after.snapshot[0].payload), normalized)
-          assert.deepEqual(after.events.map((row: any) => row.source_event_id), expectedEventIds)
-          assert.equal(after.state[0].status, 'SUCCEEDED')
-          assert.ok(after.state[0].last_successful_at)
-          assert.equal(resolved, resolvedBefore + 1)
-        }
-      }
-      await run('acknowledged commit', responseOne, 3)
-      await run('known precommit rollback', responseTwo, 3, true)
-      await run('positive retry', responseTwo, 3)
-      await run('complete empty', [], 2)
-      await run('unchanged empty', [], 0)
-    } finally {
-      beforeFinal = undefined
-      await prisma.$disconnect()
+async function licenseCollectorAuthorityWitness(
+  context: import('node:test').TestContext, owned: boolean,
+) {
+  // This fixture checks the exact registered hosted port before constructing
+  // either pg client. The shared guard additionally verifies workflow/job,
+  // host, database and role for 5432; local 55432 is refused here.
+  const f = await syncStateAuthorityFixture(context)
+  let beforeFinal: ((transaction: any) => Promise<void>) | undefined
+  let visitOwner: TenantVisitLeaseOwner | undefined
+  const prisma = new PrismaService()
+  try {
+    const scope = f.scopes[0], sibling = f.scopes[1]
+    visitOwner = owned ? (await tryAcquireTenantVisitLease(prisma, {
+      organizationId: scope.organizationId, customerTenantId: scope.tenantId,
+    }, TENANT_VISIT_DURATION_MS)) ?? undefined : undefined
+    if (owned) assert.ok(visitOwner, 'The actual owner admission must acquire this isolated fixture')
+    const [skuA, skuB, skuC, skuD, servicePlanId] = Array.from({ length: 5 }, () => randomUUID())
+    const plan = { servicePlanId, servicePlanName: 'AAD_PREMIUM_P2', provisioningStatus: 'Success' }
+    const oldA = { skuId: skuA, skuPartNumber: 'HAW70_OLD', consumedUnits: 1,
+      prepaidUnits: { enabled: 2 }, capabilityStatus: 'Enabled', servicePlans: [plan] }
+    const oldB = { ...oldA, skuId: skuB, skuPartNumber: 'HAW70_REMOVED' }
+    const newA = { ...oldA, skuPartNumber: 'HAW70_CHANGED', prepaidUnits: { enabled: 3 } }
+    const newC = { ...oldA, skuId: skuC, skuPartNumber: 'HAW70_NEW' }
+    const newD = { ...oldA, skuId: skuD, skuPartNumber: 'HAW70_RETRY' }
+    const initialRows = validatedLicenseRows([oldA, oldB])
+    const responseOne = [newA, newC]
+    const responseTwo = [oldA, newD]
+    const evidenceBuilder = new ChangeEvidenceService(prisma)
+    type Query = (sql: string, values: string[]) => Promise<any[]>
+    const observerQuery: Query = async (sql, values) => (await f.observer.query(sql, values)).rows
+    const read = async (query: Query, tenantId: string) => {
+      const values = [scope.organizationId, tenantId]
+      const inventory = await query(`SELECT microsoft_sku_id::text AS sku, sku_part_number AS part,
+        consumed_units, enabled_units, warning_units, suspended_units, locked_out_units,
+        capability_status, service_plans::text AS service_plans, last_seen_at::text AS last_seen_at
+        FROM tenant_licenses WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+        ORDER BY microsoft_sku_id`, values)
+      const snapshot = await query(`SELECT id::text, payload::text, observed_at::text AS observed_at
+        FROM tenant_entra_snapshots WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+        AND resource_type = 'LICENSES'`, values)
+      const events = await query(`SELECT source_event_id, changed_fields::text AS changed_fields, target_id
+        FROM change_evidence_events WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+        AND source = 'SNAPSHOT_DIFFERENCE' AND target_type = 'LICENSES' ORDER BY source_event_id`, values)
+      const state = await query(`SELECT status::text, last_attempt_at::text AS last_attempt_at,
+        last_successful_at::text AS last_successful_at FROM sync_states
+        WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+        AND resource_type = 'LICENSES'`, values)
+      const authority = await query(`SELECT incarnation::text, source_revision::text,
+        current_snapshot_id::text, current_observation_sequence::text, live
+        FROM tenant_health_source_authorities WHERE organization_id = $1::uuid
+        AND customer_tenant_id = $2::uuid`, values)
+      assert.equal(snapshot.length, 1)
+      assert.equal(authority.length, 1)
+      return { inventory, snapshot, events, state, authority }
     }
-  })
+    const readObserver = (tenantId = scope.tenantId) => read(observerQuery, tenantId)
+    const businessRows = (inventory: any[]) => inventory.map(row => ({
+      skuId: row.sku, skuPartNumber: row.part, consumedUnits: row.consumed_units,
+      capabilityStatus: row.capability_status,
+      prepaidUnits: { enabled: row.enabled_units, warning: row.warning_units,
+        suspended: row.suspended_units, lockedOut: row.locked_out_units },
+      servicePlans: row.service_plans === null ? null : JSON.parse(row.service_plans),
+    })).sort((left, right) => left.skuId.localeCompare(right.skuId))
+    let inventoryTransactionError: unknown
+    const serviceDb = new Proxy(prisma, {
+      get(target, property) {
+        if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: unknown) => {
+          assert.equal(typeof work, 'function', 'Collector witness requires callback-form transactions')
+          return target.$transaction(async transaction => work(new Proxy(transaction, {
+            get(client, field) {
+              if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
+                get(delegate, operation) {
+                  if (operation === 'upsert') return async (args: any) => {
+                    if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
+                      await beforeFinal(client)
+                    }
+                    return delegate.upsert(args)
+                  }
+                  const value = Reflect.get(delegate, operation, delegate)
+                  return typeof value === 'function' ? value.bind(delegate) : value
+                },
+              })
+              const value = Reflect.get(client, field, client)
+              return typeof value === 'function' ? value.bind(client) : value
+            },
+          })), options as any).catch(error => {
+            inventoryTransactionError = error
+            throw error
+          })
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    }) as PrismaService
+    let resolved = 0
+    let payload: unknown[] = []
+    const service = new TenantSyncService(serviceDb, {} as any, {} as any,
+      { resolveIncident: async () => { resolved++ }, publishIncident: async () => undefined } as any,
+      evidenceBuilder, {} as any)
+    ;(service as any).fetchGraphPage = async (url: string, token: string, label: string) => {
+      assert.equal(url, 'https://graph.microsoft.com/v1.0/subscribedSkus')
+      assert.equal(token, 'synthetic-token')
+      assert.equal(label, 'license')
+      return new Response(JSON.stringify({ value: payload }), { status: 200 })
+    }
+    ;(service as any).logger = { log() {}, warn() {} }
+    await f.writer.query('BEGIN')
+    for (const tenantId of [scope.tenantId, sibling.tenantId]) {
+      for (const row of initialRows) await f.writer.query(`INSERT INTO tenant_licenses
+        (id, organization_id, customer_tenant_id, microsoft_sku_id, sku_part_number,
+         consumed_units, enabled_units, capability_status, service_plans, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, now())`,
+      [randomUUID(), scope.organizationId, tenantId, row.skuId, row.skuPartNumber,
+        row.consumedUnits, row.prepaidUnits.enabled, row.capabilityStatus,
+        JSON.stringify(row.servicePlans)])
+      await f.writer.query(`INSERT INTO tenant_entra_snapshots
+        (id, organization_id, customer_tenant_id, resource_type, payload, observed_at, updated_at)
+        VALUES ($1, $2, $3, 'LICENSES', $4::jsonb, '2026-11-01T00:00:00Z', now())`,
+      [randomUUID(), scope.organizationId, tenantId, JSON.stringify(initialRows)])
+    }
+    await f.writer.query(`INSERT INTO sync_states
+      (id, organization_id, customer_tenant_id, resource_type, status,
+       last_attempt_at, last_successful_at, updated_at)
+      VALUES ($1, $2, $3, 'LICENSES', 'SUCCEEDED', '2026-11-01T00:00:00Z',
+        '2026-11-01T00:00:00Z', now())`, [randomUUID(), scope.organizationId, scope.tenantId])
+    await f.writer.query('COMMIT')
+    await f.tag(0)
+    const siblingBefore = await readObserver(sibling.tenantId)
+    const outsideAuthorityBefore = await f.authority(f.observer, 2)
+    assert.equal((await readObserver()).authority[0].current_snapshot_id === null, false)
+    const observerPid = (await f.observer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    const probePid = (await f.writer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+    const lockProbes = [
+      { sql: 'SELECT id FROM organizations WHERE id = $1::uuid FOR UPDATE NOWAIT', values: [scope.organizationId] },
+      // SHARE conflicts with the owner's NO KEY UPDATE, but not ordinary FK KEY SHARE.
+      { sql: 'SELECT id FROM customer_tenants WHERE id = $1::uuid AND organization_id = $2::uuid FOR SHARE NOWAIT',
+        values: [scope.tenantId, scope.organizationId] },
+      { sql: 'SELECT generation FROM tenant_sync_visit_leases WHERE customer_tenant_id = $1::uuid AND organization_id = $2::uuid FOR NO KEY UPDATE NOWAIT',
+        values: [scope.tenantId, scope.organizationId] },
+    ]
+    const probeOwnerLocks = async (held: boolean) => {
+      if (!owned) return
+      await f.writer.query('BEGIN')
+      try {
+        for (const probe of lockProbes) {
+          await f.writer.query('SAVEPOINT owner_lock_probe')
+          try {
+            if (held) await assert.rejects(f.writer.query(probe.sql, probe.values), sqlState('55P03'))
+            else assert.equal((await f.writer.query(probe.sql, probe.values)).rowCount, 1,
+              'A free-lock control must find the exact fixture row, not pass on an empty scope')
+          } finally {
+            await f.writer.query('ROLLBACK TO SAVEPOINT owner_lock_probe')
+            await f.writer.query('RELEASE SAVEPOINT owner_lock_probe')
+          }
+        }
+      } finally { await f.writer.query('ROLLBACK') }
+    }
+    await probeOwnerLocks(false)
+
+    const run = async (name: string, graphRows: unknown[], expectedNewEvents: number, abort = false) => {
+      const before = await readObserver()
+      const normalized = validatedLicenseRows(graphRows)
+      const expected = evidenceBuilder.buildSnapshotDifferenceEvidence({
+        tenant: { id: scope.tenantId, organizationId: scope.organizationId },
+        resourceType: 'LICENSES', previousPayload: JSON.parse(before.snapshot[0].payload),
+        currentPayload: normalized, observedAt: new Date(),
+        baselineObservedAt: new Date(before.snapshot[0].observed_at),
+        expiresAt: new Date('2030-01-01T00:00:00Z'),
+      })
+      assert.equal(expected.length, expectedNewEvents, `${name}: the real builder must produce the intended evidence`)
+      const expectedEventIds = [...before.events.map((row: any) => row.source_event_id),
+        ...expected.map(row => row.sourceEventId)].sort()
+      const resolvedBefore = resolved
+      const injectedError = new Error('HAW70_KNOWN_PRECOMMIT_LICENSE_ABORT')
+      inventoryTransactionError = undefined
+      let boundaryHits = 0
+      let injected = false
+      payload = graphRows
+      beforeFinal = async transaction => {
+        boundaryHits++
+        const transactionPid = (await transaction.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'))[0].pid
+        assert.notEqual(transactionPid, observerPid, 'The held writer and observer must be separate sessions')
+        if (owned) {
+          assert.equal(new Set([transactionPid, observerPid, probePid]).size, 3,
+            'The real materialization, observer and lock probes require three distinct sessions')
+          await probeOwnerLocks(true)
+        }
+        const inside = await read((sql, values) => transaction.$queryRawUnsafe(sql, ...values), scope.tenantId)
+        const outside = await readObserver()
+        assert.deepEqual(outside.inventory, before.inventory, `${name}: uncommitted SKU changes are hidden`)
+        assert.deepEqual(outside.snapshot, before.snapshot, `${name}: old baseline remains visible`)
+        assert.deepEqual(outside.events, before.events, `${name}: uncommitted evidence is hidden`)
+        assert.equal(outside.state[0].status, 'RUNNING')
+        assert.equal(outside.state[0].last_successful_at, before.state[0].last_successful_at)
+        assert.equal(BigInt(outside.authority[0].source_revision),
+          BigInt(before.authority[0].source_revision) + 1n, `${name}: RUNNING changed authority separately`)
+        assert.equal(outside.authority[0].current_snapshot_id, null)
+        assert.deepEqual(inside.authority, outside.authority,
+          `${name}: there is no installed license invalidator at this head`)
+        assert.deepEqual(inside.snapshot, before.snapshot, `${name}: held before final baseline upsert`)
+        assert.deepEqual(inside.events.map((row: any) => row.source_event_id), expectedEventIds)
+        assert.deepEqual(businessRows(inside.inventory),
+          [...normalized].sort((left, right) => left.skuId.localeCompare(right.skuId)))
+        assert.ok(inside.inventory.every((row: any) => Number.isFinite(new Date(row.last_seen_at).getTime())))
+        assert.equal(resolved, resolvedBefore, `${name}: recovery cannot precede collection commit`)
+        if (abort) { injected = true; throw injectedError }
+      }
+      if (abort) await assert.rejects((service as any).syncLicenses(
+        { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token', visitOwner ?? undefined))
+      else await (service as any).syncLicenses(
+        { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token', visitOwner ?? undefined)
+      beforeFinal = undefined
+      assert.equal(boundaryHits, 1, `${name}: actual saveSnapshot reached the final upsert once`)
+      assert.equal(injected, abort, `${name}: only the intended precommit boundary caused failure`)
+      assert.equal(inventoryTransactionError, abort ? injectedError : undefined,
+        `${name}: Prisma must preserve the known precommit cause before the wrapper translates it`)
+      await probeOwnerLocks(false)
+      const after = await readObserver()
+      assert.deepEqual(await readObserver(sibling.tenantId), siblingBefore)
+      assert.deepEqual(await f.authority(f.observer, 2), outsideAuthorityBefore)
+      assert.equal(BigInt(after.authority[0].source_revision),
+        BigInt(before.authority[0].source_revision) + 2n,
+        `${name}: RUNNING and terminal state, not inventory, advanced authority`)
+      assert.equal(after.authority[0].current_snapshot_id, null)
+      if (abort) {
+        assert.deepEqual(after.inventory, before.inventory)
+        assert.deepEqual(after.snapshot, before.snapshot)
+        assert.deepEqual(after.events, before.events)
+        assert.equal(after.state[0].status, 'FAILED')
+        assert.equal(after.state[0].last_successful_at, before.state[0].last_successful_at)
+        assert.equal(resolved, resolvedBefore)
+      } else {
+        assert.deepEqual(businessRows(after.inventory),
+          [...normalized].sort((left, right) => left.skuId.localeCompare(right.skuId)))
+        assert.ok(after.inventory.every((row: any) => Number.isFinite(new Date(row.last_seen_at).getTime())))
+        assert.deepEqual(JSON.parse(after.snapshot[0].payload), normalized)
+        assert.deepEqual(after.events.map((row: any) => row.source_event_id), expectedEventIds)
+        assert.equal(after.state[0].status, 'SUCCEEDED')
+        assert.ok(after.state[0].last_successful_at)
+        assert.equal(resolved, resolvedBefore + 1)
+      }
+    }
+    await run('acknowledged commit', responseOne, 3)
+    await run('known precommit rollback', responseTwo, 3, true)
+    await run('positive retry', responseTwo, 3)
+    await run('complete empty', [], 2)
+    await run('unchanged empty', [], 0)
+  } finally {
+    beforeFinal = undefined
+    try {
+      if (visitOwner) assert.equal(await releaseTenantVisitLease(prisma, visitOwner), true,
+        'The owned fixture must still release its exact lease; no takeover is part of this case')
+    } finally { await prisma.$disconnect() }
+  }
+}
+
+test('HAW-70 actual LICENSES collector keeps inventory, evidence and baseline atomic across commit and known rollback',
+  { skip: !RUN, timeout: 60_000 }, context => licenseCollectorAuthorityWitness(context, false))
+
+test('HAW-70 owned LICENSES collector preserves atomic outcomes with parent and lease locks',
+  { skip: !RUN, timeout: 60_000 }, context => licenseCollectorAuthorityWitness(context, true))
 
 test('HAW-70 modeled license invalidation placement exposes the multi-row direct-writer lock cycle',
   { skip: !RUN, timeout: 60_000 }, async context => {
