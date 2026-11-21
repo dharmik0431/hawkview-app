@@ -2176,17 +2176,19 @@ function captureSnapshotRaceQuery(query: Promise<pg.QueryResult>): Promise<{ res
 }
 
 async function licenseCollectorAuthorityWitness(
-  context: import('node:test').TestContext, owned: boolean,
+  context: import('node:test').TestContext, owned: boolean, auditReceipt = false,
 ) {
   // This fixture checks the exact registered hosted port before constructing
   // either pg client. The shared guard additionally verifies workflow/job,
   // host, database and role for 5432; local 55432 is refused here.
   const f = await syncStateAuthorityFixture(context)
   let beforeFinal: ((transaction: any) => Promise<void>) | undefined
+  let afterReceipt: { revision: bigint; observe: (transaction: any, count: number) => Promise<void> } | undefined
   let visitOwner: TenantVisitLeaseOwner | undefined
   const prisma = new PrismaService()
   try {
     const scope = f.scopes[0], sibling = f.scopes[1]
+    if (auditReceipt) assert.equal(owned, true, 'An audit receipt requires the actual visit owner')
     visitOwner = owned ? (await tryAcquireTenantVisitLease(prisma, {
       organizationId: scope.organizationId, customerTenantId: scope.tenantId,
     }, TENANT_VISIT_DURATION_MS)) ?? undefined : undefined
@@ -2205,6 +2207,11 @@ async function licenseCollectorAuthorityWitness(
     const evidenceBuilder = new ChangeEvidenceService(prisma)
     type Query = (sql: string, values: string[]) => Promise<any[]>
     const observerQuery: Query = async (sql, values) => (await f.observer.query(sql, values)).rows
+    const receiptColumns = `organization_id::text, customer_tenant_id::text, resource_type::text,
+      requested_revision::text, completed_revision::text,
+      (last_completed_at AT TIME ZONE 'UTC')::text AS last_completed_at,
+      (created_at AT TIME ZONE 'UTC')::text AS created_at,
+      (updated_at AT TIME ZONE 'UTC')::text AS updated_at`
     const read = async (query: Query, tenantId: string) => {
       const values = [scope.organizationId, tenantId]
       const inventory = await query(`SELECT microsoft_sku_id::text AS sku, sku_part_number AS part,
@@ -2226,9 +2233,12 @@ async function licenseCollectorAuthorityWitness(
         current_snapshot_id::text, current_observation_sequence::text, live
         FROM tenant_health_source_authorities WHERE organization_id = $1::uuid
         AND customer_tenant_id = $2::uuid`, values)
+      const receipt = auditReceipt ? await query(`SELECT ${receiptColumns}
+        FROM tenant_audit_reconciliation_work WHERE organization_id = $1::uuid
+        AND customer_tenant_id = $2::uuid AND resource_type = 'LICENSES'`, values) : []
       assert.equal(snapshot.length, 1)
       assert.equal(authority.length, 1)
-      return { inventory, snapshot, events, state, authority }
+      return { inventory, snapshot, events, state, authority, receipt }
     }
     const readObserver = (tenantId = scope.tenantId) => read(observerQuery, tenantId)
     const businessRows = (inventory: any[]) => inventory.map(row => ({
@@ -2243,24 +2253,53 @@ async function licenseCollectorAuthorityWitness(
       get(target, property) {
         if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: unknown) => {
           assert.equal(typeof work, 'function', 'Collector witness requires callback-form transactions')
-          return target.$transaction(async transaction => work(new Proxy(transaction, {
-            get(client, field) {
-              if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
-                get(delegate, operation) {
-                  if (operation === 'upsert') return async (args: any) => {
-                    if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
-                      await beforeFinal(client)
+          return target.$transaction(async transaction => {
+            let baselineWrites = 0
+            let receiptCalls = 0
+            return work(new Proxy(transaction, {
+              get(client, field) {
+                if (field === 'tenantEntraSnapshot') return new Proxy(client.tenantEntraSnapshot, {
+                  get(delegate, operation) {
+                    if (operation === 'upsert') return async (args: any) => {
+                      if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' && beforeFinal) {
+                        await beforeFinal(client)
+                      }
+                      const result = await delegate.upsert(args)
+                      if (args.where?.customerTenantId_resourceType?.resourceType === 'LICENSES' &&
+                          args.where.customerTenantId_resourceType.customerTenantId === scope.tenantId) baselineWrites++
+                      return result
                     }
-                    return delegate.upsert(args)
-                  }
-                  const value = Reflect.get(delegate, operation, delegate)
-                  return typeof value === 'function' ? value.bind(delegate) : value
-                },
-              })
-              const value = Reflect.get(client, field, client)
-              return typeof value === 'function' ? value.bind(client) : value
-            },
-          })), options as any).catch(error => {
+                    const value = Reflect.get(delegate, operation, delegate)
+                    return typeof value === 'function' ? value.bind(delegate) : value
+                  },
+                })
+                if (field === 'tenantAuditReconciliationWork' && afterReceipt) {
+                  const hook = afterReceipt
+                  return new Proxy(client.tenantAuditReconciliationWork, {
+                    get(delegate, operation) {
+                      if (operation === 'updateMany') return async (args: any) => {
+                        assert.deepEqual(args.where, {
+                          organizationId: scope.organizationId, customerTenantId: scope.tenantId,
+                          resourceType: 'LICENSES', requestedRevision: hook.revision,
+                          completedRevision: { lt: hook.revision },
+                        }, 'The actual receipt delegate must match the exact fixture request')
+                        assert.equal(args.data.completedRevision, hook.revision)
+                        assert.equal(baselineWrites, 1, 'The real baseline upsert must finish before the receipt')
+                        assert.equal(++receiptCalls, 1, 'Only one actual receipt update is expected')
+                        const result = await delegate.updateMany(args)
+                        await hook.observe(client, result.count)
+                        return result
+                      }
+                      const value = Reflect.get(delegate, operation, delegate)
+                      return typeof value === 'function' ? value.bind(delegate) : value
+                    },
+                  })
+                }
+                const value = Reflect.get(client, field, client)
+                return typeof value === 'function' ? value.bind(client) : value
+              },
+            }))
+          }, options as any).catch(error => {
             inventoryTransactionError = error
             throw error
           })
@@ -2301,6 +2340,24 @@ async function licenseCollectorAuthorityWitness(
       VALUES ($1, $2, $3, 'LICENSES', 'SUCCEEDED', '2026-11-01T00:00:00Z',
         '2026-11-01T00:00:00Z', now())`, [randomUUID(), scope.organizationId, scope.tenantId])
     await f.writer.query('COMMIT')
+    if (auditReceipt) {
+      for (const item of [
+        ...f.scopes.map(item => ({ ...item, resource: 'LICENSES' })),
+        { ...scope, resource: 'DOMAINS' },
+      ]) await f.writer.query(`INSERT INTO tenant_audit_reconciliation_work
+        (organization_id, customer_tenant_id, resource_type, requested_revision, completed_revision)
+        VALUES ($1, $2, $3::"SyncResourceType", $4::bigint, 0)`,
+      [item.organizationId, item.tenantId, item.resource,
+        item.organizationId === scope.organizationId && item.tenantId === scope.tenantId && item.resource === 'LICENSES'
+          ? '2' : '6']) // Controls match the final missing-row request's numeric revision.
+    }
+    const readControlReceipts = async () => auditReceipt ? (await f.observer.query(`SELECT ${receiptColumns}
+      FROM tenant_audit_reconciliation_work WHERE organization_id = ANY($1::uuid[])
+      AND NOT (organization_id = $2::uuid AND customer_tenant_id = $3::uuid AND resource_type = 'LICENSES')
+      ORDER BY organization_id, customer_tenant_id, resource_type`,
+    [f.scopes.map(item => item.organizationId), scope.organizationId, scope.tenantId])).rows : []
+    const controlReceiptsBefore = await readControlReceipts()
+    if (auditReceipt) assert.equal(controlReceiptsBefore.length, 3)
     await f.tag(0)
     const siblingBefore = await readObserver(sibling.tenantId)
     const outsideAuthorityBefore = await f.authority(f.observer, 2)
@@ -2315,11 +2372,17 @@ async function licenseCollectorAuthorityWitness(
       { sql: 'SELECT generation FROM tenant_sync_visit_leases WHERE customer_tenant_id = $1::uuid AND organization_id = $2::uuid FOR NO KEY UPDATE NOWAIT',
         values: [scope.tenantId, scope.organizationId] },
     ]
-    const probeOwnerLocks = async (held: boolean) => {
+    const probeOwnerLocks = async (held: boolean, includeReceipt = false) => {
       if (!owned) return
+      const probes = includeReceipt ? [...lockProbes, {
+        sql: `SELECT requested_revision FROM tenant_audit_reconciliation_work
+          WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid
+          AND resource_type = 'LICENSES' FOR NO KEY UPDATE NOWAIT`,
+        values: [scope.organizationId, scope.tenantId],
+      }] : lockProbes
       await f.writer.query('BEGIN')
       try {
-        for (const probe of lockProbes) {
+        for (const probe of probes) {
           await f.writer.query('SAVEPOINT owner_lock_probe')
           try {
             if (held) await assert.rejects(f.writer.query(probe.sql, probe.values), sqlState('55P03'))
@@ -2332,9 +2395,11 @@ async function licenseCollectorAuthorityWitness(
         }
       } finally { await f.writer.query('ROLLBACK') }
     }
-    await probeOwnerLocks(false)
+    await probeOwnerLocks(false, auditReceipt)
 
-    const run = async (name: string, graphRows: unknown[], expectedNewEvents: number, abort = false) => {
+    const run = async (name: string, graphRows: unknown[], expectedNewEvents: number, abort = false,
+      audit?: { revision: bigint; count: 0 | 1 }) => {
+      assert.equal(Boolean(audit), auditReceipt)
       const before = await readObserver()
       const normalized = validatedLicenseRows(graphRows)
       const expected = evidenceBuilder.buildSnapshotDifferenceEvidence({
@@ -2352,21 +2417,24 @@ async function licenseCollectorAuthorityWitness(
       inventoryTransactionError = undefined
       let boundaryHits = 0
       let injected = false
+      let receiptAtBoundary: any[] | undefined
       payload = graphRows
-      beforeFinal = async transaction => {
+      const inspectBoundary = async (transaction: any, count?: number) => {
         boundaryHits++
+        if (audit) assert.equal(count, audit.count, `${name}: count must come from the real receipt update`)
         const transactionPid = (await transaction.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'))[0].pid
         assert.notEqual(transactionPid, observerPid, 'The held writer and observer must be separate sessions')
         if (owned) {
           assert.equal(new Set([transactionPid, observerPid, probePid]).size, 3,
             'The real materialization, observer and lock probes require three distinct sessions')
-          await probeOwnerLocks(true)
+          await probeOwnerLocks(true, audit?.count === 1)
         }
         const inside = await read((sql, values) => transaction.$queryRawUnsafe(sql, ...values), scope.tenantId)
         const outside = await readObserver()
         assert.deepEqual(outside.inventory, before.inventory, `${name}: uncommitted SKU changes are hidden`)
         assert.deepEqual(outside.snapshot, before.snapshot, `${name}: old baseline remains visible`)
         assert.deepEqual(outside.events, before.events, `${name}: uncommitted evidence is hidden`)
+        assert.deepEqual(outside.receipt, before.receipt, `${name}: uncommitted receipt is hidden`)
         assert.equal(outside.state[0].status, 'RUNNING')
         assert.equal(outside.state[0].last_successful_at, before.state[0].last_successful_at)
         assert.equal(BigInt(outside.authority[0].source_revision),
@@ -2374,7 +2442,32 @@ async function licenseCollectorAuthorityWitness(
         assert.equal(outside.authority[0].current_snapshot_id, null)
         assert.deepEqual(inside.authority, outside.authority,
           `${name}: there is no installed license invalidator at this head`)
-        assert.deepEqual(inside.snapshot, before.snapshot, `${name}: held before final baseline upsert`)
+        if (audit) {
+          assert.deepEqual(JSON.parse(inside.snapshot[0].payload), normalized,
+            `${name}: the real baseline is already written at this later boundary`)
+          if (audit.count === 1) {
+            assert.equal(inside.receipt.length, 1)
+            assert.equal(inside.receipt[0].completed_revision, audit.revision.toString())
+            for (const key of ['organization_id', 'customer_tenant_id', 'resource_type', 'requested_revision', 'created_at']) {
+              assert.equal(inside.receipt[0][key], before.receipt[0][key], `${name}: ${key} is unchanged`)
+            }
+            const timestamp = await transaction.$queryRawUnsafe(`SELECT
+              work.last_completed_at IS NOT DISTINCT FROM snapshot.observed_at AS exact_match
+              FROM tenant_audit_reconciliation_work work JOIN tenant_entra_snapshots snapshot
+                ON snapshot.organization_id = work.organization_id
+                AND snapshot.customer_tenant_id = work.customer_tenant_id
+                AND snapshot.resource_type = work.resource_type
+              WHERE work.organization_id = $1::uuid AND work.customer_tenant_id = $2::uuid
+                AND work.resource_type = 'LICENSES'`, scope.organizationId, scope.tenantId)
+            assert.deepEqual(timestamp, [{ exact_match: true }], `${name}: compare stored timestamp precision in SQL`)
+          } else {
+            assert.deepEqual(inside.receipt, before.receipt, `${name}: zero-count acknowledgment changes no ledger field`)
+          }
+          receiptAtBoundary = inside.receipt
+          assert.deepEqual(await readControlReceipts(), controlReceiptsBefore)
+        } else {
+          assert.deepEqual(inside.snapshot, before.snapshot, `${name}: held before final baseline upsert`)
+        }
         assert.deepEqual(inside.events.map((row: any) => row.source_event_id), expectedEventIds)
         assert.deepEqual(businessRows(inside.inventory),
           [...normalized].sort((left, right) => left.skuId.localeCompare(right.skuId)))
@@ -2382,19 +2475,29 @@ async function licenseCollectorAuthorityWitness(
         assert.equal(resolved, resolvedBefore, `${name}: recovery cannot precede collection commit`)
         if (abort) { injected = true; throw injectedError }
       }
-      if (abort) await assert.rejects((service as any).syncLicenses(
-        { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token', visitOwner ?? undefined))
-      else await (service as any).syncLicenses(
-        { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token', visitOwner ?? undefined)
-      beforeFinal = undefined
-      assert.equal(boundaryHits, 1, `${name}: actual saveSnapshot reached the final upsert once`)
+      if (audit) afterReceipt = { revision: audit.revision, observe: inspectBoundary }
+      else beforeFinal = inspectBoundary
+      const collect = () => (service as any).syncLicenses(
+        { id: scope.tenantId, organizationId: scope.organizationId }, 'synthetic-token', visitOwner ?? undefined,
+        ...(audit ? [audit.revision] : []))
+      try {
+        if (abort) await assert.rejects(collect())
+        else await collect()
+      } finally { beforeFinal = undefined; afterReceipt = undefined }
+      assert.equal(boundaryHits, 1, `${name}: actual saveSnapshot reached the intended boundary once`)
       assert.equal(injected, abort, `${name}: only the intended precommit boundary caused failure`)
       assert.equal(inventoryTransactionError, abort ? injectedError : undefined,
         `${name}: Prisma must preserve the known precommit cause before the wrapper translates it`)
-      await probeOwnerLocks(false)
+      await probeOwnerLocks(false, audit?.count === 1)
       const after = await readObserver()
       assert.deepEqual(await readObserver(sibling.tenantId), siblingBefore)
       assert.deepEqual(await f.authority(f.observer, 2), outsideAuthorityBefore)
+      if (audit) {
+        assert.ok(receiptAtBoundary)
+        assert.deepEqual(after.receipt, abort ? before.receipt : receiptAtBoundary,
+          `${name}: receipt and source publication share the transaction outcome`)
+        assert.deepEqual(await readControlReceipts(), controlReceiptsBefore)
+      }
       assert.equal(BigInt(after.authority[0].source_revision),
         BigInt(before.authority[0].source_revision) + 2n,
         `${name}: RUNNING and terminal state, not inventory, advanced authority`)
@@ -2417,13 +2520,39 @@ async function licenseCollectorAuthorityWitness(
         assert.equal(resolved, resolvedBefore + 1)
       }
     }
-    await run('acknowledged commit', responseOne, 3)
-    await run('known precommit rollback', responseTwo, 3, true)
-    await run('positive retry', responseTwo, 3)
-    await run('complete empty', [], 2)
-    await run('unchanged empty', [], 0)
+    if (auditReceipt) {
+      const request = async (revision: bigint) => assert.equal((await f.writer.query(
+        `UPDATE tenant_audit_reconciliation_work SET requested_revision = $3::bigint
+          WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid AND resource_type = 'LICENSES'`,
+        [scope.organizationId, scope.tenantId, revision.toString()])).rowCount, 1)
+      // Fixture-only revision setup is not a competing real audit producer.
+      await run('matching audit receipt', responseOne, 3, false, { revision: 2n, count: 1 })
+      await request(3n)
+      await run('known post-receipt precommit rollback', responseTwo, 3, true, { revision: 3n, count: 1 })
+      await run('positive receipt retry', responseTwo, 3, false, { revision: 3n, count: 1 })
+      await request(4n)
+      await run('stale selected request', responseOne, 3, false, { revision: 3n, count: 0 })
+      assert.deepEqual((await readObserver()).receipt.map(row => [row.requested_revision, row.completed_revision]), [['4', '3']])
+      await run('current request after stale selection', responseOne, 0, false, { revision: 4n, count: 1 })
+      await run('already completed request', responseTwo, 3, false, { revision: 4n, count: 0 })
+      await request(5n)
+      await run('complete empty receipt', [], 2, false, { revision: 5n, count: 1 })
+      await request(6n)
+      await run('unchanged empty receipt', [], 0, false, { revision: 6n, count: 1 })
+      assert.equal((await f.writer.query(`DELETE FROM tenant_audit_reconciliation_work
+        WHERE organization_id = $1::uuid AND customer_tenant_id = $2::uuid AND resource_type = 'LICENSES'`,
+      [scope.organizationId, scope.tenantId])).rowCount, 1)
+      await run('missing exact request', responseOne, 2, false, { revision: 6n, count: 0 })
+    } else {
+      await run('acknowledged commit', responseOne, 3)
+      await run('known precommit rollback', responseTwo, 3, true)
+      await run('positive retry', responseTwo, 3)
+      await run('complete empty', [], 2)
+      await run('unchanged empty', [], 0)
+    }
   } finally {
     beforeFinal = undefined
+    afterReceipt = undefined
     try {
       if (visitOwner) assert.equal(await releaseTenantVisitLease(prisma, visitOwner), true,
         'The owned fixture must still release its exact lease; no takeover is part of this case')
@@ -2436,6 +2565,9 @@ test('HAW-70 actual LICENSES collector keeps inventory, evidence and baseline at
 
 test('HAW-70 owned LICENSES collector preserves atomic outcomes with parent and lease locks',
   { skip: !RUN, timeout: 60_000 }, context => licenseCollectorAuthorityWitness(context, true))
+
+test('HAW-70 owned LICENSES audit receipt shares the materialization outcome and preserves newer requests',
+  { skip: !RUN, timeout: 60_000 }, context => licenseCollectorAuthorityWitness(context, true, true))
 
 test('HAW-70 modeled license invalidation placement exposes the multi-row direct-writer lock cycle',
   { skip: !RUN, timeout: 60_000 }, async context => {
