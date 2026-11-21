@@ -8,7 +8,9 @@ import { PrismaClient } from '../generated/prisma/client.js'
 import { assertDisposableTestDatabase } from '../prisma/native-alert-test-database.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
-import { TenantSyncService } from './tenant-sync.service.js'
+import { AuditReconciliationIncompleteError, TenantSyncService } from './tenant-sync.service.js'
+import { deriveAuditReconciliationResources } from './audit-change-reconciliation.js'
+import { directoryAuditSecurityIncident } from './directory-audit-security-incident.js'
 import { validatedLicenseRows } from './license-validation.js'
 import { releaseTenantVisitLease, tryAcquireTenantVisitLease, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
 import { TENANT_VISIT_DURATION_MS } from './tenant-visit-lifecycle.js'
@@ -2568,6 +2570,227 @@ test('HAW-70 owned LICENSES collector preserves atomic outcomes with parent and 
 
 test('HAW-70 owned LICENSES audit receipt shares the materialization outcome and preserves newer requests',
   { skip: !RUN, timeout: 60_000 }, context => licenseCollectorAuthorityWitness(context, true, true))
+
+test('HAW-70 actual audit producer before LICENSES publication leaves newer work pending until the next replay',
+  { skip: !RUN, timeout: 60_000 }, async context => {
+    // Only the producer-first ordering. No transaction is held while waiting
+    // on a conflicting producer; the opposite ordering is a separate witness.
+    const f = await syncStateAuthorityFixture(context)
+    const database = new PrismaService(), producer = new PrismaService()
+    let owner: TenantVisitLeaseOwner | undefined
+    try {
+      const scope = f.scopes[0]
+      const tenant = { id: scope.tenantId, organizationId: scope.organizationId }
+      owner = (await tryAcquireTenantVisitLease(database, {
+        organizationId: scope.organizationId, customerTenantId: scope.tenantId,
+      }, TENANT_VISIT_DURATION_MS)) ?? undefined
+      assert.ok(owner)
+      const [oldSku, newSku, eventId] = [randomUUID(), randomUUID(), randomUUID()]
+      const oldRows = validatedLicenseRows([{ skuId: oldSku, skuPartNumber: 'OLD_PRODUCER_SKU',
+        consumedUnits: 1, prepaidUnits: { enabled: 2 }, servicePlans: [] }])
+      const graphRows = [{ skuId: newSku, skuPartNumber: 'NEW_PRODUCER_SKU',
+        consumedUnits: 1, prepaidUnits: { enabled: 3 }, servicePlans: [] }]
+      const newRows = validatedLicenseRows(graphRows)
+      for (const item of f.scopes) {
+        await f.writer.query(`INSERT INTO tenant_audit_reconciliation_work
+          (organization_id, customer_tenant_id, resource_type, requested_revision)
+          VALUES ($1, $2, 'LICENSES', 2)`, [item.organizationId, item.tenantId])
+        await f.writer.query(`INSERT INTO tenant_licenses
+          (id, organization_id, customer_tenant_id, microsoft_sku_id, sku_part_number, consumed_units, enabled_units, service_plans, updated_at)
+          VALUES ($1, $2, $3, $4, 'OLD_PRODUCER_SKU', 1, 2, '[]'::jsonb, now())`,
+        [randomUUID(), item.organizationId, item.tenantId, oldSku])
+        await f.writer.query(`INSERT INTO tenant_entra_snapshots
+          (id, organization_id, customer_tenant_id, resource_type, payload, observed_at, updated_at)
+          VALUES ($1, $2, $3, 'LICENSES', $4::jsonb, '2026-11-01T00:00:00Z', now())`,
+        [randomUUID(), item.organizationId, item.tenantId, JSON.stringify(oldRows)])
+      }
+      await f.writer.query(`INSERT INTO sync_states
+        (id, organization_id, customer_tenant_id, resource_type, status, last_successful_at, updated_at)
+        VALUES ($1, $2, $3, 'LICENSES', 'SUCCEEDED', '2026-11-01T00:00:00Z', now())`,
+      [randomUUID(), scope.organizationId, scope.tenantId])
+      await f.tag(0)
+      const read = async (index = 0) => {
+        const item = f.scopes[index], values = [item.organizationId, item.tenantId]
+        const inventory = (await f.observer.query(`SELECT microsoft_sku_id::text AS sku, sku_part_number,
+          consumed_units, enabled_units FROM tenant_licenses
+          WHERE organization_id = $1 AND customer_tenant_id = $2 ORDER BY microsoft_sku_id`, values)).rows
+        const snapshots = (await f.observer.query(`SELECT payload, observed_at::text FROM tenant_entra_snapshots
+          WHERE organization_id = $1 AND customer_tenant_id = $2 AND resource_type = 'LICENSES'`, values)).rows
+        const work = (await f.observer.query(`SELECT organization_id::text, customer_tenant_id::text, resource_type::text,
+          requested_revision::text, completed_revision::text, last_completed_at::text, created_at::text, updated_at::text
+          FROM tenant_audit_reconciliation_work
+          WHERE organization_id = $1 AND customer_tenant_id = $2 AND resource_type = 'LICENSES'`, values)).rows
+        const state = (await f.observer.query(`SELECT status::text, last_successful_at::text,
+          last_attempt_at::text, consecutive_failures FROM sync_states
+          WHERE organization_id = $1 AND customer_tenant_id = $2 AND resource_type = 'LICENSES'`, values)).rows
+        const raw = (await f.observer.query(`SELECT to_jsonb(a) AS row FROM directory_audit_logs a
+          WHERE organization_id = $1 AND customer_tenant_id = $2 ORDER BY microsoft_audit_id`, values)).rows
+        const evidence = (await f.observer.query(`SELECT source::text, source_event_id, to_jsonb(e) AS row
+          FROM change_evidence_events e WHERE organization_id = $1 AND customer_tenant_id = $2
+          ORDER BY source, source_event_id`, values)).rows
+        return { inventory, snapshots, work, state, raw, evidence, authority: await f.authority(f.observer, index) }
+      }
+      const initial = await read(), sibling = await read(1), otherOrganization = await read(2)
+      assert.equal(initial.work.length, 1)
+      assert.equal(initial.snapshots.length, 1)
+      assert.equal(initial.state.length, 1)
+      assert.deepEqual(initial.raw, [])
+      assert.deepEqual(initial.evidence, [])
+      const observerPid = (await f.observer.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid
+      const producerPids: number[] = []
+      const producerDb = new Proxy(producer, {
+        get(target, property) {
+          if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: any) =>
+            target.$transaction(async transaction => {
+              producerPids.push((await transaction.$queryRawUnsafe<Array<{ pid: number }>>('SELECT pg_backend_pid() AS pid'))[0].pid)
+              return work(transaction)
+            }, options)
+          const value = Reflect.get(target, property, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as PrismaService
+      let expectedRevision = 2n, expectedCount = 0
+      const receiptAttempts: Array<{ revision: bigint; count: number; pid: number }> = []
+      const replayDb = new Proxy(database, {
+        get(target, property) {
+          if (property === '$transaction') return (work: (transaction: any) => Promise<unknown>, options?: any) =>
+            target.$transaction(transaction => work(new Proxy(transaction, {
+              get(client, field) {
+                if (field === 'tenantAuditReconciliationWork') return new Proxy(client.tenantAuditReconciliationWork, {
+                  get(delegate, operation) {
+                    if (operation === 'updateMany') return async (args: any) => {
+                      assert.deepEqual(args.where, { organizationId: scope.organizationId, customerTenantId: scope.tenantId,
+                        resourceType: 'LICENSES', requestedRevision: expectedRevision,
+                        completedRevision: { lt: expectedRevision } })
+                      const result = await delegate.updateMany(args)
+                      assert.equal(result.count, expectedCount)
+                      const pid = (await client.$queryRawUnsafe<Array<{ pid: number }>>('SELECT pg_backend_pid() AS pid'))[0].pid
+                      assert.equal(new Set([pid, producerPids[0], observerPid]).size, 3,
+                        'Materialization, actual producer and committed observer must be separate sessions')
+                      receiptAttempts.push({ revision: args.where.requestedRevision, count: result.count, pid })
+                      return result
+                    }
+                    const value = Reflect.get(delegate, operation, delegate)
+                    return typeof value === 'function' ? value.bind(delegate) : value
+                  },
+                })
+                const value = Reflect.get(client, field, client)
+                return typeof value === 'function' ? value.bind(client) : value
+              },
+            })), options)
+          const value = Reflect.get(target, property, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      }) as PrismaService
+      let resolved = 0
+      const notifications = { resolveIncident: async () => { resolved++ },
+        publishIncident: async () => assert.fail('The complete synthetic source must not publish a failure'),
+        publishIncidentIfMissingInTransaction: async () => assert.fail('The exact license event is not a security notice') }
+      const builder = new ChangeEvidenceService(database)
+      const service = new TenantSyncService(replayDb, {} as any, {} as any, notifications as any, builder, {} as any) as any
+      const producerService = new TenantSyncService(producerDb, {} as any, {} as any,
+        notifications as any, new ChangeEvidenceService(producer), {} as any) as any
+      service.logger = producerService.logger = { log() {}, warn() {}, error() {} }
+      const now = new Date()
+      const record = { organizationId: scope.organizationId, customerTenantId: scope.tenantId, microsoftAuditId: eventId,
+        eventDateTime: now, activityDisplayName: 'Assign license to user', category: 'LicenseManagement',
+        operationType: 'Update', result: 'success', resultReason: null, correlationId: null, loggedByService: 'Core Directory',
+        initiatedBy: {}, targetResources: [], additionalDetails: [], raw: { id: eventId }, ingestedAt: now,
+        expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000) }
+      assert.deepEqual(deriveAuditReconciliationResources([record]), ['LICENSES'])
+      assert.equal(directoryAuditSecurityIncident(tenant, record), null)
+      const expectedDifferences = builder.buildSnapshotDifferenceEvidence({ tenant, resourceType: 'LICENSES',
+        previousPayload: initial.snapshots[0].payload, currentPayload: newRows, observedAt: now,
+        baselineObservedAt: new Date(initial.snapshots[0].observed_at), expiresAt: record.expiresAt })
+      assert.equal(expectedDifferences.length, 2)
+      let providerCalls = 0
+      let produced: Awaited<ReturnType<typeof read>> | undefined
+      service.fetchGraphPage = async (url: string, token: string, label: string) => {
+        assert.equal(url, 'https://graph.microsoft.com/v1.0/subscribedSkus')
+        assert.equal(token, 'synthetic-token'); assert.equal(label, 'license')
+        assert.ok(++providerCalls <= 2)
+        if (providerCalls === 1) {
+          // Durable selection chose revision 2 before entering this provider gap.
+          // RUNNING is committed, but publication has not acquired its owner lock.
+          const gap = await read()
+          assert.equal(gap.state[0].status, 'RUNNING')
+          assert.equal(gap.state[0].last_successful_at, initial.state[0].last_successful_at)
+          assert.deepEqual(gap.inventory, initial.inventory)
+          assert.deepEqual(gap.snapshots, initial.snapshots)
+          assert.deepEqual(gap.work, initial.work)
+          assert.equal(BigInt(gap.authority.source_revision), BigInt(initial.authority.source_revision) + 1n)
+          assert.deepEqual(await producerService.persistDirectoryAuditRows(tenant, [record], owner, true),
+            { count: 1, requestedResources: ['LICENSES'] })
+          produced = await read()
+          assert.deepEqual(produced.work.map(row => [row.requested_revision, row.completed_revision]), [['3', '0']])
+          assert.equal(produced.work[0].last_completed_at, null)
+          assert.equal(produced.raw.length, 1)
+          assert.equal(produced.raw[0].row.microsoft_audit_id, eventId)
+          assert.deepEqual(produced.evidence.map(row => [row.source, row.source_event_id]), [['DIRECTORY_AUDIT', eventId]])
+          assert.deepEqual(produced.inventory, initial.inventory)
+          assert.deepEqual(produced.snapshots, initial.snapshots)
+          assert.equal(BigInt(produced.authority.source_revision), BigInt(gap.authority.source_revision) + 1n,
+            'Raw audit insertion invalidates authority in its own committed transaction')
+          assert.equal(produced.authority.current_snapshot_id, null)
+          assert.deepEqual(await producerService.persistDirectoryAuditRows(tenant, [record], owner, true),
+            { count: 0, requestedResources: [] })
+          assert.deepEqual(await read(), produced, 'Duplicate raw/evidence input must not advance work or authority')
+          assert.equal(producerPids.length, 2)
+          assert.ok(producerPids.every(pid => pid !== observerPid))
+        }
+        return Response.json({ value: graphRows })
+      }
+      await assert.rejects(service.reconcileDirectoryAuditChanges(tenant, 'synthetic-token', [], owner), error => {
+        assert.ok(error instanceof AuditReconciliationIncompleteError)
+        assert.deepEqual(error.failedResources, [])
+        assert.deepEqual(error.pendingResources, ['LICENSES'])
+        return true
+      })
+      assert.ok(produced)
+      assert.equal(providerCalls, 1)
+      assert.deepEqual(receiptAttempts.map(({ revision, count }) => [revision, count]), [[2n, 0]])
+      const pending = await read()
+      assert.deepEqual(pending.work, produced.work, 'A stale receipt cannot alter any newer request field')
+      assert.deepEqual(pending.snapshots[0].payload, newRows)
+      assert.deepEqual(pending.inventory, [{ sku: newSku, sku_part_number: 'NEW_PRODUCER_SKU', consumed_units: 1, enabled_units: 3 }])
+      assert.deepEqual(pending.evidence.filter(row => row.source === 'SNAPSHOT_DIFFERENCE').map(row => row.source_event_id).sort(),
+        expectedDifferences.map(row => row.sourceEventId).sort())
+      assert.deepEqual(pending.raw, produced.raw)
+      assert.equal(pending.state[0].status, 'SUCCEEDED')
+      assert.equal(pending.state[0].consecutive_failures, 0)
+      assert.ok(pending.state[0].last_successful_at)
+      assert.equal(resolved, 1, 'Resource recovery does not imply all replay work completed')
+      assert.equal(BigInt(pending.authority.source_revision), BigInt(initial.authority.source_revision) + 3n,
+        'RUNNING, raw audit insert and terminal state are separate authority advances')
+      assert.deepEqual(await read(1), sibling); assert.deepEqual(await read(2), otherOrganization)
+
+      // SUCCEEDED pending work is already eligible under the existing policy.
+      // No forced resource, new event, clock edit or cooldown change is needed.
+      expectedRevision = 3n; expectedCount = 1
+      await service.reconcileDirectoryAuditChanges(tenant, 'synthetic-token', [], owner)
+      const completed = await read()
+      assert.equal(providerCalls, 2)
+      assert.deepEqual(receiptAttempts.map(({ revision, count }) => [revision, count]), [[2n, 0], [3n, 1]])
+      assert.deepEqual(completed.work.map(row => [row.requested_revision, row.completed_revision]), [['3', '3']])
+      assert.deepEqual(completed.snapshots[0].payload, newRows)
+      assert.deepEqual(completed.inventory, pending.inventory)
+      assert.deepEqual(completed.evidence, pending.evidence, 'Unchanged replay cannot duplicate either evidence source')
+      assert.deepEqual(completed.raw, pending.raw)
+      assert.deepEqual((await f.observer.query(`SELECT work.last_completed_at IS NOT DISTINCT FROM snapshot.observed_at AS exact_match
+        FROM tenant_audit_reconciliation_work work JOIN tenant_entra_snapshots snapshot
+          ON snapshot.organization_id = work.organization_id AND snapshot.customer_tenant_id = work.customer_tenant_id
+          AND snapshot.resource_type = work.resource_type
+        WHERE work.organization_id = $1 AND work.customer_tenant_id = $2 AND work.resource_type = 'LICENSES'`,
+      [scope.organizationId, scope.tenantId])).rows, [{ exact_match: true }])
+      assert.equal(completed.state[0].status, 'SUCCEEDED')
+      assert.equal(resolved, 2)
+      assert.equal(BigInt(completed.authority.source_revision), BigInt(pending.authority.source_revision) + 2n)
+      assert.deepEqual(await read(1), sibling); assert.deepEqual(await read(2), otherOrganization)
+    } finally {
+      try { if (owner) assert.equal(await releaseTenantVisitLease(database, owner), true) }
+      finally { await Promise.all([database.$disconnect(), producer.$disconnect()]) }
+    }
+  })
 
 test('HAW-70 modeled license invalidation placement exposes the multi-row direct-writer lock cycle',
   { skip: !RUN, timeout: 60_000 }, async context => {
