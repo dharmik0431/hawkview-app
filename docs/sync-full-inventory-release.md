@@ -2,6 +2,10 @@
 
 This candidate is inactive by default. It does not change the cron trigger, Microsoft permissions, licence requirements, provider quotas, retention, or failure retry delays.
 
+The preparation release also contains two notification changes that apply while the switches are off. Recurring incident updates refresh category, severity, title, description, action links and expiry from the current incident payload, alongside the existing metadata, occurrence and resolution updates. An omitted expiry clears a previously stored expiry; severity follows the current payload rather than retaining the first occurrence's value. Directory-audit security titles state that a change occurred only when the audit result is successful; failed and unknown outcomes use outcome-appropriate titles while retaining the existing severity and routing rules. These changes must be included in preparation source review and must not be described as switch-gated.
+
+The lease and audit-ledger migrations include SQL-only CHECK constraints and a monotonic-revision trigger that are not represented by the Prisma models. Preserve these protections when changing the schema or its migration history. All three additive migrations use bounded lock and statement waits; a migration failure blocks rollout and does not authorize manual recovery.
+
 ## Intended behavior
 
 After release qualification, enabling `HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED=true` selects healthy full inventories at their inclusive twenty-minute eligibility boundary. Full USERS enumeration starts without the old delta checkpoint. Existing bounded collector limits and scheduler admission remain in force. A twenty-minute eligibility interval is not a guarantee that a provider-dependent visit finishes in twenty minutes.
@@ -20,7 +24,7 @@ Audit evidence and refresh requests commit together. A later owned visit can rep
 2. Pass ordinary checks and registered disposable PostgreSQL CI at that exact commit. Include stale-owner rejection, held-write takeover ordering, rollback, renewal uncertainty, admission contention, duplicate M365 events and durable replay after interruption.
 3. Verify the existing protected merge checks and configured automatic API and cron release. Do not bypass protection, manually recover deployments or run a manual sync.
 4. Verify deployed commit identity, actual health, the authenticated canary, and naturally scheduled freshness across the affected datasets. HTTP health alone does not establish data freshness.
-5. Follow the staged admission cutover below before enabling the qualified behavior. Then observe natural runs at the initially approved three-eligible-tenant scale. Record duration, completion, deferred sources and resource usage before making any broader capacity guarantee.
+5. Follow the staged admission cutover below before enabling the qualified behavior. Then observe natural runs for the existing eligible tenant fleet under its existing batch and resource limits. The 21 November preflight recorded six listed tenants and an unchanged batch limit of ten; this is not proof that all six are eligible or that every provider can finish within twenty minutes. Record duration, completion, deferred sources and resource usage before making any broader capacity guarantee.
 
 ## Staged admission cutover
 
