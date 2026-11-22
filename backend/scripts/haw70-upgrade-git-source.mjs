@@ -31,10 +31,13 @@ function oid(value) {
   if (typeof value !== 'string' || !oidPattern.test(value)) throw new Error('Exact SHA-1 commit identity required');
   return value;
 }
-function git(root, args, absentAllowed = false) {
+function git(root, args, absentAllowed = false, outputBound = MAX_BUFFER) {
+  // `maxBuffer` is the descriptor-level bound: the child is killed once it has
+  // produced more than this, so an oversized blob can never be read whole and
+  // then size-checked afterwards. Callers pass cap+1 to detect overflow.
   const result = spawnSync('/usr/bin/git', ['--no-pager', '--no-replace-objects',
     '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
-    '-C', root, ...args], { env: environment, shell: false, timeout: 15_000, maxBuffer: MAX_BUFFER });
+    '-C', root, ...args], { env: environment, shell: false, timeout: 15_000, maxBuffer: outputBound });
   if (result.error || result.signal || (result.status !== 0 && !(absentAllowed && result.status === 1))) {
     // Do not expose arbitrary Git stderr or source bytes in diagnostic output.
     throw new Error(`Read-only Git verification failed: ${args[0]}`);
@@ -79,7 +82,7 @@ function checkedPaths(expected) {
 function samePaths(actual, expected) {
   if (JSON.stringify([...actual].sort()) !== JSON.stringify(expected)) throw new Error('Selected namespace differs from manifest');
 }
-function gitSnapshot(root, commit, expected) {
+function gitSnapshot(root, commit, expected, caps = LEGACY_ACQUISITION_CAPS, budget = null) {
   const expectedPaths = checkedPaths(expected);
   const output = utf8(git(root, ['ls-tree', '-r', '-z', '--full-tree', oid(commit), '--', migrationRoot, ...extras]));
   if (!output.endsWith('\0')) throw new Error('Malformed Git tree output');
@@ -89,7 +92,22 @@ function gitSnapshot(root, commit, expected) {
     return { mode: match[1], blob: match[2], path: match[3] };
   });
   samePaths(entries.map(entry => entry.path), expectedPaths);
-  return entries.map(({ mode, blob, path }) => ({ mode, path, bytes: git(root, ['cat-file', 'blob', blob]) }));
+  // Aggregates are charged as each blob arrives, so an oversized snapshot is
+  // refused during acquisition rather than after every buffer is retained.
+  let snapshotBytes = 0;
+  const acquired = [];
+  for (const { mode, blob, path } of entries) {
+    const bytes = git(root, ['cat-file', 'blob', blob], false, caps.file + 1);
+    if (bytes.length > caps.file) throw new Error('Acquired selected file exceeds its byte cap');
+    snapshotBytes += bytes.length;
+    if (snapshotBytes > caps.snapshot) throw new Error('Acquired selected snapshot exceeds its byte cap');
+    if (budget) {
+      budget.bytes += bytes.length;
+      if (budget.bytes > caps.combined) throw new Error('Combined acquisition exceeds its byte cap');
+    }
+    acquired.push({ mode, path, bytes });
+  }
+  return acquired;
 }
 function assertDirectory(root, path) {
   let current = root;
@@ -149,8 +167,51 @@ function diskSnapshot(root, expected) {
   });
 }
 
+/**
+ * The pre-existing inspection profile. Unchanged on purpose: the public
+ * inspector's fail-closed behaviour is separately pinned, so tightening its
+ * bounds here would be a silent contract change. The reviewed staging caps
+ * live in the materializer and are passed in explicitly.
+ */
+export const LEGACY_ACQUISITION_CAPS = Object.freeze({
+  file: MAX_BUFFER, snapshot: Number.POSITIVE_INFINITY, combined: Number.POSITIVE_INFINITY,
+});
+
+/** Private copies, so nothing the caller receives aliases a hashed buffer. */
+const ownCopies = entries => entries.map(({ mode, path, bytes }) => {
+  const own = Buffer.allocUnsafe(bytes.length);
+  bytes.copy(own);
+  return { mode, path, bytes: own };
+});
+
+/**
+ * Acquire and verify in ONE operation, returning the public evidence plus
+ * privately owned raw buffers and the real Git metadata directories. This is
+ * strictly more work than the public inspector, never less: it is not a seam
+ * for supplying bytes, a manifest of hashes, a file list or an executable, and
+ * it grants no execution. A caller can only name a repository root, exact
+ * identities and the pins to verify against; every byte still comes from the
+ * pinned Git trees here.
+ */
+export function acquireMigrationGitSource(input, caps = LEGACY_ACQUISITION_CAPS) {
+  return inspectAndAcquire(input, caps);
+}
+
+export function acquireHaw70UpgradeGitSource(input, caps = LEGACY_ACQUISITION_CAPS) {
+  keys(input, ['repositoryRoot', 'expectedCandidateCommit']);
+  const acquired = acquireMigrationGitSource({ ...input,
+    baselineCommit: pins.baselineCommit, reviewedCandidateCommit: pins.reviewedCandidateCommit,
+    manifest: { baselineFiles: pins.baselineFiles, candidateFiles: pins.candidateFiles } }, caps);
+  assertPinnedHaw70Profile(acquired.evidence);
+  return acquired;
+}
+
 // Generic offline-fixture core. Supplied manifest/refs do not grant execution.
 export function inspectMigrationGitSource(input) {
+  return inspectAndAcquire(input, LEGACY_ACQUISITION_CAPS).evidence;
+}
+
+function inspectAndAcquire(input, caps) {
   keys(input, ['repositoryRoot', 'expectedCandidateCommit', 'baselineCommit', 'reviewedCandidateCommit', 'manifest']);
   const { repositoryRoot: root, manifest } = input;
   const head = oid(input.expectedCandidateCommit);
@@ -174,8 +235,9 @@ export function inspectMigrationGitSource(input) {
   if (gitText(root, ['rev-parse', '--verify', 'HEAD^{commit}']) !== head) throw new Error('Actual HEAD differs from expected candidate');
   assertRawAncestors(root, head, [baseline, reviewed]);
   const tree = readCommit(root, head).tree;
-  const baselineFiles = gitSnapshot(root, baseline, manifest.baselineFiles);
-  const candidateFiles = gitSnapshot(root, head, manifest.candidateFiles);
+  const budget = { bytes: 0 };
+  const baselineFiles = gitSnapshot(root, baseline, manifest.baselineFiles, caps, budget);
+  const candidateFiles = gitSnapshot(root, head, manifest.candidateFiles, caps, budget);
   const committedPlan = verifyMigrationSourceSnapshots(manifest, { baselineFiles, candidateFiles });
   const worktreePlan = verifyMigrationSourceSnapshots(manifest, {
     baselineFiles, candidateFiles: diskSnapshot(root, manifest.candidateFiles),
@@ -185,21 +247,31 @@ export function inspectMigrationGitSource(input) {
   samePaths(diskPaths(root, candidatePaths), candidatePaths);
   if (gitText(root, ['rev-parse', '--verify', 'HEAD^{commit}']) !== head
     || readCommit(root, head).tree !== tree || realpathSync(root) !== root) throw new Error('Source identity changed during inspection');
-  return freeze({ kind: 'migration-git-source-snapshot-only-v1', executionAllowed: false,
+  const evidence = freeze({ kind: 'migration-git-source-snapshot-only-v1', executionAllowed: false,
     gitSnapshotVerified: true, repositoryRoot: root, candidateCommit: head, candidateTree: tree,
     baselineCommit: baseline, reviewedCandidateCommit: reviewed, sourcePlan: worktreePlan });
+  // A linked worktree's `.git` is a pointer FILE, so it is not a containment
+  // boundary. Resolve the real metadata directories from Git itself and hand
+  // them to the acquirer; the public evidence shape is deliberately unchanged.
+  const gitDirectories = freeze([...new Set(['--absolute-git-dir', '--git-common-dir']
+    .map(flag => realpathSync(resolve(root, gitText(root, ['rev-parse', flag])))))]);
+  return { evidence, gitDirectories,
+    raw: { baseline: ownCopies(baselineFiles), candidate: ownCopies(candidateFiles) } };
 }
 
-export function inspectHaw70UpgradeGitSource(input) {
-  keys(input, ['repositoryRoot', 'expectedCandidateCommit']);
-  const evidence = inspectMigrationGitSource({ ...input,
-    baselineCommit: pins.baselineCommit, reviewedCandidateCommit: pins.reviewedCandidateCommit,
-    manifest: { baselineFiles: pins.baselineFiles, candidateFiles: pins.candidateFiles } });
-  // The adapter used the same pins and verified raw bytes. Retain the pure
-  // wrapper's fixed-profile constraints without accepting a caller override.
+// The adapter used the same pins and verified raw bytes. Retain the pure
+// wrapper's fixed-profile constraints without accepting a caller override.
+function assertPinnedHaw70Profile(evidence) {
   if (evidence.sourcePlan.baselineFiles.length !== 85 || evidence.sourcePlan.candidateFiles.length !== 99
     || evidence.sourcePlan.migrationAdditions.length !== 14
     || evidence.sourcePlan.baselineDigest !== pins.baselineDigest
     || evidence.sourcePlan.candidateDigest !== pins.candidateDigest) throw new Error('Pinned HAW-70 profile mismatch');
   return evidence;
+}
+
+export function inspectHaw70UpgradeGitSource(input) {
+  keys(input, ['repositoryRoot', 'expectedCandidateCommit']);
+  return assertPinnedHaw70Profile(inspectMigrationGitSource({ ...input,
+    baselineCommit: pins.baselineCommit, reviewedCandidateCommit: pins.reviewedCandidateCommit,
+    manifest: { baselineFiles: pins.baselineFiles, candidateFiles: pins.candidateFiles } }));
 }
