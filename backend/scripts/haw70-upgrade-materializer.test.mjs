@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import dns from 'node:dns';
 import net from 'node:net';
 import { chmodSync, cpSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync,
-  readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+  readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test, { after } from 'node:test';
@@ -13,6 +13,7 @@ import {
   HAW70_STAGE_CAPS, materializeHaw70UpgradeSource, materializeMigrationSource,
   validateHaw70UpgradeStagedSource, validateMigrationStagedSource,
 } from './haw70-upgrade-materializer.mjs';
+import { LEGACY_ACQUISITION_CAPS, inspectMigrationGitSource } from './haw70-upgrade-git-source.mjs';
 
 /**
  * Focused nonconnecting tests for the inactive HAW-70 materializer.
@@ -376,12 +377,12 @@ test('a selected snapshot over two mebibytes is refused incrementally during acq
   assert.ok(additions.length * chunk + 16 * 1024 < HAW70_STAGE_CAPS.combined,
     'the combined cap must not be what refuses this case either');
 
-  // The combined bound is implemented and charged incrementally, but under the
-  // REVIEWED caps it can never bind first: the per-snapshot check runs before
-  // it, and 2 x snapshot is exactly combined, so exceeding 4 MiB in total
-  // requires one snapshot to have already exceeded 2 MiB. Recorded rather than
-  // dressed up as an independently exercised limit.
+  // Acquisition now charges THREE selected snapshots against the combined
+  // budget -- committed baseline, committed candidate and the mutable-checkout
+  // verification read -- so 4 MiB is reachable before any single snapshot
+  // exceeds 2 MiB. Recorded as arithmetic, with its own isolated case below.
   assert.equal(2 * HAW70_STAGE_CAPS.snapshot, HAW70_STAGE_CAPS.combined);
+  assert.ok(3 * HAW70_STAGE_CAPS.snapshot > HAW70_STAGE_CAPS.combined);
 
   // POSITIVE CONTROL: the same shape just under the snapshot cap stages.
   const under = Math.floor((HAW70_STAGE_CAPS.snapshot - 32 * 1024) / additions.length);
@@ -459,6 +460,7 @@ test('a symlink, hardlink, executable mode or loosened directory mode under a st
     const { result, consume } = stagedCase(`substitute-${change}`);
     const relative = anyStagedMigration(result.receipt);
     const target = join(result.outputRoot, relative);
+    const namespaceBefore = walk(result.outputRoot);
     if (change === 'file-symlink') {
       const copy = join(scratch, `sub-${++serial}.sql`);
       cpSync(target, copy);
@@ -473,9 +475,14 @@ test('a symlink, hardlink, executable mode or loosened directory mode under a st
       symlinkSync(copy, directory);
     }
     if (change === 'hardlink') {
-      const copy = join(result.outputRoot, 'candidate/migrations/20260101000000_link/migration.sql');
-      mkdirSync(dirname(copy), { mode: 0o700 });
-      linkSync(target, copy);
+      // OUTSIDE the staged root. The previous version put the alias inside the
+      // namespace, so `inspectNamespace` refused the extra paths before the
+      // link count was ever read and the test passed without exercising it.
+      const alias = join(scratch, `alias-${++serial}.sql`);
+      linkSync(target, alias);
+      assert.equal(statSync(target).nlink, 2, 'the staged file must really have two links');
+      assert.deepEqual(walk(result.outputRoot), namespaceBefore,
+        'the staged namespace itself must be unchanged by the external link');
     }
     if (change === 'executable') chmodSync(target, 0o700);
     if (change === 'directory-mode') chmodSync(join(result.outputRoot, 'candidate'), 0o755);
@@ -634,4 +641,272 @@ test('every returned receipt and result is deeply frozen and refuses execution',
   assert.throws(() => { result.receipt.stages.candidate.files.push({}); }, TypeError);
   assert.equal(JSON.stringify(result.receipt).includes('postgres'), false);
   assert.equal(JSON.stringify(result.receipt).includes('://'), false);
+});
+
+
+/* ===================== review corrections: focused controls ===================== */
+
+/**
+ * Finding 1. Valid COMMITTED source with corrupted CHECKOUT bytes. The
+ * committed blobs stay small, so `gitSnapshot` cannot be what refuses; only the
+ * checkout verification read can. The assertion names the checkout cap, which
+ * is what distinguishes an early bounded refusal from the later digest
+ * mismatch that used to be the only thing standing in the way.
+ */
+test('an oversized checkout file is refused by the bounded checkout read, not by a later digest mismatch', () => {
+  const { root, source } = small.fixture();
+  const relative = migrationPath(1);
+  // Valid committed bytes; only the working-tree copy is oversized.
+  writeFileSync(join(root, relative), Buffer.alloc(HAW70_STAGE_CAPS.checkout + 1, 0x62));
+  const parent = parentFor('checkout-file-cap');
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent }),
+    /Selected worktree file exceeds its byte cap/);
+  assert.deepEqual(readdirSync(parent), []);
+  // The committed side really is small, so the per-file Git cap is not the
+  // refusing term, and the digest mismatch is not reached.
+  const committed = spawnSync('/usr/bin/git', ['-C', root, 'cat-file', '-s', `HEAD:${relative}`], { encoding: 'utf8' });
+  assert.ok(Number(committed.stdout.trim()) < 4096);
+  // And the validator takes the same route.
+  assert.throws(() => validateMigrationStagedSource({ ...source, outputRoot: parent }),
+    /Selected worktree file exceeds its byte cap/);
+});
+
+test('a cumulatively oversized checkout snapshot is refused incrementally, with every file under its own cap', () => {
+  const { root, source } = small.fixture();
+  const relatives = [1, 2, 4].map(migrationPath);
+  const each = Math.ceil((HAW70_STAGE_CAPS.snapshot + 4096) / relatives.length);
+  assert.ok(each < HAW70_STAGE_CAPS.checkout, 'no single checkout file may breach the per-file cap');
+  for (const relative of relatives) writeFileSync(join(root, relative), Buffer.alloc(each, 0x63));
+  const parent = parentFor('checkout-snapshot-cap');
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent }),
+    /Selected worktree snapshot exceeds its byte cap|Combined acquisition exceeds its byte cap/);
+  assert.deepEqual(readdirSync(parent), []);
+  // POSITIVE CONTROL: the same route with an intact checkout stages cleanly, so
+  // the refusals above are the caps and not the route being broken.
+  const clean = small.fixture();
+  assert.equal(materializeMigrationSource({ ...clean.source, scratchParent: parentFor('checkout-cap-control') })
+    .receipt.stages.candidate.migrationCount, 5);
+});
+
+test('the public inspector keeps its legacy checkout profile deliberately', () => {
+  const { root, source } = small.fixture();
+  const oversizedForMaterializer = HAW70_STAGE_CAPS.checkout + 1;
+  assert.ok(oversizedForMaterializer < LEGACY_ACQUISITION_CAPS.file,
+    'the case must sit between the materializer cap and the legacy allowance');
+  const bytes = Buffer.alloc(oversizedForMaterializer, 0x64);
+  writeFileSync(join(root, migrationPath(1)), bytes);
+  // The inspector still reaches its own digest refusal rather than a cap.
+  assert.throws(() => inspectMigrationGitSource(source), /Candidate snapshot differs|Worktree does not match/);
+  // The materializer refuses the same checkout earlier, on its own cap.
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parentFor('legacy-profile') }),
+    /Selected worktree file exceeds its byte cap/);
+});
+
+/**
+ * Finding 3. The boundary discriminates the off-by-one. With exactly ONE extra
+ * entry the total is expected+1: incremental enumeration stops on observing it,
+ * whereas a bound of expected+1 compared with `>` would accept it and fail
+ * later with a namespace-set mismatch instead.
+ */
+test('staged namespace enumeration stops on observing one entry past the expected count', () => {
+  const one = stagedCase('enumeration-boundary');
+  writeFileSync(join(one.result.outputRoot, 'candidate/migrations/extra-one.sql'), '-- one extra\n');
+  assert.throws(one.consume, /Staged namespace enumeration bound exceeded/,
+    'one extra entry must be refused during enumeration, not after set comparison');
+
+  // A large fan-out is refused on the same path, so the refusal is not waiting
+  // for a complete listing to be built first.
+  const many = stagedCase('enumeration-fanout');
+  const directory = join(many.result.outputRoot, 'candidate/migrations');
+  for (let index = 0; index < 2000; index += 1) {
+    writeFileSync(join(directory, `fanout-${index}.sql`), '-- fan out\n');
+  }
+  assert.throws(many.consume, /Staged namespace enumeration bound exceeded/);
+
+  // CONTROL: exactly the expected set, with one name WRONG, is refused by the
+  // set comparison instead -- so the two failure modes are distinguishable and
+  // the boundary assertion above is meaningful.
+  const renamed = stagedCase('enumeration-renamed');
+  const victim = join(renamed.result.outputRoot, anyStagedMigration(renamed.result.receipt));
+  renameSync(victim, join(dirname(victim), 'renamed.sql'));
+  assert.throws(renamed.consume, /Staged file namespace differs from the fixed mapping/);
+});
+
+test('the selected checkout namespace is enumerated under the materializer bound too', () => {
+  const { root, source } = small.fixture();
+  put(root, 'backend/prisma/migrations/20260101000099_extra/migration.sql', '-- extra\n');
+  const parent = parentFor('checkout-enumeration');
+  // Either bound is a correct refusal; what matters is that the materializer
+  // path refuses while walking rather than after building the whole listing.
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent }),
+    /Selected namespace enumeration bound exceeded|unexpected directory|namespace differs/);
+  assert.deepEqual(readdirSync(parent), []);
+});
+
+/**
+ * Finding 4. Corruption AT the post-write phase, through the fixture-only seam,
+ * executing the real helper. After-creation consumer tests cannot establish
+ * this: they run a different function.
+ */
+test('post-write verification refuses a receipt corrupted between writing and verifying', () => {
+  const cases = [
+    ['bytes', path => writeFileSync(path, '{"kind":"haw70-migration-stage-receipt-v1"}\n'),
+      /Staged receipt does not match the bytes that were written/],
+    ['truncated', path => writeFileSync(path, ''),
+      /Staged receipt does not match the bytes that were written/],
+    ['executable', path => chmodSync(path, 0o700), /receipt\.json: staged file must not be executable/],
+    ['hardlinked', path => { linkSync(path, join(scratch, `receipt-alias-${++serial}.json`)); },
+      /receipt\.json: staged file must have a single link/],
+  ];
+  for (const [label, corrupt, expected] of cases) {
+    const { source } = small.fixture();
+    const parent = parentFor(`post-write-receipt-${label}`);
+    let observed = null;
+    assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent,
+      afterWriteForTests: ({ receiptPath }) => { observed = receiptPath; corrupt(receiptPath); } }),
+    expected, label);
+    assert.ok(observed, 'the seam must have run, so the corruption really was at the post-write phase');
+    // The failed root is left in place for inspection, never cleaned.
+    assert.equal(existsSync(observed), true, 'the failed root and its receipt remain for inspection');
+    assert.equal(readdirSync(parent).length, 1, 'a failed root remains, and only one was created');
+  }
+});
+
+test('post-write verification refuses a stage file corrupted between writing and verifying', () => {
+  for (const [label, corrupt, expected] of [
+    ['bytes', path => writeFileSync(path, '-- corrupted at the post-write phase\n'),
+      /does not match its recorded bytes/],
+    ['removed', path => rmSync(path), /Staged file namespace differs from the fixed mapping/],
+    ['executable', path => chmodSync(path, 0o700), /staged file must not be executable/],
+  ]) {
+    const { source } = small.fixture();
+    const parent = parentFor(`post-write-stage-${label}`);
+    let ran = false;
+    assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent,
+      afterWriteForTests: ({ outputRoot }) => {
+        ran = true;
+        corrupt(join(outputRoot, `candidate/migrations/${stamp(1)}_synthetic_1/migration.sql`));
+      } }), expected, label);
+    assert.ok(ran);
+  }
+});
+
+test('source movement DURING materialization is refused by the post-write revalidation', () => {
+  const { root, source } = small.fixture();
+  const parent = parentFor('source-during');
+  let ran = false;
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parent,
+    afterWriteForTests: () => {
+      ran = true;
+      // Moved after the staged bytes were written and before revalidation: the
+      // exact window the earlier test title claimed but did not exercise.
+      writeFileSync(join(root, migrationPath(1)), '-- moved during materialization\n');
+    } }), /Candidate snapshot differs|Worktree does not match|Selected file changed|Source identity or selected bytes changed/);
+  assert.ok(ran, 'the movement must have happened inside the operation');
+  assert.equal(readdirSync(parent).length, 1, 'the failed root is left in place');
+});
+
+test('the fixture seam is reachable only through the generic core and adds no authority', () => {
+  const base = { repositoryRoot, expectedCandidateCommit: actualHead, scratchParent: parentFor('seam-pinned') };
+  assert.throws(() => materializeHaw70UpgradeSource({ ...base, afterWriteForTests: () => {} }),
+    /unexpected shape/, 'the pinned entry must refuse the seam');
+  assert.throws(() => validateHaw70UpgradeStagedSource({ repositoryRoot, expectedCandidateCommit: actualHead,
+    outputRoot: base.scratchParent, afterWriteForTests: () => {} }), /unexpected shape/);
+  const { source } = small.fixture();
+  assert.throws(() => materializeMigrationSource({ ...source, scratchParent: parentFor('seam-type'),
+    afterWriteForTests: 'not a function' }), /fixture seam must be a function/);
+  // A seam that changes nothing cannot turn a refusal into a success, and
+  // cannot make a generic root acceptable to the pinned validator.
+  const ok = materializeMigrationSource({ ...small.fixture().source, scratchParent: parentFor('seam-noop'),
+    afterWriteForTests: () => {} });
+  assert.equal(ok.executionAllowed, false);
+  assert.throws(() => validateHaw70UpgradeStagedSource(
+    { repositoryRoot, expectedCandidateCommit: actualHead, outputRoot: ok.outputRoot }),
+  /Receipt does not match|namespace differs/);
+});
+
+/**
+ * Finding 5. A byte-perfect staged tree that has been relocated under the
+ * checkout or either real Git metadata directory is not an isolated root, and a
+ * valid copied receipt is not authority to skip that check. Covered on a LINKED
+ * worktree, where `.git` is a pointer file and the common directory is
+ * elsewhere.
+ */
+test('consumption rejects an otherwise valid staged root relocated into the checkout or Git metadata', () => {
+  const { root, source } = small.fixture();
+  // A linked worktree of the same fixture: pointer-file .git, separate common dir.
+  const linked = join(scratch, `linked-${++serial}`);
+  git(root, 'worktree', 'add', '--detach', linked, source.expectedCandidateCommit);
+  const linkedRoot = realpathSync(linked);
+  assert.ok(statSync(join(linkedRoot, '.git')).isFile(), 'the fixture must be a linked worktree');
+  const gitDir = realpathSync(git(linkedRoot, 'rev-parse', '--absolute-git-dir'));
+  const commonDir = realpathSync(git(linkedRoot, 'rev-parse', '--git-common-dir'));
+  assert.notEqual(gitDir, commonDir, 'a linked worktree must have a distinct Git directory');
+
+  const linkedSource = { ...source, repositoryRoot: linkedRoot };
+  const isolated = parentFor('relocate-isolated');
+  const staged = materializeMigrationSource({ ...linkedSource, scratchParent: isolated });
+  // POSITIVE CONTROL first: in its isolated location it validates.
+  assert.equal(validateMigrationStagedSource({ ...linkedSource, outputRoot: staged.outputRoot })
+    .executionAllowed, false);
+
+  const faithful = (destination) => {
+    cpSync(staged.outputRoot, destination, { recursive: true, preserveTimestamps: true });
+    for (const entry of walk(destination).directories) chmodSync(join(destination, entry), 0o700);
+    chmodSync(destination, 0o700);
+    return realpathSync(destination);
+  };
+  for (const [label, destination] of [
+    ['inside the checkout', join(linkedRoot, 'relocated-stage')],
+    ['inside the worktree Git directory', join(gitDir, 'relocated-stage')],
+    ['inside the common Git directory', join(commonDir, 'relocated-stage')],
+  ]) {
+    const moved = faithful(destination);
+    assert.throws(() => validateMigrationStagedSource({ ...linkedSource, outputRoot: moved }),
+      /Output root is not isolated/, label);
+  }
+  // And a faithful copy in an isolated place still validates, so the refusals
+  // above are the containment check and not the copy being unfaithful.
+  const elsewhere = faithful(join(parentFor('relocate-elsewhere'), 'stage'));
+  assert.equal(validateMigrationStagedSource({ ...linkedSource, outputRoot: elsewhere })
+    .executionAllowed, false);
+});
+
+/**
+ * Finding 2. A statically substituted FIFO receipt must be REFUSED, and a
+ * timeout is a failed test rather than a successful refusal.
+ */
+test('a FIFO receipt is refused without blocking, observed in a bounded child process', () => {
+  const { source } = small.fixture();
+  const parent = parentFor('fifo');
+  const staged = materializeMigrationSource({ ...source, scratchParent: parent });
+  const inputPath = join(scratch, `fifo-input-${++serial}.json`);
+  writeFileSync(inputPath, JSON.stringify({ ...source, outputRoot: staged.outputRoot }));
+  const runner = join(scratch, `fifo-runner-${serial}.mjs`);
+  writeFileSync(runner, `
+import { readFileSync } from 'node:fs';
+import { validateMigrationStagedSource } from '${join(import.meta.dirname, 'haw70-upgrade-materializer.mjs')}';
+const input = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+try { validateMigrationStagedSource(input); process.stdout.write('ACCEPTED'); }
+catch (error) { process.stdout.write('REFUSED:' + error.message); }
+`);
+  const child = (label) => {
+    const result = spawnSync(process.execPath, [runner, inputPath],
+      { encoding: 'utf8', timeout: 20_000, env: environment });
+    assert.equal(result.signal, null, `${label}: the child must exit on its own, not be killed on timeout`);
+    assert.equal(result.error, undefined, `${label}: ${result.error?.message ?? ''}`);
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    return result.stdout;
+  };
+  // POSITIVE CONTROL: the ordinary receipt is accepted by the same harness.
+  assert.equal(child('regular receipt'), 'ACCEPTED');
+
+  const receipt = join(staged.outputRoot, 'receipt.json');
+  rmSync(receipt);
+  const mkfifo = spawnSync('/usr/bin/mkfifo', [receipt], { encoding: 'utf8' });
+  assert.equal(mkfifo.status, 0, mkfifo.stderr);
+  assert.equal(statSync(receipt).isFIFO(), true, 'the substituted receipt must really be a FIFO');
+  const output = child('FIFO receipt');
+  assert.match(output, /^REFUSED:/, 'a FIFO receipt must be refused, not accepted');
+  assert.match(output, /nonregular entry|regular file required/);
 });

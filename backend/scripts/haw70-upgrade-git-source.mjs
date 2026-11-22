@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { constants, existsSync, fstatSync, lstatSync, openSync, closeSync,
-  readFileSync, readdirSync, realpathSync } from 'node:fs';
+  opendirSync, readFileSync, readSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import pins from './haw70-upgrade-source-manifest.json' with { type: 'json' };
 import { verifyMigrationSourceSnapshots } from './haw70-upgrade-source-plan.mjs';
@@ -117,14 +117,22 @@ function assertDirectory(root, path) {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Selected parent must be a real directory');
   }
 }
-function diskPaths(root, expectedPaths) {
+function diskPaths(root, expectedPaths, caps = LEGACY_ACQUISITION_CAPS) {
   assertDirectory(root, migrationRoot);
   const directories = new Set(expectedPaths.filter(path => path.startsWith(`${migrationRoot}/`))
     .map(path => path.slice(0, path.lastIndexOf('/'))));
+  // The migrations walk observes the lock file, one entry per expected
+  // migration directory and one file inside each, so the exact expected count
+  // is known up front. Observing one more than that stops the walk.
+  const migrations = [...directories].filter(path => path !== migrationRoot).length;
+  const bound = caps.boundedEnumeration === true
+    ? 1 + 2 * migrations : Number.POSITIVE_INFINITY;
   const found = [];
+  let seen = 0;
   const walk = relative => {
     assertDirectory(root, relative);
-    for (const entry of readdirSync(join(root, relative), { withFileTypes: true })) {
+    forEachEntry(join(root, relative), entry => {
+      if (++seen > bound) throw new Error('Selected namespace enumeration bound exceeded');
       const path = `${relative}/${entry.name}`;
       if (entry.isSymbolicLink()) throw new Error('Selected namespace contains a symlink');
       if (entry.isDirectory()) {
@@ -133,19 +141,26 @@ function diskPaths(root, expectedPaths) {
       }
       else if (entry.isFile() && selected(path)) found.push(path);
       else throw new Error('Selected namespace contains an unexpected entry');
-    }
+      return true;
+    });
   };
   walk(migrationRoot);
   return [...found, ...extras];
 }
-function diskSnapshot(root, expected) {
+function diskSnapshot(root, expected, caps = LEGACY_ACQUISITION_CAPS, budget = null) {
   const expectedPaths = checkedPaths(expected);
-  samePaths(diskPaths(root, expectedPaths), expectedPaths);
+  samePaths(diskPaths(root, expectedPaths, caps), expectedPaths);
+  // The mutable-checkout read is a third acquisition of the selected set and is
+  // charged like the other two: per file, per snapshot, and against the shared
+  // combined budget. Previously it ran unbounded at the legacy allowance, so an
+  // oversized or cumulatively oversized checkout was fully buffered and only
+  // then refused by the later digest comparison.
+  let snapshotBytes = 0;
   return expectedPaths.map(path => {
     assertDirectory(root, path.slice(0, path.lastIndexOf('/')));
     const fullPath = join(root, path);
     const stat = lstatSync(fullPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) !== 0 || stat.size > MAX_BUFFER) {
+    if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o111) !== 0) {
       throw new Error('Selected worktree entry must be a bounded non-executable regular file');
     }
     const fd = openSync(fullPath, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -154,13 +169,19 @@ function diskSnapshot(root, expected) {
       if (!before.isFile() || before.dev !== stat.dev || before.ino !== stat.ino
         || before.mode !== stat.mode || before.size !== stat.size || before.mtimeMs !== stat.mtimeMs
         || before.ctimeMs !== stat.ctimeMs) throw new Error('Selected file changed while opening');
-      const bytes = readFileSync(fd);
+      const bytes = readBoundedDescriptor(fd, caps.checkout, 'Selected worktree file');
       const after = fstatSync(fd);
       const linked = lstatSync(fullPath);
-      if (bytes.length > MAX_BUFFER || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      if (before.size !== after.size || before.mtimeMs !== after.mtimeMs
         || before.ctimeMs !== after.ctimeMs || before.mode !== after.mode
         || linked.dev !== after.dev || linked.ino !== after.ino || linked.isSymbolicLink()) {
         throw new Error('Selected file changed while reading');
+      }
+      snapshotBytes += bytes.length;
+      if (snapshotBytes > caps.snapshot) throw new Error('Selected worktree snapshot exceeds its byte cap');
+      if (budget) {
+        budget.bytes += bytes.length;
+        if (budget.bytes > caps.combined) throw new Error('Combined acquisition exceeds its byte cap');
       }
       return { path, mode: '100644', bytes };
     } finally { closeSync(fd); }
@@ -175,7 +196,46 @@ function diskSnapshot(root, expected) {
  */
 export const LEGACY_ACQUISITION_CAPS = Object.freeze({
   file: MAX_BUFFER, snapshot: Number.POSITIVE_INFINITY, combined: Number.POSITIVE_INFINITY,
+  // The mutable-checkout verification read and the selected-namespace walk had
+  // no profile of their own, so they ran at the legacy allowance even when the
+  // caller asked for the materializer bounds. They are explicit now; these two
+  // values keep the public inspector exactly as it was.
+  checkout: MAX_BUFFER, boundedEnumeration: false,
 });
+
+/**
+ * Reads at most `cap + 1` bytes from an already-open descriptor, so overflow is
+ * OBSERVED rather than inferred from a pre-read size the file may no longer
+ * have. A pre-read size check alone does not bound the read.
+ */
+function readBoundedDescriptor(fd, cap, label) {
+  const buffer = Buffer.allocUnsafe(Math.min(cap, MAX_BUFFER) + 1);
+  let total = 0;
+  for (;;) {
+    if (total > cap) break;
+    const read = readSync(fd, buffer, total, buffer.length - total, null);
+    if (read === 0) break;
+    total += read;
+  }
+  if (total > cap) throw new Error(`${label} exceeds its byte cap`);
+  return buffer.subarray(0, total);
+}
+
+/**
+ * Incremental directory iteration with the handle closed on every exit, so a
+ * very large fan-out is refused while being walked instead of being allocated
+ * in full first. `onEntry` returning false stops the walk.
+ */
+function forEachEntry(absolute, onEntry) {
+  const dir = opendirSync(absolute);
+  try {
+    for (;;) {
+      const entry = dir.readSync();
+      if (entry === null) return;
+      if (onEntry(entry) === false) return;
+    }
+  } finally { dir.closeSync(); }
+}
 
 /** Private copies, so nothing the caller receives aliases a hashed buffer. */
 const ownCopies = entries => entries.map(({ mode, path, bytes }) => {
@@ -240,11 +300,11 @@ function inspectAndAcquire(input, caps) {
   const candidateFiles = gitSnapshot(root, head, manifest.candidateFiles, caps, budget);
   const committedPlan = verifyMigrationSourceSnapshots(manifest, { baselineFiles, candidateFiles });
   const worktreePlan = verifyMigrationSourceSnapshots(manifest, {
-    baselineFiles, candidateFiles: diskSnapshot(root, manifest.candidateFiles),
+    baselineFiles, candidateFiles: diskSnapshot(root, manifest.candidateFiles, caps, budget),
   });
   if (committedPlan.candidateDigest !== worktreePlan.candidateDigest) throw new Error('Worktree does not match committed source');
   const candidatePaths = checkedPaths(manifest.candidateFiles);
-  samePaths(diskPaths(root, candidatePaths), candidatePaths);
+  samePaths(diskPaths(root, candidatePaths, caps), candidatePaths);
   if (gitText(root, ['rev-parse', '--verify', 'HEAD^{commit}']) !== head
     || readCommit(root, head).tree !== tree || realpathSync(root) !== root) throw new Error('Source identity changed during inspection');
   const evidence = freeze({ kind: 'migration-git-source-snapshot-only-v1', executionAllowed: false,

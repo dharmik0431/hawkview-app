@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { constants, closeSync, fstatSync, lstatSync, mkdirSync, openSync,
-  readSync, readdirSync, realpathSync, writeSync } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, mkdirSync, opendirSync, openSync,
+  readSync, realpathSync, writeSync } from 'node:fs';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import pins from './haw70-upgrade-source-manifest.json' with { type: 'json' };
 import { acquireHaw70UpgradeGitSource, acquireMigrationGitSource } from './haw70-upgrade-git-source.mjs';
@@ -27,6 +27,13 @@ import { acquireHaw70UpgradeGitSource, acquireMigrationGitSource } from './haw70
  * seam for refusal tests only: it still acquires every byte from the Git trees
  * it is pointed at, and it cannot execute anything either.
  *
+ * BOUNDS. Per-file, per-snapshot and combined caps are charged incrementally
+ * during acquisition, including the mutable-checkout verification read, and
+ * every descriptor read stops at cap plus one byte. The staged namespace and
+ * the selected checkout namespace are enumerated incrementally and stop one
+ * entry past the exact expected count. The public inspector keeps its own
+ * pre-existing legacy profile deliberately.
+ *
  * SUPPORTED CONTEXT, stated rather than exaggerated. A private hosted-job
  * scratch directory with no untrusted concurrent writer sharing this OS
  * identity. The namespace, mode, link-count, length and digest checks detect
@@ -40,6 +47,11 @@ const MiB = 1024 * 1024;
  *  pre-read size and then reading without a bound. */
 export const HAW70_STAGE_CAPS = Object.freeze({
   file: MiB, snapshot: 2 * MiB, combined: 4 * MiB, stage: 2 * MiB, receipt: 128 * 1024,
+  // The mutable-checkout verification read and the selected-namespace walk get
+  // the materializer profile too. Without these the acquisition ran those two
+  // steps at the legacy 8 MiB whole-file allowance, so an oversized checkout
+  // was buffered in full and only refused later by the digest comparison.
+  checkout: MiB, boundedEnumeration: true,
 });
 
 const SCHEMA_SOURCE = 'backend/prisma/schema.prisma';
@@ -79,6 +91,19 @@ function canonicalDirectory(value, label) {
   return value;
 }
 const within = (inner, outer) => inner === outer || inner.startsWith(outer.endsWith(sep) ? outer : outer + sep);
+
+/**
+ * The checkout and BOTH real Git metadata directories, in either direction. A
+ * linked worktree's `.git` is a pointer file, so `--absolute-git-dir` and
+ * `--git-common-dir` are resolved from Git during acquisition and both are
+ * excluded here.
+ */
+function assertIsolatedRoot(candidate, checkout, gitDirectories, message) {
+  for (const forbidden of [checkout, ...gitDirectories]) {
+    if (within(candidate, forbidden) || within(forbidden, candidate)) throw new Error(message);
+  }
+  return candidate;
+}
 
 /* ----------------------------- fixed stage mapping ----------------------------- */
 
@@ -136,7 +161,12 @@ function assertDistinctMigrationSelection(baseline, candidate) {
 /** Reads at most `cap + 1` bytes, so overflow is observed instead of inferred
  *  from a size the file no longer has. */
 function readBoundedFile(absolutePath, cap, label) {
-  const fd = openSync(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  // O_NONBLOCK so a statically substituted FIFO cannot park this call inside
+  // `open` before the regular-file refusal below is ever reached. The namespace
+  // pass already refuses nonregular entries without opening them at all; this
+  // is the second line of defence, not the first.
+  const fd = openSync(absolutePath,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error(`${label}: regular file required`);
@@ -189,7 +219,10 @@ function makeExclusiveDirectory(absolutePath, label) {
  * one so a hostile fan-out cannot be walked indefinitely.
  */
 function inspectNamespace(root, expectedFiles, expectedDirectories) {
-  const limit = expectedFiles.size + expectedDirectories.size + 1;
+  // Exactly the expected entry count: observing ONE more than that stops the
+  // walk. The previous bound was expected+1 and the comparison was `>`, so it
+  // only refused after observing expected+2.
+  const limit = expectedFiles.size + expectedDirectories.size;
   const files = new Set();
   const directories = new Set();
   const pending = [''];
@@ -200,14 +233,22 @@ function inspectNamespace(root, expectedFiles, expectedDirectories) {
     const stat = lstatSync(absolute);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Staged namespace contains a nondirectory parent');
     if ((stat.mode & 0o7777) !== DIRECTORY_MODE) throw new Error('Staged directory must stay owner-only');
-    for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-      if (++seen > limit) throw new Error('Staged namespace enumeration bound exceeded');
-      const path = relative ? `${relative}/${entry.name}` : entry.name;
-      if (entry.isSymbolicLink()) throw new Error('Staged namespace contains a symlink');
-      if (entry.isDirectory()) { directories.add(path); pending.push(path); }
-      else if (entry.isFile()) files.add(path);
-      else throw new Error('Staged namespace contains a nonregular entry');
-    }
+    // Incremental iteration with the directory handle closed on every exit, so
+    // a very large fan-out is refused WHILE being walked rather than allocated
+    // in full by an eager readdir and only counted afterwards.
+    const dir = opendirSync(absolute);
+    try {
+      for (;;) {
+        const entry = dir.readSync();
+        if (entry === null) break;
+        if (++seen > limit) throw new Error('Staged namespace enumeration bound exceeded');
+        const path = relative ? `${relative}/${entry.name}` : entry.name;
+        if (entry.isSymbolicLink()) throw new Error('Staged namespace contains a symlink');
+        if (entry.isDirectory()) { directories.add(path); pending.push(path); }
+        else if (entry.isFile()) files.add(path);
+        else throw new Error('Staged namespace contains a nonregular entry');
+      }
+    } finally { dir.closeSync(); }
   }
   const same = (actual, expected, what) => {
     if ([...actual].sort().join('\u0000') !== [...expected].sort().join('\u0000')) {
@@ -291,7 +332,7 @@ function checkReceiptShape(receipt) {
 
 /* --------------------------------- materialize --------------------------------- */
 
-function materializeAcquired(acquired, scratchParent, reacquire) {
+function materializeAcquired(acquired, scratchParent, reacquire, afterWriteForTests = null) {
   const { evidence, raw, gitDirectories } = acquired;
   const checkout = evidence.repositoryRoot;
   const layouts = STAGES.map((stage, index) => stageLayout(stage, index === 0 ? raw.baseline : raw.candidate));
@@ -317,17 +358,11 @@ function materializeAcquired(acquired, scratchParent, reacquire) {
   // worktree Git metadata directory and the common Git directory. A linked
   // worktree's `.git` pointer file is not a containment boundary, so both are
   // resolved from Git itself.
-  const parent = canonicalDirectory(scratchParent, 'scratch parent');
-  for (const forbidden of [checkout, ...gitDirectories]) {
-    if (within(parent, forbidden) || within(forbidden, parent)) {
-      throw new Error('Scratch parent must lie outside the checkout and its Git metadata');
-    }
-  }
-  const root = makeExclusiveDirectory(
-    join(parent, `haw70-stage-${randomBytes(16).toString('hex')}`), 'output root');
-  for (const forbidden of [checkout, ...gitDirectories]) {
-    if (within(root, forbidden) || within(forbidden, root)) throw new Error('Output root is not isolated');
-  }
+  const parent = assertIsolatedRoot(canonicalDirectory(scratchParent, 'scratch parent'),
+    checkout, gitDirectories, 'Scratch parent must lie outside the checkout and its Git metadata');
+  const root = assertIsolatedRoot(makeExclusiveDirectory(
+    join(parent, `haw70-stage-${randomBytes(16).toString('hex')}`), 'output root'),
+  checkout, gitDirectories, 'Output root is not isolated');
 
   // Requirement 4 and 5: fixed mapped paths, exclusive regular nonexecutable
   // files, per-stage aggregate charged as each file is written.
@@ -356,10 +391,18 @@ function materializeAcquired(acquired, scratchParent, reacquire) {
   if (encoded.length > HAW70_STAGE_CAPS.receipt) throw new Error('Receipt exceeds its byte cap');
   writeExclusiveFile(join(root, RECEIPT_ENTRY), encoded, RECEIPT_ENTRY);
 
-  // Requirement 6: re-read everything that was just written, then prove the
-  // source has not moved underneath the copy. A failed root is left in place
-  // for inspection and never reused or deleted.
-  verifyStagedRoot(root, receipt, verified);
+  // FIXTURE-ONLY seam, reachable solely through the generic offline core and
+  // never through a pinned entry point. It runs between writing and verifying
+  // so a test can perturb the staged root or the source AT THAT EXACT PHASE
+  // and observe the real post-write pass refuse. Its return value is ignored
+  // and it is incapable of making a failed verification succeed, so it adds no
+  // authority: the checks below still run in full afterwards.
+  if (afterWriteForTests) afterWriteForTests({ outputRoot: root, receiptPath: join(root, RECEIPT_ENTRY) });
+
+  // Requirement 6: re-read everything that was just written, including the
+  // receipt, then prove the source has not moved underneath the copy. A failed
+  // root is left in place for inspection and never reused or deleted.
+  verifyStagedRoot(root, receipt, verified, encoded);
   const again = reacquire();
   if (again.candidateCommit !== evidence.candidateCommit || again.candidateTree !== evidence.candidateTree
     || again.sourcePlan.baselineDigest !== evidence.sourcePlan.baselineDigest
@@ -370,8 +413,18 @@ function materializeAcquired(acquired, scratchParent, reacquire) {
     outputRoot: root, receiptPath: join(root, RECEIPT_ENTRY), receipt });
 }
 
-/** Shared by materialization's post-write pass and the independent consumer. */
-function verifyStagedRoot(root, expectedReceipt, expectedBytes) {
+/**
+ * Shared by materialization's post-write pass and the independent consumer.
+ *
+ * Order matters. The namespace and entry TYPES are checked first, from the
+ * independently built expectation, so a statically substituted nonregular
+ * receipt is refused without ever being opened. Only then is the receipt read,
+ * and the receipt is verified on the same terms as a staged file: bounded
+ * bytes, regular type, non-executable mode, single link, and content equal to
+ * the expectation. `exactReceiptBytes` is supplied by materialization, which
+ * knows the precise encoding it just wrote.
+ */
+function verifyStagedRoot(root, expectedReceipt, expectedBytes, exactReceiptBytes = null) {
   const expectedFiles = new Set([RECEIPT_ENTRY]);
   const directories = new Set();
   for (const stage of STAGES) {
@@ -385,6 +438,20 @@ function verifyStagedRoot(root, expectedReceipt, expectedBytes) {
     }
   }
   inspectNamespace(root, expectedFiles, directories);
+
+  // The receipt, rechecked on the success path and not merely named there.
+  const receipt = readBoundedFile(join(root, RECEIPT_ENTRY), HAW70_STAGE_CAPS.receipt, RECEIPT_ENTRY);
+  if (exactReceiptBytes && !receipt.bytes.equals(exactReceiptBytes)) {
+    throw new Error('Staged receipt does not match the bytes that were written');
+  }
+  let parsed;
+  try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(receipt.bytes)); }
+  catch { throw new Error('receipt: unreadable or malformed'); }
+  checkReceiptShape(parsed);
+  if (canonical(parsed) !== canonical(expectedReceipt)) {
+    throw new Error('Receipt does not match the independently reconstructed expectation');
+  }
+
   for (const stage of STAGES) {
     for (const file of expectedReceipt.stages[stage].files) {
       const { bytes } = readBoundedFile(join(root, file.path), HAW70_STAGE_CAPS.file, file.path);
@@ -399,17 +466,40 @@ function verifyStagedRoot(root, expectedReceipt, expectedBytes) {
   }
 }
 
-/** Generic offline-fixture core. Supplied refs/manifest grant no execution. */
+/**
+ * GENERIC OFFLINE-FIXTURE CORE, and precisely that.
+ *
+ * It accepts caller-supplied refs, a manifest and an optional post-write test
+ * seam, which the pinned entry points below do not. That makes it a synthetic
+ * refusal-test helper, NOT a production API and NOT HAW-70 authority: a
+ * successful result here says nothing about the pinned profile, because the
+ * pinned validator reacquires and rebuilds its own expectation and will refuse
+ * a generically staged root. It still performs complete raw-Git acquisition
+ * and cannot have snapshots, buffers or digests injected into it, and every
+ * result it returns is `executionAllowed: false`.
+ *
+ * Production consumers must use `materializeHaw70UpgradeSource` and
+ * `validateHaw70UpgradeStagedSource` only.
+ */
 export function materializeMigrationSource(input) {
-  exactKeys(input, ['repositoryRoot', 'expectedCandidateCommit', 'baselineCommit',
-    'reviewedCandidateCommit', 'manifest', 'scratchParent'], 'materializer input');
-  const { scratchParent, ...source } = input;
+  const required = ['repositoryRoot', 'expectedCandidateCommit', 'baselineCommit',
+    'reviewedCandidateCommit', 'manifest', 'scratchParent'];
+  const keys = Object.keys(input ?? {});
+  exactKeys(input, keys.includes('afterWriteForTests') ? [...required, 'afterWriteForTests'] : required,
+    'materializer input');
+  const { scratchParent, afterWriteForTests = null, ...source } = input;
+  if (afterWriteForTests !== null && typeof afterWriteForTests !== 'function') {
+    throw new Error('materializer input: the fixture seam must be a function');
+  }
   return materializeAcquired(
     acquireMigrationGitSource(source, HAW70_STAGE_CAPS), scratchParent,
-    () => acquireMigrationGitSource(source, HAW70_STAGE_CAPS).evidence);
+    () => acquireMigrationGitSource(source, HAW70_STAGE_CAPS).evidence, afterWriteForTests);
 }
 
-/** Requirement 1. Pinned, and the only input is root, identity and scratch parent. */
+/**
+ * Requirement 1. Pinned: the only input is root, identity and scratch parent.
+ * The fixture seam and every ref/manifest/snapshot key are refused by shape.
+ */
 export function materializeHaw70UpgradeSource(input) {
   exactKeys(input, ['repositoryRoot', 'expectedCandidateCommit', 'scratchParent'], 'materializer input');
   const { scratchParent, ...source } = input;
@@ -421,7 +511,7 @@ export function materializeHaw70UpgradeSource(input) {
 /* ------------------------- independent staged validation ------------------------- */
 
 function validateAcquired(acquired, outputRoot) {
-  const { evidence, raw } = acquired;
+  const { evidence, raw, gitDirectories } = acquired;
   const layouts = STAGES.map((stage, index) => stageLayout(stage, index === 0 ? raw.baseline : raw.candidate));
   assertDistinctMigrationSelection(layouts[0], layouts[1]);
   const owned = new Map();
@@ -441,19 +531,17 @@ function validateAcquired(acquired, outputRoot) {
   const expected = checkReceiptShape(buildReceipt(evidence, stageFiles));
 
   const root = canonicalDirectory(outputRoot, 'output root');
-  const { bytes } = readBoundedFile(join(root, RECEIPT_ENTRY), HAW70_STAGE_CAPS.receipt, RECEIPT_ENTRY);
-  let parsed;
-  try { parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
-  catch { throw new Error('receipt: unreadable or malformed'); }
-  checkReceiptShape(parsed);
-  if (canonical(parsed) !== canonical(expected)) {
-    throw new Error('Receipt does not match the independently reconstructed expectation');
-  }
+  // Requirement 4 again, at consumption. A staged tree that is byte-perfect but
+  // has been moved under the checkout, the real worktree Git directory or the
+  // common Git directory is NOT an isolated root, and a valid copied receipt is
+  // not authority to drop that invariant.
+  assertIsolatedRoot(root, evidence.repositoryRoot, gitDirectories, 'Output root is not isolated');
   verifyStagedRoot(root, expected, owned);
   return freeze({ kind: 'haw70-migration-stage-validation-v1', executionAllowed: false,
     outputRoot: root, receipt: expected });
 }
 
+/** Generic offline-fixture core, on the same fixture-only terms as above. */
 export function validateMigrationStagedSource(input) {
   exactKeys(input, ['repositoryRoot', 'expectedCandidateCommit', 'baselineCommit',
     'reviewedCandidateCommit', 'manifest', 'outputRoot'], 'validator input');
