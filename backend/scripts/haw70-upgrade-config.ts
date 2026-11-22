@@ -17,7 +17,9 @@ import { inspectHaw70UpgradeTarget } from './haw70-upgrade-target.js'
  * the complete candidate migration directory and declares a seed hook, so it
  * can neither select a stage nor be trusted to route a staged upgrade. This
  * module replaces none of that: the ordinary config is left exactly as it is
- * and is never read here.
+ * and is NEVER evaluated or imported as application configuration. Its raw
+ * bytes ARE read and hashed, deliberately, as one of the pinned compatibility
+ * inputs of the source validation below. Required read, forbidden evaluation.
  *
  * SOURCE AUTHORITY. A caller may identify only a staged root, the exact
  * candidate commit and which stage it wants, through one narrow environment
@@ -48,11 +50,20 @@ const STAGES = Object.freeze(['baseline', 'candidate'])
 /**
  * The installed Prisma config loader passes `moduleCache: false` to Jiti but no
  * `fsCache` override, and Jiti's documented default is filesystem caching into
- * `node_modules/.cache/jiti` or a temporary directory. Loading must therefore
- * be invoked with this setting ALREADY in the environment; setting it from
- * inside a loaded config is too late, because Jiti is constructed first. It is
- * required here rather than left to convention so a forgetful invoker fails
- * closed instead of writing cache entries.
+ * `node_modules/.cache/jiti` or a temporary directory.
+ *
+ * The flag must therefore ALREADY be in the environment before the invoking
+ * process starts loading, because Jiti is constructed first. The check below
+ * is NOT a safeguard against cache writes: by the time this module evaluates,
+ * any write the loader was going to make has already happened. It only refuses
+ * to ASSEMBLE for an invoker that did not apply the setting, so a forgetful
+ * invoker gets no configuration rather than a silently cached one. Preventing
+ * the write itself is the invoker's responsibility, not this module's.
+ *
+ * Note also that this is a boolean switch: the installed Jiti parses
+ * `JITI_FS_CACHE` as JSON through a boolean coercion, so a directory value is
+ * not a destination. A custom destination exists only as the programmatic
+ * `fsCache` option.
  */
 const LOADER_FS_CACHE = 'JITI_FS_CACHE'
 const failure = 'HAW-70 staged configuration is not qualified'
@@ -127,8 +138,9 @@ function assembleUnguarded(input: { environment: Environment }) {
   const snapshot: Environment = Object.freeze({ ...input.environment })
 
   const handoff = readHaw70StageHandoff(snapshot)
-  // Fail closed if the loader's filesystem cache was not disabled before this
-  // process began loading configuration.
+  // Refuse to assemble unless the invoker had already disabled the loader's
+  // filesystem cache before loading began. This cannot undo a write that the
+  // loader may already have made; see LOADER_FS_CACHE above.
   requireMatch(snapshot[LOADER_FS_CACHE] === 'false')
 
   // Environment claims and routing blocklist, against the exact identity the
