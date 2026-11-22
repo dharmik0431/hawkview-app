@@ -13,7 +13,8 @@ import {
   HAW70_STAGE_CAPS, materializeHaw70UpgradeSource, materializeMigrationSource,
   validateHaw70UpgradeStagedSource, validateMigrationStagedSource,
 } from './haw70-upgrade-materializer.mjs';
-import { LEGACY_ACQUISITION_CAPS, inspectMigrationGitSource } from './haw70-upgrade-git-source.mjs';
+import { LEGACY_ACQUISITION_CAPS, acquireHaw70UpgradeGitSource, acquireMigrationGitSource,
+  inspectMigrationGitSource } from './haw70-upgrade-git-source.mjs';
 
 /**
  * Focused nonconnecting tests for the inactive HAW-70 materializer.
@@ -909,4 +910,159 @@ catch (error) { process.stdout.write('REFUSED:' + error.message); }
   const output = child('FIFO receipt');
   assert.match(output, /^REFUSED:/, 'a FIFO receipt must be refused, not accepted');
   assert.match(output, /nonregular entry|regular file required/);
+});
+
+
+/* ============== retained backing capacity, and the combined boundary ============== */
+
+/**
+ * The reviewed P2. The bounded reader needs cap+1 bytes of room, but returning
+ * `scratch.subarray(0, total)` handed back a VIEW, so every selected checkout
+ * file kept a full cap-sized backing allocation alive: about 99 MiB under the
+ * materializer cap and 792 MiB under the legacy inspector cap, for ~497 KB of
+ * pinned content.
+ *
+ * This measures ALLOCATED BACKING CAPACITY, which is deterministic. It is not
+ * resident memory: no RSS figure is asserted and none is implied.
+ */
+function observeCheckoutAcquisition(source, caps) {
+  const seen = [];
+  const acquired = acquireMigrationGitSource(source, caps, report => seen.push(report));
+  assert.equal(seen.length, 1, 'the mutable-checkout verification snapshot must have been observed');
+  assert.equal(seen[0].stage, 'checkout');
+  // Positive evidence that this is the CHECKOUT read and not the earlier Git
+  // or baseline hashing: the observed paths are exactly the candidate selected
+  // set, and acquisition really did succeed.
+  assert.deepEqual(seen[0].files.map(file => file.path).sort(),
+    source.manifest.candidateFiles.map(file => file.path).sort());
+  assert.equal(acquired.evidence.gitSnapshotVerified, true);
+  assert.equal(acquired.evidence.executionAllowed, false);
+  return seen[0];
+}
+
+for (const [label, caps] of [['materializer', HAW70_STAGE_CAPS], ['legacy inspector', LEGACY_ACQUISITION_CAPS]]) {
+  test(`many small checkout files retain only content-sized buffers under the ${label} profile`, () => {
+    // The real pinned path profile: 99 selected candidate files, all tiny.
+    const { source } = pinned.fixture();
+    const report = observeCheckoutAcquisition(source, caps);
+    const files = report.files;
+    assert.equal(files.length, 99, 'the actual pinned selected count');
+
+    // THE PROPERTY: no returned buffer retains more backing capacity than its
+    // own content, and none is a view at a nonzero offset into something larger.
+    for (const file of files) {
+      assert.equal(file.backingCapacity, file.length, `${file.path} retains extra backing capacity`);
+      assert.equal(file.byteOffset, 0, `${file.path} is a view into a larger allocation`);
+    }
+
+    const retained = files.reduce((total, file) => total + file.backingCapacity, 0);
+    const content = files.reduce((total, file) => total + file.length, 0);
+    assert.equal(retained, content, 'retained backing capacity equals the content it holds');
+
+    // And the amplification the review computed is gone. Under the previous
+    // behaviour this figure was files * (cap + 1).
+    const previous = files.length * (Math.min(caps.file, 8 * MiB_IN_TEST) + 1);
+    assert.ok(retained * 50 < previous,
+      `retained ${retained} must be far below the previous ${previous}`);
+
+    // One bounded scratch for the whole snapshot, not one per file.
+    assert.equal(report.scratchAllocations, 1);
+    assert.equal(report.scratchCapacity, Math.min(caps.checkout, 8 * MiB_IN_TEST) + 1);
+    assert.ok(report.scratchCapacity > content, 'the scratch is still cap-sized, by design');
+  });
+}
+
+test('the pinned acquirer exposes no observation seam', () => {
+  let called = 0;
+  const observer = () => { called += 1; };
+  // Behavioural, not arity: a third argument handed to the pinned acquirer is
+  // simply not forwarded, so the observation is never reached.
+  const acquired = acquireHaw70UpgradeGitSource(
+    { repositoryRoot, expectedCandidateCommit: actualHead }, HAW70_STAGE_CAPS, observer);
+  assert.equal(called, 0, 'a pinned acquisition must never reach the fixture observation');
+  assert.equal(acquired.evidence.executionAllowed, false);
+  // POSITIVE CONTROL: the same observer IS invoked through the generic core, so
+  // the zero above is a real absence rather than a callback that never fires.
+  const { source: generic } = small.fixture();
+  acquireMigrationGitSource(generic, HAW70_STAGE_CAPS, observer);
+  assert.equal(called, 1, 'the generic core must reach the observation');
+  // And the generic core refuses a non-callable observer rather than ignoring it.
+  assert.throws(() => acquireMigrationGitSource(generic, HAW70_STAGE_CAPS, 'not a function'),
+    /Unexpected acquisition observer/);
+  // Materialization through the pinned entry still works and still refuses execution.
+  const staged = materializeHaw70UpgradeSource(
+    { repositoryRoot, expectedCandidateCommit: actualHead, scratchParent: parentFor('pinned-no-seam') });
+  assert.equal(staged.executionAllowed, false);
+});
+
+/**
+ * The combined-acquisition boundary, as an actual witness rather than
+ * arithmetic. Every individual file is under 1 MiB, every one of the three
+ * selected snapshots is under 2 MiB, and BOTH Git snapshots together are under
+ * 4 MiB -- so only the cumulative total, once the mutable-checkout snapshot is
+ * added, can cross the combined cap.
+ */
+const MiB_IN_TEST = 1024 * 1024;
+const combinedFamily = (name, bytesPerFile) => {
+  const fixed = [...COMPATIBILITY, 'backend/prisma/schema.prisma',
+    'backend/prisma/migrations/migration_lock.toml'];
+  return family(name, [...fixed, ...[1, 2, 4].map(migrationPath)],
+    [...fixed, ...[1, 2, 3, 4, 5].map(migrationPath)], () => bytesPerFile);
+};
+
+test('acquisition is refused by the combined budget alone, with a nearby passing control', () => {
+  const cap = HAW70_STAGE_CAPS.combined;
+  // Preconditions computed from the ACTUAL generated payloads.
+  const measure = (fixture, bytesPerFile) => {
+    const baseline = fixture.manifest.baselineFiles.length;
+    const candidate = fixture.manifest.candidateFiles.length;
+    for (const entry of [...fixture.manifest.baselineFiles, ...fixture.manifest.candidateFiles]) {
+      assert.equal(fixture.data(entry.path, 'candidateFiles').length, bytesPerFile);
+      assert.ok(bytesPerFile < HAW70_STAGE_CAPS.file, 'every file must be under the per-file cap');
+    }
+    const git = (baseline + candidate) * bytesPerFile;
+    const total = git + candidate * bytesPerFile;
+    assert.ok(baseline * bytesPerFile < HAW70_STAGE_CAPS.snapshot, 'baseline snapshot under its cap');
+    assert.ok(candidate * bytesPerFile < HAW70_STAGE_CAPS.snapshot, 'candidate snapshot under its cap');
+    assert.ok(git < cap, 'both Git snapshots together must stay under the combined cap');
+    return { baseline, candidate, git, total };
+  };
+
+  // PASSING CONTROL: 8,192 bytes below the combined cap.
+  const underBytes = 149_504;
+  const under = combinedFamily('combined-under', underBytes);
+  const underSums = measure(under, underBytes);
+  assert.deepEqual([underSums.baseline, underSums.candidate], [8, 10]);
+  assert.equal(underSums.total, 4_186_112);
+  assert.equal(cap - underSums.total, 8_192);
+  const ok = materializeMigrationSource(
+    { ...under.fixture().source, scratchParent: parentFor('combined-under') });
+  assert.equal(ok.receipt.stages.baseline.migrationCount, 3);
+  assert.equal(ok.receipt.stages.candidate.migrationCount, 5);
+  assert.equal(ok.receipt.stages.baseline.bytes, 5 * underBytes);
+  assert.equal(ok.receipt.stages.candidate.bytes, 7 * underBytes);
+  assert.ok(ok.receipt.stages.candidate.bytes < HAW70_STAGE_CAPS.stage);
+  const underSource = under.fixture();
+  const stagedUnder = materializeMigrationSource(
+    { ...underSource.source, scratchParent: parentFor('combined-under-validate') });
+  assert.equal(validateMigrationStagedSource(
+    { ...underSource.source, outputRoot: stagedUnder.outputRoot }).executionAllowed, false);
+
+  // COMBINED-ONLY REFUSAL: 20,480 bytes above the combined cap, with every
+  // other limit still satisfied.
+  const overBytes = 150_528;
+  const over = combinedFamily('combined-over', overBytes);
+  const overSums = measure(over, overBytes);
+  assert.deepEqual([overSums.baseline, overSums.candidate], [8, 10]);
+  assert.equal(overSums.total, 4_214_784);
+  assert.equal(overSums.total - cap, 20_480);
+  // The 27th observation is still under the cap; the 28th crosses it.
+  assert.ok(overSums.git + 9 * overBytes < cap);
+  assert.ok(overSums.git + 10 * overBytes > cap);
+  const parent = parentFor('combined-over');
+  assert.throws(() => materializeMigrationSource({ ...over.fixture().source, scratchParent: parent }),
+    /^Error: Combined acquisition exceeds its byte cap$/,
+    'the combined budget specifically, not a per-file, per-snapshot or namespace refusal');
+  assert.deepEqual(readdirSync(parent), [],
+    'acquisition fails before staging, so the scratch parent stays empty');
 });

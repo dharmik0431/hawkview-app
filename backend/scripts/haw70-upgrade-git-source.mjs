@@ -147,16 +147,19 @@ function diskPaths(root, expectedPaths, caps = LEGACY_ACQUISITION_CAPS) {
   walk(migrationRoot);
   return [...found, ...extras];
 }
-function diskSnapshot(root, expected, caps = LEGACY_ACQUISITION_CAPS, budget = null) {
+function diskSnapshot(root, expected, caps = LEGACY_ACQUISITION_CAPS, budget = null, observe = null) {
   const expectedPaths = checkedPaths(expected);
   samePaths(diskPaths(root, expectedPaths, caps), expectedPaths);
+  // One scratch buffer, allocated here and reused for every file below.
+  const scratch = boundedScratch(caps.checkout);
+  const observed = observe ? [] : null;
   // The mutable-checkout read is a third acquisition of the selected set and is
   // charged like the other two: per file, per snapshot, and against the shared
   // combined budget. Previously it ran unbounded at the legacy allowance, so an
   // oversized or cumulatively oversized checkout was fully buffered and only
   // then refused by the later digest comparison.
   let snapshotBytes = 0;
-  return expectedPaths.map(path => {
+  const entries = expectedPaths.map(path => {
     assertDirectory(root, path.slice(0, path.lastIndexOf('/')));
     const fullPath = join(root, path);
     const stat = lstatSync(fullPath);
@@ -169,7 +172,7 @@ function diskSnapshot(root, expected, caps = LEGACY_ACQUISITION_CAPS, budget = n
       if (!before.isFile() || before.dev !== stat.dev || before.ino !== stat.ino
         || before.mode !== stat.mode || before.size !== stat.size || before.mtimeMs !== stat.mtimeMs
         || before.ctimeMs !== stat.ctimeMs) throw new Error('Selected file changed while opening');
-      const bytes = readBoundedDescriptor(fd, caps.checkout, 'Selected worktree file');
+      const bytes = readBoundedDescriptor(fd, caps.checkout, 'Selected worktree file', scratch);
       const after = fstatSync(fd);
       const linked = lstatSync(fullPath);
       if (before.size !== after.size || before.mtimeMs !== after.mtimeMs
@@ -183,9 +186,20 @@ function diskSnapshot(root, expected, caps = LEGACY_ACQUISITION_CAPS, budget = n
         budget.bytes += bytes.length;
         if (budget.bytes > caps.combined) throw new Error('Combined acquisition exceeds its byte cap');
       }
+      // Metadata only: lengths and backing capacity, never bytes and never
+      // identities. Fixture observation, described at the acquisition export.
+      if (observed) {
+        observed.push({ path, length: bytes.length, byteOffset: bytes.byteOffset,
+          backingCapacity: bytes.buffer.byteLength });
+      }
       return { path, mode: '100644', bytes };
     } finally { closeSync(fd); }
   });
+  if (observe) {
+    observe({ stage: 'checkout', cap: caps.checkout, scratchAllocations: 1,
+      scratchCapacity: scratch.buffer.byteLength, files: observed });
+  }
+  return entries;
 }
 
 /**
@@ -204,21 +218,39 @@ export const LEGACY_ACQUISITION_CAPS = Object.freeze({
 });
 
 /**
+ * ONE reusable scratch buffer for a whole snapshot. The bounded read needs
+ * cap+1 bytes of room to detect overflow, but it must not leave that room
+ * attached to each result: a previous version returned `scratch.subarray(...)`,
+ * and because a subarray is a VIEW it kept the full cap+1 backing allocation
+ * alive for every file. At the pinned 99-file count that retained roughly
+ * 99 MiB under the materializer cap and 792 MiB under the legacy inspector cap
+ * for about 497 KB of content. The scratch is allocated once per snapshot and
+ * reused, so peak scratch capacity is a single cap+1 buffer.
+ */
+const boundedScratch = cap => Buffer.allocUnsafe(Math.min(cap, MAX_BUFFER) + 1);
+
+/**
  * Reads at most `cap + 1` bytes from an already-open descriptor, so overflow is
  * OBSERVED rather than inferred from a pre-read size the file may no longer
  * have. A pre-read size check alone does not bound the read.
+ *
+ * Returns a CONTENT-SIZED buffer with its own backing store -- never a view of
+ * the scratch. `allocUnsafeSlow` is deliberate: it bypasses Node's shared
+ * 8 KiB pool, so the returned buffer's backing capacity is exactly its length
+ * and that property is directly measurable rather than pool-dependent.
  */
-function readBoundedDescriptor(fd, cap, label) {
-  const buffer = Buffer.allocUnsafe(Math.min(cap, MAX_BUFFER) + 1);
+function readBoundedDescriptor(fd, cap, label, scratch = boundedScratch(cap)) {
   let total = 0;
   for (;;) {
     if (total > cap) break;
-    const read = readSync(fd, buffer, total, buffer.length - total, null);
+    const read = readSync(fd, scratch, total, scratch.length - total, null);
     if (read === 0) break;
     total += read;
   }
   if (total > cap) throw new Error(`${label} exceeds its byte cap`);
-  return buffer.subarray(0, total);
+  const bytes = Buffer.allocUnsafeSlow(total);
+  scratch.copy(bytes, 0, 0, total);
+  return bytes;
 }
 
 /**
@@ -237,9 +269,15 @@ function forEachEntry(absolute, onEntry) {
   } finally { dir.closeSync(); }
 }
 
-/** Private copies, so nothing the caller receives aliases a hashed buffer. */
+/**
+ * Private copies, so nothing the caller receives aliases a hashed buffer.
+ * `allocUnsafeSlow` keeps each retained copy content-sized with its own
+ * backing store: a pooled allocation would make a small retained copy hold a
+ * slice of Node's shared 8 KiB pool alive, which is the same class of
+ * amplification as returning a view of a cap-sized scratch.
+ */
 const ownCopies = entries => entries.map(({ mode, path, bytes }) => {
-  const own = Buffer.allocUnsafe(bytes.length);
+  const own = Buffer.allocUnsafeSlow(bytes.length);
   bytes.copy(own);
   return { mode, path, bytes: own };
 });
@@ -252,11 +290,26 @@ const ownCopies = entries => entries.map(({ mode, path, bytes }) => {
  * it grants no execution. A caller can only name a repository root, exact
  * identities and the pins to verify against; every byte still comes from the
  * pinned Git trees here.
+ *
+ * `observeForTests` is a FIXTURE-ONLY observation callback for the mutable
+ * checkout verification snapshot. It receives lengths and backing capacities
+ * only -- never bytes, identities, digests or paths outside the verified
+ * selected namespace -- its return value is ignored, and it cannot alter
+ * acquisition, hashing or any refusal. The pinned acquirer above neither
+ * accepts nor forwards it, so no pinned production path can reach it, and it
+ * confers no authority of any kind.
  */
-export function acquireMigrationGitSource(input, caps = LEGACY_ACQUISITION_CAPS) {
-  return inspectAndAcquire(input, caps);
+export function acquireMigrationGitSource(input, caps = LEGACY_ACQUISITION_CAPS, observeForTests = null) {
+  if (observeForTests !== null && typeof observeForTests !== 'function') {
+    throw new Error('Unexpected acquisition observer');
+  }
+  return inspectAndAcquire(input, caps, observeForTests);
 }
 
+/**
+ * Pinned. It takes no observer and forwards none, so the fixture observation
+ * below is unreachable from any pinned production path.
+ */
 export function acquireHaw70UpgradeGitSource(input, caps = LEGACY_ACQUISITION_CAPS) {
   keys(input, ['repositoryRoot', 'expectedCandidateCommit']);
   const acquired = acquireMigrationGitSource({ ...input,
@@ -271,7 +324,7 @@ export function inspectMigrationGitSource(input) {
   return inspectAndAcquire(input, LEGACY_ACQUISITION_CAPS).evidence;
 }
 
-function inspectAndAcquire(input, caps) {
+function inspectAndAcquire(input, caps, observeForTests = null) {
   keys(input, ['repositoryRoot', 'expectedCandidateCommit', 'baselineCommit', 'reviewedCandidateCommit', 'manifest']);
   const { repositoryRoot: root, manifest } = input;
   const head = oid(input.expectedCandidateCommit);
@@ -300,7 +353,7 @@ function inspectAndAcquire(input, caps) {
   const candidateFiles = gitSnapshot(root, head, manifest.candidateFiles, caps, budget);
   const committedPlan = verifyMigrationSourceSnapshots(manifest, { baselineFiles, candidateFiles });
   const worktreePlan = verifyMigrationSourceSnapshots(manifest, {
-    baselineFiles, candidateFiles: diskSnapshot(root, manifest.candidateFiles, caps, budget),
+    baselineFiles, candidateFiles: diskSnapshot(root, manifest.candidateFiles, caps, budget, observeForTests),
   });
   if (committedPlan.candidateDigest !== worktreePlan.candidateDigest) throw new Error('Worktree does not match committed source');
   const candidatePaths = checkedPaths(manifest.candidateFiles);
