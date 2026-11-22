@@ -11,6 +11,7 @@ export {
   type EntraCollectionLimits,
 } from './microsoft-collection-budget.js'
 import { projectSyncOutcome } from './sync-outcome-projection.js'
+import { tenantVisitLeaseLossDiagnostic } from './tenant-visit-lease-diagnostics.js'
 import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
 import {
@@ -2064,8 +2065,15 @@ export class TenantSyncService {
           failedResources: result.failedResources,
         })
       } catch (error) {
-        const failureCode = tenantVisitLeaseLoss(error) ? 'TENANT_VISIT_LEASE_LOST' : 'TENANT_SYNC_FAILED'
-        this.logger.warn(JSON.stringify({ event: 'scheduled_tenant_sync_failure', tenantId: tenant.id, failureCode }))
+        const lost = tenantVisitLeaseLoss(error)
+        const failureCode = lost ? 'TENANT_VISIT_LEASE_LOST' : 'TENANT_SYNC_FAILED'
+        // Bounded phase/reason for a recognized ownership loss only: one pair
+        // from a closed table, revalidated at emission. Ordinary failures keep
+        // the exact previous three keys, and the aggregate below is unchanged.
+        this.logger.warn(JSON.stringify({
+          event: 'scheduled_tenant_sync_failure', tenantId: tenant.id, failureCode,
+          ...(lost ? tenantVisitLeaseLossDiagnostic(lost) : {}),
+        }))
         results.push({ tenantId: tenant.id, status: 'FAILED', failureCode })
       }
     }
