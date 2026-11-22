@@ -25,6 +25,13 @@ import { M365AuditBudgetError, M365ManagementActivityService } from './m365-mana
 import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { assertTenantVisitLifecycleActive, runTenantVisitLifecycle } from './tenant-visit-lifecycle.js'
 import { AUDIT_RECONCILIATION_RESOURCES, type AuditReconciliationResource } from './audit-change-reconciliation.js'
+import {
+  DAILY_INVENTORY_ANCHORS,
+  TWENTY_MINUTE_INVENTORY_REFRESH_MS,
+  dailyInventoryResources,
+  scheduledSyncTenantWhere,
+  shouldCollectInventoryInTwentyMinuteFullPass,
+} from './scheduled-sync-selection.js'
 import { mailboxSourceDigest, sourceAttestationKey } from '../identity-risk/mailbox-source-attestation.js'
 import { IdentityRiskSafetyService } from '../identity-risk/identity-risk-safety.service.js'
 
@@ -2390,4 +2397,110 @@ test('physical displaced visitor refund cannot erase a successor charge or relea
   await displacedService.reserveDailyUsage(controlTenant, { bytes: probeBytes }, usageDate)
   assert.equal((await controlLedger()).downloadedBytes, BigInt(ceilingBytes),
     'the identical request is admitted at exactly the ceiling without the displaced bytes')
+})
+
+/**
+ * The interrupted ORDINARY full inventory: a GROUPS collector displaced
+ * mid-attempt, with NO pending audit-reconciliation request and NO new
+ * directory-audit event. This is the one shape the durable audit replay cannot
+ * reach, because nothing ever asked for a GROUPS refresh -- the sibling
+ * takeover witness above enqueues one deliberately. The absence is constructed
+ * here; it is not a claim about any production tenant.
+ *
+ * Every other daily resource and both anchors are PERSISTED fresh, and the
+ * candidate predicate is EXECUTED against those rows rather than evaluated in
+ * memory, so the case fails if the real query cannot find the tenant.
+ */
+test('physical interrupted ordinary GROUPS inventory recovers under a newly acquired fenced visit with no audit request', {
+  skip: !registeredCi, concurrency: false, timeout: 90_000,
+}, async context => {
+  const f = await physicalCollectorFixture(context)
+  // Deliberately no f.enqueue(...): the durable replay has nothing to select.
+  assert.deepEqual(await f.receipts(), [], 'no pending audit reconciliation request may exist')
+  assert.deepEqual(await selectPendingAuditReconciliationWork(f.database, f.scope, f.owner,
+    AUDIT_RECONCILIATION_RESOURCES.length), [])
+
+  const clock = new Date()
+  const interruptedAt = new Date(clock.getTime() - 26 * 60 * 60_000)
+  const earlierSuccess = new Date(clock.getTime() - 27 * 60 * 60_000)
+  const fresh = new Date(clock.getTime() - 60_000)
+  // Other inventories stay current through targeted events and hourly
+  // catch-up, so nothing but the interrupted row may make this tenant due.
+  await f.database.syncState.createMany({ data: [
+    ...dailyInventoryResources(false).filter(resource => resource !== 'GROUPS'),
+    ...DAILY_INVENTORY_ANCHORS,
+  ].map(resourceType => ({ ...f.scope, resourceType, status: 'SUCCEEDED' as const,
+    lastAttemptAt: fresh, lastSuccessfulAt: fresh })) })
+  // Exactly what runSnapshotSync leaves behind when a worker never reaches a
+  // terminal write: RUNNING, an old attempt clock, a preserved earlier
+  // success, and error fields the attempt marker itself cleared.
+  await f.database.syncState.create({ data: { ...f.scope, resourceType: 'GROUPS', status: 'RUNNING',
+    lastAttemptAt: interruptedAt, lastSuccessfulAt: earlierSuccess,
+    lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 } })
+
+  const stored = () => f.observer.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: f.tenant.id, resourceType: 'GROUPS' } },
+    select: { resourceType: true, status: true, lastAttemptAt: true, lastSuccessfulAt: true,
+      lastErrorCode: true, lastErrorMessage: true, consecutiveFailures: true },
+  })
+  /** Runs the REAL candidate predicate, narrowed to this tenant so unrelated
+   *  rows in the disposable database cannot decide the outcome. */
+  const isCandidate = async (recoverAbandoned: boolean) => (await f.observer.customerTenant.findMany({
+    where: { AND: [
+      scheduledSyncTenantWhere(clock, TWENTY_MINUTE_INVENTORY_REFRESH_MS, recoverAbandoned),
+      { id: f.tenant.id },
+    ] },
+    select: { id: true },
+  })).length === 1
+
+  assert.equal(await isCandidate(false), false,
+    'with every other inventory fresh the existing query cannot find this tenant at all')
+  assert.equal(await isCandidate(true), true,
+    'the owned full20 candidate query must find the interrupted row')
+  // Decide the dispatch gate from the DURABLE row, not a literal, so a column
+  // default or a timestamp round-trip cannot make the rule look satisfied.
+  const interrupted = await stored()
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(interrupted, clock), false,
+    'the existing ownerless full-pass policy is unchanged for the real row')
+  assert.equal(shouldCollectInventoryInTwentyMinuteFullPass(interrupted, clock, true), true)
+
+  // A displaced old owner can neither resurrect the row nor clear it.
+  assert.equal(await releaseTenantVisitLease(f.database, f.owner), true)
+  const successor = await tryAcquireTenantVisitLease(f.database, f.scope, 300_000)
+  assert.ok(successor)
+  const providerCallsBeforeDisplaced = f.providerCalls.length
+  await assert.rejects(f.service.syncGroups(f.tenant, 'synthetic-token', f.owner), TenantVisitLeaseLostError)
+  assert.deepEqual(await stored(), interrupted, 'the displaced owner must not change the durable row')
+  assert.equal(f.providerCalls.length, providerCallsBeforeDisplaced,
+    'a displaced owner must make no provider request')
+
+  // The newly acquired fenced visit performs the recovery itself.
+  await f.service.syncGroups(f.tenant, 'synthetic-token', successor)
+  const recovered = await stored()
+  assert.equal(recovered.status, 'SUCCEEDED')
+  assert.equal(recovered.lastErrorCode, null)
+  assert.equal(recovered.lastErrorMessage, null)
+  assert.ok(recovered.lastSuccessfulAt! > earlierSuccess, 'recovery must advance the success clock')
+  assert.ok(recovered.lastAttemptAt! > interruptedAt, 'recovery must advance the attempt clock')
+  assert.ok((await f.snapshot('GROUPS'))!.payload instanceof Array)
+  assert.deepEqual(await f.observer.directoryGroupMembership.findMany({ where: f.scope,
+    select: { directoryUserId: true } }), [{ directoryUserId: f.directoryUser.id }])
+  // Recovery must not fabricate a receipt for a request that never existed.
+  assert.deepEqual(await f.receipts(), [])
+  // Nothing is due any more, so the recovery cannot become a repeating loop.
+  assert.equal(await isCandidate(true), false)
+
+  // EXCHANGE_MAILBOX_CONFIGURATION keeps its existing connection gate: the
+  // same interrupted shape must not schedule a tenant with Exchange read-only
+  // disabled, and must schedule it once that access is enabled.
+  await f.database.syncState.create({ data: { ...f.scope, resourceType: 'EXCHANGE_MAILBOX_CONFIGURATION',
+    status: 'RUNNING', lastAttemptAt: interruptedAt, lastSuccessfulAt: earlierSuccess,
+    lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0 } })
+  assert.equal(await isCandidate(true), false,
+    'an old configuration row must not schedule a tenant with Exchange read-only disabled')
+  await f.database.tenantConnection.updateMany({ where: f.scope,
+    data: { exchangeReadOnlyEnabledAt: new Date(clock.getTime() - 86_400_000) } })
+  assert.equal(await isCandidate(true), true,
+    'once Exchange read-only is enabled the same row becomes a candidate')
+  assert.equal(await isCandidate(false), false, 'and only under the gate')
 })

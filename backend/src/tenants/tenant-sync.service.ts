@@ -2004,11 +2004,17 @@ export class TenantSyncService {
     const fullTwentyMinuteSync = process.env.HAWKVIEW_FULL_SYNC_20_MINUTES_ENABLED === 'true'
     const healthyInventoryRefreshMs = fullTwentyMinuteSync
       ? TWENTY_MINUTE_INVENTORY_REFRESH_MS : DAILY_INVENTORY_REFRESH_MS
+    // A collector displaced mid-attempt leaves a clean RUNNING row that no
+    // existing automatic path re-attempts. Recovery needs a fenced visit: that
+    // is what establishes the displaced writer has lost the lease. Capture
+    // once so the candidate query, ranking and execution agree for this visit.
+    const recoverAbandonedInventory = fullTwentyMinuteSync && tenantVisitLifecycleEnabled()
     const { candidateTenants, firstSegmentLength } = await this.readScheduledCandidateWindow(
-      now, candidateLimit, healthyInventoryRefreshMs,
+      now, candidateLimit, healthyInventoryRefreshMs, recoverAbandonedInventory,
     )
 
-    const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit, healthyInventoryRefreshMs)
+    const selectedWork = selectScheduledTenantWork(candidateTenants, now, candidateLimit,
+      healthyInventoryRefreshMs, recoverAbandonedInventory)
     const selectedById = new Map(selectedWork.map((work) => [work.tenantId, work]))
     const scanSegmentById = new Map(candidateTenants.map((tenant, index) =>
       [tenant.id, index < firstSegmentLength ? 0 : 1]))
@@ -2038,6 +2044,7 @@ export class TenantSyncService {
         // retry gates and per-visit budgets remain unchanged.
         const fullInventoryDue = selectedById.get(tenant.id)?.fullInventoryDue ?? requiresDailyInventoryRefresh(
           tenant.syncStates, now, Boolean(tenant.connection?.exchangeReadOnlyEnabledAt), healthyInventoryRefreshMs,
+          recoverAbandonedInventory,
         )
         const result = await this.syncConnectedTenant(tenant, false, {
           incrementalOnly: !fullInventoryDue,
@@ -2082,6 +2089,7 @@ export class TenantSyncService {
     now: Date,
     candidateLimit: number,
     healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+    recoverAbandonedOwnedAttempts = false,
   ) {
     const select = {
         id: true,
@@ -2133,7 +2141,7 @@ export class TenantSyncService {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const cursor = await this.prisma.scheduledSyncCursor.findUnique({ where: { scopeKey } })
       if (!cursor) throw new Error('Scheduled sync cursor unavailable')
-      const baseWhere = scheduledSyncTenantWhere(now, healthyInventoryRefreshMs)
+      const baseWhere = scheduledSyncTenantWhere(now, healthyInventoryRefreshMs, recoverAbandonedOwnedAttempts)
       const readPage = (idWhere: Prisma.CustomerTenantWhereInput, take: number) =>
         this.prisma.customerTenant.findMany({
           where: { AND: [baseWhere, idWhere] },
@@ -2551,6 +2559,14 @@ export class TenantSyncService {
       if (!options.preserveInventoryFailureCooldowns || ['SIGN_INS', 'AUDIT_LOGS', 'M365_AUDIT'].includes(resource)) return true
       const due = shouldCollectInventoryInTwentyMinuteFullPass(
         inventoryStateByResource.get(resource as typeof inventoryStates[number]['resourceType']), now,
+        // A collector displaced mid-attempt leaves a clean RUNNING row that no
+        // other automatic path re-attempts. Recovery is owned-only: a fenced
+        // visit is what establishes that the displaced writer has lost the
+        // lease, so ownerless passes keep their existing behaviour.
+        Boolean(visitOwner),
+        // EXCHANGE_MAILBOX_CONFIGURATION is daily inventory only while
+        // Exchange read-only is enabled; preserve that existing gate here too.
+        Boolean(tenant.connection?.exchangeReadOnlyEnabledAt),
       )
       if (!due) deferredInventoryResources.add(resource)
       return due

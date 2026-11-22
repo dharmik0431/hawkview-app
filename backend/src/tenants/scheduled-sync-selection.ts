@@ -292,6 +292,63 @@ function validPastTime(value: Date | null | undefined, now: Date) {
   return value instanceof Date && Number.isFinite(value.getTime()) && value <= now
 }
 
+/**
+ * Bulk inventory collectors that have no RUNNING recovery at all. They are
+ * outside HOURLY_INVENTORY_RESOURCES, whose RUNNING branch already recovers a
+ * clean abandoned attempt, and `dailyInventoryResourceDueAt` returns null for
+ * RUNNING -- so an interrupted attempt can neither be re-dispatched nor make
+ * its own tenant due for the full pass that would re-dispatch it.
+ *
+ * Derived from the two existing lists rather than written out, so a resource
+ * added to the daily pass cannot silently lose recovery. USERS (the
+ * tenant-wide scheduler lease), SIGN_INS (whose RUNNING row is the retained
+ * audit-fallback marker) and the other activity streams are not daily
+ * inventory resources, so they are never included.
+ */
+function abandonedInventoryRecoveryResources(exchangeReadOnlyEnabled: boolean): SyncResourceType[] {
+  return dailyInventoryResources(exchangeReadOnlyEnabled).filter((resource) =>
+    !(HOURLY_INVENTORY_RESOURCES as readonly string[]).includes(resource))
+}
+
+/**
+ * Recovery for an inventory attempt displaced mid-collection. `runSnapshotSync`
+ * marks the row RUNNING and clears its error fields before calling the
+ * collector, so a worker that never reaches a terminal write leaves a CLEAN
+ * RUNNING row: an old attempt clock, a preserved earlier success and no
+ * recorded error.
+ *
+ * This reuses the existing one-hour stale-attempt delay and the existing
+ * clean-row rule already applied to hourly inventory and to durable audit
+ * replay. It is deliberately NOT a retry for every RUNNING row:
+ *
+ *   - A recorded error keeps its existing policy. CollectionInitializingError
+ *     and non-core partial collection both write RUNNING WITH a code, and a
+ *     FAILED row never reaches this branch at all.
+ *   - A recent attempt stays excluded, so a plausibly live collector is never
+ *     re-dispatched, and no five-minute loop can form: a recovery attempt
+ *     writes a fresh attempt clock before it collects.
+ *   - A future or non-finite clock is an anomaly to report, not a retry
+ *     signal, on either clock.
+ *   - Only bulk daily inventory outside hourly coverage is eligible.
+ */
+function shouldRecoverAbandonedInventoryAttempt(
+  state: DailyInventoryState,
+  now: Date,
+  /** Required, not defaulted: EXCHANGE_MAILBOX_CONFIGURATION is a daily
+   *  resource only while Exchange read-only is enabled. Defaulting it either
+   *  way would silently schedule a disabled tenant from an old configuration
+   *  row, or silently drop recovery for an enabled one. */
+  exchangeReadOnlyEnabled: boolean,
+): boolean {
+  if (state.status !== SyncStateStatus.RUNNING) return false
+  if (!(abandonedInventoryRecoveryResources(exchangeReadOnlyEnabled) as readonly string[])
+    .includes(state.resourceType)) return false
+  if (state.lastErrorCode != null || state.lastErrorMessage != null) return false
+  if (!validPastTime(state.lastAttemptAt, now)) return false
+  if (state.lastSuccessfulAt != null && !validPastTime(state.lastSuccessfulAt, now)) return false
+  return now.getTime() - state.lastAttemptAt!.getTime() >= HOURLY_INVENTORY_REFRESH_MS
+}
+
 function earliestDue(values: Array<Date | null | undefined>, now: Date) {
   const valid = values.filter((value): value is Date => validPastTime(value, now))
   return valid.sort((left, right) => left.getTime() - right.getTime())[0] ?? new Date(0)
@@ -333,6 +390,9 @@ export function selectScheduledTenantWork(
   now: Date,
   limit: number,
   healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+  /** See `shouldRecoverAbandonedInventoryAttempt`. Owned-visit cadences only;
+   *  the default preserves the existing selection exactly. */
+  recoverAbandonedOwnedAttempts = false,
 ) {
   const work = candidates.flatMap((candidate): ScheduledTenantWork[] => {
     const byResource = new Map(candidate.syncStates.map((state) => [state.resourceType, state]))
@@ -342,6 +402,7 @@ export function selectScheduledTenantWork(
       .filter((date): date is Date => date !== null)
     const fullInventoryDue = requiresDailyInventoryRefresh(
       candidate.syncStates, now, exchangeEnabled, healthyInventoryRefreshMs,
+      recoverAbandonedOwnedAttempts,
     )
     const users = byResource.get(SyncResourceType.USERS)
     // A future/invalid durable timestamp is not an immediate retry signal:
@@ -364,7 +425,10 @@ export function selectScheduledTenantWork(
         return fullInventoryDue || shouldRunHourlyInventoryRefresh(state, now)
       }
       if (state.resourceType === SyncResourceType.USERS) return userDue
-      return shouldRunTargetedTransientRetry(state, now) || shouldRunHourlyInventoryRefresh(state, now)
+      return shouldRunTargetedTransientRetry(state, now) ||
+        shouldRunHourlyInventoryRefresh(state, now) ||
+        (recoverAbandonedOwnedAttempts &&
+          shouldRecoverAbandonedInventoryAttempt(state, now, exchangeEnabled))
     })
     return [{
       tenantId: candidate.id,
@@ -392,8 +456,16 @@ export function requiresDailyInventoryRefresh(
   now: Date,
   exchangeReadOnlyEnabled = false,
   healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+  /** See `shouldRecoverAbandonedInventoryAttempt`. Without this an abandoned
+   *  attempt can never make its own tenant due: `dailyInventoryResourceDueAt`
+   *  returns null for RUNNING, so the visit stays incremental and the one
+   *  branch that could re-dispatch the row is never reached. */
+  recoverAbandonedOwnedAttempts = false,
 ) {
   const byResource = new Map(states.map((state) => [state.resourceType, state]))
+
+  if (recoverAbandonedOwnedAttempts && states.some((state) =>
+    shouldRecoverAbandonedInventoryAttempt(state, now, exchangeReadOnlyEnabled))) return true
 
   return dailyInventoryResources(exchangeReadOnlyEnabled).some((resource) =>
     dailyInventoryResourceDueAt(byResource.get(resource), now, healthyInventoryRefreshMs) !== null) ||
@@ -428,16 +500,50 @@ export function requiresDailyInventoryRefresh(
 export function shouldCollectInventoryInTwentyMinuteFullPass(
   state: DailyInventoryState | undefined,
   now: Date,
+  /**
+   * Only a fenced visit may recover an abandoned attempt: without a visit
+   * owner nothing guarantees the displaced collector has stopped writing, so
+   * the default preserves the existing ownerless RUNNING policy exactly.
+   */
+  recoverAbandonedOwnedAttempts = false,
+  /** Preserves the existing EXCHANGE_MAILBOX_CONFIGURATION gate. */
+  exchangeReadOnlyEnabled = false,
 ): boolean {
   if (!state) return true
   if (state.lastAttemptAt != null && !validPastTime(state.lastAttemptAt, now)) return false
   if (state.lastSuccessfulAt != null && !validPastTime(state.lastSuccessfulAt, now)) return false
-  if (state.status === SyncStateStatus.RUNNING) return shouldRunHourlyInventoryRefresh(state, now)
+  if (state.status === SyncStateStatus.RUNNING) {
+    return shouldRunHourlyInventoryRefresh(state, now) ||
+      (recoverAbandonedOwnedAttempts &&
+        shouldRecoverAbandonedInventoryAttempt(state, now, exchangeReadOnlyEnabled))
+  }
   if (state.status !== SyncStateStatus.FAILED && state.lastSuccessfulAt) return true
   if (shouldRunTargetedTransientRetry(state, now)) return true
   const retryMs = DAILY_INVENTORY_ANCHORS.includes(state.resourceType as typeof DAILY_INVENTORY_ANCHORS[number])
     ? DAILY_INVENTORY_FAILURE_RETRY_MS : DAILY_INVENTORY_REFRESH_MS
   return !state.lastAttemptAt || now.getTime() - state.lastAttemptAt.getTime() >= retryMs
+}
+
+/**
+ * Candidate predicate for an abandoned attempt. Must never be narrower than
+ * `shouldRecoverAbandonedInventoryAttempt`, which remains the final gate for
+ * what actually runs: `lte` matches its `elapsed >= H` rule exactly on the
+ * boundary millisecond, and both error columns must be null for the attempt to
+ * count as abandoned rather than as a state with its own failure policy.
+ */
+function abandonedAttemptCandidate(
+  resourceTypes: readonly SyncResourceType[],
+  staleAttemptBefore: Date,
+  now: Date,
+): Prisma.CustomerTenantWhereInput {
+  return { syncStates: { some: {
+    resourceType: { in: [...resourceTypes] },
+    status: SyncStateStatus.RUNNING,
+    lastErrorCode: null,
+    lastErrorMessage: null,
+    lastAttemptAt: { lte: staleAttemptBefore },
+    OR: [{ lastSuccessfulAt: null }, { lastSuccessfulAt: { lte: now } }],
+  } } }
 }
 
 function dailyResourceCandidate(
@@ -478,6 +584,10 @@ function dailyResourceCandidate(
 export function scheduledSyncTenantWhere(
   now: Date,
   healthyInventoryRefreshMs: InventoryRefreshInterval = DAILY_INVENTORY_REFRESH_MS,
+  /** See `shouldRecoverAbandonedInventoryAttempt`. Without this branch a
+   *  tenant whose only due work is an abandoned attempt never enters the
+   *  candidate window, because every daily predicate excludes RUNNING. */
+  recoverAbandonedOwnedAttempts = false,
 ): Prisma.CustomerTenantWhereInput {
   const activeLeaseAfter = new Date(now.getTime() - TENANT_SYNC_LEASE_MS)
   const usersStaleBefore = new Date(
@@ -531,6 +641,21 @@ export function scheduledSyncTenantWhere(
       },
     }, {
       OR: [
+      // Must not be narrower than `shouldRecoverAbandonedInventoryAttempt`,
+      // which remains the final gate for what actually runs. `lte` matches its
+      // `elapsed >= H` rule exactly on the boundary millisecond, and both
+      // error columns must be null for the attempt to count as abandoned.
+      ...(recoverAbandonedOwnedAttempts ? [
+        abandonedAttemptCandidate(abandonedInventoryRecoveryResources(false), hourlyStaleBefore, now),
+        // EXCHANGE_MAILBOX_CONFIGURATION keeps its existing connection gate, so
+        // an old configuration row cannot schedule a tenant whose Exchange
+        // read-only access has since been disabled.
+        { AND: [
+          { connection: { exchangeReadOnlyEnabledAt: { not: null } } },
+          abandonedAttemptCandidate(
+            [SyncResourceType.EXCHANGE_MAILBOX_CONFIGURATION], hourlyStaleBefore, now),
+        ] },
+      ] : []),
       ...DAILY_INVENTORY_RESOURCES.map((resource) => dailyResourceCandidate(resource, now, healthyInventoryRefreshMs)),
       { AND: [
         { connection: { exchangeReadOnlyEnabledAt: { not: null } } },
