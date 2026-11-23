@@ -77,6 +77,17 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The HAW-70 suites verify genuine Git objects: they walk raw ancestry
+          # to pinned commits, read the selected tree at those commits and hash
+          # the blobs. A shallow clone cannot satisfy any of that. The ref that
+          # actions/checkout resolves by default is deliberately NOT overridden,
+          # so a pull_request still runs against its merge context and PR
+          # integration testing is not replaced by head-only testing.
+          fetch-depth: 0
+          # Later steps run test code that spawns Git. It must not inherit the
+          # checkout credential.
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -88,6 +99,52 @@ jobs:
         working-directory: .
         run: npm ci
       - run: npm ci
+      # ---------------------------------------------------------------------
+      # HAW-70 registration. These run after BOTH dependency installs and
+      # BEFORE db:generate, db:validate, the migration deploy, the broad
+      # application tests and the build, so a failure here is attributable to
+      # the HAW-70 closure rather than to database or application state. They
+      # add no database, migration CLI, provider or application execution.
+      # ---------------------------------------------------------------------
+      - name: Refuse real dotenv inputs before the HAW-70 TypeScript suites
+        working-directory: .
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          # The dedicated config control observes a loader route under a
+          # synthetic child environment. A real dotenv file or an ambient
+          # DOTENV_CONFIG_* override would make that observation depend on
+          # inputs this job does not control, so the job REFUSES rather than
+          # deleting or ignoring them. Names only are reported; no value is
+          # ever read or printed.
+          for candidate in .env .env.local backend/.env backend/.env.local; do
+            if [ -e "$candidate" ]; then
+              echo "refusing: $candidate is present and must not be supplied to this job"
+              status=1
+            fi
+          done
+          for name in $(compgen -v | grep '^DOTENV_CONFIG_' || true); do
+            echo "refusing: ambient $name is set"
+            status=1
+          done
+          if [ "$status" -ne 0 ]; then
+            echo 'The HAW-70 configuration control requires no real dotenv input.'
+          fi
+          exit "$status"
+      - name: HAW-70 narrow consumer typecheck
+        run: ./node_modules/.bin/tsc --noEmit -p tsconfig.haw70-scripts.json
+      - name: HAW-70 TypeScript suites, serial and nonconnecting
+        env:
+          # Set at the step, so both are in place before Node starts and before
+          # any loader initialises.
+          JITI_FS_CACHE: 'false'
+          TSX_DISABLE_CACHE: '1'
+        run: >-
+          node --import tsx --test --test-concurrency=1
+          scripts/haw70-upgrade-target.test.ts
+          scripts/haw70-upgrade-config.test.ts
+          scripts/haw70-upgrade-launch-plan.test.ts
       - run: npm run db:generate
       - run: npm run db:validate
       - name: Apply every committed migration
