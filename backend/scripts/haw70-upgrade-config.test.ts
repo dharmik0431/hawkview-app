@@ -43,8 +43,7 @@ const head = git('rev-parse', 'HEAD')
 /** One real staged root, produced by the pinned materializer. */
 const stageParent = realpathSync(mkdtempSync(join(scratch, 'stage-')))
 const staged = materializeHaw70UpgradeSource(
-  { repositoryRoot, expectedCandidateCommit: head, scratchParent: stageParent }) as
-  { outputRoot: string; receipt: { stages: Record<string, { schema: string; migrationLock: string }> } }
+  { repositoryRoot, expectedCandidateCommit: head, scratchParent: stageParent })
 
 /** Synthetic hosted claims the existing guard accepts. Test data only. */
 function hostedClaims(overrides: Record<string, string | undefined> = {}) {
@@ -207,8 +206,14 @@ test('the installed loader returns the validated absolute stage paths and the ex
 
 test('a refused environment fails the real load, and cannot fall back to a default config', async () => {
   const loaded = await loadDedicatedConfig(hostedClaims({ GITHUB_SHA: '0'.repeat(40) }))
+  // Read the optional config BEFORE asserting the error. Asserting it narrows
+  // the loader's union to its error branch, where a config is impossible -- so
+  // a check made after the assertion would be vacuous by construction rather
+  // than evidence. Taken before, the stronger true property can be asserted:
+  // a refused assembly yields NO config at all, not merely a different one.
+  const refusedConfig: unknown = loaded.config
   assert.ok(loaded.error, 'a refused assembly must surface as a load error')
-  assert.notEqual(loaded.config?.schema, 'prisma/schema.prisma')
+  assert.equal(refusedConfig, undefined, 'a refused assembly must produce no config')
   // POSITIVE CONTROL for the whole harness: a missing config path is a
   // DIFFERENT, recognisable outcome, so an import or loader failure cannot
   // masquerade as one of the refusals above.

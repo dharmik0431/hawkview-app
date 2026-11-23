@@ -46,7 +46,7 @@ const HANDOFF_ROOT = `${HANDOFF_PREFIX}ROOT`
 const HANDOFF_NAME = `${HANDOFF_PREFIX}NAME`
 const HANDOFF_CANDIDATE = `${HANDOFF_PREFIX}CANDIDATE`
 const HANDOFF_KEYS = Object.freeze([HANDOFF_CANDIDATE, HANDOFF_NAME, HANDOFF_ROOT])
-const STAGES = Object.freeze(['baseline', 'candidate'])
+const STAGES: readonly Haw70UpgradeStage[] = Object.freeze(['baseline', 'candidate'])
 /**
  * The installed Prisma config loader passes `moduleCache: false` to Jiti but no
  * `fsCache` override, and Jiti's documented default is filesystem caching into
@@ -68,8 +68,19 @@ const STAGES = Object.freeze(['baseline', 'candidate'])
 const LOADER_FS_CACHE = 'JITI_FS_CACHE'
 const failure = 'HAW-70 staged configuration is not qualified'
 
-function requireMatch(condition: boolean): void {
+function requireMatch(condition: boolean): asserts condition {
   if (!condition) throw new Error(failure)
+}
+
+/**
+ * A real throwing guard, so the stage name is NARROWED rather than asserted
+ * and then cast. It returns the matching literal from the pinned list, which
+ * is why no cast is needed and no value is invented.
+ */
+function requireUpgradeStage(value: string): Haw70UpgradeStage {
+  const match = STAGES.find(name => name === value)
+  if (match === undefined) throw new Error(failure)
+  return match
 }
 
 /** This committed module's own location is the only path authority. */
@@ -100,17 +111,21 @@ function readStageHandoffUnguarded(environment: Environment): {
     .filter(key => key.startsWith(HANDOFF_PREFIX) && environment[key] !== undefined).sort()
   requireMatch(present.join(',') === HANDOFF_KEYS.join(','))
 
-  const outputRoot = environment[HANDOFF_ROOT]!
-  const stage = environment[HANDOFF_NAME]!
-  const candidateCommit = environment[HANDOFF_CANDIDATE]!
+  const outputRoot = environment[HANDOFF_ROOT]
+  const stage = environment[HANDOFF_NAME]
+  const candidateCommit = environment[HANDOFF_CANDIDATE]
+  // Narrowed by the throwing guard above rather than by a non-null assertion:
+  // the keys were only checked for presence, so their type is still optional.
+  requireMatch(typeof outputRoot === 'string' && typeof stage === 'string'
+    && typeof candidateCommit === 'string')
   requireMatch(/^[0-9a-f]{40}$/.test(candidateCommit))
-  requireMatch(STAGES.includes(stage))
+  const upgradeStage = requireUpgradeStage(stage)
   // A canonical, existing, real directory. No traversal component survives
   // `resolve`/`realpathSync` equality, and a symlinked root is refused.
   requireMatch(typeof outputRoot === 'string' && isAbsolute(outputRoot)
     && resolve(outputRoot) === outputRoot && !outputRoot.endsWith('/'))
   requireMatch(realpathSync(outputRoot) === outputRoot && lstatSync(outputRoot).isDirectory())
-  return { outputRoot, stage: stage as Haw70UpgradeStage, candidateCommit }
+  return { outputRoot, stage: upgradeStage, candidateCommit }
 }
 
 /**
@@ -159,10 +174,7 @@ function assembleUnguarded(input: { environment: Environment }) {
     repositoryRoot: haw70ConfigRepositoryRoot(),
     expectedCandidateCommit: handoff.candidateCommit,
     outputRoot: handoff.outputRoot,
-  }) as {
-    executionAllowed: boolean
-    receipt: { candidateCommit: string; stages: Record<string, { schema: string; migrationLock: string }> }
-  }
+  })
   requireMatch(validated.executionAllowed === false)
   requireMatch(validated.receipt.candidateCommit === handoff.candidateCommit)
 
@@ -187,6 +199,6 @@ function assembleUnguarded(input: { environment: Environment }) {
     candidateCommit: handoff.candidateCommit,
     schemaPath,
     migrationsPath,
-    datasourceUrl: datasourceUrl!,
+    datasourceUrl,
   })
 }

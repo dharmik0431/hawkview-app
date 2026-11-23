@@ -47,7 +47,7 @@ const headTree = git('rev-parse', 'HEAD^{tree}')
 
 const stageParent = realpathSync(mkdtempSync(join(scratch, 'stage-')))
 const staged = materializeHaw70UpgradeSource(
-  { repositoryRoot, expectedCandidateCommit: head, scratchParent: stageParent }) as { outputRoot: string }
+  { repositoryRoot, expectedCandidateCommit: head, scratchParent: stageParent })
 
 /**
  * INDEPENDENT POLICY ORACLE.
@@ -350,8 +350,7 @@ test('tampered staged bytes refuse, including a baseline proposal with a damaged
 test('the anchor check requires raw ancestry and the exact historical baseline selection', () => {
   // POSITIVE: the committed anchor on the real repository.
   const real = inspectSelectedNamespaceAgainstBaseline({ repositoryRoot,
-    expectedCandidateCommit: head, anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR }) as never as
-    Record<string, unknown>
+    expectedCandidateCommit: head, anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR })
   assert.equal(real.executionAllowed, false)
   assert.equal(real.rawAncestorOfCandidate, true)
   assert.equal(real.matchesHistoricalBaseline, true)
@@ -396,7 +395,7 @@ test('the anchor check requires raw ancestry and the exact historical baseline s
   // POSITIVE CONTROL FIRST: `base` is an ancestor of the tip and carries the
   // anchor's own tree, so the whole check succeeds on this fixture.
   const fixtureControl = inspectSelectedNamespaceAgainstBaseline({ repositoryRoot: fixtureRoot,
-    expectedCandidateCommit: tip, anchorCommit: base }) as never as Record<string, unknown>
+    expectedCandidateCommit: tip, anchorCommit: base })
   assert.equal(fixtureControl.rawAncestorOfCandidate, true)
   assert.equal(fixtureControl.matchesHistoricalBaseline, true)
   assert.equal(fixtureControl.selectedFiles, REVIEWED_PINS.baselineSelectedFiles)
@@ -485,16 +484,18 @@ test('changed selected bytes at an ancestor are reported, never silently repinne
   // POSITIVE CONTROL: in the same clone the untouched anchor still matches, so
   // the clone itself is not what produces the difference below.
   const faithful = inspectSelectedNamespaceAgainstBaseline({ repositoryRoot: root,
-    expectedCandidateCommit: cloneHead, anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR }) as never as
-    Record<string, unknown>
+    expectedCandidateCommit: cloneHead, anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR })
   assert.equal(faithful.matchesHistoricalBaseline, true)
   assert.deepEqual(faithful.differing, [])
 
   // The drifted ancestor keeps the exact 85-path namespace, so it passes
-  // enumeration and is caught by the per-file mode and digest comparison.
+  // enumeration and is caught by the per-file SHA-256 comparison. Stated
+  // precisely: the adapter also compares each file's mode, but that half can
+  // never differ -- the manifest check and the ls-tree parser both admit only
+  // 100644, and all 85 pinned entries carry it -- so the digest is the live
+  // detector and this fixture deliberately keeps the victim's path and mode.
   const drifted = inspectSelectedNamespaceAgainstBaseline({ repositoryRoot: root,
-    expectedCandidateCommit: cloneHead, anchorCommit: driftedAnchor }) as never as
-    Record<string, unknown>
+    expectedCandidateCommit: cloneHead, anchorCommit: driftedAnchor })
   assert.equal(drifted.rawAncestorOfCandidate, true)
   assert.equal(drifted.selectedFiles, 85)
   assert.equal(drifted.matchesHistoricalBaseline, false, 'changed bytes must be reported')
@@ -1072,10 +1073,16 @@ test('a non-Git launch is recorded and blocked before delegation, and the comman
     'the refused command must be a real executable, or its failure proves nothing')
 
   // ---- inertness, which must hold in the MUTATED control run too -----------
-  // These two are asserted first and deliberately: they are the properties the
-  // guard-bypass control must NOT break. Its own saved report is expected to
-  // show the same two values, which is how that control proves it started no
-  // process rather than merely failing somewhere.
+  // ORDERING, STATED ACCURATELY: the refusal-message assertion above runs
+  // FIRST, so in the guard-bypass control run it fails there and the two
+  // assertions below are NEVER REACHED. They are not the mutant's evidence,
+  // and nothing here should be read as saying they executed.
+  //
+  // What establishes inertness under the mutation is (a) that control's SAVED
+  // JSON report -- attemptedDelegation 1 with its recorded entry,
+  // delegatedNonGit 0, sentinelExists false -- and (b) the inert delegate's own
+  // source, which is the only call site of the native function and re-checks
+  // the target. These two assertions bind the property for the NORMAL run.
   assert.equal(report.delegatedNonGit, 0,
     'no non-Git command may ever reach the native subprocess function')
   assert.equal(report.sentinelExists, false,

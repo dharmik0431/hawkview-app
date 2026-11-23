@@ -154,8 +154,7 @@ function buildUnguarded(input: { environment: Environment }) {
   const anchor = inspectSelectedNamespaceAgainstBaseline({
     repositoryRoot, expectedCandidateCommit: assembled.candidateCommit,
     anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR,
-  }) as Readonly<{ anchorCommit: string; anchorTree: string; candidateTree?: string; selectedFiles: number
-    rawAncestorOfCandidate: boolean; matchesHistoricalBaseline: boolean; differing: readonly string[] }>
+  })
   requireMatch(anchor.rawAncestorOfCandidate === true)
   requireMatch(anchor.matchesHistoricalBaseline === true && anchor.differing.length === 0)
 
