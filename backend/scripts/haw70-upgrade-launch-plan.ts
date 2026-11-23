@@ -17,9 +17,11 @@ import { inspectHaw70UpgradeTarget } from './haw70-upgrade-target.js'
  * WHAT IT NEVER DOES. It does not load, import, spawn or version-probe the
  * Prisma CLI; create, materialize, clean or delete a staged root; create a
  * database client; connect to anything; generate, seed, migrate or build;
- * fetch, read or write a Git ref; or touch a workflow. Sanitized READ-ONLY Git
- * inspection, which the pinned source validation already performs, is the only
- * process work involved.
+ * fetch or mutate a Git ref; accept a moving branch name as authority; or
+ * touch a workflow. Actual HEAD IS read, because identity cannot be verified
+ * without reading it; what is never trusted is a moving main reference.
+ * Sanitized READ-ONLY Git inspection, which the pinned source validation
+ * already performs, is the only process work involved.
  *
  * WHAT IT NEVER RETURNS. No runnable child environment, no raw datasource URL,
  * no arbitrary command string, and no approved-or-ready flag. The child
@@ -84,7 +86,7 @@ export const HAW70_LAUNCH_ENVIRONMENT_KEYS = Object.freeze(
 /** Gates this slice deliberately leaves unmet. None is satisfied by a plan. */
 const UNMET_GATES = Object.freeze([
   'hosted-provenance: no approved registered hosted job has run for this head',
-  'hosted-toolchain: the quality workflow selects Node 22 on Linux; the recorded runtime is this\n    machine, which is not a hosted runner whatever its version reads',
+  'hosted-toolchain: the quality workflow selects Node 22 on Linux, and no approved hosted\n    evidence for this head exists; a runtime that happens to match the claims does not supply it',
   'whole-code-and-dependency-integrity: helper and installed dependency bytes are not qualified by selected migration pins',
   'current-main-freshness: the anchor is committed policy, not proof that protected main is unchanged now',
   'database-stage: no baseline install, legacy fixture or candidate upgrade has occurred, and no database history was checked',
@@ -146,7 +148,9 @@ function buildUnguarded(input: { environment: Environment }) {
   requireMatch(lstatSync(backend).isDirectory())
 
   // Identity 2: committed anchor, raw ancestry and the full selected-namespace
-  // comparison against the historical baseline. No fetch, no ref read.
+  // comparison against the historical baseline. Nothing is fetched and no ref
+  // is written; the anchor is a committed constant, never a moving main ref.
+  // Actual HEAD is read inside, solely to verify the candidate's identity.
   const anchor = inspectSelectedNamespaceAgainstBaseline({
     repositoryRoot, expectedCandidateCommit: assembled.candidateCommit,
     anchorCommit: HAW70_REVIEWED_MAIN_ANCHOR,

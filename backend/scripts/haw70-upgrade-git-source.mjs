@@ -390,8 +390,10 @@ function assertPinnedHaw70Profile(evidence) {
  * that the anchor's complete selected namespace -- paths, modes and bytes --
  * equals the PINNED historical baseline selection, which it takes from the
  * committed manifest rather than from any caller. No manifest, digest or file
- * list may be supplied, nothing is fetched, no ref is read or written, and the
- * existing inspector semantics and resource bounds are untouched. It returns
+ * list may be supplied, nothing is fetched, no ref is written and no moving
+ * main ref is accepted as authority -- actual HEAD is read only to verify the
+ * expected candidate -- and the existing inspector semantics and resource
+ * bounds are untouched. It returns
  * counts and identities only, never bytes, and grants no execution.
  */
 export function inspectSelectedNamespaceAgainstBaseline(input, caps = LEGACY_ACQUISITION_CAPS) {
