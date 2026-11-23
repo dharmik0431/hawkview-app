@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants, existsSync, fstatSync, lstatSync, openSync, closeSync,
   opendirSync, readFileSync, readSync, readdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -380,6 +381,48 @@ function assertPinnedHaw70Profile(evidence) {
     || evidence.sourcePlan.baselineDigest !== pins.baselineDigest
     || evidence.sourcePlan.candidateDigest !== pins.candidateDigest) throw new Error('Pinned HAW-70 profile mismatch');
   return evidence;
+}
+
+/**
+ * NARROW, READ-ONLY addition for the reviewed-main anchor check.
+ *
+ * It verifies that `anchorCommit` is a RAW ancestor of the exact candidate and
+ * that the anchor's complete selected namespace -- paths, modes and bytes --
+ * equals the PINNED historical baseline selection, which it takes from the
+ * committed manifest rather than from any caller. No manifest, digest or file
+ * list may be supplied, nothing is fetched, no ref is read or written, and the
+ * existing inspector semantics and resource bounds are untouched. It returns
+ * counts and identities only, never bytes, and grants no execution.
+ */
+export function inspectSelectedNamespaceAgainstBaseline(input, caps = LEGACY_ACQUISITION_CAPS) {
+  keys(input, ['repositoryRoot', 'expectedCandidateCommit', 'anchorCommit']);
+  const root = input.repositoryRoot;
+  const head = oid(input.expectedCandidateCommit);
+  const anchor = oid(input.anchorCommit);
+  if (typeof root !== 'string' || !isAbsolute(root) || resolve(root) !== root
+    || realpathSync(root) !== root || !lstatSync(root).isDirectory()) throw new Error('Canonical repository root required');
+  if (gitText(root, ['rev-parse', '--show-toplevel']) !== root) throw new Error('Repository root mismatch');
+  if (gitText(root, ['rev-parse', '--verify', 'HEAD^{commit}']) !== head) throw new Error('Actual HEAD differs from expected candidate');
+  // Raw ancestry only: no ref name, no fetch, no network.
+  assertRawAncestors(root, head, [anchor]);
+  const anchorTree = readCommit(root, anchor).tree;
+  // The anchor's selected namespace must match the pinned baseline exactly.
+  // `gitSnapshot` refuses a differing path set or a nonregular entry; the
+  // digest comparison below covers modes and bytes.
+  const budget = { bytes: 0 };
+  const files = gitSnapshot(root, anchor, pins.baselineFiles, caps, budget);
+  const pinned = new Map(pins.baselineFiles.map(file => [file.path, { mode: file.mode, sha256: file.sha256 }]));
+  const differing = [];
+  for (const file of files) {
+    const expected = pinned.get(file.path);
+    const actual = createHash('sha256').update(file.bytes).digest('hex');
+    if (!expected || expected.mode !== file.mode || expected.sha256 !== actual) differing.push(file.path);
+  }
+  if (files.length !== pins.baselineFiles.length) throw new Error('Anchor selected namespace differs from the pinned baseline');
+  return freeze({ kind: 'haw70-main-anchor-selection-only-v1', executionAllowed: false,
+    anchorCommit: anchor, anchorTree, candidateCommit: head, candidateTree: readCommit(root, head).tree,
+    rawAncestorOfCandidate: true, selectedFiles: files.length,
+    matchesHistoricalBaseline: differing.length === 0, differing: differing.sort() });
 }
 
 export function inspectHaw70UpgradeGitSource(input) {
