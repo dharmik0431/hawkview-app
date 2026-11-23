@@ -1066,3 +1066,359 @@ test('acquisition is refused by the combined budget alone, with a nearby passing
   assert.deepEqual(readdirSync(parent), [],
     'acquisition fails before staging, so the scratch parent stays empty');
 });
+
+/* ===================== deterministic short-write regression ===================== */
+
+/**
+ * WHAT THIS PROVES, AND WHAT IT DOES NOT.
+ *
+ * The private writer loops on `writeSync(fd, bytes, written, bytes.length -
+ * written)`, advances by the ACTUAL returned count, refuses a nonpositive
+ * return with a labelled short-write error, lets a thrown write exception
+ * propagate, and closes the descriptor in `finally`. Normal successful copies
+ * cannot demonstrate any of that, because a short OS write never happens on
+ * these small files, and the post-write seam runs only after every stage and
+ * receipt write has finished, so it cannot witness the loop either.
+ *
+ * So these cases drive the real loop in a child process whose builtin
+ * filesystem exports are patched before the actual materializer is imported.
+ * The patch DELEGATES to the saved native `writeSync` with a smaller requested
+ * length and returns its real count: the bytes on disk are genuinely written a
+ * prefix at a time. It never lies about a count while writing the whole buffer.
+ * The interception is a test device and is never an input to the source under
+ * test; the child restores the builtins before reporting, and every validation
+ * below runs in this unpatched parent process.
+ *
+ * It is NOT a claim about rollback, `fsync`, crash or power-loss durability,
+ * general filesystem fault tolerance, hostile same-user races, or counts
+ * fabricated outside the filesystem API's contract. A failed materialization
+ * deliberately leaves its private root in place; that is the existing
+ * contract, not a defect this witness establishes.
+ */
+
+const SHORT_WRITE_BOUND = 7
+const SHORT_WRITE_FAULT = 'synthetic write fault for the short-write witness'
+/** Optional durable destination for the raw child reports. */
+const SHORT_WRITE_EVIDENCE = (() => {
+  const requested = process.env.HAW70_SHORT_WRITE_EVIDENCE_DIR
+  return requested && existsSync(requested) && statSync(requested).isDirectory()
+    ? realpathSync(requested) : scratch
+})()
+
+const SHORT_WRITE_RUNNER = `
+import { createRequire } from 'node:module'
+const require = createRequire(process.argv[1])
+const { syncBuiltinESMExports } = require('node:module')
+const fs = require('node:fs')
+
+const input = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+const BOUND = input.bound
+const MODE = input.mode
+const TARGET = input.target
+
+// Saved natives. Every delegated write goes through origWrite, and the report
+// is written with origWriteFile so reporting is never itself observed.
+const origOpen = fs.openSync
+const origWrite = fs.writeSync
+const origClose = fs.closeSync
+const origWriteFile = fs.writeFileSync
+
+const events = []
+const owned = new Map()
+let generation = 0
+let injections = 0
+let injected = false
+
+// ONLY descriptors this case opened for writing, under its own private scratch
+// parent. Source reads, fixture creation and unrelated files are therefore
+// invisible to the assertions, and a reused descriptor NUMBER cannot be
+// mistaken for an earlier target because every entry carries its generation.
+const classify = path => {
+  if (path.indexOf(input.scratchParent) !== 0) return null
+  if (path.lastIndexOf('/receipt.json') === path.length - 13) return 'receipt'
+  if (path.indexOf('/baseline/') !== -1 || path.indexOf('/candidate/') !== -1) return 'stage'
+  return 'other-under-parent'
+}
+
+fs.openSync = function (path, flags, ...rest) {
+  const fd = origOpen.call(this, path, flags, ...rest)
+  const target = String(path)
+  const writable = typeof flags === 'number'
+    && (flags & (fs.constants.O_WRONLY | fs.constants.O_RDWR)) !== 0
+  const klass = classify(target)
+  if (writable && klass) {
+    generation += 1
+    owned.set(fd, { path: target, klass: klass, generation: generation, writes: 0 })
+    events.push({ event: 'open', fd: fd, generation: generation, klass: klass, path: target })
+  }
+  return fd
+}
+
+fs.writeSync = function (fd, buffer, offset, length, ...rest) {
+  const own = owned.get(fd)
+  if (!own) return origWrite.call(this, fd, buffer, offset, length, ...rest)
+  own.writes += 1
+  // Eligible only AFTER at least one real positive prefix on this very
+  // descriptor, and only once: the zero is one-shot, so an incorrect retry
+  // completes normally and is visible instead of hanging the run.
+  const eligible = !injected && own.klass === TARGET && own.writes > 1
+  if (eligible && MODE === 'zero') {
+    injected = true
+    injections += 1
+    events.push({ event: 'inject-zero', fd: fd, generation: own.generation, klass: own.klass,
+      path: own.path, offset: offset, length: length, requested: 0, returned: 0, writes: own.writes })
+    return 0
+  }
+  if (eligible && MODE === 'throw') {
+    injected = true
+    injections += 1
+    events.push({ event: 'inject-throw', fd: fd, generation: own.generation, klass: own.klass,
+      path: own.path, offset: offset, length: length, writes: own.writes })
+    throw new Error(input.faultMessage)
+  }
+  const requested = BOUND > 0 ? Math.min(length, BOUND) : length
+  const returned = origWrite.call(this, fd, buffer, offset, requested, ...rest)
+  events.push({ event: 'write', fd: fd, generation: own.generation, klass: own.klass,
+    path: own.path, offset: offset, length: length, requested: requested,
+    returned: returned, writes: own.writes })
+  return returned
+}
+
+fs.closeSync = function (fd) {
+  const own = owned.get(fd)
+  if (own) {
+    events.push({ event: 'close', fd: fd, generation: own.generation, klass: own.klass,
+      path: own.path, writes: own.writes })
+    // FORGET the descriptor as soon as it closes. The kernel reuses descriptor
+    // NUMBERS, and the uninjected control caught this: leaving the entry in
+    // place made a later unrelated close of the same number look like another
+    // close of this target, so closes outnumbered opens 36 to 13.
+    owned.delete(fd)
+  }
+  return origClose.call(this, fd)
+}
+
+// Bind the patched exports into the builtin's named ESM exports BEFORE the real
+// materializer is imported, because it imports openSync/writeSync/closeSync by
+// name and would otherwise keep the originals.
+syncBuiltinESMExports()
+
+const out = { error: null, errorName: null, result: null, events: events,
+  injections: 0, mode: MODE, target: TARGET, bound: BOUND, scratchParent: input.scratchParent }
+try {
+  const mod = await import(input.materializerUrl)
+  const result = mod.materializeMigrationSource(
+    Object.assign({}, input.source, { scratchParent: input.scratchParent }))
+  out.result = { kind: result.kind, executionAllowed: result.executionAllowed,
+    outputRoot: result.outputRoot, receiptPath: result.receiptPath, receipt: result.receipt }
+} catch (error) {
+  out.error = String(error && error.message ? error.message : error)
+  out.errorName = error && error.constructor ? error.constructor.name : null
+} finally {
+  out.injections = injections
+  // Restore the builtins and re-synchronize BEFORE anything else happens, so
+  // the report write and any later work are neither observed nor bounded.
+  fs.openSync = origOpen
+  fs.writeSync = origWrite
+  fs.closeSync = origClose
+  syncBuiltinESMExports()
+  origWriteFile(input.reportPath, JSON.stringify(out, null, 1))
+}
+`
+
+/** The fixture is built HERE, in the unpatched parent, before any interception. */
+function runShortWriteCase(label, options) {
+  const { source } = small.fixture()
+  const directory = realpathSync(mkdtempSync(join(scratch, `short-write-${label}-`)))
+  const scratchParent = join(directory, 'parent')
+  mkdirSync(scratchParent, { mode: 0o700 })
+  writeFileSync(join(directory, 'runner.mjs'), SHORT_WRITE_RUNNER)
+  const reportPath = join(directory, 'report.json')
+  const inputPath = join(directory, 'input.json')
+  writeFileSync(inputPath, JSON.stringify({
+    source, scratchParent, reportPath, faultMessage: SHORT_WRITE_FAULT,
+    materializerUrl: `file://${join(import.meta.dirname, 'haw70-upgrade-materializer.mjs')}`,
+    mode: options.mode, target: options.target ?? null, bound: options.bound ?? 0,
+  }))
+  const run = spawnSync(process.execPath, [join(directory, 'runner.mjs'), inputPath],
+    { encoding: 'utf8', timeout: 180_000 })
+  assert.equal(run.signal, null, `the ${label} child must exit on its own: ${run.stderr}`)
+  assert.ok(existsSync(reportPath), `no report from ${label}: ${run.stderr}`)
+  const report = JSON.parse(readFileSync(reportPath, 'utf8'))
+  report.source = source
+  writeFileSync(join(SHORT_WRITE_EVIDENCE, `short-write-${label}.json`), JSON.stringify(report, null, 1))
+  return report
+}
+
+/** The single private root the materializer created under this case's parent. */
+function stagedRootOf(report) {
+  const entries = readdirSync(report.scratchParent, { withFileTypes: true })
+    .filter(entry => entry.isDirectory()).map(entry => entry.name)
+  assert.equal(entries.length, 1, 'exactly one private root must exist under the case parent')
+  return join(report.scratchParent, entries[0])
+}
+
+/**
+ * The EXACT refusal normal unpatched validation gives for each interrupted
+ * target, measured rather than assumed. An any-error matcher would also accept
+ * a malformed fixture, a stale root or a shape error, so each case pins its
+ * own message: an interrupted stage file leaves the staged namespace short of
+ * the fixed mapping, while an interrupted receipt leaves unparseable JSON.
+ */
+const INCOMPLETE_ROOT_REFUSAL = {
+  stage: /^Error: Staged file namespace differs from the fixed mapping$/,
+  receipt: /^Error: receipt: unreadable or malformed$/,
+}
+
+const writesOn = (report, klass) => report.events.filter(e => e.event === 'write' && e.klass === klass)
+const descriptors = (report, klass) => [...new Set(report.events
+  .filter(e => e.event === 'open' && e.klass === klass).map(e => e.generation))]
+
+/** Offsets and remaining lengths must progress exactly as the loop computes them. */
+function assertProgress(report, generation, label) {
+  const writes = report.events.filter(e => e.event === 'write' && e.generation === generation)
+  assert.ok(writes.length > 0, `${label}: no observed write`)
+  let expectedOffset = 0
+  let total = null
+  for (const write of writes) {
+    assert.equal(write.offset, expectedOffset, `${label}: offset must be the bytes already written`)
+    if (total === null) total = write.offset + write.length
+    assert.equal(write.offset + write.length, total, `${label}: length must be the remainder`)
+    const bound = report.bound > 0 ? report.bound : write.length
+    assert.equal(write.requested, Math.min(write.length, bound),
+      `${label}: the harness must request the bounded remainder`)
+    assert.ok(write.returned > 0 && write.returned <= write.requested,
+      `${label}: the native count must be positive and within the request`)
+    expectedOffset += write.returned
+  }
+  assert.equal(expectedOffset, total, `${label}: the loop must finish exactly at the full length`)
+  return { writes: writes.length, total }
+}
+
+/** Completeness, recomputed from the receipt's own per-file digests and the disk. */
+function assertCompleteStagedBytes(report) {
+  const outputRoot = report.result.outputRoot
+  let checked = 0
+  for (const stage of ['baseline', 'candidate']) {
+    for (const file of report.result.receipt.stages[stage].files) {
+      const absolute = join(outputRoot, file.path)
+      const actual = readFileSync(absolute)
+      assert.equal(actual.length, file.bytes, file.path)
+      assert.equal(sha256(actual), file.sha256, file.path)
+      assert.equal(statSync(absolute).mode & 0o7777, 0o600, file.path)
+      checked += 1
+    }
+    assert.equal(statSync(join(outputRoot, stage)).mode & 0o7777, 0o700, stage)
+  }
+  assert.ok(checked >= 10, 'both stages of the fixture must have been checked')
+  return outputRoot
+}
+
+test('an uninjected control materializes for real through the same interception harness', () => {
+  const report = runShortWriteCase('control', { mode: 'none' })
+  assert.equal(report.error, null, String(report.error))
+  assert.equal(report.injections, 0)
+  assert.equal(report.result.kind, 'haw70-migration-stage-result-v1')
+  assert.equal(report.result.executionAllowed, false)
+  // The harness really was in place: it observed the writer's own descriptors.
+  assert.ok(descriptors(report, 'stage').length >= 5, 'every staged file must be observed')
+  assert.equal(descriptors(report, 'receipt').length, 1)
+  assert.equal(report.events.filter(e => e.event === 'close').length,
+    descriptors(report, 'stage').length + 1, 'every observed descriptor must close')
+  assert.deepEqual(report.events.filter(e => e.klass === 'other-under-parent'), [],
+    'nothing else under the private parent is opened for writing')
+  // Unbounded: each file completes in a single native write.
+  assert.ok(writesOn(report, 'stage').every(write => write.offset === 0))
+  for (const generation of descriptors(report, 'stage')) assertProgress(report, generation, 'control stage')
+  const outputRoot = assertCompleteStagedBytes(report)
+  assert.equal(outputRoot, stagedRootOf(report))
+  // And the untouched root validates in THIS unpatched process.
+  assert.equal(validateMigrationStagedSource({ ...report.source, outputRoot }).executionAllowed, false)
+})
+
+test('real positive partial writes on stage descriptors and the receipt complete correctly', () => {
+  const report = runShortWriteCase('partial', { mode: 'partial', bound: SHORT_WRITE_BOUND })
+  assert.equal(report.error, null, String(report.error))
+  assert.equal(report.injections, 0, 'nothing is injected here; the writes are merely bounded')
+  assert.equal(report.result.executionAllowed, false)
+
+  // At least one stage descriptor AND the receipt needed MULTIPLE real writes.
+  const multiStage = descriptors(report, 'stage')
+    .map(generation => assertProgress(report, generation, `stage generation ${generation}`))
+    .filter(progress => progress.writes > 1)
+  assert.ok(multiStage.length >= 1, 'a staged file must take more than one real write')
+  const receiptProgress = assertProgress(report, descriptors(report, 'receipt')[0], 'receipt')
+  assert.ok(receiptProgress.writes > 1, 'the receipt must take more than one real write')
+  assert.ok(writesOn(report, 'stage').every(write => write.requested <= SHORT_WRITE_BOUND))
+  assert.ok(writesOn(report, 'receipt').every(write => write.requested <= SHORT_WRITE_BOUND))
+
+  const outputRoot = assertCompleteStagedBytes(report)
+  const encoded = readFileSync(report.result.receiptPath)
+  assert.equal(encoded.length, receiptProgress.total, 'the receipt is exactly as long as it was written')
+  assert.deepEqual(JSON.parse(encoded.toString('utf8')), report.result.receipt)
+  // Normal validation, in this unpatched process, still succeeds.
+  assert.equal(validateMigrationStagedSource({ ...report.source, outputRoot }).executionAllowed, false)
+})
+
+for (const target of ['stage', 'receipt']) {
+  test(`a one-shot zero after a real prefix on the ${target} is refused immediately and never retried`, () => {
+    const report = runShortWriteCase(`zero-${target}`, { mode: 'zero', target, bound: SHORT_WRITE_BOUND })
+    assert.equal(report.injections, 1, 'exactly one zero must have been injected')
+    assert.equal(report.result, null, 'no result may be returned')
+    const zero = report.events.find(e => e.event === 'inject-zero')
+    assert.ok(zero, 'the zero must have been reached')
+    assert.equal(zero.klass, target)
+    // A REAL positive prefix preceded it, on this very descriptor.
+    const before = report.events.filter(e => e.event === 'write' && e.generation === zero.generation)
+    assert.ok(before.length >= 1 && before.every(write => write.returned > 0),
+      'the injected zero must follow at least one real positive write')
+    assert.ok(zero.offset > 0, 'the zero must arrive after a nonzero prefix was already written')
+    // The labelled refusal from the writer itself.
+    assert.match(String(report.error), /: short write$/)
+    assert.equal(report.errorName, 'Error')
+    // NO RETRY: nothing was written on that descriptor after the zero.
+    const after = report.events.slice(report.events.indexOf(zero) + 1)
+    assert.deepEqual(after.filter(e => e.event === 'write' && e.generation === zero.generation), [],
+      'a zero return must not be retried')
+    assert.equal(report.events.filter(e => e.event === 'inject-zero').length, 1)
+    assert.ok(after.some(e => e.event === 'close' && e.generation === zero.generation),
+      'the interrupted descriptor must close')
+    // The prefix is MEASURED on disk, not merely inferred from the recorded
+    // return value: the interrupted file is exactly as long as the bytes the
+    // loop had already written when the zero arrived.
+    assert.ok(existsSync(zero.path), 'the partially written file is left in place for inspection')
+    assert.equal(statSync(zero.path).size, zero.offset,
+      'the retained file must hold exactly the real prefix that was written')
+    // The partial root is refused by normal unpatched validation, for its own
+    // specific reason rather than by any error at all.
+    const outputRoot = stagedRootOf(report)
+    assert.throws(() => validateMigrationStagedSource({ ...report.source, outputRoot }),
+      INCOMPLETE_ROOT_REFUSAL[target], 'the incomplete root must be refused')
+  })
+
+  test(`a thrown write error after a real prefix on the ${target} reaches the refusal boundary`, () => {
+    const report = runShortWriteCase(`throw-${target}`, { mode: 'throw', target, bound: SHORT_WRITE_BOUND })
+    assert.equal(report.injections, 1)
+    assert.equal(report.result, null, 'no result may be returned')
+    const thrown = report.events.find(e => e.event === 'inject-throw')
+    assert.ok(thrown, 'the fault must have been reached')
+    assert.equal(thrown.klass, target)
+    const before = report.events.filter(e => e.event === 'write' && e.generation === thrown.generation)
+    assert.ok(before.length >= 1 && before.every(write => write.returned > 0))
+    assert.ok(thrown.offset > 0, 'the fault must follow a nonzero prefix')
+    // THE EXACT synthetic error, not a later digest or size failure.
+    assert.equal(report.error, SHORT_WRITE_FAULT,
+      'the injected write error itself must reach the boundary')
+    const after = report.events.slice(report.events.indexOf(thrown) + 1)
+    assert.deepEqual(after.filter(e => e.event === 'write' && e.generation === thrown.generation), [],
+      'no further write may occur on the interrupted descriptor')
+    assert.ok(after.some(e => e.event === 'close' && e.generation === thrown.generation),
+      'the interrupted descriptor must close')
+    assert.ok(existsSync(thrown.path))
+    assert.equal(statSync(thrown.path).size, thrown.offset,
+      'the retained file must hold exactly the real prefix that was written')
+    const outputRoot = stagedRootOf(report)
+    assert.throws(() => validateMigrationStagedSource({ ...report.source, outputRoot }),
+      INCOMPLETE_ROOT_REFUSAL[target], 'the incomplete root must be refused')
+  })
+}
