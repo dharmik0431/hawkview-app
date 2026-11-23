@@ -656,6 +656,8 @@ type WitnessReport = { error: string | null; events: WitnessEvent[]; sync: boole
   harnessPrefix: string; cacheDisabled: boolean
   blockedMessage: string | null; sentinelExists: boolean | null
   controlIsExecutable: boolean | null; delegated: number | null; delegatedNonGit: number | null
+  attemptedDelegation: number | null
+  attemptedDetail: Array<{ phase: string; name: string; file: string }> | null
   inheritedKeys: string[]; exec: unknown; keys: number | null
   preview: string[] | null }
 
@@ -686,11 +688,35 @@ const probe = await import(input.probeUrl)
 
 let phase = 'preload'
 const events = []
-// Every call that actually REACHES the real function is recorded here. It is
-// the structural proof that a refused launch never ran: the control command is
-// never executed, not even once to show it could be.
+// Every call that actually REACHES the native function is recorded here.
 const delegated = []
+// Every call that reaches the INERT delegate below is recorded here. While the
+// refusal stands this array must stay empty, because the guard throws first.
+// The deliberate guard-bypass control removes that throw, and the attempt then
+// lands here -- recorded, and with no process started.
+const attempted = []
 const note = (kind, name, detail) => { events.push({ phase, kind, name, detail }) }
+
+// The ONE place the native subprocess function is ever invoked, and the only
+// thing beneath the refusal above. It re-checks the target, so a non-Git
+// command cannot reach the native function even when the guard is removed: it
+// gets an INERT result instead, and the attempt is recorded AT THIS ENTRY,
+// before anything else happens. Permitted read-only Git still runs for real,
+// which is what keeps the builder's Git observation meaningful.
+function inertResult() {
+  const empty = Buffer.alloc(0)
+  return { pid: -1, status: null, signal: null, stdout: empty, stderr: empty,
+    output: [null, empty, empty],
+    error: new Error('inert delegate: no process was started') }
+}
+function delegate(name, target, real, self, args) {
+  if (target !== GIT) {
+    attempted.push({ phase: phase, name: name, file: target })
+    return inertResult()
+  }
+  delegated.push({ phase: phase, name: name, file: target })
+  return real.apply(self, args)
+}
 
 for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
   const real = cp[name]
@@ -706,8 +732,7 @@ for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execF
       entry.blocked = true
       throw new Error('BLOCKED non-Git launch: ' + name + ' ' + target)
     }
-    delegated.push({ phase: phase, name: name, file: target })
-    return real.call(this, file, ...rest)
+    return delegate(name, target, real, this, [file, ...rest])
   }
 }
 
@@ -755,6 +780,7 @@ if (SYNC) syncBuiltinESMExports()
 const out = { error: null, events: events, sync: SYNC, harnessPrefix: harnessPrefix,
   cacheDisabled: process.env.TSX_DISABLE_CACHE === '1', blockedMessage: null,
   sentinelExists: null, controlIsExecutable: null, delegated: null, delegatedNonGit: null,
+  attemptedDelegation: null, attemptedDetail: null,
   inheritedKeys: Object.keys(process.env).sort(), exec: null, keys: null, preview: null }
 try {
   phase = 'control-binding'
@@ -795,6 +821,8 @@ try {
   phase = 'done'
   out.delegated = delegated.length
   out.delegatedNonGit = delegated.filter(entry => entry.file !== GIT).length
+  out.attemptedDelegation = attempted.length
+  out.attemptedDetail = attempted
   origWrite(input.reportPath, JSON.stringify(out, null, 1))
 }
 `
@@ -1043,13 +1071,25 @@ test('a non-Git launch is recorded and blocked before delegation, and the comman
   assert.equal(report.controlIsExecutable, true,
     'the refused command must be a real executable, or its failure proves nothing')
 
-  // THE STRUCTURAL PROOF. `delegated` records every call that reached the real
-  // function. Git work reached it; nothing else ever did, in any phase. This
-  // does not depend on the recorder noticing afterwards, and it is not
-  // satisfiable by a call the recorder missed, because a missed call would have
-  // had to pass through the same wrapper to be delegated at all.
+  // ---- inertness, which must hold in the MUTATED control run too -----------
+  // These two are asserted first and deliberately: they are the properties the
+  // guard-bypass control must NOT break. Its own saved report is expected to
+  // show the same two values, which is how that control proves it started no
+  // process rather than merely failing somewhere.
+  assert.equal(report.delegatedNonGit, 0,
+    'no non-Git command may ever reach the native subprocess function')
+  assert.equal(report.sentinelExists, false,
+    'no control process may ever create its sentinel')
+
+  // ---- the refusal itself, which the guard-bypass control must break -------
+  // `delegated` records every call that reached the native function, and
+  // `attemptedDelegation` records every call that reached the inert delegate
+  // beneath the refusal. While the refusal stands the latter must be zero,
+  // because the guard throws before the delegate is reached.
   assert.ok((report.delegated ?? 0) > 0, 'real Git work must have been delegated')
-  assert.equal(report.delegatedNonGit, 0, 'no non-Git command may ever reach the real function')
+  assert.equal(report.attemptedDelegation, 0,
+    'the inert delegate must be unreachable while the refusal stands')
+  assert.deepEqual(report.attemptedDetail, [])
 
   // No forbidden launch was RECORDED in any other phase either. Stated as a
   // recorded-event claim, which is weaker than the delegation proof above and
