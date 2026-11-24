@@ -56,6 +56,43 @@ function hostedDisposableDatabaseUrl(): URL {
   return url
 }
 
+/**
+ * Attempt EVERY closer, then surface whatever failed. A closer that rejects
+ * must not stop the remaining ones from being attempted, and a cleanup failure
+ * must not be swallowed.
+ */
+async function closeAll(label: string, closers: ReadonlyArray<() => Promise<unknown>>): Promise<void> {
+  const failures: unknown[] = []
+  for (const close of closers) {
+    try { await close() } catch (error) { failures.push(error) }
+  }
+  if (failures.length === 1) throw failures[0]
+  if (failures.length > 1) throw new AggregateError(failures, `${label}: cleanup failed`)
+}
+
+/**
+ * Run a body, then cleanup, retaining BOTH failures. A bare `finally` that
+ * awaits cleanup replaces the body's error with the cleanup error when both
+ * fail, which hides the finding that matters.
+ */
+async function withCleanup(
+  label: string,
+  body: () => Promise<void>,
+  closers: ReadonlyArray<() => Promise<unknown>>,
+): Promise<void> {
+  let bodyFailed = false
+  let bodyError: unknown
+  try { await body() } catch (error) { bodyFailed = true; bodyError = error }
+  let cleanupFailed = false
+  let cleanupError: unknown
+  try { await closeAll(label, closers) } catch (error) { cleanupFailed = true; cleanupError = error }
+  if (bodyFailed && cleanupFailed) {
+    throw new AggregateError([bodyError, cleanupError], `${label}: the test failed AND cleanup failed`)
+  }
+  if (bodyFailed) throw bodyError
+  if (cleanupFailed) throw cleanupError
+}
+
 const AS_OF = new Date('2026-11-20T12:00:00.000Z')
 const minutesBefore = (count: number) => new Date(AS_OF.getTime() - count * 60_000)
 const auditId = (index: number) => `evt-${String(index).padStart(5, '0')}`
@@ -104,6 +141,19 @@ async function fixture(tenantCount: number): Promise<Fixture> {
       })
       tenants.push(tenant.id)
     }
+  } catch (error) {
+    // A tenant-create failure part way through would otherwise leave this
+    // fixture's organization behind, because the caller never receives a
+    // handle to close. Remove only what this fixture created, and report the
+    // original failure even if that removal also fails.
+    if (organizationId) {
+      try { await prisma.organization.delete({ where: { id: organizationId } }) }
+      catch (cleanupError) {
+        throw new AggregateError([error, cleanupError],
+          'fixture creation failed AND its partial scope could not be removed')
+      }
+    }
+    throw error
   } finally {
     await prisma.$disconnect()
   }
@@ -151,27 +201,62 @@ async function fixture(tenantCount: number): Promise<Fixture> {
       // Scoped cleanup only: these fixture rows and scopes, nothing shared. The
       // organization cascade removes the tenants and their audit rows; a
       // failure here is deliberately NOT suppressed.
+      // Every owned client is attempted even when an earlier step rejects: a
+      // delete failure previously still reached both closers, but a rejecting
+      // `$disconnect` skipped `pool.end` and leaked the pool.
       const cleanup = new PrismaClient({ adapter: new PrismaPg({ connectionString, max: 2 }) })
-      try {
-        await cleanup.organization.delete({ where: { id: organizationId } })
-      } finally {
-        await cleanup.$disconnect()
-        await pool.end()
-      }
+      await closeAll('fixture close', [
+        () => cleanup.organization.delete({ where: { id: organizationId } }),
+        () => cleanup.$disconnect(),
+        () => pool.end(),
+      ])
     },
   }
 }
 
-/** Build a jsonb expression whose `::text` is EXACTLY `bytes` octets. */
-function paddedJsonb(bytes: number, character: string, characterBytes: number): string {
-  // jsonb renders an object as {"a": "..."} — nine octets of structure around
-  // the padded string. The exact length is asserted in PostgreSQL by the caller
-  // rather than trusted from this arithmetic.
-  const padding = (bytes - 9) / characterBytes
-  assert.ok(Number.isInteger(padding) && padding > 0,
-    `cannot pad to ${bytes} octets with a ${characterBytes}-octet character`)
-  return `jsonb_build_object('a', repeat('${character}', ${padding}))`
+/** `{"a": "<content>"}` — the octets of jsonb structure around the content. */
+const JSONB_WRAPPER_OCTETS = 9
+
+/**
+ * Compose a jsonb expression whose `::text` is EXACTLY `bytes` octets.
+ *
+ * A two-octet character cannot reach an odd content length on its own. An
+ * earlier version divided the content length by the character width and
+ * asserted an integer, so the 4096-octet multibyte case computed 2043.5 and
+ * threw before any SQL ran, and the over-boundary case asked for 4098 rather
+ * than the 4097 it reported. The content is therefore as many multibyte
+ * characters as fit PLUS a one-octet ASCII remainder when the target is odd,
+ * which reaches both 4096 and 4097 exactly for either width.
+ *
+ * This arithmetic is only the construction. Every caller asserts the real
+ * length with PostgreSQL's own `octet_length`, and the nonconnecting test below
+ * checks the arithmetic and emitted SQL without claiming a physical pass.
+ */
+function paddedJsonbContent(bytes: number, character: string, characterBytes: number): {
+  readonly sql: string
+  readonly multibyteCount: number
+  readonly asciiRemainder: number
+  readonly contentOctets: number
+} {
+  const contentOctets = bytes - JSONB_WRAPPER_OCTETS
+  assert.ok(contentOctets > 0, `cannot build a ${bytes}-octet payload`)
+  const multibyteCount = Math.floor(contentOctets / characterBytes)
+  const asciiRemainder = contentOctets - multibyteCount * characterBytes
+  assert.ok(Number.isInteger(multibyteCount) && multibyteCount > 0,
+    `cannot compose ${bytes} octets from ${characterBytes}-octet characters`)
+  assert.ok(asciiRemainder >= 0 && asciiRemainder < characterBytes,
+    `unexpected remainder ${asciiRemainder} for ${bytes} octets`)
+  const parts = [`repeat('${character}', ${multibyteCount})`]
+  // The remainder is ASCII, so each remaining character is exactly one octet.
+  if (asciiRemainder > 0) parts.push(`repeat('x', ${asciiRemainder})`)
+  return {
+    sql: `jsonb_build_object('a', ${parts.join(' || ')})`,
+    multibyteCount, asciiRemainder, contentOctets,
+  }
 }
+
+const paddedJsonb = (bytes: number, character: string, characterBytes: number): string =>
+  paddedJsonbContent(bytes, character, characterBytes).sql
 
 // ---------------------------------------------------------------------------
 // Family 1 — the actual query and driver contract
@@ -192,11 +277,29 @@ test('the unmodified statement executes on migrated PostgreSQL and its real rows
       ])
 
       // The unqualified relation the statement names must resolve to the public
-      // table in THIS connection. Recorded as a connection-context assumption,
-      // not as proof of deployed permissions or search_path.
+      // table in THIS connection. Compared by OBJECT IDENTITY and by
+      // pg_class/pg_namespace, not by regclass text: PostgreSQL omits the
+      // schema from regclass output when the relation is visible on the
+      // search_path, so an equality against 'public.directory_audit_logs' text
+      // rejects the correct default-path connection. Recorded as a
+      // connection-context assumption, not as proof of deployed permissions or
+      // search_path, and the production query and search_path are unchanged.
       const resolved = await f.pool.query(
-        `SELECT to_regclass('directory_audit_logs')::text AS relation, current_setting('search_path') AS search_path`)
-      assert.equal(resolved.rows[0].relation, 'public.directory_audit_logs')
+        `SELECT to_regclass('directory_audit_logs') IS NOT NULL AS resolves,
+                to_regclass('directory_audit_logs')
+                  OPERATOR(pg_catalog.=) 'public.directory_audit_logs'::regclass AS is_public_relation,
+                n.nspname AS schema_name,
+                c.relname AS relation_name,
+                current_setting('search_path') AS search_path
+           FROM pg_catalog.pg_class c
+           JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+          WHERE c.oid OPERATOR(pg_catalog.=) to_regclass('directory_audit_logs')`)
+      assert.equal(resolved.rows.length, 1, 'the unqualified relation must resolve to exactly one object')
+      assert.equal(resolved.rows[0].resolves, true)
+      assert.equal(resolved.rows[0].is_public_relation, true,
+        'the resolved object identity must BE public.directory_audit_logs')
+      assert.equal(resolved.rows[0].schema_name, 'public')
+      assert.equal(resolved.rows[0].relation_name, 'directory_audit_logs')
 
       const query = buildAuditEvidenceQuery([f.scope(0)], AS_OF)
       const raw = await f.pool.query(query.sql, [...query.params])
@@ -261,7 +364,7 @@ test('a representative positive and null case also decodes through the installed
     const prisma = new PrismaClient({
       adapter: new PrismaPg({ connectionString: url.toString(), max: 2 }),
     })
-    try {
+    await withCleanup('prisma raw path', async () => {
       await f.seed([
         { tenantId: f.tenants[0]!, microsoftAuditId: auditId(1), eventDateTime: minutesBefore(5) },
         {
@@ -283,10 +386,9 @@ test('a representative positive and null case also decodes through the installed
       assert.deepEqual(tenant.observations.map((o) => o.microsoftAuditId), [auditId(1), auditId(2)])
       assert.equal(tenant.observations[1]!.initiatedBy, null)
       assert.equal(tenant.observations[1]!.payloadWithheld, false)
-    } finally {
-      await prisma.$disconnect()
-      await f.close()
-    }
+      // The client and the fixture are both attempted even if the first
+      // rejects, which a sequential `finally` did not guarantee.
+    }, [() => prisma.$disconnect(), () => f.close()])
   })
 
 // ---------------------------------------------------------------------------
@@ -349,8 +451,15 @@ test('a noisy tenant cannot consume a quiet tenant’s window, in one real query
 test('the statement matches exact organization/tenant pairs, not either column alone',
   { skip: !enabled, timeout: 60_000 }, async () => {
     const first = await fixture(1)
-    const second = await fixture(1)
+    let second: Awaited<ReturnType<typeof fixture>>
     try {
+      second = await fixture(1)
+    } catch (error) {
+      // Creating the second fixture failed, so the first would otherwise leak.
+      await closeAll('crossed-scope setup', [() => first.close()])
+      throw error
+    }
+    await withCleanup('crossed scopes', async () => {
       await first.seed([{ tenantId: first.tenants[0]!, microsoftAuditId: 'own', eventDateTime: minutesBefore(5) }])
       await second.seed([{ tenantId: second.tenants[0]!, microsoftAuditId: 'other-org', eventDateTime: minutesBefore(5) }])
 
@@ -366,32 +475,48 @@ test('the statement matches exact organization/tenant pairs, not either column a
       assert.deepEqual(batch.tenants[1]!.observations, [],
         'the other organization’s event is not returned for a crossed pair')
       assert.equal(JSON.stringify(batch).includes('other-org'), false)
-    } finally {
-      await first.close()
-      await second.close()
-    }
+      // Both owned fixtures are attempted below even if one close rejects, and
+      // a cleanup failure never replaces a body failure.
+    }, [() => first.close(), () => second.close()])
   })
 
-test('results follow the requested scope order, independently of SQL row order',
+test('results follow the requested scope order, against a deliberately opposite SQL order',
   { skip: !enabled, timeout: 60_000 }, async () => {
     const f = await fixture(3)
     try {
-      for (let index = 0; index < 3; index += 1) {
+      // Three random UUIDs can already arrive in request order, so a reader
+      // that passed SQL order straight through would pass about one time in
+      // six. The request is therefore built as the EXACT REVERSE of the order
+      // the statement itself produces, and that opposition is asserted against
+      // the real raw rows rather than inferred from the SQL text.
+      const sqlOrder = [...f.tenants].sort()
+      const requested: AuditEvidenceScope[] = [...sqlOrder].reverse()
+        .map((customerTenantId) => ({ organizationId: f.organizationId, customerTenantId }))
+      const auditIdFor = new Map(f.tenants.map((id, index) => [id, `tenant-${index}`]))
+      for (const tenantId of f.tenants) {
         await f.seed([{
-          tenantId: f.tenants[index]!, microsoftAuditId: `tenant-${index}`,
-          eventDateTime: minutesBefore(index + 1),
+          tenantId, microsoftAuditId: auditIdFor.get(tenantId)!, eventDateTime: minutesBefore(5),
         }])
       }
-      const reversed = [f.scope(2), f.scope(0), f.scope(1)]
-      const batch = await readTenantAuditEvidenceBatch(f.store, reversed, AS_OF)
+
+      const query = buildAuditEvidenceQuery(requested, AS_OF)
+      const raw = await f.pool.query(query.sql, [...query.params])
+      const rawOrder = raw.rows.map((row) => row.customer_tenant_id)
+      assert.equal(rawOrder.length, 3, 'one row per tenant')
+      assert.deepEqual(rawOrder, sqlOrder,
+        'the statement returns tenants in ascending customer_tenant_id order')
+      assert.deepEqual(rawOrder, [...requested].reverse().map((scope) => scope.customerTenantId),
+        'which is exactly the reverse of what was requested')
+      assert.notDeepEqual(rawOrder, requested.map((scope) => scope.customerTenantId),
+        'so SQL order and request order cannot coincide by chance')
+
+      const batch = await readTenantAuditEvidenceBatch(f.store, requested, AS_OF)
       assert.deepEqual(batch.tenants.map((t) => t.scope.customerTenantId),
-        reversed.map((s) => s.customerTenantId), 'requested order is preserved')
+        requested.map((scope) => scope.customerTenantId),
+        'the decoded result follows the REQUEST, not the raw SQL order')
       assert.deepEqual(batch.tenants.map((t) => t.observations[0]!.microsoftAuditId),
-        ['tenant-2', 'tenant-0', 'tenant-1'])
-      // The SQL itself orders by customer_tenant_id, which is deliberately a
-      // different order from the request.
-      const query = buildAuditEvidenceQuery(reversed, AS_OF)
-      assert.ok(query.sql.includes('ORDER BY customer_tenant_id ASC'))
+        requested.map((scope) => auditIdFor.get(scope.customerTenantId)!),
+        'and each tenant carries its own event')
     } finally {
       await f.close()
     }
@@ -487,11 +612,12 @@ for (const [label, character, characterBytes] of [
     { skip: !enabled, timeout: 90_000 }, async () => {
       const f = await fixture(1)
       try {
+        // Exactly the cap, and exactly one octet over it, for BOTH widths.
         const atCap = paddedJsonb(AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES, character, characterBytes)
-        const overCap = paddedJsonb(AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES + characterBytes, character, characterBytes)
+        const overCap = paddedJsonb(AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES + 1, character, characterBytes)
         // Lengths established by PostgreSQL, not by JavaScript string length.
         assert.equal(await f.octets(atCap), AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES)
-        assert.equal(await f.octets(overCap), AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES + characterBytes)
+        assert.equal(await f.octets(overCap), AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES + 1)
 
         await f.seed([
           // Exactly at the cap: delivered.
@@ -630,3 +756,112 @@ test('an oversized payload on the sentinel row alone leaves a capped window CAPP
       await f.close()
     }
   })
+
+// ---------------------------------------------------------------------------
+// NONCONNECTING checks of this suite's own harness.
+//
+// These run without any database, opt-in or marker, and they are NOT physical
+// passes: they verify the fixture generator's arithmetic and the cleanup
+// helpers' behaviour, not PostgreSQL. Every physical case above remains gated
+// and is reported as NOT RUN locally. The real octet lengths are asserted by
+// PostgreSQL's own octet_length inside those gated cases.
+// ---------------------------------------------------------------------------
+
+test('the payload generator composes exact octet targets for both character widths', () => {
+  for (const [character, characterBytes] of [['x', 1], ['é', 2]] as const) {
+    for (const target of [
+      AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES,
+      AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES + 1,
+    ]) {
+      const built = paddedJsonbContent(target, character, characterBytes)
+      const label = `${target} octets of ${characterBytes}-octet content`
+      assert.equal(built.contentOctets, target - JSONB_WRAPPER_OCTETS, label)
+      assert.equal(
+        built.multibyteCount * characterBytes + built.asciiRemainder,
+        target - JSONB_WRAPPER_OCTETS,
+        `${label}: the composed parts must total the content length exactly`)
+      assert.ok(built.multibyteCount > 0, label)
+      assert.ok(built.asciiRemainder === 0 || characterBytes > 1,
+        'a one-octet character never needs a remainder')
+      assert.ok(built.sql.startsWith("jsonb_build_object('a', repeat("), label)
+      // Counted, not matched as a substring: the single-byte padding character
+      // IS 'x', so looking for "repeat('x'" cannot distinguish the remainder.
+      assert.equal(built.sql.split('repeat(').length - 1, built.asciiRemainder > 0 ? 2 : 1,
+        `${label}: a second repeat() appears only when a remainder is needed`)
+    }
+  }
+})
+
+test('the 4096-octet multibyte target composes rather than throwing, and 4097 needs no remainder', () => {
+  // The two exact cases independent review found. Previously 4096 with a
+  // two-octet character computed (4096 - 9) / 2 = 2043.5 and the integer
+  // assertion threw before any SQL ran, and the over-boundary case asked for
+  // 4098 while reporting 4097.
+  const atCap = paddedJsonbContent(4096, 'é', 2)
+  assert.equal(atCap.multibyteCount, 2043)
+  assert.equal(atCap.asciiRemainder, 1, '4087 content octets is odd, so one ASCII octet completes it')
+  assert.equal(atCap.multibyteCount * 2 + atCap.asciiRemainder, 4087)
+
+  const overCap = paddedJsonbContent(4097, 'é', 2)
+  assert.equal(overCap.multibyteCount, 2044)
+  assert.equal(overCap.asciiRemainder, 0, '4088 content octets is even')
+  assert.equal(overCap.multibyteCount * 2, 4088)
+
+  // And the single-byte pair, for completeness.
+  assert.equal(paddedJsonbContent(4096, 'x', 1).multibyteCount, 4087)
+  assert.equal(paddedJsonbContent(4097, 'x', 1).multibyteCount, 4088)
+  assert.equal(paddedJsonbContent(4096, 'x', 1).asciiRemainder, 0)
+})
+
+test('closeAll attempts every closer and reports what failed', async () => {
+  const attempted: string[] = []
+  const ok = (name: string) => async () => { attempted.push(name) }
+  const bad = (name: string) => async () => { attempted.push(name); throw new Error(name) }
+
+  // A rejecting closer must not stop the ones after it.
+  attempted.length = 0
+  await assert.rejects(
+    () => closeAll('t', [bad('first'), ok('second'), bad('third')]),
+    (error: unknown) => error instanceof AggregateError && error.errors.length === 2)
+  assert.deepEqual(attempted, ['first', 'second', 'third'],
+    'every closer is attempted even after one rejects')
+
+  // A single failure surfaces as itself rather than being wrapped.
+  attempted.length = 0
+  await assert.rejects(() => closeAll('t', [ok('a'), bad('only')]),
+    (error: unknown) => error instanceof Error && error.message === 'only')
+  assert.deepEqual(attempted, ['a', 'only'])
+
+  attempted.length = 0
+  await closeAll('t', [ok('a'), ok('b')])
+  assert.deepEqual(attempted, ['a', 'b'], 'the all-clear path runs them in order')
+})
+
+test('withCleanup retains a body failure and a cleanup failure together', async () => {
+  const seen: string[] = []
+  // Body fails, cleanup succeeds: the body error survives unchanged.
+  await assert.rejects(
+    () => withCleanup('t', async () => { throw new Error('body') },
+      [async () => { seen.push('closed') }]),
+    (error: unknown) => error instanceof Error && error.message === 'body')
+  assert.deepEqual(seen, ['closed'], 'cleanup still ran')
+
+  // Body succeeds, cleanup fails: the cleanup error surfaces.
+  await assert.rejects(
+    () => withCleanup('t', async () => {}, [async () => { throw new Error('cleanup') }]),
+    (error: unknown) => error instanceof Error && error.message === 'cleanup')
+
+  // BOTH fail: neither is hidden. A bare `finally` would have discarded the
+  // body error here, which is the finding this guards.
+  await assert.rejects(
+    () => withCleanup('t', async () => { throw new Error('body') },
+      [async () => { throw new Error('cleanup') }]),
+    (error: unknown) => error instanceof AggregateError &&
+      error.errors.length === 2 &&
+      error.errors.some((e) => e instanceof Error && e.message === 'body') &&
+      error.errors.some((e) => e instanceof Error && e.message === 'cleanup'))
+
+  // All clear.
+  await withCleanup('t', async () => { seen.push('body-ok') }, [async () => { seen.push('close-ok') }])
+  assert.deepEqual(seen, ['closed', 'body-ok', 'close-ok'])
+})
