@@ -6,8 +6,15 @@ module `scripts/haw70-upgrade-witness.ts`.
 It is a **driver**, not another planner. The three earlier HAW-70 modules
 (`-target`, `-config`, `-launch-plan`) describe and validate an upgrade; this
 one performs the ordered stages against a real database through an injected
-boundary. Nothing registers it: no workflow step, no `package.json` script, no
-import from application code. Running it is an explicit, deliberate act.
+boundary.
+
+Its registration is deliberately narrow, and is described in full under
+"How this is registered in CI" below. No `package.json` script and no
+application or startup code imports it. In this candidate the workflow
+registers its NONCONNECTING suite on every run, and prepares a default-off
+`workflow_dispatch` choice for the physical upgrade. That preparation is not
+published and has never been dispatched, so running the physical protocol
+remains an explicit, deliberate act that has not occurred.
 
 ## What gap it closes
 
@@ -398,3 +405,94 @@ made about parameter values, their ordering, or cleanup-SQL forwarding. The
 fake-core suite covers that staged control flow; physical migration and
 database semantics remain evidence a registered disposable-CI run would have
 to produce. No second database simulator is built to paper over this.
+
+
+## How this is registered in CI
+
+Two separate registrations, and two separate proofs. Conflating them would be
+the easiest way to overstate what is known.
+
+### 1. The nonconnecting suite, on every run
+
+`scripts/haw70-upgrade-runner.test.ts` is the fourth explicitly named file in
+the existing serial HAW-70 TypeScript step of `.github/workflows/quality-gates.yml`,
+alongside the target, config and launch-plan suites. It keeps that step's
+`--test-concurrency=1`, its step-level `JITI_FS_CACHE=false` and
+`TSX_DISABLE_CACHE=1`, the dotenv refusal that precedes it, both dependency
+installs, the full-history checkout and the disabled checkout credential. The
+narrow compiler command is unchanged and already lists this file among its
+explicit roots, so no compiler-config edit was needed.
+
+This suite opens no database and launches no migration executable. It proves
+control flow, refusals and assertion logic — nothing physical.
+
+### 2. The staged upgrade, default off
+
+A `workflow_dispatch` input `migration_profile` defaults to `fresh`, which is
+exactly today's behaviour: apply every committed migration to an empty
+disposable database. The only other choice is `haw70-upgrade`, and **only the
+exact conjunction** of a `workflow_dispatch` event and that choice enables the
+physical step. A pull request cannot reach it, and neither can a default
+dispatch.
+
+The upgrade step runs **before** any fresh migration, and the fresh migration
+and the database application suite are skipped when it runs. That exclusion is
+load-bearing, not tidiness:
+
+- the driver refuses a non-empty target, so a fresh deploy first would make it
+  refuse; and
+- after its scoped cleanup it deliberately retains the authority tombstones
+  and the two fixture organizations, which must never be handed to the
+  ordinary suite as a pristine database.
+
+The workflow name, the `backend-quality` job id, the PostgreSQL service, the
+read-only permissions, the frontend job and the 25-minute backend deadline are
+all unchanged. The job identity matters: the driver's target guard admits only
+workflow **Required quality gates**, job **backend-quality**, a
+`workflow_dispatch` event and a branch ref, so the step has to live inside
+that job rather than in a new one.
+
+### The launch, and what the workflow does not supply
+
+The step resolves the setup-node executable first, then hands Node a **closed**
+environment built with `env -i` before Node initialises: `PATH=/usr/bin:/bin`,
+the seventeen hosted identity values carried through exactly as GitHub reports
+them, and the fixed physical settings. Nothing else. No stage handoff, no
+`NODE_OPTIONS` or `NODE_PATH`, no proxy, no `PG*`, no dotenv, no Git routing,
+no credential, no secret reference, and no caller-supplied URL, command,
+binary or source SHA.
+
+The identity values are carried, never manufactured. The target guard requires
+`GITHUB_SHA`, `GITHUB_WORKFLOW_SHA` and the actual checkout to agree, so a
+mismatch must fail rather than be substituted with HEAD. The candidate comes
+from those dispatch claims and the driver's own raw-Git ancestry and
+selected-byte checks bind it; the historical baseline `8928934406fd` and the
+reviewed pin `a88af992` stay distinct from it, and no commit is hardcoded as
+the runtime candidate.
+
+A small inline module calls the exported `runHaw70StagedUpgrade` once with that
+closed environment, prints only the sanitized outcome, and exits non-zero on
+`completed !== true`, on an unexpected rejection, or on its 20-minute bound.
+
+That bound deserves an honest description. It is a JavaScript timer raced
+against the driver's promise, so it is **cooperative**: it fires only when the
+event loop is free to deliver it, and a long synchronous operation inside the
+driver can delay delivery past the nominal 20 minutes. It is therefore a
+best-effort guard, not a hard kill. The real outer bound is the unchanged
+25-minute CI job deadline, which the workflow does not extend — and that
+deadline covers the preceding checkout, both installs, the prechecks and the
+compiler step as well, not just this invocation.
+
+A refusal is a CI failure, not a green job with a disappointing receipt, and
+the raw error text never reaches the receipt. No new runtime module, package script, application import
+or launcher framework was added, and the driver still owns staging, all three
+deployment stages, the source checks, the fixture checks and the cleanup.
+
+### What registration does not establish
+
+It does not execute the physical upgrade. The staged-upgrade dispatch has never
+been run, so the baseline-80-to-candidate-94 transition, the real history
+retention, real fixture preservation, the real backfill and catalog, the real
+no-op and the real cleanup remain unproved. Ordinary fresh-database CI and the
+explicit staged-upgrade CI are two separately identified proofs, and neither
+substitutes for the other.

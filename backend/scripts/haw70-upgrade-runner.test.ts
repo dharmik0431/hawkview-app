@@ -1910,6 +1910,317 @@ test('the ACTUAL fixed adapter is observed, inertly, on both connect paths', () 
   assert.equal(rejectedOutcome.failure, 'refused before completion')
 })
 
+/* ===================== CI registration controls (nonconnecting) ===================== */
+
+/**
+ * The workflow is parsed, never pattern-matched as text. These controls cover
+ * exactly the new boundary: the fourth suite's registration, the default-off
+ * dispatch gate and its mutual exclusion, the closed launch environment, and
+ * the inline invocation's exit propagation. Nothing here runs a migration,
+ * opens a database or dispatches anything.
+ */
+const workflowDocument = (): Record<string, never> => {
+  const loaded = spawnSync(process.execPath, ['-e',
+    'const y = require("js-yaml"); const f = require("node:fs");'
+    + ' process.stdout.write(JSON.stringify(y.load(f.readFileSync(process.argv[1], "utf8"))))',
+    join(repositoryRoot, '.github/workflows/quality-gates.yml')],
+  { encoding: 'utf8', timeout: 60_000, cwd: repositoryRoot })
+  assert.equal(loaded.status, 0, loaded.stderr)
+  return JSON.parse(loaded.stdout) as Record<string, never>
+}
+const UPGRADE_GATE = "github.event_name == 'workflow_dispatch'"
+  + " && inputs.migration_profile == 'haw70-upgrade'"
+
+test('the workflow registers the runner suite without weakening that step', () => {
+  const document = workflowDocument() as unknown as {
+    name: string; permissions: Record<string, string>
+    jobs: Record<string, { name: string; 'timeout-minutes': number
+      services?: Record<string, { image: string }>
+      steps: { name?: string; uses?: string; run?: string; if?: string
+        env?: Record<string, string>; with?: Record<string, unknown> }[] }>
+  }
+  // Identity the target guard depends on, unchanged.
+  assert.equal(document.name, 'Required quality gates')
+  assert.deepEqual(Object.keys(document.jobs).sort(), ['backend-quality', 'frontend-quality'])
+  assert.deepEqual(document.permissions, { contents: 'read' })
+  const backend = document.jobs['backend-quality']
+  assert.equal(backend.name, 'Backend quality and database integration')
+  // The existing deadline is PRESERVED, not extended to accommodate a new step.
+  assert.equal(backend['timeout-minutes'], 25)
+  assert.equal(backend.services?.postgres.image, 'postgres:16-alpine')
+
+  // EXACT names. Matching a fragment picked the wrong step: the dotenv
+  // refusal is itself called "...before the HAW-70 TypeScript suites", so a
+  // substring search for "TypeScript suites" found it first and read its
+  // shell body as the suite command.
+  const names = backend.steps.map(step => step.name ?? step.uses ?? '')
+  const indexOf = (exact: string) => {
+    const found = names.indexOf(exact)
+    assert.ok(found >= 0, `step not found: ${exact}`)
+    return found
+  }
+  const suite = backend.steps[indexOf('HAW-70 TypeScript suites, serial and nonconnecting')]
+  // THE FOURTH FILE, in order, with the serial and cache settings intact.
+  const invoked = String(suite.run).split(/\s+/).filter(token => token.endsWith('.test.ts'))
+  assert.deepEqual(invoked, [
+    'scripts/haw70-upgrade-target.test.ts',
+    'scripts/haw70-upgrade-config.test.ts',
+    'scripts/haw70-upgrade-launch-plan.test.ts',
+    'scripts/haw70-upgrade-runner.test.ts',
+  ])
+  assert.match(String(suite.run), /--test-concurrency=1/)
+  assert.match(String(suite.run), /--import tsx --test/)
+  assert.equal(suite.env?.JITI_FS_CACHE, 'false')
+  assert.equal(suite.env?.TSX_DISABLE_CACHE, '1')
+  // The dotenv refusal still precedes it, and is not weakened to a warning.
+  const dotenvStep = 'Refuse real dotenv inputs before the HAW-70 TypeScript suites'
+  const refusal = backend.steps[indexOf(dotenvStep)]
+  assert.ok(indexOf(dotenvStep)
+    < indexOf('HAW-70 TypeScript suites, serial and nonconnecting'))
+  assert.match(String(refusal.run), /exit "\$status"/)
+  assert.match(String(refusal.run), /DOTENV_CONFIG_/)
+  // Narrow compiler command unchanged, and both installs still present.
+  assert.equal(String(backend.steps[indexOf('HAW-70 narrow consumer typecheck')].run).trim(),
+    './node_modules/.bin/tsc --noEmit -p tsconfig.haw70-scripts.json')
+  // BOTH installs are preserved: the root one for the cross-layer tests and
+  // the backend one. There are therefore two `npm ci` steps, not one.
+  assert.ok(indexOf('Install root dependencies for cross-layer tests') >= 0)
+  assert.equal(backend.steps.filter(step => String(step.run).trim() === 'npm ci').length, 2)
+  // Full history and no persisted checkout credential.
+  const checkout = backend.steps.find(step => String(step.uses).startsWith('actions/checkout'))
+  assert.equal(checkout?.with?.['fetch-depth'], 0)
+  assert.equal(checkout?.with?.['persist-credentials'], false)
+})
+
+test('the staged upgrade branch is default-off and mutually exclusive', () => {
+  const document = workflowDocument() as unknown as {
+    on: { workflow_dispatch: { inputs: Record<string, {
+      default: string; options: string[]; type: string }> } }
+    jobs: Record<string, { steps: { name?: string; run?: string; if?: string }[] }>
+  }
+  const input = document.on.workflow_dispatch.inputs.migration_profile
+  // DEFAULT IS TODAY'S PATH. The opt-in is the only other choice.
+  assert.equal(input.default, 'fresh')
+  assert.equal(input.type, 'choice')
+  assert.deepEqual([...input.options].sort(), ['fresh', 'haw70-upgrade'])
+
+  const steps = document.jobs['backend-quality'].steps
+  const at = (fragment: string) => steps.findIndex(step => (step.name ?? '').includes(fragment))
+  const upgradeAt = at('staged baseline-to-candidate upgrade')
+  const migrateAt = at('Apply every committed migration')
+  const dbSuiteAt = at('Backend tests, including real PostgreSQL')
+  assert.ok(upgradeAt >= 0 && migrateAt >= 0 && dbSuiteAt >= 0)
+  // ORDER: the upgrade precedes any fresh migration, because the driver
+  // refuses a non-empty target.
+  assert.ok(upgradeAt < migrateAt, `${upgradeAt} < ${migrateAt}`)
+  assert.ok(migrateAt < dbSuiteAt)
+
+  const normalize = (condition: string) => condition.replace(/\s+/g, ' ').trim()
+  assert.equal(normalize(String(steps[upgradeAt].if)), UPGRADE_GATE)
+  assert.equal(normalize(String(steps[migrateAt].if)), `!(${UPGRADE_GATE})`)
+  assert.equal(normalize(String(steps[dbSuiteAt].if)), `!(${UPGRADE_GATE})`)
+
+  // THE TRUTH TABLE, evaluated rather than asserted by inspection. The
+  // evaluator understands only the two comparisons and the connectives these
+  // conditions use; anything else throws rather than being guessed.
+  const evaluate = (condition: string, event: string, profile: string | null): boolean => {
+    const negated = /^!\((.*)\)$/s.exec(normalize(condition))
+    if (negated !== null) return !evaluate(negated[1], event, profile)
+    const parts = normalize(condition).split(' && ')
+    assert.equal(parts.length, 2, condition)
+    assert.equal(parts[0], "github.event_name == 'workflow_dispatch'")
+    assert.equal(parts[1], "inputs.migration_profile == 'haw70-upgrade'")
+    return event === 'workflow_dispatch' && profile === 'haw70-upgrade'
+  }
+  const runs = (event: string, profile: string | null) => ({
+    upgrade: evaluate(String(steps[upgradeAt].if), event, profile),
+    migrate: evaluate(String(steps[migrateAt].if), event, profile),
+    dbSuite: evaluate(String(steps[dbSuiteAt].if), event, profile),
+  })
+  // A pull request keeps today's behaviour exactly.
+  assert.deepEqual(runs('pull_request', null), { upgrade: false, migrate: true, dbSuite: true })
+  // So does a default dispatch.
+  assert.deepEqual(runs('workflow_dispatch', 'fresh'), { upgrade: false, migrate: true, dbSuite: true })
+  // Only the exact conjunction flips it, and it is EXCLUSIVE.
+  assert.deepEqual(runs('workflow_dispatch', 'haw70-upgrade'),
+    { upgrade: true, migrate: false, dbSuite: false })
+  // An unexpected profile value does not enable it.
+  assert.deepEqual(runs('workflow_dispatch', 'something-else'),
+    { upgrade: false, migrate: true, dbSuite: true })
+  // In every case the upgrade and the fresh path are never both selected.
+  for (const [event, profile] of [['pull_request', null], ['workflow_dispatch', 'fresh'],
+    ['workflow_dispatch', 'haw70-upgrade'], ['workflow_dispatch', 'other']] as [string, string | null][]) {
+    const selected = runs(event, profile)
+    assert.equal(selected.upgrade && selected.migrate, false, `${event}/${profile}`)
+    assert.equal(selected.upgrade && selected.dbSuite, false, `${event}/${profile}`)
+  }
+})
+
+test('the dispatch step hands Node a closed environment and no caller input', () => {
+  const document = workflowDocument() as unknown as {
+    jobs: Record<string, { steps: { name?: string; run?: string }[] }> }
+  const step = document.jobs['backend-quality'].steps
+    .find(entry => (entry.name ?? '').includes('staged baseline-to-candidate upgrade'))
+  assert.ok(step !== undefined)
+  const script = String(step.run)
+  // `env -i` is what makes it closed: nothing ambient survives into Node.
+  assert.match(script, /env -i \\/)
+  // The setup-node executable is resolved BEFORE the environment is closed,
+  // and invoked absolutely, because the closed PATH cannot reach it.
+  assert.ok(script.indexOf('node_executable="$(command -v node)"') < script.indexOf('env -i'))
+  assert.match(script, /PATH=\/usr\/bin:\/bin/)
+  assert.match(script, /"\$node_executable" --import tsx --input-type=module -e/)
+
+  // A literal `|` block is DEDENTED by the parser, so these sit at two
+  // spaces here rather than at their twelve columns in the file.
+  const assignments = [...script.matchAll(/^\s{2,}([A-Z][A-Z0-9_]*)=(.*?)\s*\\$/gm)]
+    .map(match => [match[1], match[2]] as [string, string])
+  const supplied = new Map(assignments)
+  // EXACTLY the permitted set, nothing more.
+  assert.deepEqual([...supplied.keys()].sort(), [
+    'CI', 'DATABASE_URL', 'GITHUB_ACTIONS', 'GITHUB_API_URL', 'GITHUB_EVENT_NAME', 'GITHUB_JOB',
+    'GITHUB_REF', 'GITHUB_REF_TYPE', 'GITHUB_REPOSITORY', 'GITHUB_RUN_ATTEMPT', 'GITHUB_RUN_ID',
+    'GITHUB_SERVER_URL', 'GITHUB_SHA', 'GITHUB_WORKFLOW', 'GITHUB_WORKFLOW_REF',
+    'GITHUB_WORKFLOW_SHA', 'HAWKVIEW_CI_DISPOSABLE_POSTGRES', 'HAWKVIEW_CI_MIGRATION_PROFILE',
+    'HAWKVIEW_HAW70_AUDIT_WRITER_WITNESS', 'HAWKVIEW_HAW70_DELETE_LOCK_ORDER_WITNESS',
+    'HAWKVIEW_HAW70_TENANT_DELETE_WITNESS', 'HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS',
+    'HAWKVIEW_RUN_HAW70_UPGRADE', 'JITI_FS_CACHE', 'LANG', 'LC_ALL', 'PATH',
+    'RUNNER_ENVIRONMENT', 'RUNNER_OS', 'TSX_DISABLE_CACHE', 'TZ',
+  ])
+  // The hosted identity values are CARRIED, not manufactured: each is a
+  // reference to the runner's own variable, never a literal.
+  for (const carried of ['CI', 'GITHUB_ACTIONS', 'RUNNER_ENVIRONMENT', 'RUNNER_OS',
+    'GITHUB_REPOSITORY', 'GITHUB_SERVER_URL', 'GITHUB_API_URL', 'GITHUB_WORKFLOW', 'GITHUB_JOB',
+    'GITHUB_EVENT_NAME', 'GITHUB_REF_TYPE', 'GITHUB_REF', 'GITHUB_WORKFLOW_REF', 'GITHUB_RUN_ID',
+    'GITHUB_RUN_ATTEMPT', 'GITHUB_SHA', 'GITHUB_WORKFLOW_SHA']) {
+    assert.ok(script.includes(`${carried}="$${carried}"`), carried)
+  }
+  // The fixed physical settings are literals, and the datasource is the
+  // registered disposable loopback service only.
+  assert.equal(supplied.get('HAWKVIEW_CI_MIGRATION_PROFILE'), 'haw70-upgrade')
+  assert.equal(supplied.get('HAWKVIEW_RUN_HAW70_UPGRADE'), '1')
+  assert.equal(supplied.get('DATABASE_URL'),
+    'postgresql://hawkview_ci:hawkview_ci@127.0.0.1:5432/hawkview_ci')
+  assert.equal(supplied.get('TZ'), 'UTC')
+  assert.equal(supplied.get('JITI_FS_CACHE'), 'false')
+  assert.equal(supplied.get('TSX_DISABLE_CACHE'), '1')
+  // NOTHING the driver refuses, and no stage handoff: the driver derives its
+  // own stage, so a prestaged root here would be a second authority path.
+  //
+  // SCANNED WITH THE SHELL COMMENTS REMOVED. The step's own comment names the
+  // variables it refuses to pass, so a bare search over the whole block
+  // matches its own denial. That is the third time this class of mistake has
+  // appeared in this work, so it is stripped and controlled rather than
+  // remembered.
+  const shellCode = script.split('\n').filter(line => !/^\s*#/.test(line)).join('\n')
+  // CONTROLS ON THE STRIPPER, in both directions: the prose really does name
+  // the token, the code really does not, and the stripper has not simply
+  // eaten the step.
+  assert.ok(script.includes('NODE_OPTIONS'), 'the comment is expected to name it')
+  assert.equal(shellCode.includes('NODE_OPTIONS'), false)
+  assert.match(shellCode, /env -i/)
+  assert.ok(shellCode.split('\n').length > 30, 'stripper removed too much')
+  for (const forbidden of ['NODE_OPTIONS', 'NODE_PATH', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+    'PGHOST', 'PGSERVICE', 'PGSERVICEFILE', 'DOTENV_CONFIG_PATH', 'GIT_DIR', 'GIT_WORK_TREE',
+    'DIRECT_URL', 'SHADOW_DATABASE_URL', 'HAWKVIEW_HAW70_STAGE_ROOT',
+    'HAWKVIEW_HAW70_STAGE_NAME', 'HAWKVIEW_HAW70_STAGE_CANDIDATE']) {
+    assert.equal(shellCode.includes(forbidden), false, forbidden)
+  }
+  // No secret reference, and no caller-supplied command, URL or SHA.
+  assert.equal(shellCode.includes('secrets.'), false)
+  assert.equal(/2b94402|d5b9ffb|78df701/.test(shellCode), false)
+  // The pinned historical commits are NOT used as the runtime candidate.
+  assert.equal(shellCode.includes('8928934406'), false)
+  assert.equal(shellCode.includes('a88af992'), false)
+  // The actual checkout identity is recorded for the receipt.
+  assert.match(shellCode, /git -C \.\. rev-parse HEAD/)
+  assert.match(shellCode, /git -C \.\. rev-parse HEAD\^\{tree\}/)
+})
+
+test('the inline dispatch invocation propagates the outcome as an exit code', () => {
+  const document = workflowDocument() as unknown as {
+    jobs: Record<string, { steps: { name?: string; run?: string }[] }> }
+  const step = document.jobs['backend-quality'].steps
+    .find(entry => (entry.name ?? '').includes('staged baseline-to-candidate upgrade'))
+  const extracted = /-e '([\s\S]*)'\s*$/.exec(String(step?.run).trimEnd())
+  assert.ok(extracted !== null, 'inline script not extractable')
+  const inline = extracted[1]
+  // The embedded script must contain neither quote character that would
+  // terminate its own shell or template context.
+  assert.equal(inline.includes("'"), false)
+  assert.equal(inline.includes('`'), false)
+
+  // THE ACTUAL EXTRACTED SCRIPT, run against a stubbed driver so the exit
+  // propagation is observed rather than read. The stub is resolved by a loader
+  // hook, so the script itself is unmodified and cannot drift from the
+  // workflow.
+  const scriptFile = join(scratch, 'dispatch-inline.mjs')
+  writeFileSync(scriptFile, inline)
+  const run = (outcome: string): { status: number | null; stdout: string
+    receipt: Record<string, unknown> } => {
+    const stub = join(scratch, `dispatch-stub-${Buffer.from(outcome).toString('hex').slice(0, 8)}.mjs`)
+    writeFileSync(stub, `export const runHaw70StagedUpgrade = async () => ${outcome}\n`)
+    const loader = join(scratch, 'dispatch-loader.mjs')
+    writeFileSync(loader, [
+      "import { registerHooks } from 'node:module'",
+      "import { pathToFileURL } from 'node:url'",
+      `const stub = pathToFileURL(${JSON.stringify(stub)}).href`,
+      'registerHooks({ resolve (specifier, context, nextResolve) {',
+      "  if (specifier.endsWith('haw70-upgrade-runner.ts')) return { url: stub, shortCircuit: true }",
+      '  return nextResolve(specifier, context)',
+      '} })',
+    ].join('\n'))
+    const result = spawnSync(process.execPath, ['--import', loader, scriptFile],
+      { encoding: 'utf8', timeout: 120_000, cwd: backend,
+        env: { PATH: String(process.env.PATH) } })
+    const stdout = String(result.stdout)
+    let receipt: Record<string, unknown> = {}
+    try { receipt = JSON.parse(stdout) as Record<string, unknown> } catch { /* reported below */ }
+    return { status: result.status, stdout, receipt }
+  }
+
+  // A COMPLETED outcome exits zero.
+  const completed = run('({ kind: "haw70-staged-upgrade-outcome-v1", completed: true,'
+    + ' phase: "completed", failure: null, candidateCommit: "a".repeat(40),'
+    + ' counts: { deployments: 3 }, retained: ["one"] })')
+  assert.equal(completed.status, 0, completed.stdout)
+  assert.equal(completed.receipt.completed, true)
+  assert.equal(completed.receipt.haw70, 'outcome')
+  assert.equal(completed.receipt.phase, 'completed')
+
+  // AN INCOMPLETE outcome exits NONZERO. This is the gate that makes a
+  // refusal a CI failure rather than a green job with a sad receipt.
+  const incomplete = run('({ kind: "haw70-staged-upgrade-outcome-v1", completed: false,'
+    + ' phase: "backfill", failure: "authority backfill inventory", candidateCommit: null,'
+    + ' counts: { deployments: 2 }, retained: [] })')
+  assert.equal(incomplete.status, 1, incomplete.stdout)
+  assert.equal(incomplete.receipt.completed, false)
+  assert.equal(incomplete.receipt.failure, 'authority backfill inventory')
+
+  // `completed` missing entirely is also a failure, not a pass by omission.
+  const absent = run('({ kind: "haw70-staged-upgrade-outcome-v1", phase: "cleanup",'
+    + ' failure: null, candidateCommit: null, counts: {}, retained: [] })')
+  assert.equal(absent.status, 1, absent.stdout)
+
+  // AN UNEXPECTED REJECTION is classified and exits nonzero, and the raw
+  // error text never reaches the receipt.
+  const rejected = run('Promise.reject(new Error("postgresql://secret@host/db leaked"))')
+  assert.equal(rejected.status, 1, rejected.stdout)
+  assert.equal(rejected.receipt.haw70, 'refused')
+  assert.equal(rejected.receipt.reason, 'unexpected rejection')
+  assert.equal(rejected.stdout.includes('secret'), false)
+  assert.equal(rejected.stdout.includes('://'), false)
+
+  // The TIMEOUT arm is classified distinctly from an ordinary rejection. The
+  // real timer is not waited out; this exercises the classification only, and
+  // the bound itself is asserted from the script text below.
+  const timedOut = run('Promise.reject(new Error("haw70-timeout"))')
+  assert.equal(timedOut.status, 1, timedOut.stdout)
+  assert.equal(timedOut.receipt.reason, 'timeout')
+  assert.match(inline, /const limitMs = 1200000/)
+  assert.ok(1_200_000 < 25 * 60 * 1000, 'the bound must sit inside the job deadline')
+})
+
 test('nothing in this suite started a database, a CLI or a migration', () => {
   assert.ok(stagedRoot.startsWith(scratch))
   assert.ok(existsSync(join(stagedRoot, 'baseline', 'schema.prisma')))

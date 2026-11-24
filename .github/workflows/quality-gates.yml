@@ -4,6 +4,22 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      migration_profile:
+        description: >-
+          Database provisioning for the backend job. 'fresh' is today's path:
+          apply every committed migration to an empty disposable database.
+          'haw70-upgrade' instead runs the HAW-70 staged baseline-to-candidate
+          upgrade driver and SKIPS the fresh migration and the database
+          application suite, because that driver requires an empty target and
+          deliberately retains authority tombstones after its scoped cleanup.
+          The two are mutually exclusive and remain separate proofs.
+        required: false
+        default: fresh
+        type: choice
+        options:
+          - fresh
+          - haw70-upgrade
 
 permissions:
   contents: read
@@ -145,11 +161,129 @@ jobs:
           scripts/haw70-upgrade-target.test.ts
           scripts/haw70-upgrade-config.test.ts
           scripts/haw70-upgrade-launch-plan.test.ts
+          scripts/haw70-upgrade-runner.test.ts
       - run: npm run db:generate
       - run: npm run db:validate
+      # -------------------------------------------------------------------
+      # HAW-70 STAGED UPGRADE, DEFAULT OFF.
+      #
+      # Reached ONLY by the exact conjunction of a workflow_dispatch event and
+      # the explicit 'haw70-upgrade' choice. A pull request cannot reach it,
+      # and neither can a default dispatch.
+      #
+      # It runs BEFORE any fresh migration, and the fresh migration and the
+      # database application suite below are skipped when it runs. That is not
+      # tidiness. The driver refuses a non-empty target, so a fresh deploy
+      # first would make it refuse; and after its scoped cleanup it
+      # deliberately retains the authority tombstones and the two fixture
+      # organizations, which must never be presented to the ordinary suite as
+      # a pristine database.
+      #
+      # The driver owns everything else: it materializes its own stage from
+      # this checkout, derives its own stage handoff, qualifies the installed
+      # Prisma before connecting, and performs all three deployment stages,
+      # the history and fixture checks, the backfill and catalog checks, the
+      # no-op redeploy and the scoped cleanup. Nothing here supplies a stage
+      # root, a source SHA, a URL, a binary or a command.
+      # -------------------------------------------------------------------
+      - name: HAW-70 staged baseline-to-candidate upgrade, explicit dispatch only
+        if: github.event_name == 'workflow_dispatch' && inputs.migration_profile == 'haw70-upgrade'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Resolve the setup-node executable BEFORE closing the environment,
+          # because the closed environment deliberately carries no PATH to it.
+          node_executable="$(command -v node)"
+          test -x "$node_executable"
+          echo "node executable:  $node_executable"
+          echo "checked out HEAD: $(git -C .. rev-parse HEAD)"
+          echo "checked out tree: $(git -C .. rev-parse HEAD^{tree})"
+          # A CLOSED environment, constructed here and handed to Node before it
+          # initialises. The hosted identity values are carried through EXACTLY
+          # as GitHub reports them and are never substituted: the driver's
+          # target guard requires GITHUB_SHA, GITHUB_WORKFLOW_SHA and the
+          # actual checkout to agree, and a mismatch must fail rather than be
+          # papered over. No stage handoff, NODE_OPTIONS, NODE_PATH, proxy,
+          # PG*, dotenv, Git-routing or credential variable is passed.
+          env -i \
+            PATH=/usr/bin:/bin \
+            CI="$CI" \
+            GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_OS="$RUNNER_OS" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_SERVER_URL="$GITHUB_SERVER_URL" \
+            GITHUB_API_URL="$GITHUB_API_URL" \
+            GITHUB_WORKFLOW="$GITHUB_WORKFLOW" \
+            GITHUB_JOB="$GITHUB_JOB" \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
+            GITHUB_REF_TYPE="$GITHUB_REF_TYPE" \
+            GITHUB_REF="$GITHUB_REF" \
+            GITHUB_WORKFLOW_REF="$GITHUB_WORKFLOW_REF" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_WORKFLOW_SHA="$GITHUB_WORKFLOW_SHA" \
+            HAWKVIEW_CI_MIGRATION_PROFILE=haw70-upgrade \
+            HAWKVIEW_RUN_HAW70_UPGRADE=1 \
+            HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS=1 \
+            HAWKVIEW_CI_DISPOSABLE_POSTGRES=1 \
+            HAWKVIEW_HAW70_TENANT_DELETE_WITNESS=1 \
+            HAWKVIEW_HAW70_AUDIT_WRITER_WITNESS=1 \
+            HAWKVIEW_HAW70_DELETE_LOCK_ORDER_WITNESS=1 \
+            DATABASE_URL=postgresql://hawkview_ci:hawkview_ci@127.0.0.1:5432/hawkview_ci \
+            TZ=UTC \
+            JITI_FS_CACHE=false \
+            TSX_DISABLE_CACHE=1 \
+            LANG=C \
+            LC_ALL=C \
+            "$node_executable" --import tsx --input-type=module -e '
+              const started = Date.now()
+              const runner = await import("./scripts/haw70-upgrade-runner.ts")
+              const limitMs = 1200000
+              let timer = null
+              const deadline = new Promise((resolve, reject) => {
+                timer = setTimeout(() => reject(new Error("haw70-timeout")), limitMs)
+              })
+              let outcome = null
+              try {
+                outcome = await Promise.race([
+                  runner.runHaw70StagedUpgrade({ environment: process.env }),
+                  deadline,
+                ])
+              } catch (error) {
+                if (timer !== null) clearTimeout(timer)
+                const timedOut = error instanceof Error && error.message === "haw70-timeout"
+                process.stdout.write(JSON.stringify({
+                  haw70: "refused",
+                  reason: timedOut ? "timeout" : "unexpected rejection",
+                  elapsedMs: Date.now() - started,
+                }) + "\n")
+                process.exit(1)
+              }
+              if (timer !== null) clearTimeout(timer)
+              process.stdout.write(JSON.stringify({
+                haw70: "outcome",
+                kind: outcome.kind,
+                completed: outcome.completed,
+                phase: outcome.phase,
+                failure: outcome.failure,
+                candidateCommit: outcome.candidateCommit,
+                counts: outcome.counts,
+                retained: outcome.retained,
+                elapsedMs: Date.now() - started,
+              }, null, 2) + "\n")
+              process.exit(outcome.completed === true ? 0 : 1)
+            '
       - name: Apply every committed migration
+        if: >-
+          !(github.event_name == 'workflow_dispatch'
+          && inputs.migration_profile == 'haw70-upgrade')
         run: npm run db:migrate:deploy
       - name: Backend tests, including real PostgreSQL isolation
+        if: >-
+          !(github.event_name == 'workflow_dispatch'
+          && inputs.migration_profile == 'haw70-upgrade')
         shell: bash
         run: |
           mapfile -t tests < <(find src -type f -name '*.test.ts' -print | sort)

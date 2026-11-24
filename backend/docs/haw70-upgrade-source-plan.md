@@ -2,9 +2,14 @@
 
 This helper verifies in-memory source bytes and selects the exact reviewed main
 migration set. It does not connect to a database, read environment variables,
-spawn a tool, read Git or the filesystem, or execute a migration. No workflow or
-runtime entrypoint imports it. The normal standalone script-test glob discovers
-its non-database tests only after this new source is separately approved/published.
+spawn a tool, read Git or the filesystem, or execute a migration.
+
+No application or runtime entrypoint imports it. It IS reached by the
+implemented HAW-70 driver's own source validation, through
+`haw70-upgrade-git-source.mjs`, which is why it is one of the declared
+executable-source files the driver checks for drift before doing anything
+physical. The normal standalone script-test glob discovers its non-database
+tests only after this source is separately approved and published.
 
 `createHaw70UpgradeSourcePlan` pins baseline commit
 `8928934406fdcaf5fdb911d2003ac03439b05145` and the migration/schema/dependency slice
@@ -35,17 +40,38 @@ selection and refusal logic. Local one-off verification against the two actual
 Git snapshots can check the wrapper's positive path without running a database.
 That local result does not replace registered CI on the eventual exact head.
 
-The next adapter must prove actual candidate checkout/ancestry, enumerate complete
-selected Git trees, bind paths/modes to actual raw bytes, and revalidate at each
-stage. This helper cannot detect a caller lying about a file's mode or omitting a
-file from an allegedly complete tree if it supplies an otherwise matching byte
-set. Such provenance belongs to the future adapter, not a claimed SHA argument.
+Provenance beyond in-memory bytes is NOT this helper's job: it cannot detect a
+caller lying about a file's mode, or omitting a file from an allegedly complete
+tree, if it supplies an otherwise matching byte set. Proving actual candidate
+checkout and ancestry, enumerating complete selected Git trees, binding paths
+and modes to actual raw bytes and revalidating at each stage belong to the
+adapter, not to a claimed SHA argument.
 
-The dedicated hosted-target/profile guard, config, stage runner, synthetic legacy
-fixture, history/catalog/backfill/legacy assertions, successful no-op redeploy,
-scoped cleanup and upgraded-schema full suite are all still unimplemented.
-Existing approved a88 CI proves fresh94 only, not main80-to-candidate94 upgrade
-or this newer helper. Any future physical test is restricted to registered
+That adapter now exists. `haw70-upgrade-git-source.mjs` performs the raw
+ancestry walk, the selected-tree enumeration and the byte and mode binding,
+and `haw70-upgrade-materializer.mjs` stages and revalidates the source. The
+hosted-target and profile guard, the dedicated config, the stage runner, the
+synthetic legacy fixture, the history, catalog, backfill and legacy-tag
+assertions, the no-op redeploy comparison and the scoped cleanup are all
+implemented in `backend/scripts/haw70-upgrade-runner.ts` and
+`backend/scripts/haw70-upgrade-witness.ts`, and are documented in
+`backend/docs/haw70-upgrade-runner.md`.
+
+What that means and does not mean needs care:
+
+- They are qualified SYNTHETICALLY only. The focused suite drives the real
+  driver through an injected fake transport and process boundary, so the
+  no-op and cleanup results there are assertions about the driver's control
+  flow and its checks, not observations of a database.
+- The upgraded-schema full application suite remains unimplemented, and is a
+  separately specified later step.
+- Existing approved a88 CI proves fresh 94 only. It does not prove the
+  main-80-to-candidate-94 upgrade, and neither does this helper.
+
+The driver is registered in CI in two distinct ways, which must not be
+conflated: its nonconnecting suite runs on every pull request, while the
+physical staged upgrade is a default-off `workflow_dispatch` choice that has
+not been executed. Registration is not physical qualification. Any future physical test is restricted to registered
 disposable CI; no local/live database, provider operation or manual recovery.
 
 No upgrade execution, online migration, invalid-index recovery, full writer or
