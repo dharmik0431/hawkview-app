@@ -434,6 +434,49 @@ const asPosition = (value: unknown): number | null => {
 }
 
 /**
+ * Every column the statement projects, by name.
+ *
+ * The projection is FIXED and always returns all of them, so a row that omits
+ * one, or carries `undefined` for one, did not deliver that evidence — it is a
+ * non-conforming row, not a row with an absent value.
+ *
+ * That distinction is the whole point. For the nullable columns an explicit SQL
+ * NULL is legitimate and stays valid. Treating an omitted key as the same thing
+ * would let a dropped payload read as "this event has no payload", which can
+ * yield COMPLETE and a clean assessment from evidence that was never delivered.
+ */
+export const AUDIT_EVIDENCE_PROJECTED_COLUMNS: readonly string[] = Object.freeze([
+  'organization_id', 'customer_tenant_id', 'microsoft_audit_id', 'event_date_time',
+  'activity_display_name', 'category', 'operation_type', 'result', 'row_position',
+  'field_oversize', 'over_payload_budget', 'initiated_by_withheld',
+  'target_resources_withheld', 'initiated_by_text', 'target_resources_text',
+])
+
+/** The projected columns that may legitimately be SQL NULL. Each must be
+ *  PRESENT, and must be `null` or a string; `undefined` is refused. */
+export const AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS: readonly string[] = Object.freeze([
+  'category', 'operation_type', 'result', 'initiated_by_text', 'target_resources_text',
+])
+
+/**
+ * Presence is tested with `hasOwnProperty` rather than by reading the value,
+ * because the two failure shapes differ: a row built as
+ * `{ ...row, category: undefined }` HAS the key, and a row missing the key has
+ * neither. Both must be refused, while `null` must be accepted.
+ */
+function conformingProjectedRow(row: object): boolean {
+  for (const column of AUDIT_EVIDENCE_PROJECTED_COLUMNS) {
+    if (!Object.prototype.hasOwnProperty.call(row, column)) return false
+    if ((row as Record<string, unknown>)[column] === undefined) return false
+  }
+  for (const column of AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS) {
+    const value = (row as Record<string, unknown>)[column]
+    if (!(value === null || typeof value === 'string')) return false
+  }
+  return true
+}
+
+/**
  * Booleans must FAIL CLOSED. These four projected flags are the only thing
  * separating "withheld" from "genuinely absent", and adapters render `bool` as
  * a JS boolean, as 't'/'f', or as 1/0. A bare `=== true` would read every
@@ -463,7 +506,10 @@ const asText = (value: unknown): string | null =>
  */
 function parsePayload(value: unknown, withheld: boolean): { value: unknown; withheld: boolean } {
   if (withheld) return { value: null, withheld: true }
-  if (value === null || value === undefined) return { value: null, withheld: false }
+  // ONLY an explicit SQL NULL is an absent payload. `undefined` is already
+  // refused by the projected-row conformance check, and is treated as withheld
+  // here too so this function cannot fail open on its own.
+  if (value === null) return { value: null, withheld: false }
   if (typeof value !== 'string') return { value: null, withheld: true }
   try { return { value: JSON.parse(value) as unknown, withheld: false } }
   catch { return { value: null, withheld: true } }
@@ -569,11 +615,11 @@ export async function readTenantAuditEvidenceBatch(
       !Number.isFinite(eventDateTime.getTime())) {
       return { asOf: frozenAsOf, tenants: requestedScopes.map((scope) => unread(scope, 'ROW_VALIDATION_FAILED')) }
     }
-    for (const optional of [candidate.category, candidate.operation_type, candidate.result]) {
-      if (!(optional === null || optional === undefined || typeof optional === 'string')) {
-        return { asOf: frozenAsOf, tenants: requestedScopes.map((scope) => unread(scope, 'ROW_VALIDATION_FAILED')) }
-      }
-    }
+    // The projection is fixed, so a row that omits a projected column or
+    // carries `undefined` for one did not deliver that evidence and is refused.
+    // An explicit SQL NULL stays valid for the nullable columns. This replaces
+    // an earlier check that accepted `undefined` for the nullable scalars.
+    if (!conformingProjectedRow(candidate)) return rowValidationFailed()
 
     // Every projected boolean is coerced fail-closed. An unrecognized rendering
     // is a validation failure, never a silent "nothing was withheld".

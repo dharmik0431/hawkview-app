@@ -6,6 +6,8 @@ import {
   AUDIT_EVIDENCE_MAX_PAYLOAD_FIELD_BYTES,
   AUDIT_EVIDENCE_MAX_SCOPES_PER_BATCH,
   AUDIT_EVIDENCE_MAX_TENANT_PAYLOAD_BYTES,
+  AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS,
+  AUDIT_EVIDENCE_PROJECTED_COLUMNS,
   AUDIT_EVIDENCE_PROJECTED_VARCHAR_WIDTHS,
   AUDIT_EVIDENCE_SENTINEL_ROWS,
   AUDIT_EVIDENCE_TENANT_CAP,
@@ -1066,4 +1068,163 @@ test('a store that applies its own narrower window is NOT detectable, and this r
     'and would authorize a clean audit assessment — the limitation this test records')
   assert.equal(batch.tenants[0].capReached, false,
     'the truncated tenant shows no sentinel either, so no signal reaches the caller')
+})
+
+// ---------------------------------------------------------------------------
+// Projected-column conformance.
+//
+// Independent review of the sealed candidate b4fb5ac found that the decoder
+// accepted an OMITTED or `undefined` projected value as a legitimately absent
+// one. The statement always projects these columns by name, so a storage
+// adapter or projection regression that dropped `target_resources_text` while
+// still reporting withheld=false produced targetResources=null,
+// withheldPayloads=0, status COMPLETE and, with no observed adverse finding, a
+// clean assessment — from evidence that was never delivered.
+//
+// Explicit SQL NULL must stay valid; omitted and `undefined` must fail closed.
+// ---------------------------------------------------------------------------
+
+test('the declared projected-column lists match the statement that is actually built', () => {
+  // Guards against the lists drifting from the SQL they describe.
+  const { sql } = buildAuditEvidenceQuery([{ organizationId: ORG_A, customerTenantId: QUIET }], AS_OF)
+  const finalSelect = sql.slice(sql.lastIndexOf('    SELECT'))
+  for (const column of AUDIT_EVIDENCE_PROJECTED_COLUMNS) {
+    assert.ok(finalSelect.includes(column), `the projection must carry ${column}`)
+  }
+  assert.equal(AUDIT_EVIDENCE_PROJECTED_COLUMNS.length, 15)
+  for (const column of AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS) {
+    assert.ok(AUDIT_EVIDENCE_PROJECTED_COLUMNS.includes(column),
+      `${column} must be one of the projected columns`)
+  }
+  assert.deepEqual([...AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS],
+    ['category', 'operation_type', 'result', 'initiated_by_text', 'target_resources_text'])
+})
+
+test('an OMITTED projected column is refused and can never yield a clean assessment', async () => {
+  for (const column of AUDIT_EVIDENCE_PROJECTED_COLUMNS) {
+    const row: Record<string, unknown> = { ...rawRow() }
+    delete row[column]
+    assert.equal(Object.prototype.hasOwnProperty.call(row, column), false,
+      `${column} must genuinely be absent from the fixture`)
+    const batch = await readTenantAuditEvidenceBatch(rowStore([row]), ONE_SCOPE, AS_OF)
+    const tenant = batch.tenants[0]
+    assert.equal(tenant.status, 'UNREAD', `omitted ${column}`)
+    assert.ok(['ROW_VALIDATION_FAILED', 'SCOPE_MISMATCH'].includes(tenant.reason),
+      `omitted ${column} gave ${tenant.reason}`)
+    assert.deepEqual(tenant.observations, [], `omitted ${column} returns no observations`)
+    const assessment = assessTenantAuditEvidence(tenant)
+    assert.equal(assessment.auditWindowComplete, false, `omitted ${column}`)
+    assert.equal(assessment.auditWindowUnknown, true, `omitted ${column}`)
+    assert.equal(assessment.auditAssessmentClean, false,
+      `omitted ${column} must not authorize a clean assessment`)
+  }
+})
+
+test('an explicitly undefined projected value is refused, although its key is present', async () => {
+  // The other failure shape: the key exists, so a presence test that read the
+  // value would see the same thing an absent key produces, and a presence test
+  // that only used `in` would accept it.
+  for (const column of AUDIT_EVIDENCE_PROJECTED_COLUMNS) {
+    const row: Record<string, unknown> = { ...rawRow(), [column]: undefined }
+    assert.equal(Object.prototype.hasOwnProperty.call(row, column), true,
+      `${column} key must be present in this fixture`)
+    assert.equal(row[column], undefined)
+    const batch = await readTenantAuditEvidenceBatch(rowStore([row]), ONE_SCOPE, AS_OF)
+    const tenant = batch.tenants[0]
+    assert.equal(tenant.status, 'UNREAD', `undefined ${column}`)
+    assert.ok(['ROW_VALIDATION_FAILED', 'SCOPE_MISMATCH'].includes(tenant.reason),
+      `undefined ${column} gave ${tenant.reason}`)
+    assert.equal(assessTenantAuditEvidence(tenant).auditAssessmentClean, false,
+      `undefined ${column} must not authorize a clean assessment`)
+  }
+})
+
+test('an explicit SQL NULL stays valid for every nullable projected column', async () => {
+  // The positive control for the correction. Without it, refusing undefined
+  // could not be distinguished from refusing absent values in general, and the
+  // legitimate "this event carried no payload and no category" read would be
+  // broken instead of preserved.
+  const row: Record<string, unknown> = { ...rawRow() }
+  for (const column of AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS) row[column] = null
+  const batch = await readTenantAuditEvidenceBatch(rowStore([row]), ONE_SCOPE, AS_OF)
+  const tenant = batch.tenants[0]
+
+  assert.equal(tenant.status, 'COMPLETE', 'explicit NULLs are a complete read')
+  assert.equal(tenant.reason, 'OK')
+  assert.equal(tenant.withheldPayloads, 0, 'an explicit NULL payload is absent, not withheld')
+  assert.equal(tenant.observations.length, 1)
+  assert.equal(tenant.observations[0].payloadWithheld, false)
+  assert.equal(tenant.observations[0].initiatedBy, null)
+  assert.equal(tenant.observations[0].targetResources, null)
+  assert.equal(tenant.observations[0].category, null)
+  assert.equal(tenant.observations[0].operationType, null)
+  assert.equal(tenant.observations[0].result, null)
+  assert.equal(assessTenantAuditEvidence(tenant).auditAssessmentClean, true,
+    'and it can still authorize a clean assessment, which is the behaviour being preserved')
+})
+
+test('a valid string and valid JSON payload still decode normally', async () => {
+  const batch = await readTenantAuditEvidenceBatch(rowStore([rawRow()]), ONE_SCOPE, AS_OF)
+  const observation = batch.tenants[0].observations[0]
+  assert.equal(batch.tenants[0].status, 'COMPLETE')
+  assert.deepEqual(observation.initiatedBy, { user: 'actor' })
+  assert.deepEqual(observation.targetResources, [{ displayName: 'app' }])
+  assert.equal(observation.category, 'ApplicationManagement')
+  assert.equal(observation.payloadWithheld, false)
+})
+
+test('the exact defect the review described is closed', async () => {
+  // Verbatim from the review: target_resources_text omitted while the
+  // withholding flags still report false.
+  const row: Record<string, unknown> = { ...rawRow(), target_resources_withheld: false }
+  delete row.target_resources_text
+  const batch = await readTenantAuditEvidenceBatch(rowStore([row]), ONE_SCOPE, AS_OF)
+  const tenant = batch.tenants[0]
+  assert.notEqual(tenant.status, 'COMPLETE',
+    'the dropped payload must not read as a complete window')
+  assert.equal(tenant.status, 'UNREAD')
+  assert.equal(tenant.withheldPayloads, 0, 'no observation is returned at all')
+  assert.equal(assessTenantAuditEvidence(tenant).auditAssessmentClean, false)
+  assert.equal(JSON.stringify(batch).includes('SELECT'), false, 'and still no SQL in the result')
+})
+
+test('a projected value supplied by the prototype, not the row, is refused', async () => {
+  // This is what makes the own-property test non-redundant. Reading the value
+  // alone cannot tell an inherited default from a delivered one: both are
+  // defined. The projection delivers OWN columns, so a driver row whose
+  // prototype supplies a payload has not delivered that evidence.
+  const inherited = Object.create({ target_resources_text: '[{"displayName":"from-prototype"}]' })
+  const complete = rawRow()
+  for (const [key, value] of Object.entries(complete)) {
+    if (key !== 'target_resources_text') inherited[key] = value
+  }
+  assert.equal(Object.prototype.hasOwnProperty.call(inherited, 'target_resources_text'), false,
+    'the column is not an own property')
+  assert.equal(inherited.target_resources_text, '[{"displayName":"from-prototype"}]',
+    'yet reading it returns a value, so a value-only check would accept it')
+
+  const batch = await readTenantAuditEvidenceBatch(rowStore([inherited]), ONE_SCOPE, AS_OF)
+  assert.equal(batch.tenants[0].status, 'UNREAD')
+  assert.equal(batch.tenants[0].reason, 'ROW_VALIDATION_FAILED')
+  assert.equal(assessTenantAuditEvidence(batch.tenants[0]).auditAssessmentClean, false)
+  assert.equal(JSON.stringify(batch).includes('from-prototype'), false,
+    'and the inherited value never reaches the result')
+})
+
+test('a nullable projected column carrying a non-string value is refused, not coerced', async () => {
+  // Isolates the nullable-type half of the conformance check. Without it these
+  // values reach `asText`, which returns null for anything that is not a
+  // string — so a number, object or boolean in `category` would be published
+  // as "this event had no category", a quiet fail-open for the scalars the
+  // adverse-finding logic reads.
+  for (const column of AUDIT_EVIDENCE_NULLABLE_TEXT_COLUMNS) {
+    for (const value of [42, 0, true, false, {}, [], Symbol.iterator] as unknown[]) {
+      const batch = await readTenantAuditEvidenceBatch(
+        rowStore([{ ...rawRow(), [column]: value }]), ONE_SCOPE, AS_OF)
+      const tenant = batch.tenants[0]
+      assert.equal(tenant.status, 'UNREAD', `${column} = ${String(value)}`)
+      assert.equal(tenant.reason, 'ROW_VALIDATION_FAILED', `${column} = ${String(value)}`)
+      assert.equal(assessTenantAuditEvidence(tenant).auditAssessmentClean, false)
+    }
+  }
 })
