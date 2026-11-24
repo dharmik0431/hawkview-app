@@ -1376,25 +1376,90 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
     const owned = ${JSON.stringify(owned)}
     const outside = ${JSON.stringify(outside)}
     const attempt = (label, fn) => { try { fn() } catch { /* refused, as recorded */ } }
-    // PERMITTED: a read-only status inside the owned repository, with only
-    // the allowlisted disabling settings.
-    attempt('allowed', () => spawnSync('/usr/bin/git',
-      ['--no-pager', '--no-replace-objects', '-c', 'core.fsmonitor=false',
-       '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false',
-       '-C', owned, 'status', '--porcelain=v1'], { encoding: 'utf8' }))
-    // REFUSED, each for its own reason.
-    attempt('push', () => spawnSync('/usr/bin/git', ['-C', owned, 'push', 'origin', 'main']))
-    attempt('clean', () => spawnSync('/usr/bin/git', ['-C', owned, 'clean', '-fdx']))
-    attempt('fetch', () => spawnSync('/usr/bin/git', ['-C', owned, 'fetch', '--all']))
+    // The closed environment and process options the driver's own adapter
+    // supplies. A request WITHOUT these is refused, which is asserted below.
+    const safeEnv = { PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C',
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0',
+      GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1' }
+    const safeOptions = { env: safeEnv, shell: false, timeout: 15000, encoding: 'utf8' }
+    const prefix = ['--no-pager', '--no-replace-objects', '-c', 'core.fsmonitor=false',
+      '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false', '-C', owned]
+    // PERMITTED: the exact read-only status form the driver issues.
+    attempt('allowed-status', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      safeOptions))
+    // PERMITTED: the read-only config probe the source adapter issues.
+    attempt('allowed-config', () => spawnSync('/usr/bin/git',
+      [...prefix, 'config', '--local', '--name-only', '--get-regexp', '^extensions\\.'],
+      safeOptions))
+    // REFUSED, each for its own reason. None of these runs.
+    //
+    // THE TWO WRITE FORMS a verb allowlist admitted: both have the allowed
+    // verb and otherwise acceptable options.
+    attempt('config-write', () => spawnSync('/usr/bin/git',
+      [...prefix, 'config', 'core.hooksPath', '/tmp/x'], safeOptions))
+    attempt('config-switch', () => spawnSync('/usr/bin/git',
+      [...prefix, 'config', '--local', '--unset', 'core.hooksPath'], safeOptions))
+    attempt('symbolic-ref-write', () => spawnSync('/usr/bin/git',
+      [...prefix, 'symbolic-ref', 'HEAD', 'refs/heads/other'], safeOptions))
+    attempt('push', () => spawnSync('/usr/bin/git', [...prefix, 'push', 'origin', 'main'], safeOptions))
+    attempt('clean', () => spawnSync('/usr/bin/git', [...prefix, 'clean', '-fdx'], safeOptions))
+    attempt('fetch', () => spawnSync('/usr/bin/git', [...prefix, 'fetch', '--all'], safeOptions))
+    // MISSING OR UNSAFE REQUEST FIELDS.
     attempt('hookspath', () => spawnSync('/usr/bin/git',
-      ['-c', 'core.hooksPath=/tmp/evil', '-C', owned, 'status']))
-    attempt('outside', () => spawnSync('/usr/bin/git', ['-C', outside, 'status']))
-    attempt('routing', () => spawnSync('/usr/bin/git', ['-C', owned, 'status'],
-      { env: { PATH: '/usr/bin:/bin', GIT_DIR: outside } }))
-    attempt('shell', () => spawnSync('/usr/bin/git', ['-C', owned, 'status'], { shell: true }))
+      ['-c', 'core.hooksPath=/tmp/evil', '-C', owned, 'status', '--porcelain=v1',
+       '--untracked-files=all', '--', 'tracked.txt'], safeOptions))
+    attempt('no-containment', () => spawnSync('/usr/bin/git',
+      ['--no-pager', 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      safeOptions))
+    attempt('outside', () => spawnSync('/usr/bin/git',
+      ['--no-pager', '--no-replace-objects', '-c', 'core.fsmonitor=false',
+       '-c', 'core.hooksPath=/dev/null', '-c', 'core.untrackedCache=false', '-C', outside,
+       'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'], safeOptions))
+    attempt('cwd-outside', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { ...safeOptions, cwd: outside }))
+    attempt('routing', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { ...safeOptions, env: { ...safeEnv, GIT_DIR: outside } }))
+    attempt('env-tampered', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { ...safeOptions, env: { ...safeEnv, GIT_CONFIG_GLOBAL: '/tmp/theirs' } }))
+    attempt('env-absent', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { shell: false, timeout: 15000 }))
+    // A STRING-VALUED shell, which shell === true alone did not catch.
+    attempt('shell-string', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { ...safeOptions, shell: '/bin/sh' }))
+    attempt('shell-true', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { ...safeOptions, shell: true }))
+    attempt('no-timeout', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt'],
+      { env: safeEnv, shell: false }))
+    // TRAILING-ARGUMENT forms that the verb check alone accepted.
+    attempt('status-absolute-path', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', '/etc/passwd'],
+      safeOptions))
+    attempt('status-traversal', () => spawnSync('/usr/bin/git',
+      [...prefix, 'status', '--porcelain=v1', '--untracked-files=all', '--', '../elsewhere'],
+      safeOptions))
+    attempt('cat-file-non-oid', () => spawnSync('/usr/bin/git',
+      [...prefix, 'cat-file', 'blob', 'HEAD:tracked.txt'], safeOptions))
+    attempt('rev-parse-other-ref', () => spawnSync('/usr/bin/git',
+      [...prefix, 'rev-parse', '--verify', 'refs/heads/other'], safeOptions))
+    attempt('extra-trailing-token', () => spawnSync('/usr/bin/git',
+      [...prefix, 'rev-parse', '--show-toplevel', 'extra'], safeOptions))
     attempt('api', () => exec('/usr/bin/git status'))
-    attempt('noverb', () => spawnSync('/usr/bin/git', ['--no-pager']))
+    attempt('noverb', () => spawnSync('/usr/bin/git', [...prefix], safeOptions))
   `)
+  // GUARD: a backtick inside this file's probe template would terminate the
+  // template literal and produce a syntax error that reads as an unrelated
+  // test failure. It has happened three times in this work, so it is checked
+  // rather than remembered.
+  const probeSource = readFileSync(probe, 'utf8')
+  assert.equal(probeSource.includes('`'), false, 'probe source must contain no backtick')
   const output = join(scratch, 'git-exception.json')
   const result = spawnSync(process.execPath,
     ['--import', join(import.meta.dirname, 'haw70-upgrade-import-observer.mjs'), probe],
@@ -1412,24 +1477,52 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
     .filter(a => a.kind.startsWith('child_process.') && !a.detail.startsWith('delegated-git'))
     .map(a => (JSON.parse(a.detail) as { refused: string }).refused)
 
-  // EXACTLY ONE delegation: the permitted read-only status.
-  assert.equal(delegated.length, 1, JSON.stringify(delegated))
+  // EXACTLY TWO delegations: the permitted read-only status and config probe.
+  assert.equal(delegated.length, 2, JSON.stringify(delegated))
   // And every prohibited shape refused, each for its own stated reason.
   assert.deepEqual(refused.sort(), [
     'api exec',
     'config core.hooksPath=/tmp/evil',
+    'containment',
+    'cwd outside repository',
+    'environment GIT_CONFIG_GLOBAL',
+    'environment keys',
+    'environment missing',
+    'form cat-file',
+    'form config',
+    'form config',
+    'form rev-parse',
+    'form rev-parse',
+    'form status',
+    'form status',
     'no verb',
-    'routing GIT_DIR',
-    'shell requested',
+    'shell',
+    'shell',
     'target outside repository',
+    'timeout',
     'verb clean',
     'verb fetch',
     'verb push',
+    'verb symbolic-ref',
   ])
-  // CONTROL: the refusals are not vacuous -- the permitted request really was
-  // delegated and really did run, so the boundary distinguishes rather than
-  // refusing everything.
-  assert.match(delegated[0].detail, /delegated-git/)
+  // CONTROL: the refusals are not vacuous -- the permitted requests really
+  // were delegated and really did run, so the boundary distinguishes rather
+  // than refusing everything.
+  assert.ok(delegated.every(entry => entry.detail.startsWith('delegated-git')))
+  // And the delegated receipt is now a COMPLETE request, not one argument.
+  const summary = (JSON.parse(readFileSync(output, 'utf8')) as {
+    delegatedGit: { signature: string; count: number
+      request: { argv: string[]; environment: Record<string, string>
+        shell: boolean | null; timeout: number | null; cwd: string | null } }[] }).delegatedGit
+  assert.equal(summary.length, 2, JSON.stringify(summary.map(entry => entry.signature)))
+  for (const entry of summary) {
+    assert.ok(entry.request.argv.includes('-C'))
+    assert.equal(entry.request.shell, false)
+    assert.equal(entry.request.timeout, 15000)
+    assert.deepEqual(Object.keys(entry.request.environment).sort(),
+      ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_NO_LAZY_FETCH', 'GIT_NO_REPLACE_OBJECTS',
+        'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'LANG', 'LC_ALL', 'PATH'])
+  }
 })
 
 test('a cold import of the driver attempts no child, socket or name resolution', () => {
@@ -1589,7 +1682,11 @@ test('the ACTUAL fixed adapter is observed, inertly, on both connect paths', () 
   const cloneRef = `refs/heads/${gitIn(clone, 'rev-parse', '--abbrev-ref', 'HEAD').trim()}`
 
   const observe = (connectRejects: boolean): {
-    kinds: string[]; detail: (kind: string) => string; gitDelegations: number } => {
+    kinds: string[]; detail: (kind: string) => string; gitDelegations: number
+    delegatedVerbs: string[]
+    delegatedSummary: { signature: string; count: number
+      request: { argv: string[]; environment: Record<string, string>
+        shell: boolean | null; timeout: number | null; cwd: string | null } }[] } => {
     const output = join(scratch, `adapter-${connectRejects ? 'reject' : 'accept'}.json`)
     const environment = {
       ...environmentFor(), GITHUB_SHA: cloneHead, GITHUB_WORKFLOW_SHA: cloneHead,
@@ -1614,8 +1711,12 @@ test('the ACTUAL fixed adapter is observed, inertly, on both connect paths', () 
           ...(connectRejects ? { HAW70_OBSERVER_PG_CONNECT_REJECTS: '1' } : {}),
         } })
     assert.equal(result.status, 0, result.stderr)
-    const recorded = JSON.parse(readFileSync(output, 'utf8')) as
-      { attempts: { kind: string; detail: string }[] }
+    const recorded = JSON.parse(readFileSync(output, 'utf8')) as {
+      attempts: { kind: string; detail: string }[]
+      delegatedGit: { signature: string; count: number
+        request: { argv: string[]; environment: Record<string, string>
+          shell: boolean | null; timeout: number | null; cwd: string | null } }[]
+    }
     // The delegated read-only git calls are excluded from BOTH views, so a
     // lookup for the migration child cannot match a git invocation instead.
     const observed = recorded.attempts
@@ -1628,6 +1729,10 @@ test('the ACTUAL fixed adapter is observed, inertly, on both connect paths', () 
         return found.detail
       },
       gitDelegations: recorded.attempts.length - observed.length,
+      delegatedVerbs: recorded.attempts
+        .filter(attempt => attempt.detail.startsWith('delegated-git'))
+        .map(attempt => attempt.detail.replace('delegated-git ', '')),
+      delegatedSummary: recorded.delegatedGit,
     }
   }
 
@@ -1638,6 +1743,23 @@ test('the ACTUAL fixed adapter is observed, inertly, on both connect paths', () 
   // The delegated git work is counted, not hidden: the driver materializes
   // its own stage, so this is expected to be substantial.
   assert.ok(accepted.gitDelegations > 100, String(accepted.gitDelegations))
+  // AND THE ALLOWLIST MATCHES THE REAL DRIVER. Every one of those delegated
+  // calls passed the exact-form validator, so the permitted set is neither
+  // too narrow (the run reached the adapter) nor a verb-level approximation.
+  // The verbs seen are asserted to be a subset of the declared safe set, and
+  // each receipt carries the closed environment and safe options.
+  assert.deepEqual([...new Set(accepted.delegatedVerbs)].sort()
+    .filter(verb => !['cat-file', 'config', 'for-each-ref', 'ls-tree', 'rev-parse', 'status']
+      .includes(verb)), [], JSON.stringify([...new Set(accepted.delegatedVerbs)].sort()))
+  assert.ok(accepted.delegatedSummary.length >= 3,
+    JSON.stringify(accepted.delegatedSummary.map(entry => entry.signature)))
+  for (const entry of accepted.delegatedSummary) {
+    assert.equal(entry.request.shell, false, entry.signature)
+    assert.ok(entry.request.argv.includes('-C'), entry.signature)
+    assert.deepEqual(Object.keys(entry.request.environment).sort(),
+      ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_NO_LAZY_FETCH', 'GIT_NO_REPLACE_OBJECTS',
+        'GIT_OPTIONAL_LOCKS', 'GIT_TERMINAL_PROMPT', 'LANG', 'LC_ALL', 'PATH'], entry.signature)
+  }
   // THE ACTUAL CONSTRUCTED OPTIONS, from the real adapter.
   const options = JSON.parse(accepted.detail('pg:construct')) as Record<string, unknown>
   assert.equal(options.host, '127.0.0.1')

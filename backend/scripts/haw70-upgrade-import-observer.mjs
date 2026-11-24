@@ -65,23 +65,103 @@ const allowGit = process.env.HAW70_OBSERVER_ALLOW_GIT === '1'
 const gitRoot = process.env.HAW70_OBSERVER_GIT_ROOT
 const databaseUrl = process.env.HAW70_OBSERVER_DATASOURCE
 
-/** The read-only verbs the driver's own source validation actually uses. */
-const READ_ONLY_GIT_VERBS = new Set(['status', 'cat-file', 'rev-parse', 'ls-tree', 'ls-files',
-  'archive', 'merge-base', 'show', 'config', 'symbolic-ref', 'for-each-ref', 'log', 'diff'])
-/** The only `-c` settings permitted, all of which DISABLE behaviour. */
+/**
+ * THE EXACT REQUEST FORMS the driver's own fixed Git adapter issues, and
+ * nothing else.
+ *
+ * An earlier version allowlisted VERBS, which is not the same thing as
+ * allowlisting read-only requests: `config` and `symbolic-ref` both have write
+ * forms, and nothing validated the arguments after the verb, so
+ * `config core.hooksPath /tmp/x` and `symbolic-ref HEAD refs/heads/other`
+ * would have been delegated as writes. It also skipped containment when `-C`
+ * was absent, left `cwd` unchecked, rejected only `shell === true` (so a
+ * string value passed), and inspected the environment only when one was
+ * supplied -- an absent one inheriting ambient configuration.
+ *
+ * The driver's whole Git surface is ONE call site plus the executable-source
+ * status command, so the safe set is small and can be stated exactly.
+ * `symbolic-ref` is not among them and is simply gone; `config` remains only
+ * in its read-only `--get-regexp` shape, which has no value argument.
+ */
+const SAFE_GIT_ENVIRONMENT = Object.freeze({
+  PATH: '/usr/bin:/bin', LANG: 'C', LC_ALL: 'C',
+  GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0',
+  GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1',
+})
 const ALLOWED_GIT_CONFIG = new Set(['core.fsmonitor=false', 'core.hooksPath=/dev/null',
   'core.untrackedCache=false'])
 const ALLOWED_GIT_FLAGS = new Set(['--no-pager', '--no-replace-objects'])
+const OID = /^[0-9a-f]{40}$/
+const REFUSED_OPTION_KEYS = ['detached', 'uid', 'gid', 'input', 'argv0', 'windowsVerbatimArguments']
+const MAX_DELEGATED_TIMEOUT = 60_000
 
-/** Returns null when the request may be delegated, else the reason to refuse. */
+/** A relative, non-flag, non-traversing path. */
+const safeRelative = token => typeof token === 'string' && token.length > 0
+  && !token.startsWith('-') && !token.startsWith('/')
+  && !token.split('/').includes('..')
+
+/** Exact trailing forms per verb. Anything else is refused. */
+const GIT_FORMS = Object.freeze({
+  'cat-file': tail => tail.length === 2
+    && (tail[0] === 'commit' || tail[0] === 'blob') && OID.test(tail[1]),
+  'ls-tree': tail => tail.length >= 6 && tail[0] === '-r' && tail[1] === '-z'
+    && tail[2] === '--full-tree' && OID.test(tail[3]) && tail[4] === '--'
+    && tail.slice(5).every(safeRelative),
+  'rev-parse': tail =>
+    (tail.length === 1 && ['--show-toplevel', '--is-shallow-repository',
+      '--absolute-git-dir', '--git-common-dir'].includes(tail[0]))
+    || (tail.length === 2 && tail[0] === '--verify' && tail[1] === 'HEAD^{commit}')
+    || (tail.length === 2 && tail[0] === '--git-path' && safeRelative(tail[1])),
+  // READ-ONLY config ONLY. A write is `config <key> <value>`; requiring this
+  // exact four-token shape leaves no room for a value or a mutating switch.
+  config: tail => tail.length === 4 && tail[0] === '--local'
+    && tail[1] === '--name-only' && tail[2] === '--get-regexp'
+    && typeof tail[3] === 'string' && !tail[3].startsWith('-'),
+  'for-each-ref': tail => tail.length === 2 && tail[0] === '--format=%(refname)'
+    && typeof tail[1] === 'string' && tail[1].startsWith('refs/'),
+  status: tail => tail.length >= 3 && tail[0] === '--porcelain=v1'
+    && tail[1] === '--untracked-files=all' && tail[2] === '--'
+    && tail.slice(3).every(safeRelative),
+})
+
+const contained = (candidate, root) => {
+  let resolved
+  try { resolved = realpathSync(candidate) } catch { return false }
+  return resolved === root || resolved.startsWith(`${root}/`)
+}
+
+/** Returns null when the COMPLETE request may be delegated, else the reason. */
 function gitRefusalReason(name, args) {
   if (name !== 'spawnSync') return `api ${name}`
   if (String(args[0]) !== '/usr/bin/git') return 'executable'
-  const argv = Array.isArray(args[1]) ? args[1].map(String) : null
+  const argv = Array.isArray(args[1]) && args[1].every(t => typeof t === 'string')
+    ? args[1] : null
   if (argv === null) return 'argv shape'
-  const options = (args[2] && typeof args[2] === 'object') ? args[2] : {}
-  if (options.shell === true) return 'shell requested'
+  const options = (args[2] && typeof args[2] === 'object') ? args[2] : null
+  if (options === null) return 'options missing'
+  // ANY shell value, not just `true`. A string selects a shell too.
+  if (options.shell !== undefined && options.shell !== false) return 'shell'
+  for (const key of REFUSED_OPTION_KEYS) {
+    if (options[key] !== undefined) return `options ${key}`
+  }
+  if (typeof options.timeout !== 'number' || !(options.timeout > 0)
+    || options.timeout > MAX_DELEGATED_TIMEOUT) return 'timeout'
   if (typeof gitRoot !== 'string' || gitRoot.length === 0) return 'no owned repository'
+  // The environment must be PRESENT and exactly the safe set: absent means
+  // the child inherits this process's configuration.
+  const childEnvironment = options.env
+  if (!childEnvironment || typeof childEnvironment !== 'object') return 'environment missing'
+  const expectedKeys = Object.keys(SAFE_GIT_ENVIRONMENT).sort()
+  const suppliedKeys = Object.keys(childEnvironment).sort()
+  if (suppliedKeys.join(',') !== expectedKeys.join(',')) return 'environment keys'
+  for (const key of expectedKeys) {
+    if (String(childEnvironment[key]) !== SAFE_GIT_ENVIRONMENT[key]) return `environment ${key}`
+  }
+  if (options.cwd !== undefined
+    && (typeof options.cwd !== 'string' || !contained(options.cwd, gitRoot))) {
+    return 'cwd outside repository'
+  }
+  // Leading flags and `-c` settings, then a MANDATORY contained `-C` target.
   let index = 0
   let target = null
   while (index < argv.length) {
@@ -93,29 +173,22 @@ function gitRefusalReason(name, args) {
       continue
     }
     if (token === '-C') {
+      if (target !== null) return 'repeated target'
       target = argv[index + 1]
       index += 2
       continue
     }
     break
   }
+  if (target === null) return 'containment'
+  if (typeof target !== 'string' || !contained(target, gitRoot)) {
+    return 'target outside repository'
+  }
   if (index >= argv.length) return 'no verb'
-  if (!READ_ONLY_GIT_VERBS.has(argv[index])) return `verb ${argv[index]}`
-  // Containment: the target must be inside the owned repository.
-  if (target !== null) {
-    let resolved
-    try { resolved = realpathSync(target) } catch { return 'unresolvable target' }
-    if (resolved !== gitRoot && !resolved.startsWith(`${gitRoot}/`)) return 'target outside repository'
-  }
-  // Routing overrides must not reach the delegated child.
-  const childEnvironment = options.env
-  if (childEnvironment && typeof childEnvironment === 'object') {
-    for (const key of Object.keys(childEnvironment)) {
-      if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|ALTERNATE|OBJECT_DIRECTORY|CEILING|COMMON_DIR|NAMESPACE)/.test(key)) {
-        return `routing ${key}`
-      }
-    }
-  }
+  const verb = argv[index]
+  const form = GIT_FORMS[verb]
+  if (form === undefined) return `verb ${verb}`
+  if (!form(argv.slice(index + 1))) return `form ${verb}`
   return null
 }
 
@@ -145,13 +218,27 @@ function describeRequest(name, args) {
   }
 }
 
+/**
+ * Delegated receipts, BOUNDED but auditable: one compact line per call (the
+ * driver issues thousands), plus the FULL request recorded once for each
+ * distinct form signature and a final counted summary. Previously a delegated
+ * call kept a single argument, so its actual argv, cwd, environment and
+ * options were unavailable for the audit the comment claimed.
+ */
+const delegatedForms = new Map()
+
 for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']) {
   childProcess[name] = (...args) => {
     const refusal = allowGit ? gitRefusalReason(name, args) : 'git delegation disabled'
     if (refusal === null) {
-      // Recorded compactly: the driver issues thousands of these and the
-      // full receipt is reserved for the requests under observation.
-      record(`child_process.${name}`, `delegated-git ${String(args[1]?.[args[1].length - 2] ?? '')}`)
+      const request = describeRequest(name, args)
+      const verb = request.argv[request.argv.indexOf('-C') + 2] ?? ''
+      const signature = `${verb}:${request.argv.length}`
+      if (!delegatedForms.has(signature)) {
+        delegatedForms.set(signature, { count: 0, request })
+      }
+      delegatedForms.get(signature).count += 1
+      record(`child_process.${name}`, `delegated-git ${verb}`)
       return realChild[name](...args)
     }
     record(`child_process.${name}`, JSON.stringify({
@@ -222,7 +309,12 @@ const control = process.env.HAW70_OBSERVER_POSITIVE_CONTROL === '1'
 
 process.on('beforeExit', () => {
   if (typeof output === 'string') {
-    writeFileSync(output, JSON.stringify({ attempts }, null, 2))
+    writeFileSync(output, JSON.stringify({
+      attempts,
+      delegatedGit: [...delegatedForms.entries()]
+        .map(([signature, entry]) => ({ signature, count: entry.count, request: entry.request }))
+        .sort((left, right) => left.signature.localeCompare(right.signature)),
+    }, null, 2))
   }
 })
 

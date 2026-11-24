@@ -296,15 +296,55 @@ identical, nothing stages, and the clone's own identity is kept. An
 unconditional commit would exit nonzero for "nothing to commit" and fail
 exactly in the sealed/restored validation. Both paths are exercised.
 
-The delegated read-only Git exception is **enforced**, not merely declared:
-only `spawnSync`, only `/usr/bin/git`, only an allowlisted read-only verb,
-only the three allowlisted `-c` settings (all of which disable behaviour), a
-`-C` target that must resolve inside the owned repository, no `shell`, and no
-`GIT_DIR`-style routing in the child environment. Everything else is recorded
-with its reason and refused before delegation, and the negative controls cover
-a mutation verb, a network verb, a `core.hooksPath` redirect, an
-outside-repository target, a routing override, `shell: true`, a different
-process API and a missing verb. None of those runs.
+The delegated read-only Git exception is enforced on the **complete request**,
+not on its verb.
+
+A verb allowlist is not the same thing, and the earlier version proved it:
+`config` and `symbolic-ref` both have write forms, and nothing validated the
+arguments after the verb, so `config core.hooksPath /tmp/x` and
+`symbolic-ref HEAD refs/heads/other` would have been delegated as writes. It
+also skipped containment when `-C` was absent, left `cwd` unchecked, rejected
+only `shell === true` so a string value passed, and inspected the environment
+only when one was supplied — an absent one inheriting ambient configuration.
+
+What is enforced now: only `spawnSync`, only `/usr/bin/git`, only the two
+allowed leading flags and the three allowed `-c` settings (all of which
+disable behaviour), a **mandatory** `-C` target that must resolve inside the
+owned repository, a `cwd` that must also be contained if present, an
+environment that must be **present and exactly** the closed nine-key set with
+those values, a positive bounded `timeout`, no `shell` value of any kind, and
+none of `detached`, `uid`, `gid`, `input` or `argv0`. Then the verb must be
+one of six, and its **trailing arguments must match an exact form**:
+
+| verb | permitted trailing form |
+| --- | --- |
+| `cat-file` | `commit <40-hex>` or `blob <40-hex>` |
+| `ls-tree` | `-r -z --full-tree <40-hex> -- <relative paths>` |
+| `rev-parse` | `--show-toplevel`, `--is-shallow-repository`, `--absolute-git-dir`, `--git-common-dir`, `--verify HEAD^{commit}`, or `--git-path <relative>` |
+| `config` | `--local --name-only --get-regexp <pattern>` — read-only; the shape leaves no room for a value or a mutating switch |
+| `for-each-ref` | `--format=%(refname) refs/…` |
+| `status` | `--porcelain=v1 --untracked-files=all -- <relative paths>` |
+
+`symbolic-ref` is gone, because the driver never issues it. These are the
+forms the driver's single Git call site and its executable-source status
+command actually use; the adapter observation asserts that every one of the
+~1,900 calls a real run delegates passed this validator, so the set is neither
+a verb-level approximation nor too narrow to reach the adapter.
+
+Twenty-three negative controls cover both write forms, a mutating `config`
+switch, three network or destructive verbs, a `core.hooksPath` redirect, a
+missing `-C`, an outside-repository target, an outside `cwd`, a routing
+override, a tampered and an absent environment, `shell: true` and
+`shell: '/bin/sh'`, a missing timeout, an absolute and a traversing path, a
+non-OID `cat-file`, an unexpected `rev-parse` ref, a trailing extra token, a
+different process API and a missing verb. None of them runs: each is refused
+before delegation, with its reason recorded.
+
+Delegated receipts are bounded but complete: one compact line per call, plus
+the full request — argv, cwd, environment, `shell`, `timeout`, `maxBuffer`,
+`stdio` — recorded once per distinct form signature with a counted summary.
+Previously a delegated call kept only one argument, so the audit the comment
+claimed was not available.
 
 ### What this observation does NOT establish
 
