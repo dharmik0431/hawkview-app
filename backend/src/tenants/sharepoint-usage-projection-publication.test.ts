@@ -72,8 +72,19 @@ function storedUsageSnapshot(coherent: boolean) {
 const REAL_USED_BYTES = 2 * 4 * GIB
 const REAL_ALLOCATED_BYTES = 2 * 25 * GIB
 
-async function publishedBundle(coherent: boolean) {
-  const snapshot = storedUsageSnapshot(coherent)
+type BundleOptions = {
+  /** Replace the stored SHAREPOINT_USAGE payload entirely. `null` omits the
+   *  snapshot row, which is the absent-evidence case. */
+  usagePayload?: unknown[] | null
+  fieldOverrides?: Record<string, Partial<{
+    state: string; reasonCode: string | null; message: string | null; isStale: boolean
+  }>>
+}
+
+async function publishedBundle(coherent: boolean, options: BundleOptions = {}) {
+  const snapshot = options.usagePayload === undefined
+    ? storedUsageSnapshot(coherent)
+    : options.usagePayload
   const observedAt = new Date()
   const syncRow = {
     lastAttemptAt: new Date(Date.now() - 60_000),
@@ -83,10 +94,11 @@ async function publishedBundle(coherent: boolean) {
     consecutiveFailures: 0,
   }
   const field = (fieldKey: string) => ({
-    fieldKey, state: 'AVAILABLE', reasonCode: null, message: null,
+    fieldKey, state: 'AVAILABLE', reasonCode: null as string | null, message: null as string | null,
     source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail',
     lastAttemptAt: syncRow.lastAttemptAt, lastSuccessfulAt: syncRow.lastSuccessfulAt,
     isStale: false,
+    ...(options.fieldOverrides?.[fieldKey] ?? {}),
   })
   const scoped = ({ where }: any) => {
     assert.equal(where.organizationId, SCOPE.organizationId)
@@ -100,7 +112,9 @@ async function publishedBundle(coherent: boolean) {
       findMany: async (args: any) => {
         scoped(args)
         return [
-          { resourceType: 'SHAREPOINT_USAGE', payload: snapshot, observedAt },
+          ...(snapshot === null
+            ? []
+            : [{ resourceType: 'SHAREPOINT_USAGE', payload: snapshot, observedAt }]),
           {
             resourceType: 'SHAREPOINT_SITES',
             observedAt,
@@ -217,21 +231,259 @@ test('an incomplete projection publishes no summed value and claims no capabilit
   assert.equal(sharepoint.overview.storageQuotaSource, 'unavailable')
 })
 
-test('a residual this correction does NOT close: the usage envelope still reads AVAILABLE', async () => {
-  // Recorded as a limitation rather than asserted as correct. The value is now
-  // null, so no fabricated number is published, but the envelope's state still
-  // comes from the durable field row, which is AVAILABLE because:
-  //   - the field-key table attaches `projectionEvidence` to only the two
-  //     `*-usage-projection` keys, not to `sharepoint.usage`
-  //     (tenant-sync.service.ts:2925-2930 versus the override at :2947); and
-  //   - even were it PENDING, `collectionState` discards a PENDING field whose
-  //     collector has completed (:7314-7317), which SHAREPOINT_USAGE has.
-  // Closing it means changing that discard rule, which every field key in the
-  // bundle depends on. That is not a minimal correction and is left for review.
+test('the usage envelope publishes a truthful state when the projection is incomplete', async () => {
+  // CORRECTED DIAGNOSIS. An earlier version of this test claimed a global
+  // PENDING-discard rule prevented truthful envelope metadata. That was wrong,
+  // and independent review showed why: `collectionState('sharepoint.usage',
+  // value)` passes NO resourceType (tenant-sync.service.ts:8117-8120), so
+  // `sync` is undefined and `pendingFieldHasCompletedCollector` is false at
+  // :7305-7317. The field row's own state is therefore published as-is, and no
+  // change to that shared rule is needed.
+  //
+  // The usage-specific fix is that `refreshCollectionFieldStates` now attaches
+  // the same projection evidence to `sharepoint.usage` that the two
+  // *-usage-projection keys already carry, so the durable row is PENDING with
+  // an existing reason instead of AVAILABLE with a null one. This test supplies
+  // the row that producer now writes and asserts the envelope publishes it.
+  const sharepoint = await publishedBundle(false, {
+    fieldOverrides: {
+      'sharepoint.usage': {
+        state: 'PENDING',
+        reasonCode: 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE',
+        message: 'The stored Microsoft usage report does not contain complete validated period and refresh-date evidence.',
+        isStale: true,
+      },
+    },
+  })
+  assert.equal(sharepoint.collection.usage.value, null, 'the value stays unknown')
+  assert.equal(sharepoint.collection.usage.state, 'PENDING',
+    'a PENDING usage field is NOT discarded, because this call passes no resourceType')
+  assert.equal(sharepoint.collection.usage.reasonCode, 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE')
+  assert.equal(sharepoint.collection.usage.isStale, true)
+})
+
+// ---------------------------------------------------------------------------
+// Independent review of 3bcb32a found two remaining false-zero paths: absent or
+// legacy evidence still reached the legacy reducers, and a COMPLETE projection
+// does not establish that every storage cell is a usable number. Each bullet of
+// that review's required coverage has a test below.
+// ---------------------------------------------------------------------------
+
+/** One coherent SharePoint row, with real bytes, usable as legacy input. */
+const legacyRow = (over: Record<string, string> = {}) => usageRow({
+  'Site Id': 'legacy-a', 'Site URL': `${SITE_URL}/legacy-a`, ...over,
+})
+
+test('an absent usage snapshot with a SUCCEEDED collection publishes unknown, never an invented zero', async () => {
+  // Finding 1. With no stored snapshot the row array is empty and there is no
+  // v2 projection, so the old flag admitted it and every total summed to 0
+  // while the capabilities read true.
+  const sharepoint = await publishedBundle(true, { usagePayload: null })
+
+  assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, null)
+  assert.equal(sharepoint.overview.summedSiteQuotaBytes, null)
+  assert.equal(sharepoint.collection.usage.value, null)
+  assert.equal(sharepoint.capabilities.usageReport, false)
+  assert.equal(sharepoint.capabilities.siteOwnerPresence, false)
+  assert.equal(sharepoint.capabilities.deletedSites, false)
+  assert.equal(sharepoint.deletedSitesSynchronized, false)
+  assert.equal(sharepoint.overview.totalStorageQuotaGB, null)
+  assert.equal(sharepoint.overview.storageQuotaSource, 'unavailable')
+})
+
+test('a coherent LEGACY v1 snapshot keeps publishing its real values', async () => {
+  // Finding 1, compatibility half. A v1 dataset carries no v2 projection
+  // evidence, so its rows are not gated. Rejecting every legacy shape would
+  // lose working behaviour, so a non-empty legacy row set stays usable.
+  const sharepoint = await publishedBundle(true, {
+    usagePayload: [{
+      hawkviewDataset: 'microsoft-usage-reports-v1',
+      sharePointSites: [legacyRow(), legacyRow({ 'Site Id': 'legacy-b', 'Site URL': `${SITE_URL}/legacy-b` })],
+      oneDriveAccounts: [],
+    }],
+  })
+  assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, REAL_USED_BYTES,
+    'coherent legacy rows still produce their real total')
+  assert.equal(sharepoint.overview.summedSiteQuotaBytes, REAL_ALLOCATED_BYTES)
+  assert.equal(sharepoint.collection.usage.value, REAL_USED_BYTES)
+  assert.equal(sharepoint.capabilities.usageReport, true)
+})
+
+test('an unrecognized bare-row snapshot also keeps working, which is preserved legacy behaviour', async () => {
+  const sharepoint = await publishedBundle(true, {
+    usagePayload: [legacyRow(), legacyRow({ 'Site Id': 'legacy-b', 'Site URL': `${SITE_URL}/legacy-b` })],
+  })
+  assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, REAL_USED_BYTES)
+  assert.equal(sharepoint.capabilities.usageReport, true)
+})
+
+test('a LEGACY snapshot with no rows is unknown, not a measured zero', async () => {
+  // The deliberate behaviour change, stated in the source comment: without
+  // projection evidence there is no way to distinguish a tenant with no
+  // reported sites from a report that never arrived.
+  for (const payload of [
+    [{ hawkviewDataset: 'microsoft-usage-reports-v1', sharePointSites: [], oneDriveAccounts: [] }],
+    [] as unknown[],
+  ]) {
+    const sharepoint = await publishedBundle(true, { usagePayload: payload })
+    assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, null, JSON.stringify(payload).slice(0, 60))
+    assert.equal(sharepoint.collection.usage.value, null)
+    assert.equal(sharepoint.capabilities.usageReport, false)
+  }
+})
+
+test('a COMPLETE projection with an unusable byte cell publishes unknown for that total only', async () => {
+  // Finding 2. Projection coherence validates period, dates and identity — not
+  // storage cells. Each case below keeps the projection AUTHORITATIVE_COMPLETE
+  // while one storage column is unusable, and used and allocated are summed
+  // INDEPENDENTLY so one does not destroy the other.
+  const cases: Array<[string, Record<string, string>, 'used' | 'allocated']> = [
+    ['missing used', { 'Storage Used (Byte)': '' }, 'used'],
+    ['non-numeric used', { 'Storage Used (Byte)': 'n/a' }, 'used'],
+    ['negative used', { 'Storage Used (Byte)': '-1' }, 'used'],
+    ['fractional used', { 'Storage Used (Byte)': '1.5' }, 'used'],
+    ['missing allocated', { 'Storage Allocated (Byte)': '' }, 'allocated'],
+    ['negative allocated', { 'Storage Allocated (Byte)': '-4096' }, 'allocated'],
+  ]
+  for (const [label, damage, which] of cases) {
+    const rows = [
+      usageRow({ 'Site Id': 'site-a', 'Site URL': `${SITE_URL}/a` }),
+      usageRow({ 'Site Id': 'site-b', 'Site URL': `${SITE_URL}/b`, ...damage }),
+    ]
+    const sharepoint = await publishedBundle(true, {
+      usagePayload: buildMicrosoftUsageReportSnapshot(rows, []) as unknown[],
+    })
+    const evidence = inspectMicrosoftUsageProjectionEvidence(
+      buildMicrosoftUsageReportSnapshot(rows, []))
+    assert.equal(evidence.sharePoint.state, 'AUTHORITATIVE_COMPLETE',
+      `${label}: the projection itself is still complete, which is the point`)
+
+    if (which === 'used') {
+      assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, null, `${label}: used unknown`)
+      assert.equal(sharepoint.collection.usage.value, null, `${label}`)
+      assert.equal(sharepoint.overview.summedSiteQuotaBytes, REAL_ALLOCATED_BYTES,
+        `${label}: allocated is unaffected — the two totals are independent`)
+      assert.equal(sharepoint.overview.storageQuotaSource, 'reported-site-allocation')
+    } else {
+      assert.equal(sharepoint.overview.summedSiteQuotaBytes, null, `${label}: allocated unknown`)
+      assert.equal(sharepoint.overview.totalStorageQuotaGB, null, `${label}`)
+      assert.equal(sharepoint.overview.storageQuotaSource, 'unavailable', `${label}`)
+      assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, REAL_USED_BYTES,
+        `${label}: a good used figure is NOT lost because allocation is unusable`)
+      assert.equal(sharepoint.collection.usage.value, REAL_USED_BYTES, `${label}`)
+    }
+    // The capability is still asserted: the rows were verified and used. Only
+    // the specific total is unknown.
+    assert.equal(sharepoint.capabilities.usageReport, true, `${label}`)
+  }
+})
+
+test('a legitimate measured zero is still published as zero, not as unknown', async () => {
+  // The control that stops the correction from over-reaching. A complete
+  // projection over rows whose storage really is zero must publish 0.
+  const rows = [
+    usageRow({ 'Site Id': 'site-a', 'Site URL': `${SITE_URL}/a`, 'Storage Used (Byte)': '0', 'Storage Allocated (Byte)': '0' }),
+    usageRow({ 'Site Id': 'site-b', 'Site URL': `${SITE_URL}/b`, 'Storage Used (Byte)': '0', 'Storage Allocated (Byte)': '0' }),
+  ]
+  const sharepoint = await publishedBundle(true, {
+    usagePayload: buildMicrosoftUsageReportSnapshot(rows, []) as unknown[],
+  })
+  assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, 0, 'a measured zero stays zero')
+  assert.equal(sharepoint.overview.summedSiteQuotaBytes, 0)
+  assert.equal(sharepoint.collection.usage.value, 0)
+  assert.equal(sharepoint.capabilities.usageReport, true)
+  // And an allocation of zero still yields no quota figure, as before.
+  assert.equal(sharepoint.overview.totalStorageQuotaGB, null)
+  assert.equal(sharepoint.overview.storageQuotaSource, 'unavailable')
+})
+
+test('an incomplete projection cannot regain usable totals through the canonical contract either', async () => {
+  // The review's fifth bullet: there must be no back door where the canonical
+  // re-derivation supplies a number the legacy path refused.
   const sharepoint = await publishedBundle(false)
-  assert.equal(sharepoint.collection.usage.state, 'AVAILABLE')
-  assert.equal(sharepoint.collection.usage.reasonCode, null)
-  assert.equal(sharepoint.collection.usage.isStale, false)
-  assert.equal(sharepoint.collection.usage.value, null,
-    'the value is unknown, which is what this correction guarantees')
+  assert.equal(sharepoint.overview.summedSiteStorageUsedBytes, null, 'the legacy total is unknown')
+  assert.equal(sharepoint.dataContract.usageReports.sharePoint.state, 'partial')
+  assert.equal(sharepoint.dataContract.overview.sharePointStorageUsedGB, null,
+    'and the canonical total is unknown too, so neither path supplies a figure')
+  assert.equal(sharepoint.dataContract.usageReports.sharePoint.rowCount, 0,
+    'the contract reports the gated row count rather than the stored one')
+})
+
+test('report refresh dates and site inventory semantics are unchanged by this correction', async () => {
+  // Explicitly out of scope: the review requires these stay as they were.
+  const complete = await publishedBundle(true)
+  assert.equal(complete.collection.activity.value, 2, 'site-derived activity count unchanged')
+  assert.equal(complete.overview.totalSites, 2, 'site inventory unchanged')
+  assert.equal(complete.dataContract.usageReports.sharePoint.reportRefreshDate, '2026-08-18',
+    'the provider report date is unchanged')
+})
+
+// ---------------------------------------------------------------------------
+// The producer half of the envelope-metadata fix: what
+// `refreshCollectionFieldStates` now writes for `sharepoint.usage`.
+// ---------------------------------------------------------------------------
+
+/** Drive the real field-state producer and return the upsert it wrote per key. */
+async function writtenFieldStates(usagePayload: unknown[]) {
+  const writes = new Map<string, Record<string, unknown>>()
+  const service = new TenantSyncService({
+    syncState: {
+      findMany: async () => [
+        { resourceType: 'SHAREPOINT_USAGE', status: 'SUCCEEDED' },
+        { resourceType: 'SHAREPOINT_SITES', status: 'SUCCEEDED' },
+      ],
+    },
+    tenantEntraSnapshot: {
+      findMany: async ({ select, where }: any) => {
+        if (select?.resourceType) {
+          return [{ resourceType: 'SHAREPOINT_USAGE' }, { resourceType: 'SHAREPOINT_SITES' }]
+        }
+        return where?.resourceType === 'SHAREPOINT_USAGE' ? [{ payload: usagePayload }] : [{ payload: [] }]
+      },
+    },
+    tenantCollectionFieldState: {
+      upsert: async (args: any) => {
+        writes.set(args.where.customerTenantId_fieldKey.fieldKey, args.create ?? args.update)
+      },
+    },
+  } as never, {} as never, {} as never, {} as never, {} as never, {} as never)
+  await (service as never as {
+    refreshCollectionFieldStates: (t: unknown) => Promise<void>
+  }).refreshCollectionFieldStates({
+    id: SCOPE.customerTenantId, organizationId: SCOPE.organizationId,
+    microsoftTenantId: '11111111-1111-4111-8111-111111111111', status: 'ACTIVE',
+    displayName: null, primaryDomain: null,
+    connection: {
+      status: 'CONNECTED', connectionMode: 'HAWKVIEW_MANAGED',
+      exchangeReadOnlyEnabledAt: null, clientId: null, credentialReference: null,
+    },
+  })
+  return writes
+}
+
+test('an incomplete projection makes the durable sharepoint.usage row truthful, not AVAILABLE', async () => {
+  const writes = await writtenFieldStates(storedUsageSnapshot(false) as unknown[])
+  const usage = writes.get('sharepoint.usage')
+  assert.ok(usage, 'the usage key is written')
+  assert.equal(usage!.state, 'PENDING',
+    'an incomplete projection must not leave this row AVAILABLE with a null reason')
+  assert.equal(usage!.reasonCode, 'USAGE_PROJECTION_EVIDENCE_INCOMPLETE')
+  assert.equal(usage!.isStale, true)
+
+  // The projection keys keep their existing behaviour, and the site-derived
+  // keys are untouched by this change.
+  assert.equal(writes.get('sharepoint.usage-projection')!.state, 'PENDING')
+  assert.equal(writes.get('sharepoint.usage-projection')!.reasonCode,
+    'USAGE_PROJECTION_EVIDENCE_INCOMPLETE')
+  assert.equal(writes.get('sharepoint.sites.inventory')!.state, 'AVAILABLE',
+    'site inventory is not a usage-report projection and is unchanged')
+})
+
+test('a complete projection leaves the durable sharepoint.usage row AVAILABLE', async () => {
+  const writes = await writtenFieldStates(storedUsageSnapshot(true) as unknown[])
+  const usage = writes.get('sharepoint.usage')!
+  assert.equal(usage.state, 'AVAILABLE', 'the healthy path is unchanged')
+  assert.equal(usage.reasonCode, null)
+  assert.equal(usage.isStale, false)
+  assert.equal(writes.get('sharepoint.usage-projection')!.state, 'AVAILABLE')
 })
