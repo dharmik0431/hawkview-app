@@ -38,6 +38,9 @@
     "scripts/haw70-upgrade-launch-plan.test.ts",
     "prisma/haw70-upgrade.config.ts",
     "scripts/haw70-upgrade-materializer.d.mts",
-    "scripts/haw70-upgrade-git-source.d.mts"
+    "scripts/haw70-upgrade-git-source.d.mts",
+    "scripts/haw70-upgrade-witness.ts",
+    "scripts/haw70-upgrade-runner.ts",
+    "scripts/haw70-upgrade-runner.test.ts"
   ]
 }
