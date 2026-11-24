@@ -23,6 +23,7 @@ import net from 'node:net'
 import dns from 'node:dns'
 import { createHash } from 'node:crypto'
 import { realpathSync, writeFileSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { registerHooks, syncBuiltinESMExports } from 'node:module'
 
@@ -88,9 +89,30 @@ const SAFE_GIT_ENVIRONMENT = Object.freeze({
   GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_OPTIONAL_LOCKS: '0',
   GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1',
 })
-const ALLOWED_GIT_CONFIG = new Set(['core.fsmonitor=false', 'core.hooksPath=/dev/null',
-  'core.untrackedCache=false'])
-const ALLOWED_GIT_FLAGS = new Set(['--no-pager', '--no-replace-objects'])
+/**
+ * THE COMPLETE FIXED PREFIX the production caller issues, REQUIRED rather than
+ * merely permitted, followed by the mandatory `-C`.
+ *
+ * Treating these as optional was a real omitted barrier. The safe environment
+ * sets `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL=/dev/null`, which suppress
+ * SYSTEM and GLOBAL configuration -- not the owned repository's own
+ * `.git/config`. Measured: a locally configured value is still returned under
+ * that environment, and only the `-c` override changes it. So a contained
+ * `status` request with the exact safe environment and no `-c` settings would
+ * have been delegated, and a local `core.fsmonitor` helper could then execute
+ * inside the native child, outside every JavaScript patch here.
+ *
+ * Both real call sites -- the source adapter's single `git()` and the
+ * executable-source status command -- emit exactly this sequence, so requiring
+ * it verbatim costs nothing and removes the whole class.
+ */
+const REQUIRED_GIT_PREFIX = Object.freeze([
+  '--no-pager', '--no-replace-objects',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.hooksPath=/dev/null',
+  '-c', 'core.untrackedCache=false',
+  '-C',
+])
 const OID = /^[0-9a-f]{40}$/
 const REFUSED_OPTION_KEYS = ['detached', 'uid', 'gid', 'input', 'argv0', 'windowsVerbatimArguments']
 const MAX_DELEGATED_TIMEOUT = 60_000
@@ -124,6 +146,11 @@ const GIT_FORMS = Object.freeze({
     && tail.slice(3).every(safeRelative),
 })
 
+/**
+ * Containment for `options.cwd` only. With an absolute canonical `-C`, Git's
+ * repository selection no longer depends on `cwd` at all; this stays as a
+ * second barrier so a delegated child cannot be started somewhere unexpected.
+ */
 const contained = (candidate, root) => {
   let resolved
   try { resolved = realpathSync(candidate) } catch { return false }
@@ -161,29 +188,32 @@ function gitRefusalReason(name, args) {
     && (typeof options.cwd !== 'string' || !contained(options.cwd, gitRoot))) {
     return 'cwd outside repository'
   }
-  // Leading flags and `-c` settings, then a MANDATORY contained `-C` target.
-  let index = 0
-  let target = null
-  while (index < argv.length) {
-    const token = argv[index]
-    if (ALLOWED_GIT_FLAGS.has(token)) { index += 1; continue }
-    if (token === '-c') {
-      if (!ALLOWED_GIT_CONFIG.has(argv[index + 1])) return `config ${argv[index + 1]}`
-      index += 2
-      continue
+  // THE EXACT PREFIX, token for token. A missing or reordered barrier is
+  // reported with its position so each omission has its own reason.
+  for (let position = 0; position < REQUIRED_GIT_PREFIX.length; position += 1) {
+    if (argv[position] !== REQUIRED_GIT_PREFIX[position]) {
+      return `prefix ${position} ${REQUIRED_GIT_PREFIX[position]}`
     }
-    if (token === '-C') {
-      if (target !== null) return 'repeated target'
-      target = argv[index + 1]
-      index += 2
-      continue
-    }
-    break
   }
-  if (target === null) return 'containment'
-  if (typeof target !== 'string' || !contained(target, gitRoot)) {
+  // THE TARGET MUST BE ABSOLUTE AND ALREADY CANONICAL.
+  //
+  // A relative `-C` cannot be validated here at all: `realpathSync` resolves
+  // it against THIS process's working directory, while Git applies `-C` after
+  // chdir'ing to `options.cwd`. Measured: with the observer in
+  // `<owned>/backend`, `options.cwd = <owned>` and `-C ..`, validation
+  // resolves to `<owned>` while Git lands in its parent. The production
+  // caller always supplies an absolute canonical root, so the ambiguous form
+  // is refused rather than interpreted.
+  const target = argv[REQUIRED_GIT_PREFIX.length]
+  if (typeof target !== 'string' || !isAbsolute(target)) return 'target not absolute'
+  if (resolve(target) !== target) return 'target not canonical'
+  let resolvedTarget
+  try { resolvedTarget = realpathSync(target) } catch { return 'target unresolvable' }
+  if (resolvedTarget !== target) return 'target not canonical'
+  if (resolvedTarget !== gitRoot && !resolvedTarget.startsWith(`${gitRoot}/`)) {
     return 'target outside repository'
   }
+  const index = REQUIRED_GIT_PREFIX.length + 1
   if (index >= argv.length) return 'no verb'
   const verb = argv[index]
   const form = GIT_FORMS[verb]
@@ -232,7 +262,7 @@ for (const name of ['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execF
     const refusal = allowGit ? gitRefusalReason(name, args) : 'git delegation disabled'
     if (refusal === null) {
       const request = describeRequest(name, args)
-      const verb = request.argv[request.argv.indexOf('-C') + 2] ?? ''
+      const verb = request.argv[REQUIRED_GIT_PREFIX.length + 1] ?? ''
       const signature = `${verb}:${request.argv.length}`
       if (!delegatedForms.has(signature)) {
         delegatedForms.set(signature, { count: 0, request })

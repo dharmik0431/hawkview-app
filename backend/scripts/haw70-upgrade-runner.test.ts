@@ -1369,6 +1369,10 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
   seed('-c', 'user.email=t@local', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'seed')
   const outside = realpathSync(mkdtempSync(join(scratch, 'git-outside-')))
   seed('init', '--quiet')
+  // A symlink POINTING AT the owned root: absolute and self-resolving as a
+  // string, but not canonical, so the target check must refuse it.
+  const linkedOwned = join(scratch, 'git-linked-owned')
+  symlinkSync(owned, linkedOwned)
 
   const probe = join(scratch, 'git-exception-probe.mjs')
   writeFileSync(probe, `
@@ -1451,6 +1455,36 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
       [...prefix, 'rev-parse', '--verify', 'refs/heads/other'], safeOptions))
     attempt('extra-trailing-token', () => spawnSync('/usr/bin/git',
       [...prefix, 'rev-parse', '--show-toplevel', 'extra'], safeOptions))
+    // EACH REQUIRED BARRIER DELETED IN TURN. The safe environment suppresses
+    // system and global configuration but NOT the owned repository's local
+    // .git/config, so these -c overrides are the actual barrier and a request
+    // without them must be refused rather than merely tolerated.
+    const noPager = prefix.slice(1)
+    const noReplace = [prefix[0], ...prefix.slice(2)]
+    const noFsmonitor = [prefix[0], prefix[1], ...prefix.slice(4)]
+    const noHooksPath = [...prefix.slice(0, 4), ...prefix.slice(6)]
+    const noUntracked = [...prefix.slice(0, 6), ...prefix.slice(8)]
+    const noSettings = [prefix[0], prefix[1], '-C', owned]
+    const reordered = [prefix[0], prefix[1], '-c', 'core.hooksPath=/dev/null',
+      '-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', owned]
+    const statusTail = ['status', '--porcelain=v1', '--untracked-files=all', '--', 'tracked.txt']
+    for (const [label, head] of [['omit-no-pager', noPager], ['omit-no-replace', noReplace],
+      ['omit-fsmonitor', noFsmonitor], ['omit-hookspath', noHooksPath],
+      ['omit-untracked', noUntracked], ['omit-all-settings', noSettings],
+      ['reordered-settings', reordered]]) {
+      attempt(label, () => spawnSync('/usr/bin/git', [...head, ...statusTail], safeOptions))
+    }
+    // A RELATIVE TARGET whose meaning changes under options.cwd. Validation in
+    // the observer would resolve it against the observer's own working
+    // directory; Git applies -C after chdir to cwd. The cwd here is INSIDE the
+    // owned repository, so only the target check can catch this.
+    attempt('relative-target', () => spawnSync('/usr/bin/git',
+      [...prefix.slice(0, 9), '..', ...statusTail], { ...safeOptions, cwd: owned }))
+    // An absolute but NON-CANONICAL target, and a symlink to the owned root.
+    attempt('noncanonical-target', () => spawnSync('/usr/bin/git',
+      [...prefix.slice(0, 9), owned + '/backend/..', ...statusTail], safeOptions))
+    attempt('symlinked-target', () => spawnSync('/usr/bin/git',
+      [...prefix.slice(0, 9), ${JSON.stringify(linkedOwned)}, ...statusTail], safeOptions))
     attempt('api', () => exec('/usr/bin/git status'))
     attempt('noverb', () => spawnSync('/usr/bin/git', [...prefix], safeOptions))
   `)
@@ -1480,10 +1514,12 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
   // EXACTLY TWO delegations: the permitted read-only status and config probe.
   assert.equal(delegated.length, 2, JSON.stringify(delegated))
   // And every prohibited shape refused, each for its own stated reason.
+  // Each reason was derived from the predicate before the run, so this list
+  // checks that reasoning rather than recording whatever came out. The two
+  // `prefix` duplicates are real: the hooksPath-redirect control also starts
+  // with `-c`, and the missing-`-C` control also drops `--no-replace-objects`.
   assert.deepEqual(refused.sort(), [
     'api exec',
-    'config core.hooksPath=/tmp/evil',
-    'containment',
     'cwd outside repository',
     'environment GIT_CONFIG_GLOBAL',
     'environment keys',
@@ -1496,8 +1532,20 @@ test('the observer delegates only enforced read-only Git, and refuses the rest',
     'form status',
     'form status',
     'no verb',
+    'prefix 0 --no-pager',
+    'prefix 0 --no-pager',
+    'prefix 1 --no-replace-objects',
+    'prefix 1 --no-replace-objects',
+    'prefix 2 -c',
+    'prefix 3 core.fsmonitor=false',
+    'prefix 3 core.fsmonitor=false',
+    'prefix 5 core.hooksPath=/dev/null',
+    'prefix 6 -c',
     'shell',
     'shell',
+    'target not absolute',
+    'target not canonical',
+    'target not canonical',
     'target outside repository',
     'timeout',
     'verb clean',

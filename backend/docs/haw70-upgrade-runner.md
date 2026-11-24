@@ -307,14 +307,20 @@ also skipped containment when `-C` was absent, left `cwd` unchecked, rejected
 only `shell === true` so a string value passed, and inspected the environment
 only when one was supplied — an absent one inheriting ambient configuration.
 
-What is enforced now: only `spawnSync`, only `/usr/bin/git`, only the two
-allowed leading flags and the three allowed `-c` settings (all of which
-disable behaviour), a **mandatory** `-C` target that must resolve inside the
-owned repository, a `cwd` that must also be contained if present, an
-environment that must be **present and exactly** the closed nine-key set with
-those values, a positive bounded `timeout`, no `shell` value of any kind, and
-none of `detached`, `uid`, `gid`, `input` or `argv0`. Then the verb must be
-one of six, and its **trailing arguments must match an exact form**:
+What is enforced now: only `spawnSync`, only `/usr/bin/git`, then the
+production caller's **complete fixed prefix, required token for token** —
+
+```
+--no-pager --no-replace-objects
+-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.untrackedCache=false
+-C <absolute canonical owned root>
+```
+
+— an environment that must be **present and exactly** the closed nine-key set
+with those values, a positive bounded `timeout`, no `shell` value of any kind,
+a contained `cwd` if one is present, and none of `detached`, `uid`, `gid`,
+`input` or `argv0`. Then the verb must be one of six, and its **trailing
+arguments must match an exact form**:
 
 | verb | permitted trailing form |
 | --- | --- |
@@ -331,20 +337,47 @@ command actually use; the adapter observation asserts that every one of the
 ~1,900 calls a real run delegates passed this validator, so the set is neither
 a verb-level approximation nor too narrow to reach the adapter.
 
-Twenty-three negative controls cover both write forms, a mutating `config`
-switch, three network or destructive verbs, a `core.hooksPath` redirect, a
-missing `-C`, an outside-repository target, an outside `cwd`, a routing
-override, a tampered and an absent environment, `shell: true` and
-`shell: '/bin/sh'`, a missing timeout, an absolute and a traversing path, a
-non-OID `cat-file`, an unexpected `rev-parse` ref, a trailing extra token, a
-different process API and a missing verb. None of them runs: each is refused
-before delegation, with its reason recorded.
+**Why the prefix is required rather than permitted.** Treating those `-c`
+settings as optional left a real omitted barrier. `GIT_CONFIG_NOSYSTEM` and
+`GIT_CONFIG_GLOBAL=/dev/null` suppress **system and global** configuration —
+not the owned repository's own `.git/config`. Measured directly: a locally
+configured value is still returned under that exact environment, and only the
+`-c` override changes it. So a contained `status` request with the safe
+environment and no `-c` settings would have been delegated, and a local
+`core.fsmonitor` helper could then execute inside the native child, outside
+every JavaScript patch here. Both real call sites emit this prefix verbatim,
+so requiring it costs nothing.
 
-Delegated receipts are bounded but complete: one compact line per call, plus
-the full request — argv, cwd, environment, `shell`, `timeout`, `maxBuffer`,
-`stdio` — recorded once per distinct form signature with a counted summary.
-Previously a delegated call kept only one argument, so the audit the comment
-claimed was not available.
+**Why a relative `-C` is refused rather than interpreted.** It cannot be
+validated here at all. `realpathSync` resolves a relative target against the
+observer's working directory, while Git applies `-C` *after* changing to the
+spawn `cwd`. Measured: with the observer in `<owned>/backend`,
+`cwd = <owned>` and `-C ..`, validation resolves to `<owned>` while Git lands
+in its parent. The production caller always supplies an absolute canonical
+root, so the ambiguous form is rejected — as is an absolute but non-canonical
+path, and a symlink pointing at the owned root.
+
+Thirty-three negative controls cover both write forms, a mutating `config`
+switch, three network or destructive verbs, a `core.hooksPath` redirect, each
+of the five required prefix barriers deleted in turn, all three `-c` settings
+dropped together, a reordered prefix, an outside-repository target, a relative
+target under an in-repository `cwd`, a non-canonical absolute target, a
+symlinked target, an outside `cwd`, a routing override, a tampered and an
+absent environment, `shell: true` and `shell: '/bin/sh'`, a missing timeout, an
+absolute and a traversing path, a non-OID `cat-file`, an unexpected
+`rev-parse` ref, a trailing extra token, a different process API and a missing
+verb. None of them runs: each is refused before delegation, with its own
+distinct reason recorded. Each expected reason was derived from the predicate
+before the controls ran, so the assertion checks that reasoning rather than
+recording whatever the run produced.
+
+Delegated receipts are **representative, not a per-invocation byte audit**:
+one compact line per call, plus the full request — argv, cwd, environment,
+`shell`, `timeout`, `maxBuffer`, `stdio` — recorded once per distinct form
+signature, with counts. The signature is the verb plus the argv length, so
+different object ids or paths of the same arity share one representative.
+That is command-form evidence. Previously a delegated call kept only one
+argument, so even that was unavailable.
 
 ### What this observation does NOT establish
 
