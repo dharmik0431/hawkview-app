@@ -7399,6 +7399,22 @@ export class TenantSyncService {
       Boolean(sharePointSettings)
     const sharePointUsageSynchronized =
       sharePointUsageSyncState?.status === 'SUCCEEDED'
+    // The row gate above discards usage rows whose stored projection evidence
+    // is not authoritative-complete. Anything SUMMED or LISTED from those rows
+    // must then be published as unknown rather than as a value: a sum over the
+    // discarded rows is 0, and a collector-status boolean is still true, so
+    // together they would publish a fabricated zero as available evidence for a
+    // tenant whose storage HawkView declined to verify.
+    //
+    // This is deliberately the same condition as the row gate, so published
+    // values track the rows actually used. It is NOT substituted for
+    // `usageSynchronized` into the data contract, which re-derives coherence
+    // itself and correctly reports the source as partial, nor for
+    // `collection.activity`, which counts sites rather than usage rows.
+    const sharePointUsageRowsUsable =
+      sharePointUsageSynchronized &&
+      (!combinedUsageProjection ||
+        combinedUsageProjection.sharePoint.state === 'AUTHORITATIVE_COMPLETE')
     const latestSharePointReportRefreshDate = sharePointUsage
       .map((row: Record<string, string>) => row?.['Report Refresh Date']?.trim())
       .filter((value: string | undefined): value is string => Boolean(value))
@@ -8100,7 +8116,7 @@ export class TenantSyncService {
             ),
             usage: collectionState(
               'sharepoint.usage',
-              sharePointUsageSynchronized ? reportedSharePointUsedBytes : null
+              sharePointUsageRowsUsable ? reportedSharePointUsedBytes : null
             ),
             activity: collectionState(
               'sharepoint.activity',
@@ -8140,19 +8156,19 @@ export class TenantSyncService {
           },
           capabilities: {
             tenantSettings: sharePointSettingsSynchronized,
-            usageReport: sharePointUsageSynchronized,
+            usageReport: sharePointUsageRowsUsable,
             // The usage report provides one reported owner, not a complete
             // owners collection. It can still identify sites for which
             // Microsoft reports no owner at all.
-            siteOwnerPresence: sharePointUsageSynchronized,
-            deletedSites: sharePointUsageSynchronized,
+            siteOwnerPresence: sharePointUsageRowsUsable,
+            deletedSites: sharePointUsageRowsUsable,
           },
           overview: {
             totalSites: sharePointSites.length,
-            summedSiteStorageUsedBytes: sharePointUsageSynchronized
+            summedSiteStorageUsedBytes: sharePointUsageRowsUsable
               ? reportedSharePointUsedBytes
               : null,
-            summedSiteQuotaBytes: sharePointUsageSynchronized
+            summedSiteQuotaBytes: sharePointUsageRowsUsable
               ? reportedSharePointAllocationBytes
               : null,
             // Microsoft Graph does not expose the licensed tenant storage
@@ -8160,12 +8176,12 @@ export class TenantSyncService {
             // allocation, so expose that useful aggregate with an explicit
             // capability label instead of presenting it as licensed quota.
             totalStorageQuotaGB:
-              sharePointUsageSynchronized &&
+              sharePointUsageRowsUsable &&
               reportedSharePointAllocationBytes > 0
                 ? bytesToGb(reportedSharePointAllocationBytes)
                 : null,
             storageQuotaSource:
-              sharePointUsageSynchronized &&
+              sharePointUsageRowsUsable &&
               reportedSharePointAllocationBytes > 0
                 ? 'reported-site-allocation'
                 : 'unavailable',
@@ -8295,7 +8311,7 @@ export class TenantSyncService {
           // It is not the SharePoint recycle bin and must not be presented as
           // a complete list of recoverable sites.
           deletedSites: sharePointDataContract.reportedDeletedSites,
-          deletedSitesSynchronized: sharePointUsageSynchronized,
+          deletedSitesSynchronized: sharePointUsageRowsUsable,
           unsupported: {
             siteOwnerCount:
               'Microsoft Graph site inventory and usage reports do not provide a reliable owner count.',
