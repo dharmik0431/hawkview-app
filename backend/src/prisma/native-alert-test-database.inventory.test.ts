@@ -47,6 +47,8 @@ const expected = [
   "tenants/directory-role-receipt-store.database-integration.test.ts",
   "tenants/existing-tenant-consent.database-integration.test.ts",
   "tenants/scheduled-sync-cursor.database-integration.test.ts",
+  "tenants/tenant-health-audit-evidence.database-integration.test.ts",
+  "tenants/tenant-health-source-authority.database-integration.test.ts",
   "tenants/tenant-directory.database-integration.test.ts",
   "tenants/tenant-visit-audit-atomic.database-integration.test.ts",
   "tenants/tenant-visit-materialization.database-integration.test.ts",

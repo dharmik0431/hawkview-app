@@ -1,0 +1,46 @@
+{
+  // DEDICATED HAW-70 CONSUMER TYPECHECK. No emit, no broad inclusion.
+  //
+  //     ./node_modules/.bin/tsc --noEmit -p tsconfig.haw70-scripts.json
+  //
+  // `tsconfig.scripts.json` includes `src/**/*.ts` and every script, so it
+  // cannot answer a bounded question about the HAW-70 closure. This project
+  // CLEARS the inherited inclusion -- `include: []` with an exact `files` list
+  // -- so the compiler's own file list is the boundary evidence rather than an
+  // exclusion pattern.
+  //
+  // `skipLibCheck` is deliberately false and `noCheck` false: a declaration
+  // error here must be reported, not skipped. `allowJs` is false, so the `.mjs`
+  // implementations are NOT compiled; the two adjacent `.d.mts` contracts are
+  // what the consumers are checked against.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "incremental": false,
+    "declaration": false,
+    "sourceMap": false,
+    "strict": true,
+    "noCheck": false,
+    "allowJs": false,
+    "checkJs": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": false,
+    "types": ["node"]
+  },
+  "include": [],
+  "files": [
+    "scripts/haw70-upgrade-target.ts",
+    "scripts/haw70-upgrade-target.test.ts",
+    "scripts/haw70-upgrade-config.ts",
+    "scripts/haw70-upgrade-config.test.ts",
+    "scripts/haw70-upgrade-launch-plan.ts",
+    "scripts/haw70-upgrade-launch-plan.test.ts",
+    "prisma/haw70-upgrade.config.ts",
+    "scripts/haw70-upgrade-materializer.d.mts",
+    "scripts/haw70-upgrade-git-source.d.mts",
+    "scripts/haw70-upgrade-witness.ts",
+    "scripts/haw70-upgrade-runner.ts",
+    "scripts/haw70-upgrade-runner.test.ts"
+  ]
+}
