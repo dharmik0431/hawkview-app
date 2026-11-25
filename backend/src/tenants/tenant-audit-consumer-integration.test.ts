@@ -533,31 +533,122 @@ test('every mapper call outside the tenant-list path passes no audit evidence', 
 // One captured clock
 // ---------------------------------------------------------------------------
 
-test('one internal assessment time drives the window, the expiry edge and every derived field', async () => {
-  // The event floor is inclusive and the expiry bound is strict, both against
-  // the SAME captured value.
-  const seeds = [
-    criticalEvent({ microsoftAuditId: 'at-window-edge', eventDateTime: new Date(NOW.getTime() - DAY) }),
-    criticalEvent({ microsoftAuditId: 'outside-window', eventDateTime: new Date(NOW.getTime() - DAY - 1) }),
-    criticalEvent({ microsoftAuditId: 'expiry-equal', eventDateTime: new Date(NOW.getTime() - 500), expiresAt: NOW }),
-  ]
-  let clockCalls = 0
-  const h = harness({ seeds })
-  const result = await h.service.listForIdentity(identity, {
-    now: () => { clockCalls += 1; return new Date(NOW.getTime() + clockCalls * 60_000) },
+/**
+ * The value the injected clock returns on its FIRST call. Every fixture below
+ * is built relative to this, because the boundaries are resolved against the
+ * captured assessment time and not against the moment the fixture was written.
+ * A second call deliberately returns a different value, so a service that read
+ * the clock twice would bind a window this test does not expect.
+ */
+const ASSESSED = new Date('2026-11-25T09:00:00.000Z')
+const countingClock = () => {
+  const state = { calls: 0 }
+  return {
+    state,
+    now: () => {
+      state.calls += 1
+      return state.calls === 1 ? new Date(ASSESSED.getTime()) : new Date(ASSESSED.getTime() + 60_000)
+    },
+  }
+}
+
+// Each boundary is driven in its OWN harness with exactly ONE seeded event, so
+// neither the three-finding budget nor the label deduplication in the finding
+// derivation can hide a positive case, and every case asserts the observed
+// count as well as the surfaced key. The pairs differ by ONE millisecond on
+// either side of a bound, so each positive case is its own negative control.
+const clockBoundaries: Array<{
+  name: string
+  eventOffsetMs: number
+  expiresOffsetMs: number
+  eligible: boolean
+  why: string
+}> = [
+  { name: 'event exactly at the 24-hour lower bound', eventOffsetMs: -DAY, expiresOffsetMs: DAY,
+    eligible: true, why: 'the event floor is inclusive' },
+  { name: 'event one millisecond before the lower bound', eventOffsetMs: -DAY - 1, expiresOffsetMs: DAY,
+    eligible: false, why: 'one millisecond earlier is outside the window' },
+  { name: 'expiry exactly equal to the assessment time', eventOffsetMs: -500, expiresOffsetMs: 0,
+    eligible: false, why: 'the expiry bound is strict' },
+  { name: 'expiry one millisecond after the assessment time', eventOffsetMs: -500, expiresOffsetMs: 1,
+    eligible: true, why: 'one millisecond later is still eligible' },
+]
+
+for (const boundary of clockBoundaries) {
+  test(`one captured assessment time resolves the boundary: ${boundary.name}`, async () => {
+    const auditId = `boundary-${boundary.eventOffsetMs}-${boundary.expiresOffsetMs}`
+    const seed = criticalEvent({
+      microsoftAuditId: auditId,
+      eventDateTime: new Date(ASSESSED.getTime() + boundary.eventOffsetMs),
+      expiresAt: new Date(ASSESSED.getTime() + boundary.expiresOffsetMs),
+    })
+    const clock = countingClock()
+    const h = harness({ seeds: [seed] })
+    const result = await h.service.listForIdentity(identity, { now: clock.now })
+
+    // One read of the clock, and the window is bound to exactly that value.
+    assert.equal(clock.state.calls, 1, 'the clock is read exactly once per request')
+    assert.equal(h.reads.length, 1)
+    assert.deepEqual(h.reads[0]!.params[1], new Date(ASSESSED.getTime() - DAY),
+      'the inclusive event floor is the captured time minus 24 hours')
+    assert.deepEqual(h.reads[0]!.params[2], new Date(ASSESSED.getTime()),
+      'the strict expiry bound is the captured time itself')
+    // The bound VALUES alone do not establish inclusivity or strictness: the
+    // outcome below is produced by this file's storage fake, so inverting the
+    // production operators would not move it. Bind the operators in the issued
+    // statement itself. Execution of those operators against PostgreSQL stays
+    // with the registered physical witness.
+    assert.match(h.reads[0]!.sql, /event_date_time >= \$2/,
+      'the event floor is INCLUSIVE in the statement the service issued')
+    assert.match(h.reads[0]!.sql, /expires_at > \$3/,
+      'the expiry bound is STRICT in the statement the service issued')
+    assert.equal(h.reads[0]!.sql.includes('event_date_time > $2'), false,
+      'a strict floor would exclude an event stored exactly at the bound')
+    assert.equal(h.reads[0]!.sql.includes('expires_at >= $3'), false,
+      'an inclusive expiry bound would admit an event that expired exactly now')
+
+    // The boundary outcome, asserted positively on both sides.
+    const tenant = result.tenants[0]!
+    assert.equal(tenant.tenantHealth.auditEvidence.observedCount, boundary.eligible ? 1 : 0, boundary.why)
+    assert.deepEqual(auditKeys(tenant), boundary.eligible ? [`audit-ca-${auditId}`] : [], boundary.why)
+    // Either way the window itself was read completely: an excluded event is a
+    // genuinely empty complete read, never an unread one.
+    assert.equal(tenant.tenantHealth.auditEvidence.status, 'COMPLETE')
+    assert.equal(tenant.tenantHealth.auditEvidence.reason, 'OK')
+
+    // Response and saved timestamps are the same captured value.
+    assert.equal(tenant.tenantHealth.evaluatedAt, ASSESSED.toISOString())
+    assert.equal(tenant.tenantHealth.auditEvidence.assessedAt, ASSESSED.toISOString())
+    assert.equal(h.writes.length, 1)
+    assert.equal(h.writes[0].evaluatedAt.toISOString(), ASSESSED.toISOString())
+    assert.equal((h.writes[0].payload as any).auditEvidence.assessedAt, ASSESSED.toISOString())
+    assert.equal((h.writes[0].payload as any).evaluatedAt, ASSESSED.toISOString())
   })
-  assert.equal(clockCalls, 1, 'the clock is read exactly once per request')
-  const expected = new Date(NOW.getTime() + 60_000)
-  const tenant = result.tenants[0]!
-  assert.deepEqual(h.reads[0]!.params[1], new Date(expected.getTime() - DAY))
-  assert.deepEqual(h.reads[0]!.params[2], expected)
-  assert.equal(tenant.tenantHealth.evaluatedAt, expected.toISOString())
-  assert.equal(tenant.tenantHealth.auditEvidence.assessedAt, expected.toISOString())
-  assert.equal(h.writes[0].evaluatedAt.toISOString(), expected.toISOString())
-  // Window and expiry edges resolved against that one value.
-  const keys = auditKeys(tenant)
-  assert.equal(keys.includes('audit-ca-outside-window'), false, 'before the inclusive event floor')
-  assert.equal(keys.includes('audit-ca-expiry-equal'), false, 'expiry equal to the assessment time is not eligible')
+}
+
+test('the same event flips eligibility across each bound, so the bounds are the cause', async () => {
+  // A direct same-fixture comparison: only the millisecond moves. The status is
+  // returned alongside the count because an observed count of zero is ALSO what
+  // an UNREAD page produces — without the status, a read failure would satisfy
+  // every negative case here.
+  const run = async (eventOffsetMs: number, expiresOffsetMs: number) => {
+    const h = harness({ seeds: [criticalEvent({
+      microsoftAuditId: 'flip',
+      eventDateTime: new Date(ASSESSED.getTime() + eventOffsetMs),
+      expiresAt: new Date(ASSESSED.getTime() + expiresOffsetMs),
+    })] })
+    const result = await h.service.listForIdentity(identity, { now: countingClock().now })
+    const evidence = result.tenants[0]!.tenantHealth.auditEvidence
+    return { observedCount: evidence.observedCount, status: evidence.status, reason: evidence.reason }
+  }
+  const complete = { status: 'COMPLETE', reason: 'OK' }
+  assert.deepEqual(await run(-DAY, DAY), { observedCount: 1, ...complete }, 'inclusive at the floor')
+  assert.deepEqual(await run(-DAY - 1, DAY), { observedCount: 0, ...complete },
+    'excluded one millisecond earlier, by the window and not by a failed read')
+  assert.deepEqual(await run(-500, 0), { observedCount: 0, ...complete },
+    'excluded when expiry equals the assessment time, by the bound and not by a failed read')
+  assert.deepEqual(await run(-500, 1), { observedCount: 1, ...complete },
+    'eligible one millisecond after expiry equality')
 })
 
 test('the assessment time is not an HTTP-controlled input', async () => {
@@ -637,7 +728,203 @@ test('a failure part way through a traversal preserves earlier pages and leaves 
 // History deduplication
 // ---------------------------------------------------------------------------
 
-test('history deduplication keeps completeness and finding changes while suppressing unchanged polls', async () => {
+/**
+ * The polling clock must not reach the deduplication signature.
+ *
+ * This drives TWO real service calls a minute apart and keeps the first call's
+ * own persisted timestamps, so the second evaluation genuinely carries a
+ * different assessment time while every semantic term is identical. The earlier
+ * version of this control ran both calls at the same injected time and only
+ * backdated the previous row, so the two audit summaries' clocks were equal and
+ * a signature that included the clock would have survived it.
+ */
+const CLOCK_FIXTURES: Array<{
+  name: string
+  base: Date
+  later: Date
+  collectors: boolean
+  /** True when the two evaluations fall in different UTC hours AND dates. */
+  straddlesUtcBuckets: boolean
+}> = [
+  // No collector state: the other clock-derived fields are null on both sides.
+  { name: 'no collector state', base: NOW, later: new Date(NOW.getTime() + 60_000),
+    collectors: false, straddlesUtcBuckets: false },
+  // All collectors currently successful: now the freshness terms the signature
+  // reads ARE computed from the clock on both sides, and they still have to
+  // come out equal. Without this fixture the "nothing but the clock differs"
+  // comparison would hold only by construction.
+  { name: 'all collectors current', base: NOW, later: new Date(NOW.getTime() + 60_000),
+    collectors: true, straddlesUtcBuckets: false },
+  // A 60-second advance inside one UTC hour cannot discriminate a clock term
+  // BUCKETED to the hour or the day: both renderings would compare equal and the
+  // row would still be suppressed. Deduplication only applies within 15 minutes,
+  // so the gap cannot simply be widened. This pair straddles midnight instead,
+  // changing the UTC hour and the UTC date across a 60-second gap.
+  { name: 'across a UTC hour and date boundary',
+    base: new Date('2026-11-25T23:59:30.000Z'), later: new Date('2026-11-26T00:00:30.000Z'),
+    collectors: false, straddlesUtcBuckets: true },
+]
+
+for (const fixture of CLOCK_FIXTURES) {
+ test(`an advanced assessment clock with identical semantic evidence writes no history row (${fixture.name})`, async () => {
+  const BASE = fixture.base
+  const LATER = fixture.later
+  // Seeds are relative to this fixture's own captured value, never to a
+  // file-level constant: that mismatch is exactly what made the superseded
+  // control assert nothing.
+  const quietSeed = [criticalEvent({
+    microsoftAuditId: 'stable-finding',
+    eventDateTime: new Date(BASE.getTime() - 1000),
+    expiresAt: new Date(BASE.getTime() + DAY),
+  })]
+  const collectorStates: SyncStateRow[] = fixture.collectors
+    ? TENANT_HEALTH_RESOURCE_REGISTRY.map(resource => ({
+        resourceType: resource.resourceType, status: 'SUCCEEDED',
+        lastAttemptAt: BASE, lastSuccessfulAt: BASE,
+        lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+      }))
+    : []
+  const previous = new Map<string, any>()
+  const tenant = { ...tenantRow(QUIET), syncStates: collectorStates }
+  const first = harness({ tenants: [tenant], seeds: quietSeed, previous })
+  const initial = (await first.service.listForIdentity(identity, { now: () => new Date(BASE.getTime()) })).tenants[0]!
+  assert.equal(first.writes.length, 1)
+  const saved = first.writes[0]
+  // The stored row keeps exactly what the first real call produced; nothing is
+  // backdated, so the gap below comes from the clock actually moving.
+  assert.equal(saved.evaluatedAt.toISOString(), BASE.toISOString())
+  assert.equal((saved.payload as any).auditEvidence.assessedAt, BASE.toISOString())
+  assert.equal((saved.payload as any).evaluatedAt, BASE.toISOString())
+  previous.set(QUIET, {
+    overallStatus: saved.overallStatus,
+    payload: JSON.parse(JSON.stringify(saved.payload)),
+    healthModelVersion: saved.healthModelVersion,
+    evaluatedAt: saved.evaluatedAt,
+  })
+
+  // Second real call, one minute later: inside the 15-minute window.
+  const unchanged = harness({ tenants: [tenant], seeds: quietSeed, previous })
+  const polled = (await unchanged.service.listForIdentity(identity, { now: () => new Date(LATER.getTime()) })).tenants[0]!
+
+  // The assessment clock really advanced, in the response and in both the
+  // health envelope and the audit summary.
+  assert.notEqual(polled.tenantHealth.auditEvidence.assessedAt, initial.tenantHealth.auditEvidence.assessedAt)
+  assert.equal(initial.tenantHealth.auditEvidence.assessedAt, BASE.toISOString())
+  assert.equal(polled.tenantHealth.auditEvidence.assessedAt, LATER.toISOString())
+  // How COARSE a clock term this fixture can discriminate, stated rather than
+  // assumed. The first two fixtures share a UTC hour and date, so they detect
+  // only a term finer than the 60-second gap; the third detects an hour- or
+  // day-bucketed term as well.
+  const utcHour = (iso: string) => iso.slice(0, 13)
+  const utcDate = (iso: string) => iso.slice(0, 10)
+  const before = initial.tenantHealth.auditEvidence.assessedAt
+  const after = polled.tenantHealth.auditEvidence.assessedAt
+  if (fixture.straddlesUtcBuckets) {
+    assert.notEqual(utcHour(after), utcHour(before), 'the two evaluations are in different UTC hours')
+    assert.notEqual(utcDate(after), utcDate(before), 'and in different UTC dates')
+  } else {
+    assert.equal(utcHour(after), utcHour(before))
+    assert.equal(utcDate(after), utcDate(before))
+  }
+  assert.notEqual(polled.tenantHealth.evaluatedAt, initial.tenantHealth.evaluatedAt)
+  assert.equal(polled.tenantHealth.evaluatedAt, LATER.toISOString())
+  assert.deepEqual(unchanged.reads[0]!.params[2], LATER, 'the later value really bound the window too')
+  assert.equal(
+    new Date(polled.tenantHealth.evaluatedAt).getTime() - saved.evaluatedAt.getTime(),
+    60_000, 'the two evaluations are a minute apart, well inside the dedupe window')
+
+  // Every semantic term is equal: status, findings, audit coverage, model
+  // version, freshness and the derived sections the signature is built from.
+  assert.equal(polled.tenantHealth.overallStatus, initial.tenantHealth.overallStatus)
+  assert.deepEqual(auditKeys(polled), auditKeys(initial))
+  assert.deepEqual(polled.tenantHealth.attention, initial.tenantHealth.attention)
+  assert.equal(polled.tenantHealth.auditEvidence.status, initial.tenantHealth.auditEvidence.status)
+  assert.equal(polled.tenantHealth.auditEvidence.reason, initial.tenantHealth.auditEvidence.reason)
+  assert.equal(polled.tenantHealth.auditEvidence.windowComplete, initial.tenantHealth.auditEvidence.windowComplete)
+  assert.equal(polled.tenantHealth.healthModelVersion, initial.tenantHealth.healthModelVersion)
+  assert.deepEqual(polled.syncFreshness, initial.syncFreshness)
+  assert.deepEqual(polled.tenantHealth.data, initial.tenantHealth.data)
+  assert.deepEqual(polled.tenantHealth.security, initial.tenantHealth.security)
+  // The ONLY difference between the two evaluations is the clock.
+  const withoutClock = (value: any) => {
+    const copy = JSON.parse(JSON.stringify(value))
+    delete copy.evaluatedAt
+    delete copy.auditEvidence.assessedAt
+    return copy
+  }
+  assert.deepEqual(withoutClock(polled.tenantHealth), withoutClock(initial.tenantHealth),
+    'nothing but the assessment clock differs')
+  // The terms the deduplication signature ACTUALLY consumes, compared directly.
+  // `tenantHealth.data.freshnessStatus` is a DIFFERENT derivation — tenant-health
+  // computes it over the health resource registry, while the signature reads
+  // `syncFreshness.services` from the service registry — so asserting the former
+  // would not establish anything about the latter.
+  const signatureFreshnessTerms = (row: typeof initial) =>
+    Object.values(row.syncFreshness.services).map(service => ({
+      service: service.service, status: service.status,
+      freshness: service.freshnessStatus,
+      failures: service.partialFailures.map(failure => failure.collector),
+    }))
+  assert.deepEqual(signatureFreshnessTerms(polled), signatureFreshnessTerms(initial),
+    'every freshness term the signature reads is equal across the minute')
+
+  if (fixture.collectors) {
+    // Measured THROUGH THE SERVICE, not from a direct call to the freshness
+    // helper: the service also passes the readiness exclusions, which changes
+    // the answer. With all 21 health-registry collectors successful at the
+    // captured time, FIVE of the six service terms come from the clock-dependent
+    // branch of deriveTenantSyncFreshness — two CURRENT and three STALE, the
+    // STALE ones because those services also expect collectors this fixture
+    // seeds no state for, which is an absent-state effect and not a clock one.
+    // The sixth, SIGN_IN_LOGS, is pinned UNKNOWN because this fixture carries no
+    // license evidence, so its source is excluded before the clock is consulted.
+    const terms = signatureFreshnessTerms(initial)
+    assert.equal(terms.length, 6)
+    const clockDerived = terms.filter(term => ['CURRENT', 'AGING', 'STALE'].includes(term.freshness))
+    assert.equal(clockDerived.length, 5, 'five of the six terms are computed from the clock')
+    assert.equal(terms.filter(term => term.freshness === 'CURRENT').length, 2)
+    assert.equal(terms.filter(term => term.freshness === 'STALE').length, 3)
+    assert.deepEqual(terms.filter(term => term.freshness === 'UNKNOWN').map(term => term.service),
+      ['SIGN_IN_LOGS'], 'exactly one term is pinned, and it is the unlicensed sign-in source')
+    assert.equal(initial.tenantHealth.data.status, 'COMPLETE')
+    assert.equal(polled.tenantHealth.data.status, 'COMPLETE')
+    // CRITICAL, not HEALTHY: the seeded conditional-access removal is a real
+    // critical finding. What matters here is that the whole model ran over
+    // clock-classified collectors and reached the SAME verdict a minute later.
+    assert.equal(initial.tenantHealth.overallStatus, 'CRITICAL')
+    assert.equal(polled.tenantHealth.overallStatus, 'CRITICAL')
+    assert.deepEqual(polled.tenantHealth.resourceHealth, initial.tenantHealth.resourceHealth)
+  }
+
+  // Therefore no row is written. Adding the clock to the signature at full
+  // precision makes exactly this assertion fail; an external negative control
+  // run records that, for two different ways of adding it, and records that the
+  // superseded version of this control did NOT fail. The coarseness this
+  // fixture can detect is bounded above by the gap asserted on the UTC buckets
+  // above, which is why the straddling fixture exists.
+  assert.equal(unchanged.writes.length, 0, 'an advanced clock alone does not force a row per poll')
+  // The suppression comes from the deduplication return, not from a swallowed
+  // exception: persistTenantHealthSnapshot wraps its whole body in try/catch and
+  // logs a warning on failure, so an empty warning log rules that out.
+  assert.deepEqual(unchanged.warnings, [], 'nothing was caught and swallowed inside the writer')
+  // And it is not an absent previous row or a different early return either: a
+  // changed finding at the same clock still writes.
+  const changedFinding = harness({
+    tenants: [tenant], previous,
+    seeds: [criticalEvent({
+      microsoftAuditId: 'a-moved-finding',
+      eventDateTime: new Date(BASE.getTime() - 1000),
+      expiresAt: new Date(BASE.getTime() + DAY),
+    })],
+  })
+  await changedFinding.service.listForIdentity(identity, { now: () => new Date(LATER.getTime()) })
+  assert.equal(changedFinding.writes.length, 1,
+    'the same previous row and the same clock still writes when the evidence moves')
+  assert.deepEqual(changedFinding.warnings, [])
+ })
+}
+
+test('history deduplication keeps completeness and finding changes', async () => {
   const quietSeed = [criticalEvent({ microsoftAuditId: 'stable-finding' })]
   const previous = new Map<string, any>()
   const first = harness({ seeds: quietSeed, previous })
@@ -650,24 +937,53 @@ test('history deduplication keeps completeness and finding changes while suppres
     healthModelVersion: data.healthModelVersion,
     evaluatedAt: new Date(NOW.getTime() + offsetMs),
   })
-
-  // An unchanged evaluation inside the window writes nothing, even though the
-  // assessment time advanced.
   previous.set(QUIET, asPrevious(saved))
-  const unchanged = harness({ seeds: quietSeed, previous })
-  await list(unchanged)
-  assert.equal(unchanged.writes.length, 0, 'an unchanged semantic summary does not force a row per poll')
 
-  // Completeness alone changing is retained.
+  // Completeness alone changing is retained, and the change is ISOLATED.
+  //
+  // The superseded version of this case withheld the ADVERSE event's own
+  // payload, which emptied its target resources, deleted the finding and flipped
+  // the overall status — so the row was written for those reasons and the
+  // completeness term was never what carried it. Here the adverse event stays
+  // delivered and a SECOND, non-adverse event goes over the tenant payload
+  // budget, which makes the tenant's window UNREAD without touching anything
+  // that was observed.
+  const inert = event({
+    microsoftAuditId: 'inert-group-change',
+    activityDisplayName: 'Update group', category: 'GroupManagement',
+    eventDateTime: new Date(NOW.getTime() - 2000),
+  })
+  const pairSeeds = [quietSeed[0]!, inert]
+  const pairBaseline = harness({ seeds: pairSeeds })
+  const baselineTenant = (await list(pairBaseline)).tenants[0]!
+  assert.equal(baselineTenant.tenantHealth.auditEvidence.status, 'COMPLETE')
+  assert.equal(baselineTenant.tenantHealth.auditEvidence.observedCount, 2)
+  assert.deepEqual(auditKeys(baselineTenant), ['audit-ca-stable-finding'],
+    'the second event contributes no finding, so the finding set can stay fixed')
+  const pairPrevious = new Map<string, any>([[QUIET, {
+    overallStatus: pairBaseline.writes[0].overallStatus,
+    payload: JSON.parse(JSON.stringify(pairBaseline.writes[0].payload)),
+    healthModelVersion: pairBaseline.writes[0].healthModelVersion,
+    evaluatedAt: pairBaseline.writes[0].evaluatedAt,
+  }]])
   const completenessChanged = harness({
-    seeds: quietSeed, previous,
-    override: (read) => project(read, quietSeed).map((row: any) => ({ ...row, over_payload_budget: true,
-      initiated_by_withheld: true, target_resources_withheld: true,
-      initiated_by_text: null, target_resources_text: null })),
+    seeds: [quietSeed[0]!, { ...inert, overBudget: true }], previous: pairPrevious,
   })
   const withheld = (await list(completenessChanged)).tenants[0]!
-  assert.equal(completenessChanged.writes.length, 1, 'a changed audit completeness is never suppressed')
+  assert.equal(withheld.tenantHealth.auditEvidence.status, 'UNREAD')
   assert.equal(withheld.tenantHealth.auditEvidence.reason, 'PAYLOAD_BYTES_WITHHELD')
+  // Nothing else moved: the same finding at the same severity, the same overall
+  // status, and the same freshness terms the signature reads.
+  assert.deepEqual(auditKeys(withheld), auditKeys(baselineTenant))
+  assert.deepEqual(withheld.tenantHealth.attention, baselineTenant.tenantHealth.attention)
+  assert.equal(withheld.tenantHealth.overallStatus, baselineTenant.tenantHealth.overallStatus)
+  assert.equal(withheld.tenantHealth.security.criticalFindings,
+    baselineTenant.tenantHealth.security.criticalFindings)
+  assert.deepEqual(withheld.syncFreshness, baselineTenant.syncFreshness)
+  assert.equal(withheld.tenantHealth.healthModelVersion, baselineTenant.tenantHealth.healthModelVersion)
+  assert.equal(completenessChanged.writes.length, 1,
+    'a changed audit completeness ALONE is never suppressed')
+  assert.deepEqual(completenessChanged.warnings, [])
 
   // A different observed finding at the same overall status and freshness is
   // retained: the identity of what was seen is part of the signature.
@@ -679,8 +995,13 @@ test('history deduplication keeps completeness and finding changes while suppres
   assert.deepEqual(auditKeys(changed), ['audit-ca-a-different-finding'])
   assert.equal(differentFinding.writes.length, 1, 'a changed finding identity is never suppressed')
 
-  // A legacy row with no audit metadata is not a complete read, so the first
-  // evaluation under the new model is always retained.
+  // A realistic legacy row — an older model version, no audit metadata and no
+  // attention array — is always superseded. This case deliberately moves THREE
+  // signature terms at once, so it shows only that such a row never suppresses
+  // the first evaluation under the new model; the ISOLATED claim that absent
+  // audit metadata alone is not a complete read is proved separately by
+  // 'a saved row whose audit metadata is absent is never read as a complete
+  // window'.
   const legacyPayload = JSON.parse(JSON.stringify(saved.payload))
   delete legacyPayload.auditEvidence
   delete legacyPayload.attention
@@ -688,7 +1009,7 @@ test('history deduplication keeps completeness and finding changes while suppres
     healthModelVersion: 2, evaluatedAt: new Date(NOW.getTime() - 60_000) })
   const legacy = harness({ seeds: quietSeed, previous })
   await list(legacy)
-  assert.equal(legacy.writes.length, 1, 'missing legacy metadata is not treated as a complete audit read')
+  assert.equal(legacy.writes.length, 1, 'a legacy row is always superseded by the new model')
   assert.equal(legacy.writes[0].healthModelVersion, TENANT_HEALTH_MODEL_VERSION)
 
   // A model-version change alone is retained even with identical labels.
