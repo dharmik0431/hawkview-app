@@ -1072,6 +1072,109 @@ test('a saved row whose audit metadata is absent is never read as a complete win
     'missing audit metadata is not equivalent to a complete read')
 })
 
+test('an isolated service-freshness transition inside the dedupe window retains a history row', async () => {
+  // The converse of the unchanged-poll controls above: when the only thing that
+  // moves between two polls is a service freshness term, the row must be kept.
+  //
+  // SHAREPOINT_SETTINGS is chosen deliberately, against the registries rather
+  // than by name. It is OPTIONAL in TENANT_HEALTH_RESOURCE_REGISTRY, so crossing
+  // its freshness boundary adds no attention item and cannot move the finding
+  // term; and SERVICE_COLLECTOR_REGISTRY puts it in SHAREPOINT_ONEDRIVE, whose
+  // three collectors this fixture all seeds, so that service reads CURRENT
+  // rather than being pinned STALE by a collector with no state at all.
+  // SECURE_SCORES would NOT work here: the service registry owns it under
+  // ENTRA_ID, which this fixture already reports STALE for exactly that
+  // absent-collector reason, so aging it would change no term.
+  const DAILY_CURRENT_MS = 24 * 60 * 60 * 1000
+  const BASE = NOW
+  const LATER = new Date(BASE.getTime() + 60_000)
+  const AGING_COLLECTOR = 'SHAREPOINT_SETTINGS'
+  // One millisecond inside the current window at BASE, so 60 seconds later it
+  // is outside it — and still well inside the 26-hour aging bound, which keeps
+  // its own classification SUCCESS and its resourceHealth row identical.
+  const states: SyncStateRow[] = TENANT_HEALTH_RESOURCE_REGISTRY.map(resource => ({
+    resourceType: resource.resourceType, status: 'SUCCEEDED',
+    lastAttemptAt: BASE,
+    lastSuccessfulAt: resource.resourceType === AGING_COLLECTOR
+      ? new Date(BASE.getTime() - (DAILY_CURRENT_MS - 1))
+      : BASE,
+    lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0,
+  }))
+  const seeds = [criticalEvent({
+    microsoftAuditId: 'freshness-holds-status',
+    eventDateTime: new Date(BASE.getTime() - 1000),
+    expiresAt: new Date(BASE.getTime() + DAY),
+  })]
+  const tenant = { ...tenantRow(QUIET), syncStates: states }
+  const previous = new Map<string, any>()
+
+  const first = harness({ tenants: [tenant], seeds, previous })
+  const initial = (await first.service.listForIdentity(identity, { now: () => new Date(BASE.getTime()) })).tenants[0]!
+  assert.equal(first.writes.length, 1)
+  const saved = first.writes[0]
+  // The stored row keeps exactly what the first real call produced.
+  assert.equal(saved.evaluatedAt.toISOString(), BASE.toISOString())
+  assert.equal((saved.payload as any).evaluatedAt, BASE.toISOString())
+  assert.equal((saved.payload as any).auditEvidence.assessedAt, BASE.toISOString())
+  previous.set(QUIET, {
+    overallStatus: saved.overallStatus,
+    payload: JSON.parse(JSON.stringify(saved.payload)),
+    healthModelVersion: saved.healthModelVersion,
+    evaluatedAt: saved.evaluatedAt,
+  })
+
+  const second = harness({ tenants: [tenant], seeds, previous })
+  const polled = (await second.service.listForIdentity(identity, { now: () => new Date(LATER.getTime()) })).tenants[0]!
+  assert.equal(
+    new Date(polled.tenantHealth.evaluatedAt).getTime() - saved.evaluatedAt.getTime(),
+    60_000, 'the two evaluations are a minute apart, inside the 15-minute dedupe window')
+
+  // Every OTHER term the signature reads is unchanged.
+  assert.equal(polled.tenantHealth.overallStatus, initial.tenantHealth.overallStatus)
+  assert.equal(polled.tenantHealth.overallStatus, 'CRITICAL',
+    'the observed critical finding holds the overall status constant across the transition')
+  assert.equal(polled.tenantHealth.healthModelVersion, initial.tenantHealth.healthModelVersion)
+  assert.equal(polled.tenantHealth.auditEvidence.status, initial.tenantHealth.auditEvidence.status)
+  assert.equal(polled.tenantHealth.auditEvidence.reason, initial.tenantHealth.auditEvidence.reason)
+  assert.equal(polled.tenantHealth.auditEvidence.windowComplete, initial.tenantHealth.auditEvidence.windowComplete)
+  assert.deepEqual(auditKeys(polled), auditKeys(initial))
+  assert.deepEqual(
+    polled.tenantHealth.attention.map(item => [item.key, item.severity]),
+    initial.tenantHealth.attention.map(item => [item.key, item.severity]),
+    'no finding identity or severity moved, so the finding term of the signature is fixed')
+
+  // The ONE term that changed, named exactly.
+  const sharePoint = (row: typeof initial) => row.syncFreshness.services.sharePointOneDrive
+  assert.equal(sharePoint(initial).service, 'SHAREPOINT_ONEDRIVE')
+  assert.equal(sharePoint(initial).freshnessStatus, 'CURRENT')
+  assert.equal(sharePoint(polled).freshnessStatus, 'AGING')
+  assert.equal(sharePoint(polled).status, sharePoint(initial).status,
+    'the service status is unchanged; only its freshness crossed the bound')
+  const otherServices = (row: typeof initial) => Object.values(row.syncFreshness.services)
+    .filter(service => service.service !== 'SHAREPOINT_ONEDRIVE')
+    .map(service => ({
+      service: service.service, status: service.status, freshness: service.freshnessStatus,
+      failures: service.partialFailures.map(failure => failure.collector),
+    }))
+  assert.deepEqual(otherServices(polled), otherServices(initial),
+    'exactly one of the six service terms changed')
+  // The aging collector's own health row is identical, which is why no finding
+  // and no status could have carried this write.
+  const row = (value: typeof initial) =>
+    value.tenantHealth.resourceHealth.find(item => item.resourceType === AGING_COLLECTOR)
+  assert.equal(row(initial)?.classification, 'SUCCESS')
+  assert.deepEqual(row(polled), row(initial))
+
+  // Therefore the row is retained, and the saved payload carries the change.
+  assert.equal(second.writes.length, 1,
+    'a service-freshness transition alone retains a history row')
+  assert.deepEqual(second.warnings, [], 'nothing was caught and swallowed inside the writer')
+  const savedPayload = second.writes[0].payload as any
+  assert.equal(savedPayload.syncFreshness.services.sharePointOneDrive.freshnessStatus, 'AGING')
+  assert.equal(savedPayload.evaluatedAt, LATER.toISOString())
+  assert.equal(second.writes[0].evaluatedAt.toISOString(), LATER.toISOString())
+})
+
 test('a persistence failure fails neither the list nor the tenants after it', async () => {
   const fleet = Array.from({ length: 3 }, (_, index) =>
     tenantRow(uuid('0b66', index + 1), ORG, `tenant-${index}`))
