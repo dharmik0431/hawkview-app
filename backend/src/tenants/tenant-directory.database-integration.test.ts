@@ -6,6 +6,11 @@ import { PrismaService } from '../prisma/prisma.service.js'
 import { ChangesService } from '../changes/changes.service.js'
 import { ChangeEvidenceService } from '../changes/change-evidence.service.js'
 import { TenantsService } from './tenants.service.js'
+import {
+  AUDIT_EVIDENCE_SENTINEL_ROWS,
+  AUDIT_EVIDENCE_TENANT_CAP,
+} from './tenant-health-audit-evidence.js'
+import { TENANT_HEALTH_MODEL_VERSION } from './tenant-health.js'
 import { TenantSyncService } from './tenant-sync.service.js'
 
 const databaseIntegrationEnabled =
@@ -233,10 +238,22 @@ test('physical tenant list expiry: saved boundary, event window, workspace scope
   assert.deepEqual(result.tenants.map(t => t.id).sort(), [mine.tenantId, other.id].sort())
   assert.deepEqual(listAuditKeys(result.tenants.find(t => t.id === mine.tenantId)!), ['audit-auth-boundary-1'])
   assert.deepEqual(listAuditKeys(result.tenants.find(t => t.id === other.id)!), ['audit-auth-second-tenant'])
+  // Each tenant's own window was read and nothing was withheld, so both report
+  // a complete read against the exact pair and both carry the one clock.
+  for (const id of [mine.tenantId, other.id]) {
+    const evidence = result.tenants.find(t => t.id === id)!.tenantHealth.auditEvidence
+    assert.equal(evidence.status, 'COMPLETE', id)
+    assert.equal(evidence.reason, 'OK', id)
+    assert.equal(evidence.windowComplete, true, id)
+    assert.equal(evidence.observedCount, 1, id)
+    assert.equal(evidence.assessedAt, READ_CLOCK.toISOString(), id)
+  }
   const snapshot = await prisma.tenantHealthSnapshot.findFirstOrThrow({ where: {
     organizationId: mine.organizationId, customerTenantId: mine.tenantId,
   } })
   assert.deepEqual(listAuditKeys(snapshot.payload as any), ['audit-auth-boundary-1'])
+  assert.equal((snapshot.payload as any).auditEvidence.status, 'COMPLETE')
+  assert.equal(snapshot.healthModelVersion, TENANT_HEALTH_MODEL_VERSION)
   await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: READ_CLOCK } })
   await assert.rejects(service.listForIdentity(identityOf(mine), { now: readNow }), /disabled/)
   await prisma.user.update({ where: { authProviderUserId: mine.subject }, data: { disabledAt: null } })
@@ -265,11 +282,74 @@ test('physical tenant list expiry: positive attention survives expired pre-take 
   assert.equal(first.every(row => row.eventDateTime > readDate(-700)), true, 'both eligible witnesses outside unfiltered first500')
   const result = await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: readNow })
   assert.deepEqual(listAuditKeys(result.tenants[0]!), ['audit-auth-eligible-newer', 'audit-auth-eligible-older'])
+  // The strict expiry bound is applied before the per-tenant ranking, so 501
+  // expired rows do not reach the cap and the window still reads complete.
+  assert.equal(result.tenants[0]!.tenantHealth.auditEvidence.status, 'COMPLETE')
+  assert.equal(result.tenants[0]!.tenantHealth.auditEvidence.observedCount, 2)
   const snapshot = await prisma.tenantHealthSnapshot.findFirstOrThrow({ where: {
     organizationId: mine.organizationId, customerTenantId: mine.tenantId,
   } })
   assert.deepEqual(listAuditKeys(snapshot.payload as any), ['audit-auth-eligible-newer', 'audit-auth-eligible-older'])
+  assert.equal((snapshot.payload as any).auditEvidence.status, 'COMPLETE')
   await assertPersistedExpiry(prisma.directoryAuditLog, ids, 504, 2)
+})
+
+test('physical tenant list: a noisy tenant cannot starve a quiet tenant’s older critical finding', { skip: !databaseIntegrationEnabled }, async context => {
+  assertDisposableTestDatabase()
+  const { prisma, track } = physicalContext(context)
+  await prisma.$connect()
+  const mine = await seedExportWorkspace(prisma, 'list-starvation', randomUUID(), track)
+  const quiet = await prisma.customerTenant.create({ data: {
+    organizationId: mine.organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE',
+  } })
+  // 501 eligible events for the noisy tenant: the sentinel row establishes
+  // CAPPED for that tenant and nothing else.
+  const noisyRows = Array.from({ length: AUDIT_EVIDENCE_SENTINEL_ROWS }, (_, index) =>
+    listAudit(mine, `noisy-${String(index).padStart(4, '0')}`, 1, -1_000 - index))
+  // One OLDER adverse event for the quiet tenant. Under the previous shared
+  // workspace-wide `take: 500` this row was never read at all.
+  const quietRow = {
+    ...listAudit({ ...mine, tenantId: quiet.id }, 'quiet-critical', 1, -600_000),
+    activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+    targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }],
+  }
+  await prisma.directoryAuditLog.createMany({ data: [...noisyRows, quietRow] })
+  const ids = [...noisyRows, quietRow].map(row => row.id)
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, AUDIT_EVIDENCE_SENTINEL_ROWS + 1, AUDIT_EVIDENCE_SENTINEL_ROWS + 1)
+  // The quiet row is outside the newest 500 events of the workspace, which is
+  // exactly the population the old shared read would have returned.
+  const sharedWindow = await prisma.directoryAuditLog.findMany({
+    where: { organizationId: mine.organizationId, eventDateTime: { gte: readDate(-86_400_000) },
+      expiresAt: { gt: READ_CLOCK } },
+    orderBy: { eventDateTime: 'desc' }, take: AUDIT_EVIDENCE_TENANT_CAP,
+    select: { customerTenantId: true },
+  })
+  assert.equal(sharedWindow.length, AUDIT_EVIDENCE_TENANT_CAP)
+  assert.equal(sharedWindow.every(row => row.customerTenantId === mine.tenantId), true,
+    'the quiet tenant is absent from the unfiltered shared window')
+
+  const result = await tenantListReader(prisma).listForIdentity(identityOf(mine), { now: readNow })
+  const noisy = result.tenants.find(t => t.id === mine.tenantId)!
+  const quietTenant = result.tenants.find(t => t.id === quiet.id)!
+  // The quiet tenant's older critical finding survives in the response.
+  assert.deepEqual(listAuditKeys(quietTenant), ['audit-ca-quiet-critical'])
+  assert.equal(quietTenant.tenantHealth.security.criticalFindings, 1)
+  assert.equal(quietTenant.tenantHealth.overallStatus, 'CRITICAL')
+  assert.equal(quietTenant.tenantHealth.auditEvidence.status, 'COMPLETE')
+  // And in the saved snapshot.
+  const quietSnapshot = await prisma.tenantHealthSnapshot.findFirstOrThrow({ where: {
+    organizationId: mine.organizationId, customerTenantId: quiet.id,
+  } })
+  assert.deepEqual(listAuditKeys(quietSnapshot.payload as any), ['audit-ca-quiet-critical'])
+  assert.equal((quietSnapshot.payload as any).auditEvidence.status, 'COMPLETE')
+  // The noisy tenant reports its OWN capped window, keeps at most the cap, and
+  // cannot read healthy on unknown coverage.
+  assert.equal(noisy.tenantHealth.auditEvidence.status, 'CAPPED')
+  assert.equal(noisy.tenantHealth.auditEvidence.reason, 'TENANT_EVENT_CAP_REACHED')
+  assert.equal(noisy.tenantHealth.auditEvidence.observedCount, AUDIT_EVIDENCE_TENANT_CAP)
+  assert.notEqual(noisy.tenantHealth.security.status, 'HEALTHY')
+  assert.notEqual(noisy.tenantHealth.overallStatus, 'HEALTHY')
+  await assertPersistedExpiry(prisma.directoryAuditLog, ids, AUDIT_EVIDENCE_SENTINEL_ROWS + 1, AUDIT_EVIDENCE_SENTINEL_ROWS + 1)
 })
 
 const bundleReader = (prisma: PrismaService) => new TenantSyncService(

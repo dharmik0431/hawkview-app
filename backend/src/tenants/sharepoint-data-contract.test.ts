@@ -1014,7 +1014,7 @@ test('tenant-list mapping uses only tenant-scoped compact projection fields', ()
     ],
     m365ActivitySubscriptions: [],
   }
-  const mapped = (service as any).mapTenant(tenant)
+  const mapped = (service as any).mapTenant(tenant, null, new Date())
   const datasets = mapped.collectionReadiness.workloads.find(
     (workload: any) => workload.key === 'sharepoint_onedrive',
   ).datasets
@@ -1026,7 +1026,7 @@ test('tenant-list mapping uses only tenant-scoped compact projection fields', ()
     id: 'tenant-b',
     organization: { id: 'org-b', name: 'Org B', slug: 'org-b' },
     collectionFieldStates: [],
-  })
+  }, null, new Date())
   const otherDatasets = otherTenant.collectionReadiness.workloads.find(
     (workload: any) => workload.key === 'sharepoint_onedrive',
   ).datasets

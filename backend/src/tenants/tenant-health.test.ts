@@ -3,10 +3,24 @@ import test from 'node:test'
 import { summarizeMicrosoftRisk } from '../identity-risk/microsoft-risk-summary.js'
 import {
   deriveTenantHealth,
+  TENANT_HEALTH_MODEL_VERSION,
   TENANT_HEALTH_RESOURCE_REGISTRY,
   type TenantAuditEvent,
+  type TenantAuditEvidenceSummary,
 } from './tenant-health'
 import { sanitizeHealthMessage } from './sanitize-health-message'
+
+const ASSESSED_AT = '2026-08-13T12:00:00.000Z'
+
+/** The explicit form of what a defaulted empty event array used to mean here:
+ *  a read that COMPLETED and found nothing. It is now stated rather than
+ *  assumed, because the two cases are no longer interchangeable. */
+function completeAuditEvidence(observedCount = 0): TenantAuditEvidenceSummary {
+  return {
+    status: 'COMPLETE', reason: 'OK', windowComplete: true,
+    observedCount, withheldPayloads: 0, assessedAt: ASSESSED_AT,
+  }
+}
 
 function baseInput() {
   return {
@@ -18,6 +32,7 @@ function baseInput() {
     authSnapshot: null,
     riskyIdentityCount: 0,
     auditEvents: [] as TenantAuditEvent[],
+    auditEvidence: completeAuditEvidence(),
   }
 }
 
@@ -643,6 +658,120 @@ test('initial collection is pending and failed newer state overrides older succe
   const result = deriveTenantHealth({ ...baseInput(), now, syncStates: states })
   assert.equal(result.resourceHealth.find((item) => item.resourceType === 'USERS')?.classification, 'FAILED')
   assert.equal(result.overallStatus, 'DEGRADED')
+})
+
+// ---------------------------------------------------------------------------
+// Audit-window completeness at the health boundary
+// ---------------------------------------------------------------------------
+
+const criticalAuditEvent = (now: Date): TenantAuditEvent => ({
+  microsoftAuditId: 'incomplete-critical', eventDateTime: now,
+  activityDisplayName: 'Disable conditional access policy', category: 'Policy',
+  operationType: 'Update', result: 'success', initiatedBy: null,
+  targetResources: [{ type: 'conditionalAccessPolicy', displayName: 'Require MFA' }],
+})
+
+test('an unknown audit window can never produce healthy security or healthy overall', () => {
+  const now = new Date(ASSESSED_AT)
+  const incomplete: TenantAuditEvidenceSummary[] = [
+    { status: 'CAPPED', reason: 'TENANT_EVENT_CAP_REACHED', windowComplete: false, observedCount: 500, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+    { status: 'UNREAD', reason: 'READ_FAILED', windowComplete: false, observedCount: 0, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+    { status: 'UNREAD', reason: 'SCOPE_MISMATCH', windowComplete: false, observedCount: 0, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+    { status: 'UNREAD', reason: 'ROW_VALIDATION_FAILED', windowComplete: false, observedCount: 0, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+    { status: 'UNREAD', reason: 'PAYLOAD_FIELD_OVERSIZE', windowComplete: false, observedCount: 2, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+    { status: 'UNREAD', reason: 'PAYLOAD_BYTES_WITHHELD', windowComplete: false, observedCount: 2, withheldPayloads: 1, assessedAt: ASSESSED_AT },
+    // A forged summary: COMPLETE and OK, but a payload was withheld, so what
+    // was returned is not what is stored. The gate is derived, not trusted.
+    { status: 'COMPLETE', reason: 'OK', windowComplete: true, observedCount: 2, withheldPayloads: 1, assessedAt: ASSESSED_AT },
+    // Equally forged the other way: the boolean claims a complete window the
+    // status does not support.
+    { status: 'CAPPED', reason: 'TENANT_EVENT_CAP_REACHED', windowComplete: true, observedCount: 500, withheldPayloads: 0, assessedAt: ASSESSED_AT },
+  ]
+  for (const auditEvidence of incomplete) {
+    const label = `${auditEvidence.status}/${auditEvidence.reason}/withheld=${auditEvidence.withheldPayloads}`
+    const result = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now), auditEvidence })
+    assert.notEqual(result.security.status, 'HEALTHY', label)
+    assert.equal(result.security.status, 'UNKNOWN', label)
+    assert.notEqual(result.overallStatus, 'HEALTHY', label)
+    assert.equal(result.auditEvidence.windowComplete, false, `${label}: the response cannot claim a complete window`)
+    assert.equal(result.auditEvidence.status, auditEvidence.status, label)
+    assert.equal(result.auditEvidence.reason, auditEvidence.reason, label)
+  }
+  // Negative control: the SAME inputs with a genuinely complete window are
+  // healthy, so these assertions are about the audit gate and not about some
+  // other unmet condition in the fixture.
+  const complete = deriveTenantHealth({ ...baseInput(), now, syncStates: completeCurrentStates(now) })
+  assert.equal(complete.security.status, 'HEALTHY')
+  assert.equal(complete.overallStatus, 'HEALTHY')
+  assert.equal(complete.auditEvidence.windowComplete, true)
+})
+
+test('a health call that supplies no audit completeness fails closed', () => {
+  const now = new Date(ASSESSED_AT)
+  const { auditEvidence: _omitted, ...withoutEvidence } = baseInput()
+  const result = deriveTenantHealth({ ...withoutEvidence, now, syncStates: completeCurrentStates(now) })
+  assert.equal(result.auditEvidence.status, 'UNREAD')
+  assert.equal(result.auditEvidence.reason, 'NOT_READ')
+  assert.equal(result.auditEvidence.windowComplete, false)
+  assert.equal(result.auditEvidence.observedCount, 0)
+  assert.equal(result.auditEvidence.assessedAt, ASSESSED_AT, 'the summary carries the evaluation clock')
+  assert.notEqual(result.security.status, 'HEALTHY')
+  assert.notEqual(result.overallStatus, 'HEALTHY')
+  // An empty event array is NOT evidence that nothing adverse exists: the old
+  // default could reach a clean assessment, and this is the control that the
+  // defaulted path can no longer do so.
+  assert.deepEqual(result.attention, [])
+})
+
+test('unknown audit coverage preserves adverse findings and cannot outrank existing precedence', () => {
+  const now = new Date(ASSESSED_AT)
+  const unread: TenantAuditEvidenceSummary = {
+    status: 'UNREAD', reason: 'PAYLOAD_BYTES_WITHHELD', windowComplete: false,
+    observedCount: 1, withheldPayloads: 1, assessedAt: ASSESSED_AT,
+  }
+  // A critical finding observed inside incomplete evidence survives at its own
+  // severity: the unknown window does not downgrade it to merely unknown.
+  const critical = deriveTenantHealth({
+    ...baseInput(), now, syncStates: completeCurrentStates(now),
+    auditEvents: [criticalAuditEvent(now)], auditEvidence: unread,
+  })
+  assert.equal(critical.security.criticalFindings, 1)
+  assert.equal(critical.security.status, 'CRITICAL')
+  assert.equal(critical.overallStatus, 'CRITICAL')
+  assert.equal(critical.attention.some((item) => item.key === 'audit-ca-incomplete-critical'), true)
+  assert.equal(critical.auditEvidence.windowComplete, false)
+  // Disconnected still outranks the audit gate, and a required collector
+  // failure still degrades rather than being replaced by unknown coverage.
+  assert.equal(deriveTenantHealth({ ...baseInput(), now, connectionStatus: 'REVOKED', auditEvidence: unread }).overallStatus, 'DISCONNECTED')
+  const degraded = completeCurrentStates(now).map((state) => state.resourceType === 'USERS'
+    ? { ...state, status: 'FAILED', lastErrorCode: 'collector-failed', lastErrorMessage: 'synthetic failure', consecutiveFailures: 1 }
+    : state)
+  assert.equal(deriveTenantHealth({ ...baseInput(), now, syncStates: degraded, auditEvidence: unread }).overallStatus, 'DEGRADED')
+})
+
+test('the audit summary carries no payload, error or statement text, and the model version is explicit', () => {
+  const now = new Date(ASSESSED_AT)
+  const result = deriveTenantHealth({
+    ...baseInput(), now, syncStates: completeCurrentStates(now),
+    auditEvents: [criticalAuditEvent(now)], auditEvidence: completeAuditEvidence(1),
+  })
+  assert.deepEqual(Object.keys(result.auditEvidence).sort(),
+    ['assessedAt', 'observedCount', 'reason', 'status', 'windowComplete', 'withheldPayloads'])
+  const serialized = JSON.stringify(result.auditEvidence)
+  for (const forbidden of ['SELECT', 'select ', 'initiated_by', 'targetResources', 'Require MFA', 'conditionalAccessPolicy']) {
+    assert.equal(serialized.includes(forbidden), false, `audit summary must not carry ${forbidden}`)
+  }
+  // The version decision is part of the contract: audit completeness changed
+  // what HEALTHY means, so it is not the same number as the previous model.
+  assert.equal(result.healthModelVersion, TENANT_HEALTH_MODEL_VERSION)
+  assert.equal(TENANT_HEALTH_MODEL_VERSION, 3)
+  assert.ok(TENANT_HEALTH_MODEL_VERSION > 2, 'retaining version 2 would change versioned semantics silently')
+  // Compatibility: every field the previous model published is still present.
+  for (const field of ['healthModelVersion', 'overallStatus', 'connection', 'data', 'security', 'operations',
+    'resourceHealth', 'evaluatedAt', 'legacyHealthStatus', 'healthScore', 'mfaCoverage', 'riskyIdentityCount',
+    'microsoftRiskSummary', 'attention']) {
+    assert.ok(field in result, `version 3 must preserve ${field}`)
+  }
 })
 
 test('missing security collectors are unknown and empty is not failed', () => {

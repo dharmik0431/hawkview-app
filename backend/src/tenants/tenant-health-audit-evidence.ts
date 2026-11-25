@@ -18,16 +18,18 @@
  *      the per-tenant cap, which is why the statement shape is asserted
  *      directly and why registered database verification remains a follow-up.
  *
- * INACTIVE. Nothing in the application imports this module. It prepares the
- * bounded tenant-evidence contract so the live mapper, list, verification and
- * history wiring can be changed later, under their own review. It performs no
- * history write, no current-pointer publication, no generation promotion, no
- * recovery and no provider call, and it changes no runtime, permission, quota
- * or cadence setting.
+ * WIRED, UNPUBLISHED. `tenants.service.ts` now reads tenant audit evidence
+ * through this module on the tenant-list path, which replaced the
+ * workspace-wide ORM read described below; the verification and reconnect
+ * paths perform no audit read and report an unread window instead. This module
+ * itself is unchanged by that wiring and still performs no history write, no
+ * current-pointer publication, no generation promotion, no recovery and no
+ * provider call, and it changes no runtime, permission, quota or cadence
+ * setting.
  *
- * WHY IT EXISTS. `tenants.service.ts` reads audit evidence with a single
+ * WHY IT EXISTS. `tenants.service.ts` USED TO read audit evidence with a single
  * workspace-wide `take: 500` ordered only by `eventDateTime desc`, across every
- * authorized tenant at once. Three consequences follow, and this module is
+ * authorized tenant at once. Three consequences followed, and this module is
  * written to not reproduce any of them:
  *
  *   1. One noisy tenant's newest 500 events can consume the whole window, so a

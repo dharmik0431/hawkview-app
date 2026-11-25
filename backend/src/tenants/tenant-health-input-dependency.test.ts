@@ -6,6 +6,7 @@ import { SyncResourceType } from '../generated/prisma/enums.js'
 import { CONNECTION_REQUIRED_PERMISSIONS } from '../microsoft/microsoft-access-contract.js'
 import { deriveCollectionReadiness } from './collection-readiness.js'
 import { deriveTenantHealth, TENANT_HEALTH_RESOURCE_REGISTRY } from './tenant-health.js'
+import type { AuditEvidenceForTenant } from './tenant-health-audit-evidence.js'
 import type { TenantSyncFreshness } from './service-sync-freshness.js'
 import { TenantsService } from './tenants.service.js'
 
@@ -13,6 +14,13 @@ import { TenantsService } from './tenants.service.js'
 // response. These synthetic mapper/writer witnesses do not prove DB coherence.
 const now = new Date('2026-11-16T01:40:00.000Z')
 const collected = new Date('2026-11-16T01:35:00.000Z')
+// The mapper now requires the audit read behind the evaluation to be stated.
+// A completed empty read is the explicit form of this fixture's prior
+// behaviour; `null` and the incomplete statuses are exercised below.
+const completeAudit = (): AuditEvidenceForTenant => ({
+  scope: { organizationId: 'org-a', customerTenantId: 'tenant-a' },
+  status: 'COMPLETE', reason: 'OK', observations: [], capReached: false, withheldPayloads: 0,
+})
 function fixture() {
   return {
     id: 'tenant-a', microsoftTenantId: '11111111-1111-4111-8111-111111111111',
@@ -62,11 +70,11 @@ function harness(t: TestContext) {
     getRequiredPermissions: () => CONNECTION_REQUIRED_PERMISSIONS.map(name => ({ name })),
     getAccessContract: () => ({ connectionRequiredPermissions: CONNECTION_REQUIRED_PERMISSIONS }),
   } as never, {} as never) as unknown as {
-    mapTenant(tenant: ReturnType<typeof fixture>): Mapped;
+    mapTenant(tenant: ReturnType<typeof fixture>, audit: AuditEvidenceForTenant | null, now: Date): Mapped;
     persistTenantHealthSnapshot(tenant: ReturnType<typeof fixture>, health: Mapped['tenantHealth'], freshness: TenantSyncFreshness): Promise<void>;
   }
-  return async (tenant: ReturnType<typeof fixture>) => {
-    const mapped = service.mapTenant(tenant)
+  return async (tenant: ReturnType<typeof fixture>, audit: AuditEvidenceForTenant | null = completeAudit()) => {
+    const mapped = service.mapTenant(tenant, audit, now)
     const before = writes.length
     await service.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
     assert.equal(writes.length, before + 1, 'The actual history writer must reach its synthetic sink')
@@ -77,6 +85,31 @@ function harness(t: TestContext) {
     return { mapped, payload: saved.payload }
   }
 }
+test('HAW-70 audit read completeness is itself a saved health dependency', async t => {
+  const record = harness(t), original = fixture()
+  const baseline = await record(original)
+  assert.equal(baseline.mapped.tenantHealth.auditEvidence.status, 'COMPLETE')
+  assert.equal(baseline.mapped.tenantHealth.auditEvidence.windowComplete, true)
+  assert.equal(baseline.mapped.tenantHealth.auditEvidence.assessedAt, now.toISOString())
+  const variants: Array<{ name: string; audit: AuditEvidenceForTenant | null }> = [
+    { name: 'no read performed', audit: null },
+    { name: 'capped window', audit: { ...completeAudit(), status: 'CAPPED', reason: 'TENANT_EVENT_CAP_REACHED', capReached: true } },
+    { name: 'read failed', audit: { ...completeAudit(), status: 'UNREAD', reason: 'READ_FAILED' } },
+    { name: 'payload withheld', audit: { ...completeAudit(), status: 'UNREAD', reason: 'PAYLOAD_BYTES_WITHHELD', withheldPayloads: 1 } },
+  ]
+  for (const { name, audit } of variants) await t.test(name, async () => {
+    const tenant = structuredClone(original)
+    const result = await record(tenant, audit)
+    assert.deepEqual(tenant, original, 'no tenant input supplies the changed result')
+    assert.equal(result.mapped.tenantHealth.auditEvidence.windowComplete, false, name)
+    assert.notEqual(result.mapped.tenantHealth.security.status, 'HEALTHY', name)
+    assert.notEqual(result.mapped.tenantHealth.overallStatus, 'HEALTHY', name)
+    assert.notDeepEqual(result.payload, baseline.payload, `${name} must reach the saved projection`)
+    const restored = await record(structuredClone(original))
+    assert.deepEqual(restored.payload, baseline.payload, 'restoring the completed read restores the saved projection')
+  })
+})
+
 function usage(mapped: Mapped, key: string) {
   const dataset = mapped.collectionReadiness.workloads.find(row => row.key === 'sharepoint_onedrive')
     ?.datasets?.find(row => row.key === key)
