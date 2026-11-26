@@ -1007,6 +1007,7 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
           findUnique: async () => null,
           upsert: async () => undefined,
           update: async ({ data }: any) => { syncUpdates.push(data); return data },
+          updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
         },
         m365ActivityContent: {
           count: async ({ where }: any) => {
@@ -1024,7 +1025,7 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
         m365ActivitySubscription: { findMany: async () => [] },
         m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
         m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
-        $transaction: async (operations: any) => Promise.all(operations),
+        $transaction: async (work: any) => Array.isArray(work) ? Promise.all(work) : work((prisma as any).__tx ?? prisma),
       }
       const consent: any = {
         getTenantManagementActivityContext: async () => ({
@@ -1076,8 +1077,9 @@ test('reports incomplete subscription coverage as a collector failure while poll
       findUnique: async () => null,
       upsert: async () => undefined,
       update: async ({ data }: any) => { syncUpdates.push(data); return data },
-      // A terminal failure clears this attempt observation, guarded by its token.
-      updateMany: async () => ({ count: 1 }),
+      // The terminal/outer transitions are now one fenced updateMany; record it
+      // in the same place the old status update was recorded.
+      updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
     },
     m365ActivityContent: {
       count: async () => 0,
@@ -1094,7 +1096,7 @@ test('reports incomplete subscription coverage as a collector failure while poll
     },
     m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
-    $transaction: async (operations: any) => Promise.all(operations),
+    $transaction: async (work: any) => Array.isArray(work) ? Promise.all(work) : work(prisma),
   }
   const consent: any = {
     getTenantManagementActivityContext: async () => ({
@@ -1131,6 +1133,7 @@ test('treats a daily/monthly budget stop as recoverable backpressure, not a coll
       findUnique: async () => null,
       upsert: async () => undefined,
       update: async ({ data }: any) => { syncUpdates.push(data); return data },
+        updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
     },
     m365ActivityContent: {
       count: async () => 1,
@@ -1141,7 +1144,9 @@ test('treats a daily/monthly budget stop as recoverable backpressure, not a coll
     $transaction: async (work: any) => work({
       syncState: {
         update: async ({ data }: any) => { syncUpdates.push(data); return data },
-        updateMany: async () => ({ count: 1 }),
+      // The terminal/outer transitions are now one fenced updateMany; record it
+      // in the same place the old status update was recorded.
+      updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
       },
     }),
   }

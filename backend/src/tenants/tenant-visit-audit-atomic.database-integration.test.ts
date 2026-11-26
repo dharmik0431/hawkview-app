@@ -22,7 +22,7 @@ import {
 import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, releaseTenantVisitLease, renewTenantVisitLease, tryAcquireTenantVisitLease } from './tenant-visit-lease-store.js'
 import { M365AuditBudgetError, M365ManagementActivityService } from './m365-management-activity.service.js'
-import { qualifiedBudgetRefusal } from './m365-audit-refusal-observation.js'
+import { qualifiedBudgetRefusal } from './sync-outcome-projection.js'
 import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { assertTenantVisitLifecycleActive, runTenantVisitLifecycle } from './tenant-visit-lifecycle.js'
 import { AUDIT_RECONCILIATION_RESOURCES, type AuditReconciliationResource } from './audit-change-reconciliation.js'
@@ -2512,8 +2512,13 @@ test('physical interrupted ordinary GROUPS inventory recovers under a newly acqu
 // PREPARED for the existing registered disposable PostgreSQL phase. These are
 // the behaviours a transaction fake cannot witness: a real token compare-and-set
 // against a concurrent successor, a genuine rollback of the coupled disposition
-// and observation, and the additive nullable column on legacy rows. They are
-// NOT executed locally.
+// and observation, and the additive nullable column on legacy rows.
+//
+// SCOPE, stated plainly: these are HAND-WRITTEN Prisma statements that exercise
+// the storage and compare-and-set semantics the production writer relies on.
+// They do NOT drive syncTenant/processContent against PostgreSQL, so they do not
+// prove the production writer's own branches. That still requires exact-head
+// registered CI after review. They are NOT executed locally.
 // ===========================================================================
 
 async function physicalRefusalFixture(context: TestContext, label: string) {
@@ -2561,8 +2566,11 @@ test('physical HAW-75 token compare-and-set refuses a stale attempt and leaves t
   skip: !registeredCi, concurrency: false, timeout: 60_000,
 }, async context => {
   const { writer, observer, scope } = await physicalRefusalFixture(context, 'token-cas')
+  // IDENTICAL captured times on purpose: only the token can distinguish the two
+  // attempts, so this isolates the token compare-and-set rather than letting a
+  // timestamp difference do the work.
   const staleAt = new Date(Date.UTC(2026, 10, 26, 12, 0, 0))
-  const successorAt = new Date(Date.UTC(2026, 10, 26, 12, 5, 0))
+  const successorAt = staleAt
   const staleToken = randomUUID()
   const successorToken = randomUUID()
   await writer.syncState.create({
@@ -2624,10 +2632,13 @@ test('physical HAW-75 coupled disposition and observation roll back together', {
   })
   // Both writes in one transaction, then an abort: neither may survive.
   await assert.rejects(() => writer.$transaction(async transaction => {
-    await transaction.m365ActivityContent.updateMany({
+    const disposition = await transaction.m365ActivityContent.updateMany({
       where: { id: content.id, ...scope }, data: { status: 'RETRY' },
     })
-    await transaction.syncState.updateMany({
+    // Both mutations must really have matched their one row; otherwise the
+    // rollback assertion below would pass for the wrong reason.
+    assert.equal(disposition.count, 1, 'the disposition matched its claimed row')
+    const observation = await transaction.syncState.updateMany({
       where: {
         ...scope, resourceType: 'M365_AUDIT', lastAttemptAt: attemptAt,
         m365AuditAttempt: { path: ['attemptToken'], equals: token },
@@ -2637,6 +2648,7 @@ test('physical HAW-75 coupled disposition and observation roll back together', {
         observedAt: attemptAt.toISOString(), retryNotBefore: new Date(Date.UTC(2026, 10, 27)).toISOString(),
       }) as never },
     })
+    assert.equal(observation.count, 1, 'the observation compare-and-set matched its attempt')
     throw new Error('synthetic abort after both writes')
   }), /synthetic abort/)
   const [afterContent, afterState] = await Promise.all([

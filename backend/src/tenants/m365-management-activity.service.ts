@@ -18,7 +18,7 @@ import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenan
 import {
   beginAttemptEnvelope, envelopeWithRefusal, selectBudgetConstraint,
   type M365AuditBudgetConstraint, type M365AuditRefusalPath,
-} from './m365-audit-refusal-observation.js'
+} from './sync-outcome-projection.js'
 
 export { classifyManagementActivity, managementActivityRoleFromEvidence } from '../changes/m365-activity-classification.js'
 
@@ -987,16 +987,63 @@ export class M365ManagementActivityService {
    * existing accounting, and recording it needs scope, attempt and ownership
    * coherence rather than a new shared critical section.
    */
-  private async recordBudgetRefusal(
+  /** The scope every current-attempt state transition is fenced by. */
+  private currentAttemptWhere(tenant: TenantTarget, attempt: M365AuditAttempt) {
+    return {
+      organizationId: tenant.organizationId,
+      customerTenantId: tenant.id,
+      resourceType: 'M365_AUDIT' as const,
+      lastAttemptAt: attempt.attemptAt,
+      m365AuditAttempt: { path: ['attemptToken'], equals: attempt.token },
+    }
+  }
+
+  /**
+   * THE state writer for this collector. Every status, reason, success-clock and
+   * envelope change for an attempt goes through here, as one compare-and-set on
+   * organization, tenant, resource, attempt token and captured attempt time.
+   *
+   * It reports a zero-row result instead of retrying or upserting, so a stale
+   * worker can never mark a successor succeeded, replace its reason, advance its
+   * success clock or touch its envelope. Callers fail closed inside the coupled
+   * transaction. No budget lock is taken: the existing accounting already made
+   * the decision this records.
+   */
+  private async applyCurrentAttemptState(
     database: Pick<Prisma.TransactionClient, 'syncState'>,
     tenant: TenantTarget,
+    attempt: M365AuditAttempt,
+    data: Prisma.SyncStateUpdateManyMutationInput,
+  ): Promise<'applied' | 'superseded'> {
+    const updated = await database.syncState.updateMany({
+      where: this.currentAttemptWhere(tenant, attempt), data,
+    })
+    return updated.count === 1 ? 'applied' : 'superseded'
+  }
+
+  /**
+   * Confirm this attempt is still current WITHOUT writing anything. Used where
+   * there is no structured detail to record but a coupled change still must not
+   * commit for a stale attempt.
+   */
+  private async currentAttemptHolds(
+    database: Pick<Prisma.TransactionClient, 'syncState'>,
+    tenant: TenantTarget,
+    attempt: M365AuditAttempt,
+  ): Promise<boolean> {
+    return await database.syncState.count({ where: this.currentAttemptWhere(tenant, attempt) }) === 1
+  }
+
+  /** This attempt's envelope carrying its latest refusal, or null when the error
+   *  proved no cap -- an unproven cap yields no detail, never a fabricated one. */
+  private refusalEnvelope(
     attempt: M365AuditAttempt,
     path: M365AuditRefusalPath,
     error: M365AuditBudgetError,
     observedAt: Date,
-  ): Promise<'recorded' | 'nothing-to-record' | 'superseded'> {
-    if (error.constraint === null) return 'nothing-to-record'
-    const envelope = envelopeWithRefusal(
+  ) {
+    if (error.constraint === null) return null
+    return envelopeWithRefusal(
       beginAttemptEnvelope(attempt.token, attempt.attemptAt),
       {
         attemptToken: attempt.token,
@@ -1006,18 +1053,6 @@ export class M365ManagementActivityService {
         retryNotBefore: error.retryAt,
       },
     )
-    if (!envelope) return 'nothing-to-record'
-    const updated = await database.syncState.updateMany({
-      where: {
-        organizationId: tenant.organizationId,
-        customerTenantId: tenant.id,
-        resourceType: 'M365_AUDIT',
-        lastAttemptAt: attempt.attemptAt,
-        m365AuditAttempt: { path: ['attemptToken'], equals: attempt.token },
-      },
-      data: { m365AuditAttempt: envelope as never },
-    })
-    return updated.count === 1 ? 'recorded' : 'superseded'
   }
 
   private async reserveDailyUsage(
@@ -1499,10 +1534,19 @@ export class M365ManagementActivityService {
         applied: { count: number },
       ) => {
         if (applied.count !== 1 || !budgetLimited || !attempt) return
-        const outcome = await this.recordBudgetRefusal(
-          transaction, tenant, attempt, 'content', error, new Date(),
-        )
-        if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+        const envelope = this.refusalEnvelope(attempt, 'content', error, new Date())
+        if (envelope) {
+          const outcome = await this.applyCurrentAttemptState(
+            transaction, tenant, attempt, { m365AuditAttempt: envelope as never },
+          )
+          if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+          return
+        }
+        // Nothing to record, but the attempt fence is unconditional: a stale
+        // worker's content disposition must not commit either.
+        if (!(await this.currentAttemptHolds(transaction, tenant, attempt))) {
+          throw new M365AuditAttemptSupersededError()
+        }
       }
       if (visitOwner) {
         const disposition = await this.prisma.$transaction(async (transaction) => {
@@ -1731,74 +1775,72 @@ export class M365ManagementActivityService {
         failedBacklog +
         subscriptionBacklog +
         (discoveryBacklog ? 1 : 0)
-      const terminalWrites = (database: Pick<Prisma.TransactionClient,
-        'm365AuditRecord' | 'm365ActivityContent' | 'm365AuditDailyUsage' | 'syncState'>) => [
-        () => database.m365AuditRecord.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, expiresAt: { lte: now } } }),
-        () => database.m365ActivityContent.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, ledgerExpiresAt: { lte: now } } }),
-        () => database.m365AuditDailyUsage.deleteMany({
+      // HAW-75: ONE attempt-fenced terminal transition. Retention runs first,
+      // exactly as released, then status, reason, success clock and envelope move
+      // together under a compare-and-set on this attempt's token and captured
+      // time. EVERY branch is fenced -- success, failed backlog/subscriptions and
+      // ordinary backlog alike -- so a paused worker whose successor installed a
+      // different token cannot mark it succeeded, replace its reason, advance its
+      // success clock or touch its envelope. Zero rows aborts the whole coupled
+      // transaction, retention included.
+      const commitTerminalState = async (database: Pick<Prisma.TransactionClient,
+        'm365AuditRecord' | 'm365ActivityContent' | 'm365AuditDailyUsage' | 'syncState'>) => {
+        await database.m365AuditRecord.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, expiresAt: { lte: now } } })
+        await database.m365ActivityContent.deleteMany({ where: { organizationId: tenant.organizationId, customerTenantId: tenant.id, ledgerExpiresAt: { lte: now } } })
+        await database.m365AuditDailyUsage.deleteMany({
           where: {
             organizationId: tenant.organizationId,
             customerTenantId: tenant.id,
             usageDate: { lt: new Date(m365AuditUsageDate(now).getTime() - 35 * 24 * 60 * 60 * 1000) },
           },
-        }),
-        // HAW-75: a terminal success or a non-budget failure clears THIS
-        // attempt's observation, compare-and-set on its own token so a stale
-        // worker can never erase a successor's envelope. The ordinary backlog
-        // outcome deliberately preserves it -- that is the case the reader needs.
-        ...(failedBacklog > 0 || failedSubscriptions.length > 0 || blocked === 0
-          ? [() => database.syncState.updateMany({
-              where: {
-                organizationId: tenant.organizationId,
-                customerTenantId: tenant.id,
-                resourceType: 'M365_AUDIT' as const,
-                lastAttemptAt: attempt.attemptAt,
-                m365AuditAttempt: { path: ['attemptToken'], equals: attempt.token },
-              },
-              data: { m365AuditAttempt: freshEnvelope as never },
-            })]
-          : []),
-        () => database.syncState.update({
-          where: {
-            customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
-          },
-          data: failedBacklog > 0 || failedSubscriptions.length > 0
+        })
+        const adverse = failedBacklog > 0 || failedSubscriptions.length > 0
+        // Only the ordinary backlog keeps this attempt's observation; that is the
+        // single state the reader is allowed to surface it in.
+        const keepsObservation = !adverse && blocked > 0
+        const terminal: Prisma.SyncStateUpdateManyMutationInput = adverse
+          ? {
+            status: 'FAILED',
+            lastErrorCode: failedSubscriptions.length > 0
+              ? 'm365-audit-subscription-incomplete'
+              : 'm365-audit-content-unavailable',
+            lastErrorMessage: failedSubscriptions.length > 0
+              ? `${failedSubscriptions.length} Microsoft audit subscription(s) failed: ${failedSubscriptions.map((subscription) => `${subscription.contentType}: ${subscription.lastError ?? 'activation failed'}`).join('; ')}. Enabled=${enabledContentTypes.size}/${M365_ACTIVITY_CONTENT_TYPES.length}; content pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}, permanently unavailable=${failedBacklog}.`.slice(0, 1_000)
+              : `${failedBacklog} Microsoft audit content blob(s) are permanently unavailable; pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}.`,
+            consecutiveFailures: { increment: 1 },
+          }
+          : blocked > 0
             ? {
-                status: 'FAILED',
-                lastErrorCode: failedSubscriptions.length > 0
-                  ? 'm365-audit-subscription-incomplete'
-                  : 'm365-audit-content-unavailable',
-                lastErrorMessage: failedSubscriptions.length > 0
-                  ? `${failedSubscriptions.length} Microsoft audit subscription(s) failed: ${failedSubscriptions.map((subscription) => `${subscription.contentType}: ${subscription.lastError ?? 'activation failed'}`).join('; ')}. Enabled=${enabledContentTypes.size}/${M365_ACTIVITY_CONTENT_TYPES.length}; content pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}, permanently unavailable=${failedBacklog}.`.slice(0, 1_000)
-                  : `${failedBacklog} Microsoft audit content blob(s) are permanently unavailable; pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}.`,
-                consecutiveFailures: { increment: 1 },
-              }
-            : blocked > 0
-              ? {
-                // A bounded backlog is expected recovery work, not a failed
-                // Microsoft request. RUNNING keeps service freshness honest
-                // without turning cost backpressure into a permanent failure.
-                status: 'RUNNING',
-                lastErrorCode: 'm365-audit-backlog',
-                lastErrorMessage: `${subscriptionBacklog} subscription(s) await activation; discovery backlog=${discoveryBacklog}; content pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}, permanently unavailable=${failedBacklog}.`,
-                consecutiveFailures: 0,
-              }
-              : {
-                status: 'SUCCEEDED',
-                lastSuccessfulAt: new Date(),
-                lastErrorCode: null,
-                lastErrorMessage: null,
-                consecutiveFailures: 0,
-              },
-        }),
-      ]
+              // A bounded backlog is expected recovery work, not a failed
+              // Microsoft request. RUNNING keeps service freshness honest
+              // without turning cost backpressure into a permanent failure.
+              status: 'RUNNING',
+              lastErrorCode: 'm365-audit-backlog',
+              lastErrorMessage: `${subscriptionBacklog} subscription(s) await activation; discovery backlog=${discoveryBacklog}; content pending=${pendingBacklog}, processing=${processingBacklog}, retry=${retryBacklog}, permanently unavailable=${failedBacklog}.`,
+              consecutiveFailures: 0,
+            }
+            : {
+              status: 'SUCCEEDED',
+              lastSuccessfulAt: new Date(),
+              lastErrorCode: null,
+              lastErrorMessage: null,
+              consecutiveFailures: 0,
+            }
+        const outcome = await this.applyCurrentAttemptState(database, tenant, attempt, {
+          ...terminal,
+          ...(keepsObservation ? {} : { m365AuditAttempt: freshEnvelope as never }),
+        })
+        if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+      }
       if (visitOwner) {
         await this.prisma.$transaction(async (transaction) => {
           await assertTenantVisitLeaseOwner(transaction, visitOwner)
-          for (const write of terminalWrites(transaction)) await write()
+          await commitTerminalState(transaction)
         })
       } else {
-        await this.prisma.$transaction(terminalWrites(this.prisma).map((write) => write()))
+        // Interactive rather than the array form, because the fence must read
+        // its own affected-row count and abort the coupled transaction.
+        await this.prisma.$transaction(commitTerminalState)
       }
       return changes
     } catch (error) {
@@ -1815,25 +1857,20 @@ export class M365ManagementActivityService {
         return [] as ManagementActivityChange[]
       }
       if (error instanceof M365AuditBudgetError) {
-        const budgetStateWrite = {
-          where: {
-            customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
-          },
-          data: {
-            status: 'RUNNING',
-            lastErrorCode: 'm365-audit-budget-exhausted',
-            lastErrorMessage: safeMessage(error),
-            consecutiveFailures: 0,
-          },
-        } as const
-        // HAW-75: the existing RUNNING/budget-exhausted write and this
-        // attempt's observation commit together, or neither does. The ownerless
-        // path becomes transactional for exactly that reason.
+        // HAW-75: the existing RUNNING/budget-exhausted state and this attempt's
+        // observation move in ONE fenced write. The fence is unconditional: an
+        // error that proved no cap records no detail, but a stale worker still
+        // may not commit the status against a successor's token.
+        const refusal = this.refusalEnvelope(attempt, 'discovery', error, new Date())
+        const budgetData: Prisma.SyncStateUpdateManyMutationInput = {
+          status: 'RUNNING',
+          lastErrorCode: 'm365-audit-budget-exhausted',
+          lastErrorMessage: safeMessage(error),
+          consecutiveFailures: 0,
+          ...(refusal ? { m365AuditAttempt: refusal as never } : {}),
+        }
         const writeBudgetState = async (transaction: Prisma.TransactionClient) => {
-          await transaction.syncState.update(budgetStateWrite)
-          const outcome = await this.recordBudgetRefusal(
-            transaction, tenant, attempt, 'discovery', error, new Date(),
-          )
+          const outcome = await this.applyCurrentAttemptState(transaction, tenant, attempt, budgetData)
           if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
         }
         try {
@@ -1858,24 +1895,37 @@ export class M365ManagementActivityService {
         : /does not exist|audit.*not.*enabled|unified audit/i.test(safeMessage(error))
           ? 'm365-audit-disabled'
           : 'm365-audit-sync-failed'
-      const failedStateWrite = {
-        where: {
-          customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
-        },
-        data: {
-          status: 'FAILED',
-          lastErrorCode: code,
-          lastErrorMessage: safeMessage(error),
-          consecutiveFailures: { increment: 1 },
-        },
-      } as const
-      if (visitOwner) {
-        await this.prisma.$transaction(async (transaction) => {
-          await assertTenantVisitLeaseOwner(transaction, visitOwner)
-          await transaction.syncState.update(failedStateWrite)
-        })
-      } else {
-        await this.prisma.syncState.update(failedStateWrite)
+      // HAW-75: a non-budget failure is fenced the same way, and it clears THIS
+      // attempt's observation in the same transition -- a failed state must not
+      // keep a refusal detail alive. A stale worker leaves the successor's
+      // status, reason, success clock and envelope exactly as they were; its own
+      // provider error still propagates, it simply records nothing.
+      const failedData: Prisma.SyncStateUpdateManyMutationInput = {
+        status: 'FAILED',
+        lastErrorCode: code,
+        lastErrorMessage: safeMessage(error),
+        consecutiveFailures: { increment: 1 },
+        m365AuditAttempt: freshEnvelope as never,
+      }
+      const writeFailedState = async (transaction: Prisma.TransactionClient) => {
+        const outcome = await this.applyCurrentAttemptState(transaction, tenant, attempt, failedData)
+        if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+      }
+      try {
+        if (visitOwner) {
+          await this.prisma.$transaction(async (transaction) => {
+            await assertTenantVisitLeaseOwner(transaction, visitOwner)
+            await writeFailedState(transaction)
+          })
+        } else {
+          await this.prisma.$transaction(writeFailedState)
+        }
+      } catch (writeError) {
+        if (!(writeError instanceof M365AuditAttemptSupersededError)) throw writeError
+        this.logger.warn(JSON.stringify({
+          event: 'm365_audit_attempt', phase: 'INGESTION', outcome: 'SUPERSEDED',
+          reasonCode: 'STALE_FAILURE_NOT_RECORDED',
+        }))
       }
       throw error
     }

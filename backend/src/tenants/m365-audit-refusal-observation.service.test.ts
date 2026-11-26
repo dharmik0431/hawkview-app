@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import { readFileSync } from 'node:fs'
 import { M365ManagementActivityService, M365AuditBudgetError } from './m365-management-activity.service.js'
-import { projectSyncOutcome } from './sync-outcome-projection.js'
-import { parseAttemptEnvelope, qualifiedBudgetRefusal } from './m365-audit-refusal-observation.js'
+import { parseAttemptEnvelope, qualifiedBudgetRefusal } from './sync-outcome-projection.js'
 
 const tenant = {
   id: '11111111-1111-1111-1111-111111111111',
@@ -21,60 +20,147 @@ const owner = {
   token: '66666666-6666-6666-6666-666666666666', generation: 3n,
   expiresAt: new Date('2030-01-01T00:00:00Z'),
 }
-const BOUNDARY = new Date('2026-11-27T00:00:00.000Z')
-const budgetError = (constraint: any = 'daily_tenant_bytes') =>
-  new M365AuditBudgetError('budget reached', BOUNDARY, constraint)
+/** A frozen clock so attempt times are exactly reproducible. */
+const CLOCK = Date.UTC(2026, 10, 26, 12, 0, 0)
+/** Relative, so no fixture can expire by being read on a later real-world day. */
+const boundaryAfter = (ms: number) => new Date(CLOCK + ms)
+const budgetError = (constraint: any = 'daily_tenant_bytes', ms = 12 * 60 * 60 * 1000) =>
+  new M365AuditBudgetError('budget reached', boundaryAfter(ms), constraint)
 
+type Row = {
+  organizationId: string; customerTenantId: string; resourceType: string
+  status: string; lastAttemptAt: Date | null; lastSuccessfulAt: Date | null
+  lastErrorCode: string | null; lastErrorMessage: string | null
+  consecutiveFailures: number; m365AuditAttempt: unknown
+}
 type Call = { method: string; args: readonly unknown[] }
 
+/** Tests may build more than one harness; the clock is enabled once each. */
+const frozen = new WeakSet<object>()
+
+/** Evaluate the ACTUAL where clause against the stored row, including the JSON
+ *  path token filter and exact attempt-time equality. A configured count would
+ *  prove nothing about the predicate the production code writes. */
+function matches(row: Row | null, where: any): boolean {
+  if (!row || !where) return false
+  for (const key of ['organizationId', 'customerTenantId', 'resourceType'] as const) {
+    if (where[key] !== undefined && where[key] !== row[key]) return false
+  }
+  if (where.lastAttemptAt !== undefined) {
+    const want = where.lastAttemptAt instanceof Date ? where.lastAttemptAt.getTime() : NaN
+    const have = row.lastAttemptAt instanceof Date ? row.lastAttemptAt.getTime() : NaN
+    if (!Number.isFinite(want) || want !== have) return false
+  }
+  if (where.m365AuditAttempt !== undefined) {
+    const filter = where.m365AuditAttempt
+    if (!Array.isArray(filter?.path) || filter.path.length !== 1) return false
+    const stored = row.m365AuditAttempt
+    const value = stored && typeof stored === 'object'
+      ? (stored as Record<string, unknown>)[filter.path[0]] : undefined
+    if (value !== filter.equals) return false
+  }
+  return true
+}
+
+function applyData(row: Row, data: any): Row {
+  const next: any = { ...row }
+  for (const [key, value] of Object.entries(data ?? {})) {
+    next[key] = value && typeof value === 'object' && 'increment' in (value as object)
+      ? (next[key] ?? 0) + (value as { increment: number }).increment
+      : value
+  }
+  return next as Row
+}
+
+const baseRow = (overrides: Partial<Row> = {}): Row => ({
+  organizationId: tenant.organizationId, customerTenantId: tenant.id, resourceType: 'M365_AUDIT',
+  status: 'RUNNING', lastAttemptAt: null, lastSuccessfulAt: null,
+  lastErrorCode: null, lastErrorMessage: null, consecutiveFailures: 0, m365AuditAttempt: null,
+  ...overrides,
+})
+
 /**
- * Drives the REAL syncTenant -> processContent path. Only the external
- * envelope (provider request, consent, subscription activation, discovery) is
- * stubbed; the attempt mint, the disposition/observation coupling, the terminal
- * write and the clear all execute unchanged.
+ * Drives the REAL syncTenant path over a STATEFUL store. Only the provider
+ * envelope is stubbed. A successor can be installed at a chosen point so stale
+ * terminal and failure transitions are exercised for real.
  */
-function harness(options: {
+function harness(context: TestContext, options: {
   visitOwner?: typeof owner
-  /** What the reservation does: throw a budget error, throw a provider error, or succeed. */
   reservation?: 'budget' | 'provider-retry' | 'ok'
   constraint?: any
-  /** Rows the initial PENDING/RETRY -> PROCESSING claim changes. */
   claimCount?: number
-  /** Rows the scoped failure disposition changes. */
   dispositionCount?: number
-  /** Rows the token compare-and-set claims to have changed. */
-  casCount?: number
   pendingContent?: boolean
   failedBacklog?: number
+  retryBacklog?: number
   subscriptionsEnabled?: string[]
-  discoveryThrowsBudget?: boolean
-  storedState?: Record<string, unknown> | null
+  discoveryThrows?: 'budget' | 'provider' | null
+  /** Install a successor attempt at this point in the real flow. */
+  successorDuring?: 'discovery' | 'content' | null
+  /** Give the successor the SAME captured time, so only the token differs. */
+  successorSameTime?: boolean
+  storedRow?: Row | null
   leaseLost?: boolean
 } = {}) {
+  // One frozen clock per test, however many harnesses that test builds.
+  if (!frozen.has(context)) { context.mock.timers.enable({ apis: ['Date'], now: CLOCK }); frozen.add(context) }
   const calls: Call[] = []
   const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }) }
-  let row: Record<string, unknown> | null = options.storedState === undefined
-    ? { status: 'RUNNING', lastAttemptAt: null, lastSuccessfulAt: null, lastErrorCode: null }
-    : options.storedState
+  let row: Row | null = options.storedRow === undefined ? baseRow() : options.storedRow
+  const successorToken = 'successor-token-9999'
+  let successorInstalled: Row | null = null
+  const installSuccessor = () => {
+    // A real concurrent attempt: it rewrites the envelope and (unless we are
+    // isolating the token) the captured attempt time too.
+    row = applyData(row ?? baseRow(), {
+      status: 'RUNNING',
+      lastErrorCode: 'm365-audit-backlog',
+      lastSuccessfulAt: new Date(CLOCK - 60_000),
+      ...(options.successorSameTime ? {} : { lastAttemptAt: new Date(CLOCK + 1) }),
+      m365AuditAttempt: {
+        v: 1, attemptToken: successorToken,
+        attemptAt: new Date(options.successorSameTime ? CLOCK : CLOCK + 1).toISOString(),
+        refusal: null,
+      },
+    })
+    successorInstalled = { ...row }
+  }
   const syncState = {
     findUnique: async () => row,
+    count: async ({ where }: any) => (matches(row, where) ? 1 : 0),
     upsert: async ({ create, update }: any) => {
       record('syncState.upsert', { create, update })
-      row = { ...(row ?? {}), ...update }
+      row = row ? applyData(row, update) : applyData(baseRow(), create)
       return row
     },
-    update: async ({ data }: any) => { record('syncState.update', data); row = { ...(row ?? {}), ...data }; return row },
-    updateMany: async (args: any) => {
-      record('syncState.updateMany', args)
-      const count = options.casCount ?? 1
-      if (count === 1) row = { ...(row ?? {}), ...args.data }
-      return { count }
+    updateMany: async ({ where, data }: any) => {
+      record('syncState.updateMany', { where, data })
+      if (!matches(row, where)) return { count: 0 }
+      row = applyData(row!, data)
+      return { count: 1 }
     },
   }
   const content = {
     id: '77777777-7777-7777-7777-777777777777',
     contentUri: 'https://manage.office.com/api/v1.0/x/activity/feed/audit/blob',
     attemptCount: 0,
+  }
+  const contentClient = {
+    count: async (args: any) => {
+      const status = args?.where?.status
+      if (status === 'FAILED') return options.failedBacklog ?? 0
+      if (status === 'PROCESSING') return 0
+      if (status === 'RETRY') return options.retryBacklog ?? 1
+      return options.pendingContent === false ? 0 : 1
+    },
+    findMany: async () => (options.pendingContent === false ? [] : [content]),
+    updateMany: async (args: any) => {
+      record('content.updateMany', args)
+      const claiming = args?.data?.status === 'PROCESSING'
+      return { count: claiming ? (options.claimCount ?? 1) : (options.dispositionCount ?? 1) }
+    },
+    update: async () => undefined,
+    deleteMany: async () => ({ count: 0 }),
   }
   const transactionClient = {
     $executeRawUnsafe: async () => 1,
@@ -87,46 +173,29 @@ function harness(options: {
       return []
     },
     syncState,
-    m365ActivityContent: {
-      updateMany: async (args: any) => {
-        record('content.updateMany', args)
-        const claiming = args?.data?.status === 'PROCESSING'
-        return { count: claiming ? (options.claimCount ?? 1) : (options.dispositionCount ?? 1) }
-      },
-      update: async () => undefined,
-      deleteMany: async () => ({ count: 0 }),
-    },
+    m365ActivityContent: contentClient,
     m365AuditRecord: { createMany: async () => ({ count: 0 }), deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
     changeEvidenceEvent: { createMany: async () => ({ count: 0 }) },
     tenantAuditReconciliationWork: { upsert: async () => undefined },
   }
   const prisma: any = {
-    // A real transaction discards its writes when the work throws, so the fake
-    // must too -- otherwise a rolled-back write still looks committed here.
+    // Rollback is modelled: a throwing transaction discards its row mutations
+    // AND its recorded calls, so a rolled-back write cannot look committed.
     $transaction: async (work: any) => {
       if (Array.isArray(work)) return Promise.all(work)
-      const committedCalls = calls.length
       const committedRow = row === null ? null : { ...row }
+      const committedCalls = calls.length
       try {
         return await work(transactionClient)
       } catch (error) {
-        calls.length = committedCalls
         row = committedRow
+        calls.length = committedCalls
         throw error
       }
     },
     syncState,
-    m365ActivityContent: {
-      count: async () => (options.pendingContent === false ? 0 : 1),
-      findMany: async () => (options.pendingContent === false ? [] : [content]),
-      updateMany: async (args: any) => {
-        record('content.updateMany', args)
-        const claiming = args?.data?.status === 'PROCESSING'
-        return { count: claiming ? (options.claimCount ?? 1) : (options.dispositionCount ?? 1) }
-      },
-      deleteMany: async () => ({ count: 0 }),
-    },
+    m365ActivityContent: contentClient,
     m365ActivitySubscription: { findMany: async () => [], upsert: async () => undefined },
     m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
@@ -135,332 +204,336 @@ function harness(options: {
     getTenantManagementActivityContext: async () => ({ accessToken: 'token', publisherIdentifier }),
   }
   const service = new M365ManagementActivityService(prisma, consent)
-  const enabled = new Set(options.subscriptionsEnabled ?? ['Audit.Exchange'])
-  ;(service as any).ensureSubscriptions = async () => enabled
+  ;(service as any).ensureSubscriptions = async () => new Set(options.subscriptionsEnabled ?? ['Audit.Exchange'])
   ;(service as any).discoverContent = async () => {
-    if (options.discoveryThrowsBudget) throw budgetError(options.constraint)
+    if (options.successorDuring === 'discovery') installSuccessor()
+    if (options.discoveryThrows === 'budget') throw budgetError(options.constraint)
+    if (options.discoveryThrows === 'provider') throw new Error('Microsoft returned a transient failure.')
     return false
   }
   ;(service as any).request = async () => new Response('[]', { status: 200 })
   ;(service as any).reserveDailyUsage = async () => {
+    if (options.successorDuring === 'content') installSuccessor()
     if (options.reservation === 'budget') throw budgetError(options.constraint)
     if (options.reservation === 'provider-retry') throw new Error('Microsoft returned a transient failure.')
   }
   ;(service as any).logger = { warn: () => {}, error: () => {}, log: () => {} }
-  // Backlog counts drive the terminal status decision.
-  const originalCount = prisma.m365ActivityContent.count
-  prisma.m365ActivityContent.count = async (args: any) => {
-    const status = args?.where?.status
-    if (status === 'FAILED') return options.failedBacklog ?? 0
-    if (status === 'PROCESSING') return 0
-    if (status === 'RETRY') return 1
-    return originalCount(args)
-  }
   return {
     calls, service,
     row: () => row,
+    successor: () => successorInstalled,
+    successorToken,
     envelope: () => parseAttemptEnvelope((row ?? {}).m365AuditAttempt),
     of: (method: string) => calls.filter((call) => call.method === method),
+    attemptTokenFromUpsert: () => {
+      const upsert = calls.find((call) => call.method === 'syncState.upsert')
+      return (upsert?.args[0] as any)?.update?.m365AuditAttempt?.attemptToken as string | undefined
+    },
     run: () => service.syncTenant(tenant as never, options.visitOwner as never),
   }
 }
 
 const SOURCE = readFileSync(new URL('./m365-management-activity.service.ts', import.meta.url), 'utf8')
-const BUNDLE_SOURCE = readFileSync(new URL('./tenant-sync.service.ts', import.meta.url), 'utf8')
 
 // ==========================================================================
-// The inner content path -- the common case the outer catch never sees
+// Behavioural: the attempt fence on every current-attempt state transition
 // ==========================================================================
 
-test('an inner content-budget refusal records a qualified observation and still reports backlog', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget' })
-  const changes = await fake.run()
-  assert.deepEqual(changes, [], 'the refusal is still swallowed, exactly as released')
+for (const visitOwner of [owner, undefined] as const) {
+  const lane = visitOwner ? 'owned' : 'ownerless'
 
-  const envelope = fake.envelope()
-  assert.ok(envelope?.refusal, 'this attempt carries its refusal')
-  assert.equal(envelope.refusal.path, 'content')
-  assert.equal(envelope.refusal.constraint, 'daily_tenant_bytes')
-  assert.equal(envelope.refusal.retryNotBefore, BOUNDARY.toISOString())
-  assert.equal(envelope.refusal.attemptToken, envelope.attemptToken)
-
-  // The terminal outcome is unchanged and PRESERVES the observation.
-  const terminal = fake.of('syncState.update').at(-1)!.args[0] as Record<string, unknown>
-  assert.equal(terminal.status, 'RUNNING')
-  assert.equal(terminal.lastErrorCode, 'm365-audit-backlog')
-  assert.equal(terminal.lastSuccessfulAt, undefined, 'success is not advanced')
-  assert.ok(fake.envelope()?.refusal, 'the backlog terminal write did not clear it')
-
-  // And a reader qualifies it against the row the scoped query would return.
-  const qualified = qualifiedBudgetRefusal({
-    resourceType: 'M365_AUDIT',
-    status: terminal.status as string,
-    lastErrorCode: terminal.lastErrorCode as string,
-    lastAttemptAt: (fake.row() as any).lastAttemptAt,
-    m365AuditAttempt: (fake.row() as any).m365AuditAttempt,
-  }, new Date())
-  assert.equal(qualified?.constraint, 'daily_tenant_bytes')
-})
-
-test('the observation is written in the SAME transaction as its content disposition', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget' })
-  await fake.run()
-  const order = fake.calls.map((call) => call.method)
-  const disposition = order.lastIndexOf('content.updateMany')
-  const cas = order.indexOf('syncState.updateMany')
-  assert.ok(disposition >= 0 && cas > disposition,
-    'the compare-and-set follows the disposition inside one transaction')
-  const casArgs = fake.of('syncState.updateMany')[0]!.args[0] as any
-  assert.equal(casArgs.where.organizationId, tenant.organizationId)
-  assert.equal(casArgs.where.customerTenantId, tenant.id)
-  assert.equal(casArgs.where.resourceType, 'M365_AUDIT')
-  assert.deepEqual(casArgs.where.m365AuditAttempt.path, ['attemptToken'])
-  assert.ok(casArgs.where.lastAttemptAt instanceof Date, 'scoped to the captured attempt time')
-})
-
-test('an ordinary provider retry records no observation at all', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'provider-retry' })
-  await fake.run()
-  assert.equal(fake.envelope()?.refusal, null, 'no budget detail is fabricated')
-  const terminal = fake.of('syncState.update').at(-1)!.args[0] as Record<string, unknown>
-  assert.equal(terminal.lastErrorCode, 'm365-audit-backlog', 'the same code as a cost refusal')
-  assert.equal(qualifiedBudgetRefusal({
-    resourceType: 'M365_AUDIT', status: 'RUNNING', lastErrorCode: 'm365-audit-backlog',
-    lastAttemptAt: (fake.row() as any).lastAttemptAt,
-    m365AuditAttempt: (fake.row() as any).m365AuditAttempt,
-  }, new Date()), null, 'which is exactly why the observation, not the code, carries the meaning')
-})
-
-test('an error proving no constraint yields no fabricated detail', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget', constraint: null })
-  await fake.run()
-  assert.equal(fake.envelope()?.refusal, null)
-  assert.deepEqual(fake.of('syncState.updateMany').filter((call) => {
-    const data = (call.args[0] as any).data?.m365AuditAttempt
-    return data && data.refusal !== null
-  }), [])
-})
-
-test('the ownerless compatibility path is transactional and token-guarded too', async () => {
-  const fake = harness({ reservation: 'budget' })
-  await fake.run()
-  assert.ok(fake.envelope()?.refusal, 'recorded without a lease, fenced by the token')
-  const casArgs = fake.of('syncState.updateMany')[0]!.args[0] as any
-  assert.deepEqual(casArgs.where.m365AuditAttempt.path, ['attemptToken'])
-})
-
-// ==========================================================================
-// Fail-closed: zero-row disposition, zero-row CAS, lost owner
-// ==========================================================================
-
-test('an unclaimable blob never reaches the budget path at all', async () => {
-  // The released claim already refuses a row it does not own; nothing after it
-  // runs, so there is no refusal to record.
-  const fake = harness({ visitOwner: owner, reservation: 'budget', claimCount: 0 })
-  const changes = await fake.run()
-  assert.deepEqual(changes, [])
-  assert.equal(fake.envelope()?.refusal, null)
-})
-
-test('a zero-row failure disposition rolls back its coupled observation', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget', dispositionCount: 0 })
-  await assert.rejects(() => fake.run(), /lease|lost|Lease/i)
-  assert.equal(fake.envelope()?.refusal, null, 'no observation survives an unclaimed disposition')
-  assert.deepEqual(fake.of('syncState.updateMany').filter((call) =>
-    (call.args[0] as any).data?.m365AuditAttempt?.refusal), [])
-})
-
-test('a superseded attempt writes nothing and abandons, rather than overwriting a successor', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget', casCount: 0 })
-  const changes = await fake.run()
-  assert.deepEqual(changes, [], 'the stale worker abandons')
-  assert.equal(fake.envelope()?.refusal, null, 'the successor envelope is untouched')
-  assert.deepEqual(fake.of('syncState.update'), [],
-    'and no terminal status was written by the stale worker')
-})
-
-test('a lost lease refuses before any observation', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget', leaseLost: true })
-  await assert.rejects(() => fake.run())
-  assert.deepEqual(fake.of('syncState.updateMany').filter((call) =>
-    (call.args[0] as any).data?.m365AuditAttempt?.refusal), [])
-})
-
-// ==========================================================================
-// The outer discovery path
-// ==========================================================================
-
-test('an outer discovery refusal records its constraint with the unchanged deadline', async () => {
-  const fake = harness({
-    visitOwner: owner, discoveryThrowsBudget: true, constraint: 'monthly_deployment_bytes',
+  test(`${lane}: a stale terminal SUCCESS leaves the successor state untouched`, async (context) => {
+    const fake = harness(context, {
+      visitOwner, reservation: 'ok', pendingContent: false, retryBacklog: 0,
+      subscriptionsEnabled: ['Audit.AzureActiveDirectory', 'Audit.Exchange', 'Audit.SharePoint', 'Audit.General'],
+      successorDuring: 'discovery', successorSameTime: true,
+    })
+    const changes = await fake.run()
+    assert.deepEqual(changes, [])
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.notEqual(after.status, 'SUCCEEDED', 'the stale worker must not mark a success')
+    assert.equal(after.status, successor.status)
+    assert.equal(after.lastErrorCode, successor.lastErrorCode)
+    assert.equal(after.lastSuccessfulAt?.getTime(), successor.lastSuccessfulAt?.getTime(),
+      'the successor success clock is not advanced')
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+    assert.equal(fake.envelope()?.attemptToken, fake.successorToken)
   })
+
+  test(`${lane}: a stale terminal FAILED-backlog leaves the successor state untouched`, async (context) => {
+    const fake = harness(context, {
+      visitOwner, reservation: 'ok', failedBacklog: 3,
+      successorDuring: 'discovery', successorSameTime: true,
+    })
+    await fake.run()
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.notEqual(after.status, 'FAILED')
+    assert.equal(after.lastErrorCode, successor.lastErrorCode)
+    assert.equal(after.consecutiveFailures, successor.consecutiveFailures,
+      'the successor failure counter is not incremented')
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+  })
+
+  test(`${lane}: a stale ordinary BACKLOG terminal leaves the successor state untouched`, async (context) => {
+    const fake = harness(context, {
+      visitOwner, reservation: 'provider-retry',
+      successorDuring: 'content', successorSameTime: true,
+    })
+    await fake.run()
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.equal(after.lastErrorMessage, successor.lastErrorMessage,
+      'the backlog branch is fenced too, so no reason text is replaced')
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+  })
+
+  test(`${lane}: a stale OUTER budget refusal with a known cap writes nothing`, async (context) => {
+    const fake = harness(context, {
+      visitOwner, discoveryThrows: 'budget', constraint: 'monthly_deployment_bytes',
+      successorDuring: 'discovery', successorSameTime: true,
+    })
+    const changes = await fake.run()
+    assert.deepEqual(changes, [])
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.equal(after.lastErrorCode, successor.lastErrorCode)
+    assert.notEqual(after.lastErrorCode, 'm365-audit-budget-exhausted')
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+  })
+
+  test(`${lane}: a stale OUTER budget refusal with NO proven cap also writes nothing`, async (context) => {
+    // The fence is unconditional: an unproven cap records no detail, and must
+    // not be a licence to write the status against a successor's token.
+    const fake = harness(context, {
+      visitOwner, discoveryThrows: 'budget', constraint: null,
+      successorDuring: 'discovery', successorSameTime: true,
+    })
+    await fake.run()
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.notEqual(after.lastErrorCode, 'm365-audit-budget-exhausted')
+    assert.equal(after.lastErrorCode, successor.lastErrorCode)
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+  })
+
+  test(`${lane}: a stale OUTER non-budget failure writes nothing but still raises`, async (context) => {
+    const fake = harness(context, {
+      visitOwner, discoveryThrows: 'provider',
+      successorDuring: 'discovery', successorSameTime: true,
+    })
+    await assert.rejects(() => fake.run())
+    const after = fake.row()!
+    const successor = fake.successor()!
+    assert.notEqual(after.status, 'FAILED', 'the successor is not marked failed by a stale worker')
+    assert.equal(after.status, successor.status)
+    assert.equal(after.consecutiveFailures, successor.consecutiveFailures)
+    assert.deepEqual(after.m365AuditAttempt, successor.m365AuditAttempt)
+  })
+}
+
+// ==========================================================================
+// Behavioural: the current attempt's own transitions
+// ==========================================================================
+
+test('a current inner content refusal records its detail and keeps the backlog outcome', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'budget' })
   const changes = await fake.run()
-  assert.deepEqual(changes, [])
-  const status = fake.of('syncState.update').at(-1)!.args[0] as Record<string, unknown>
-  assert.equal(status.status, 'RUNNING', 'existing state write unchanged')
-  assert.equal(status.lastErrorCode, 'm365-audit-budget-exhausted')
-  assert.equal(status.consecutiveFailures, 0)
+  assert.deepEqual(changes, [], 'still swallowed, exactly as released')
+  const after = fake.row()!
+  assert.equal(after.status, 'RUNNING')
+  assert.equal(after.lastErrorCode, 'm365-audit-backlog')
+  assert.equal(after.lastSuccessfulAt, null, 'success is never advanced')
   const envelope = fake.envelope()
-  assert.equal(envelope?.refusal?.path, 'discovery')
-  assert.equal(envelope?.refusal?.constraint, 'monthly_deployment_bytes')
-  assert.equal(envelope?.refusal?.retryNotBefore, BOUNDARY.toISOString(),
-    'the released retry boundary is recorded verbatim')
+  assert.equal(envelope?.refusal?.path, 'content')
+  assert.equal(envelope?.refusal?.constraint, 'daily_tenant_bytes')
+  assert.equal(envelope?.refusal?.attemptToken, envelope?.attemptToken)
+  // The reader qualifies it off the stored row, at a time before the boundary.
+  const qualified = qualifiedBudgetRefusal(after as never, new Date(CLOCK + 60_000))
+  assert.equal(qualified?.constraint, 'daily_tenant_bytes')
+  assert.equal(qualified?.retryNotBefore, boundaryAfter(12 * 60 * 60 * 1000).toISOString())
 })
 
-test('a superseded outer refusal writes neither status nor observation', async () => {
-  const fake = harness({ visitOwner: owner, discoveryThrowsBudget: true, casCount: 0 })
-  const changes = await fake.run()
-  assert.deepEqual(changes, [])
-  assert.deepEqual(fake.of('syncState.update'), [], 'the status write rolled back with the observation')
+test('a current outer discovery refusal records its cap and the released deadline', async (context) => {
+  const fake = harness(context, {
+    visitOwner: owner, discoveryThrows: 'budget', constraint: 'monthly_deployment_bytes',
+  })
+  await fake.run()
+  const after = fake.row()!
+  assert.equal(after.status, 'RUNNING')
+  assert.equal(after.lastErrorCode, 'm365-audit-budget-exhausted')
+  assert.equal(fake.envelope()?.refusal?.path, 'discovery')
+  assert.equal(fake.envelope()?.refusal?.constraint, 'monthly_deployment_bytes')
+  assert.equal(fake.envelope()?.refusal?.retryNotBefore,
+    boundaryAfter(12 * 60 * 60 * 1000).toISOString())
 })
 
-// ==========================================================================
-// Lifecycle: attempt identity, clearing, early return
-// ==========================================================================
+test('a current outer budget refusal with no proven cap records status and NO detail', async (context) => {
+  const fake = harness(context, { visitOwner: owner, discoveryThrows: 'budget', constraint: null })
+  await fake.run()
+  const after = fake.row()!
+  assert.equal(after.lastErrorCode, 'm365-audit-budget-exhausted', 'status still recorded')
+  assert.equal(fake.envelope()?.refusal, null, 'and no fabricated detail')
+})
 
-test('each attempt mints a distinct token even when two share an instant', async () => {
-  const tokens = new Set<string>()
+test('a current outer non-budget failure records FAILED and clears the observation', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'budget' })
+  await fake.run()
+  assert.ok(fake.envelope()?.refusal, 'a refusal exists first')
+  const second = harness(context, {
+    visitOwner: owner, discoveryThrows: 'provider',
+    storedRow: baseRow({
+      lastAttemptAt: new Date(CLOCK),
+      m365AuditAttempt: fake.row()!.m365AuditAttempt,
+    }),
+  })
+  await assert.rejects(() => second.run())
+  assert.equal(second.row()!.status, 'FAILED')
+  assert.equal(second.envelope()?.refusal, null, 'a failed state keeps no refusal alive')
+})
+
+test('an ordinary provider retry records no detail under the identical error code', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'provider-retry' })
+  await fake.run()
+  const after = fake.row()!
+  assert.equal(after.lastErrorCode, 'm365-audit-backlog')
+  assert.equal(fake.envelope()?.refusal, null)
+  assert.equal(qualifiedBudgetRefusal(after as never, new Date(CLOCK + 60_000)), null,
+    'which is why the observation, not the code, carries the meaning')
+})
+
+test('a terminal success clears this attempt observation', async (context) => {
+  // SUCCEEDED needs every content type enabled and nothing blocked at all.
+  const fake = harness(context, {
+    visitOwner: owner, reservation: 'ok', pendingContent: false, retryBacklog: 0,
+    subscriptionsEnabled: ['Audit.AzureActiveDirectory', 'Audit.Exchange', 'Audit.SharePoint', 'Audit.General'],
+  })
+  await fake.run()
+  const after = fake.row()!
+  assert.equal(after.status, 'SUCCEEDED')
+  assert.ok(after.lastSuccessfulAt instanceof Date)
+  assert.equal(fake.envelope()?.refusal, null)
+})
+
+test('two attempts at the identical instant have identical captured times and different tokens', async (context) => {
+  const tokens: string[] = []
+  const times: number[] = []
   for (let index = 0; index < 2; index += 1) {
-    const fake = harness({ visitOwner: owner, reservation: 'budget' })
+    const fake = harness(context, { visitOwner: owner, reservation: 'budget' })
     await fake.run()
     const upsert = fake.of('syncState.upsert')[0]!.args[0] as any
-    tokens.add(upsert.update.m365AuditAttempt.attemptToken)
-    assert.equal(
-      upsert.update.m365AuditAttempt.attemptAt,
+    tokens.push(upsert.update.m365AuditAttempt.attemptToken)
+    times.push((upsert.update.lastAttemptAt as Date).getTime())
+    assert.equal(upsert.update.m365AuditAttempt.attemptAt,
       (upsert.update.lastAttemptAt as Date).toISOString(),
-      'the envelope attempt time is exactly the value written to lastAttemptAt',
-    )
+      'the envelope time is exactly the value written to lastAttemptAt')
   }
-  assert.equal(tokens.size, 2, 'a millisecond clock is not the fence; the token is')
+  assert.equal(times[0], times[1], 'precondition: both attempts captured the SAME instant')
+  assert.notEqual(tokens[0], tokens[1], 'so only the token can distinguish them')
 })
 
-test('a new attempt installs a refusal-free envelope, superseding the old observation', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'budget' })
-  await fake.run()
-  const upsert = fake.of('syncState.upsert')[0]!.args[0] as any
-  assert.equal(upsert.update.m365AuditAttempt.refusal, null)
-  assert.equal(upsert.create.m365AuditAttempt.refusal, null)
-})
-
-test('a terminal success clears this attempt observation, guarded by its own token', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'ok', subscriptionsEnabled: [] })
-  await fake.run()
-  const terminal = fake.of('syncState.update').at(-1)!.args[0] as Record<string, unknown>
-  const clears = fake.of('syncState.updateMany').filter((call) =>
-    (call.args[0] as any).data?.m365AuditAttempt?.refusal === null)
-  if (terminal.status === 'SUCCEEDED' || terminal.status === 'FAILED') {
-    assert.ok(clears.length >= 1, 'a non-backlog terminal state clears the observation')
-    const guard = (clears[0]!.args[0] as any).where
-    assert.deepEqual(guard.m365AuditAttempt.path, ['attemptToken'])
-    assert.ok(guard.lastAttemptAt instanceof Date)
+test('the early fresh/no-work return mutates nothing', async (context) => {
+  const prior = {
+    v: 1, attemptToken: 'prior-token', attemptAt: new Date(CLOCK - 600_000).toISOString(), refusal: null,
   }
-})
-
-test('a non-budget terminal failure clears it as well', async () => {
-  const fake = harness({ visitOwner: owner, reservation: 'ok', failedBacklog: 2 })
-  await fake.run()
-  const terminal = fake.of('syncState.update').at(-1)!.args[0] as Record<string, unknown>
-  assert.equal(terminal.status, 'FAILED')
-  assert.ok(fake.of('syncState.updateMany').some((call) =>
-    (call.args[0] as any).data?.m365AuditAttempt?.refusal === null),
-  'the failure path clears the observation')
-})
-
-test('the early fresh/no-work return mutates nothing', async () => {
-  const fake = harness({
-    visitOwner: owner,
-    pendingContent: false,
-    storedState: {
-      status: 'RUNNING', lastSuccessfulAt: new Date(), lastAttemptAt: new Date(),
-      lastErrorCode: 'm365-audit-backlog', m365AuditAttempt: { v: 1, attemptToken: 'prior-token', attemptAt: new Date().toISOString(), refusal: null },
-    },
+  const fake = harness(context, {
+    visitOwner: owner, pendingContent: false,
+    storedRow: baseRow({
+      lastSuccessfulAt: new Date(CLOCK - 1000), lastAttemptAt: new Date(CLOCK - 600_000),
+      lastErrorCode: 'm365-audit-backlog', m365AuditAttempt: prior,
+    }),
   })
-  const changes = await fake.run()
-  assert.deepEqual(changes, [])
+  await fake.run()
   assert.deepEqual(fake.of('syncState.upsert'), [], 'no attempt was minted')
-  assert.deepEqual(fake.of('syncState.updateMany'), [], 'no envelope was touched')
-  assert.deepEqual(fake.of('syncState.update'), [])
+  assert.deepEqual(fake.of('syncState.updateMany'), [], 'no state transition at all')
+  assert.deepEqual(fake.row()!.m365AuditAttempt, prior, 'the prior envelope is intact')
 })
 
 // ==========================================================================
-// The reader path, and that it needs no new query
+// Inner coupling, fail-closed
 // ==========================================================================
 
-test('the scoped bundle query carries the column and needs no new lookup', () => {
-  // The buildBundle sync-state load is an unfiltered findMany, so the new
-  // column arrives with the row. A `select` there would silently drop it.
-  const load = BUNDLE_SOURCE.indexOf('this.prisma.syncState.findMany({')
-  assert.ok(load > 0, 'the scoped load exists')
-  const block = BUNDLE_SOURCE.slice(load, load + 260)
-  assert.doesNotMatch(block, /select:|omit:/, 'no projection that could drop the column')
-  assert.match(block, /organizationId: tenant\.organizationId/)
-  assert.match(block, /customerTenantId: tenant\.id/)
-  // Exactly one M365_AUDIT projection call, and no new table lookup was added.
-  assert.equal(BUNDLE_SOURCE.split("projectSyncOutcome('M365_AUDIT'").length - 1, 1)
-  assert.equal(BUNDLE_SOURCE.split('m365AuditAttempt').length - 1, 0,
-    'the bundle does not query or reshape the envelope itself')
+test('an unclaimable blob never reaches the budget path', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'budget', claimCount: 0 })
+  await fake.run()
+  assert.equal(fake.envelope()?.refusal, null)
 })
 
-test('the projection exposes the detail for M365_AUDIT and nothing else', () => {
-  const attemptAt = new Date('2026-11-26T12:00:00.000Z')
-  const now = new Date('2026-11-26T12:00:10.000Z')
-  const row = {
-    resourceType: 'M365_AUDIT', status: 'RUNNING', lastErrorCode: 'm365-audit-backlog',
-    lastAttemptAt: attemptAt, lastSuccessfulAt: null,
-    m365AuditAttempt: {
-      v: 1, attemptToken: 'aaaa-bbbb', attemptAt: attemptAt.toISOString(),
-      refusal: {
-        attemptToken: 'aaaa-bbbb', path: 'content', constraint: 'daily_deployment_records',
-        observedAt: '2026-11-26T12:00:05.000Z', retryNotBefore: '2026-11-27T00:00:00.000Z',
-      },
-    },
-  }
-  const projected = projectSyncOutcome('M365_AUDIT', row as never, now)
-  assert.equal(projected.recordedOutcome.kind, 'DEFERRED_WORK_RECORDED', 'existing meaning preserved')
-  assert.equal(projected.reasonCode, 'm365-audit-backlog')
-  assert.deepEqual(projected.observedBudgetRefusal, {
-    path: 'content', constraint: 'daily_deployment_records',
-    observedAt: '2026-11-26T12:00:05.000Z', retryNotBefore: '2026-11-27T00:00:00.000Z',
+test('a zero-row failure disposition rolls back its coupled observation', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'budget', dispositionCount: 0 })
+  await assert.rejects(() => fake.run())
+  assert.equal(fake.envelope()?.refusal, null)
+})
+
+test('a stale inner refusal rolls back both the disposition and the observation', async (context) => {
+  const fake = harness(context, {
+    visitOwner: owner, reservation: 'budget',
+    successorDuring: 'content', successorSameTime: true,
   })
-  // A different resource with the same row shape gets no detail and an
-  // unchanged response shape.
-  const other = projectSyncOutcome('SIGN_INS', { ...row, resourceType: 'SIGN_INS' } as never, now)
-  assert.equal('observedBudgetRefusal' in other, false)
-  // A legacy null envelope leaves the response exactly as released.
-  const legacy = projectSyncOutcome('M365_AUDIT', { ...row, m365AuditAttempt: null } as never, now)
-  assert.equal('observedBudgetRefusal' in legacy, false)
-  assert.equal(legacy.recordedOutcome.kind, 'DEFERRED_WORK_RECORDED')
-  assert.equal(legacy.reasonCode, 'm365-audit-backlog')
+  await fake.run()
+  const after = fake.row()!
+  assert.deepEqual(after.m365AuditAttempt, fake.successor()!.m365AuditAttempt)
+  assert.equal(fake.envelope()?.refusal, null)
+})
+
+test('a stale inner refusal with NO proven cap is fenced by the read-only check', async (context) => {
+  const fake = harness(context, {
+    visitOwner: owner, reservation: 'budget', constraint: null,
+    successorDuring: 'content', successorSameTime: true,
+  })
+  await fake.run()
+  assert.deepEqual(fake.row()!.m365AuditAttempt, fake.successor()!.m365AuditAttempt)
+})
+
+test('a lost lease refuses before any observation', async (context) => {
+  const fake = harness(context, { visitOwner: owner, reservation: 'budget', leaseLost: true })
+  await assert.rejects(() => fake.run())
+  // The attempt upsert itself rolled back, so there is no envelope at all --
+  // which is stronger than an envelope carrying no refusal.
+  assert.equal(fake.row()!.m365AuditAttempt, null)
+  assert.deepEqual(fake.of('syncState.updateMany'), [])
 })
 
 // ==========================================================================
-// Accounting is untouched
+// STRUCTURAL assertions (source text, not behaviour) -- labelled as such
 // ==========================================================================
 
-test('no budget lock is taken to record an observation', () => {
+test('STRUCTURAL: every sync-state transition goes through the fenced writer', () => {
+  // Any direct `syncState.update(` would be an unfenced status write.
+  assert.equal(SOURCE.split('syncState.update(').length - 1, 0,
+    'no unique-key status update remains')
+  const writers = [...SOURCE.matchAll(/syncState\.(updateMany|upsert|count)\(/g)].map((m) => m[1])
+  assert.deepEqual(writers.sort(), ['count', 'updateMany', 'upsert', 'upsert'],
+    'exactly one guarded updateMany, the two attempt-installing upserts, and one read')
+  assert.match(SOURCE, /private async applyCurrentAttemptState\(/)
+  assert.match(SOURCE, /private currentAttemptWhere\(/)
+})
+
+test('STRUCTURAL: no budget lock is taken to record', () => {
   const helper = SOURCE.slice(
-    SOURCE.indexOf('private async recordBudgetRefusal('),
+    SOURCE.indexOf('private currentAttemptWhere('),
     SOURCE.indexOf('private async reserveDailyUsage('),
   )
   assert.ok(helper.length > 0)
-  assert.doesNotMatch(helper, /pg_advisory_xact_lock/, 'recording needs no shared critical section')
+  assert.doesNotMatch(helper, /pg_advisory_xact_lock/)
   assert.doesNotMatch(helper, /m365-(daily|monthly)-budget/)
 })
 
-test('the released reservation, refund and record accounting are unchanged', () => {
-  // Byte reservation still precedes the read and is retained on interruption.
+test('STRUCTURAL: the released reservation, refund and record accounting are unchanged', () => {
   assert.match(SOURCE, /Reserve the maximum possible body before reading it/)
   assert.match(SOURCE, /Keep the conservative reservation when a stream is interrupted/)
-  // Records are still charged inside the accept transaction, only when accepted.
   assert.match(SOURCE, /Charge only records the database actually accepted/)
   assert.match(SOURCE, /\{ records: insertedRecordCount, blobs: 1 \}/)
-  // The guarded refund is untouched.
   assert.match(SOURCE, /downloadedBytes: \{ gte: BigInt\(Math\.ceil\(bytes\)\) \}/)
   assert.match(SOURCE, /downloadedBytes: \{ decrement: BigInt\(Math\.ceil\(bytes\)\) \}/)
 })
 
-test('the eight closed constraints are derived from the eight released comparisons', () => {
-  const decision = SOURCE.slice(SOURCE.indexOf('const exceeded: Record<'), SOURCE.indexOf('if (dailyExceeded || monthlyExceeded)'))
+test('STRUCTURAL: the eight closed caps keep their released comparisons', () => {
+  const decision = SOURCE.slice(
+    SOURCE.indexOf('const exceeded: Record<'),
+    SOURCE.indexOf('if (dailyExceeded || monthlyExceeded)'),
+  )
   for (const [name, expression] of [
     ['monthly_tenant_bytes', 'tenantMonthlyBytes + bytes > limits.tenantMonthlyBytes'],
     ['monthly_deployment_bytes', 'deploymentMonthlyBytes + bytes > limits.deploymentMonthlyBytes'],
@@ -471,9 +544,7 @@ test('the eight closed constraints are derived from the eight released compariso
     ['daily_tenant_records', 'tenantRecords + records > limits.tenantRecords'],
     ['daily_deployment_records', 'deploymentRecords + records > limits.deploymentRecords'],
   ] as const) {
-    assert.ok(decision.includes(`${name}: ${expression},`), `${name} keeps its released comparison`)
+    assert.ok(decision.includes(`${name}: ${expression},`), name)
   }
-  // The thrown message and boundary are still derived the released way.
   assert.match(SOURCE, /monthlyExceeded \? nextUtcMonthDate\(now\) : nextUtcUsageDate\(now\)/)
-  assert.match(SOURCE, /cost budget is exhausted; ingestion will resume after the next UTC/)
 })

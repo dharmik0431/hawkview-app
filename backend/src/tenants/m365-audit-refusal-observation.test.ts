@@ -9,7 +9,7 @@ import {
   qualifiedBudgetRefusal,
   selectBudgetConstraint,
   type M365AuditBudgetConstraint,
-} from './m365-audit-refusal-observation.js'
+} from './sync-outcome-projection.js'
 
 const TOKEN = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 const ATTEMPT_AT = new Date('2026-11-26T12:00:00.000Z')
