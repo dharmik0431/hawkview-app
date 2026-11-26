@@ -10,14 +10,16 @@ const p2={servicePlanId:'p2',servicePlanName:'AAD_PREMIUM_P2',provisioningStatus
 const sku=(plans:unknown=[p1])=>({skuId:'sku-a',skuPartNumber:'P1',servicePlans:plans})
 function harness(initialRows: any[] = validatedLicenseRows([sku([p2])]), scopedTenant = tenant) {
  const tenant = scopedTenant
- let rows=structuredClone(initialRows), snapshot:any={payload:structuredClone(initialRows),organizationId:tenant.organizationId,observedAt:at}
+ let rows=structuredClone(initialRows), snapshot:any={id:'license-snapshot-row',payload:structuredClone(initialRows),organizationId:tenant.organizationId,observedAt:at}
  const state:any={status:'SUCCEEDED',lastAttemptAt:at,lastSuccessfulAt:at,consecutiveFailures:0}
- let payload:any={value:[sku()]}, responseStatus=200, failCommit=false, resolved=0, saves=0
+ let payload:any={value:[sku()]}, responseStatus=200, failCommit=false, resolved=0, saves=0, observations=0
  const update=(data:any)=> {const failures=data.consecutiveFailures?.increment?state.consecutiveFailures+1:data.consecutiveFailures??state.consecutiveFailures;Object.assign(state,data,{consecutiveFailures:failures});return {...state}}
  const db:any={
   syncState:{upsert:async({where,update:data}:any)=>{assert.equal(where.customerTenantId_resourceType.customerTenantId,tenant.id);return update(data)},update:async({data}:any)=>{return update(data)}},
   $executeRawUnsafe:async()=>0,
-  tenantEntraSnapshot:{findUnique:async()=>snapshot,upsert:async({create,update:data}:any)=>{snapshot={...create,...data};saves++;return snapshot}},
+  tenantEntraSnapshot:{findUnique:async()=>snapshot,upsert:async({create,update:data}:any)=>{snapshot={id:snapshot?.id??'license-snapshot-row',...create,...data};saves++;return snapshot},
+   // Unchanged documents advance observation time only, carrying no payload.
+   updateMany:async({where,data}:any)=>{assert.deepEqual(Object.keys(data),['observedAt']);assert.equal(where.organizationId,tenant.organizationId);assert.equal(where.customerTenantId,tenant.id);assert.equal(where.resourceType,'LICENSES');if(!snapshot||where.id!==snapshot.id)return{count:0};snapshot={...snapshot,observedAt:data.observedAt};observations++;return{count:1}}},
   tenantLicense:{upsert:async({create,update:data}:any)=>{assert.equal(create.organizationId,tenant.organizationId);rows=rows.filter(r=>r.skuId!==create.microsoftSkuId);rows.push({...data,skuId:create.microsoftSkuId});},deleteMany:async({where}:any)=>{assert.equal(where.organizationId,tenant.organizationId);assert.equal(where.customerTenantId,tenant.id);rows=rows.filter(r=>where.microsoftSkuId.notIn.includes(r.skuId))}},
   $transaction:async(work:any)=>{const prior={rows:structuredClone(rows),snapshot:structuredClone(snapshot)};try{const result=await work(db);if(failCommit)throw new Error('synthetic commit failure');return result}catch(e){({rows,snapshot}=prior);throw e}},
  }
@@ -25,7 +27,7 @@ function harness(initialRows: any[] = validatedLicenseRows([sku([p2])]), scopedT
  service.changeEvidence={buildSnapshotDifferenceEvidence:()=>[]}
  service.logger={warn(){},log(){}}
  service.fetchGraphPage=async()=>new Response(JSON.stringify(payload),{status:responseStatus})
- return {service,state,get rows(){return rows},get snapshot(){return snapshot},get saves(){return saves},get resolved(){return resolved},set payload(value:any){payload=value},set responseStatus(value:number){responseStatus=value},set failCommit(value:boolean){failCommit=value},run:()=>service.syncLicenses(tenant,'synthetic-token')}
+ return {service,state,get rows(){return rows},get snapshot(){return snapshot},get saves(){return saves},get observations(){return observations},get resolved(){return resolved},set payload(value:any){payload=value},set responseStatus(value:number){responseStatus=value},set failCommit(value:boolean){failCommit=value},run:()=>service.syncLicenses(tenant,'synthetic-token')}
 }
 for(const [name,value] of Object.entries({blankSKU:[{...sku(),skuId:' '}],longSKU:[{...sku(),skuPartNumber:'x'.repeat(201)}],malformedSKU:[sku(),{}],nullSKU:[null],missingPlans:[{skuId:'x',skuPartNumber:'X'}],malformedPlan:[sku([p1,{}])],overPlans:[sku(Array.from({length:129},(_,i)=>({...p1,servicePlanId:String(i)})))],overSKUs:Array.from({length:1001},(_,i)=>({...sku(),skuId:String(i)})),duplicateSKU:[sku(),sku()],duplicatePlan:[sku([p1,p1])],longPlan:[sku([{...p1,servicePlanName:'x'.repeat(121)}])]})) {
  test(`${name} preserves the prior snapshot, rows and success; complete recovery validates`,async()=>{
@@ -37,7 +39,11 @@ for(const [name,value] of Object.entries({blankSKU:[{...sku(),skuId:' '}],longSK
 }
 
 test('complete empty and unchanged license inventory persists without inventing a loss',async()=>{
- const h=harness([]);h.payload={value:[]};await h.run();assert.equal(h.state.status,'SUCCEEDED');assert.equal(h.rows.length,0);assert.equal(h.saves,1)
+ const h=harness([]);h.payload={value:[]};await h.run();assert.equal(h.state.status,'SUCCEEDED');assert.equal(h.rows.length,0)
+ // An empty inventory is the one license document with no number in it, so it
+ // is the only one this writer can prove unchanged: it records observation time
+ // alone and retains the stored document instead of re-sending it.
+ assert.equal(h.saves,0);assert.equal(h.observations,1);assert.deepEqual(h.snapshot.payload,[])
  h.payload={value:[sku([p2])]};await h.run();assert.equal(h.rows[0].servicePlans[0].servicePlanName,'AAD_PREMIUM_P2')
  const before=structuredClone(h.snapshot);h.failCommit=true;h.payload={value:[]};await assert.rejects(h.run);assert.deepEqual(h.snapshot,before);assert.equal(h.rows[0].servicePlans[0].servicePlanName,'AAD_PREMIUM_P2')
 })

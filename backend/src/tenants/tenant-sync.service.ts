@@ -14,6 +14,7 @@ import { projectSyncOutcome } from './sync-outcome-projection.js'
 import { tenantVisitLeaseLossDiagnostic } from './tenant-visit-lease-diagnostics.js'
 import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import { identicalSnapshotDocument } from './snapshot-payload-identity.js'
 import {
   assertTenantVisitLifecycleActive, recordTenantVisitLifecycleFailure,
   runTenantVisitLifecycle, tenantVisitLifecycleEnabled,
@@ -5952,7 +5953,7 @@ export class TenantSyncService {
       )
       const existing = await transaction.tenantEntraSnapshot.findUnique({
         where: { customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType } },
-        select: { payload: true, observedAt: true, organizationId: true },
+        select: { id: true, payload: true, observedAt: true, organizationId: true },
       })
       if (existing && existing.organizationId !== tenant.organizationId) {
         throw new Error('Snapshot organization mismatch; refusing cross-organization comparison.')
@@ -5976,22 +5977,51 @@ export class TenantSyncService {
         })
       }
       if (persistWithSnapshot) await persistWithSnapshot(transaction)
-      await transaction.tenantEntraSnapshot.upsert({
-        where: {
-          customerTenantId_resourceType: {
+      // The stored document is compared against the FINAL merged rows, inside
+      // this transaction and under the resource advisory lock, so no concurrent
+      // writer can move the baseline between the comparison and the write.
+      if (existing && identicalSnapshotDocument(existing.payload, rows)) {
+        // Record the successful check without sending the document again. This
+        // branch carries no payload in its data or its filter and returns no
+        // document, and it is scoped to the exact row this transaction read.
+        // A deleted or replaced row therefore matches nothing: the count is not
+        // one and the whole transaction -- difference evidence, the resource
+        // inventory callback and any audit acknowledgment included -- rolls
+        // back, rather than this branch resurrecting a row it never read.
+        const observation = await transaction.tenantEntraSnapshot.updateMany({
+          where: {
+            id: existing.id,
+            organizationId: tenant.organizationId,
             customerTenantId: tenant.id,
             resourceType,
           },
-        },
-        create: {
-          organizationId: tenant.organizationId,
-          customerTenantId: tenant.id,
-          resourceType,
-          payload: rows as never,
-          observedAt,
-        },
-        update: { payload: rows as never, observedAt },
-      })
+          data: { observedAt },
+        })
+        if (observation.count !== 1) {
+          throw new Error(
+            `SNAPSHOT_UNCHANGED_OBSERVATION_NOT_ONE_ROW:${resourceType}:${observation.count}`
+          )
+        }
+      } else {
+        // Absent, changed or undecidable: the existing full write, unchanged,
+        // including the create payload a first collection needs.
+        await transaction.tenantEntraSnapshot.upsert({
+          where: {
+            customerTenantId_resourceType: {
+              customerTenantId: tenant.id,
+              resourceType,
+            },
+          },
+          create: {
+            organizationId: tenant.organizationId,
+            customerTenantId: tenant.id,
+            resourceType,
+            payload: rows as never,
+            observedAt,
+          },
+          update: { payload: rows as never, observedAt },
+        })
+      }
       if (auditRequestedRevision !== undefined) {
         // The complete source snapshot and its exact request acknowledgment
         // either commit together or neither does. A newer audit request keeps

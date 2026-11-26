@@ -11,7 +11,11 @@ import {
   AUDIT_EVIDENCE_TENANT_CAP,
 } from './tenant-health-audit-evidence.js'
 import { TENANT_HEALTH_MODEL_VERSION } from './tenant-health.js'
-import { TenantSyncService } from './tenant-sync.service.js'
+import { TenantSyncService, authoritativeSnapshot } from './tenant-sync.service.js'
+import { createAdapter } from '../prisma/prisma.service.js'
+import { PrismaClient } from '../generated/prisma/client.js'
+import { tryAcquireTenantVisitLease } from './tenant-visit-lease-store.js'
+import { identicalSnapshotDocument } from './snapshot-payload-identity.js'
 
 const databaseIntegrationEnabled =
   process.env.HAWKVIEW_RUN_DATABASE_INTEGRATION_TESTS === '1'
@@ -1294,5 +1298,414 @@ test(
       assert.doesNotMatch(text, new RegExp(leak), leak)
     }
     assert.match(text, /kept-note/)
+  },
+)
+
+// ===========================================================================
+// HAW-89: the unchanged-snapshot observation branch, against physical jsonb.
+//
+// Prepared for registered disposable PostgreSQL CI. These cases are the ones a
+// transaction fake cannot witness: real jsonb normalisation, the request the
+// driver actually sends, and rollback of a genuinely aborted transaction.
+// ===========================================================================
+
+/** A group definition document with no number anywhere, which is what makes it
+ *  decidable by the conservative comparator. */
+const SNAPSHOT_SENTINEL = 'haw89-physical-document-sentinel'
+const groupDocument = () => [
+  { id: 'group-a', displayName: SNAPSHOT_SENTINEL, securityEnabled: true, visibility: null, groupTypes: ['Unified'] },
+  { id: 'group-b', displayName: 'Second group', securityEnabled: false, visibility: 'Private', groupTypes: [] },
+]
+/** The same jsonb value written with every object's keys in another order. */
+const reorderedGroupDocument = () => [
+  { groupTypes: ['Unified'], visibility: null, securityEnabled: true, displayName: SNAPSHOT_SENTINEL, id: 'group-a' },
+  { visibility: 'Private', groupTypes: [], securityEnabled: false, displayName: 'Second group', id: 'group-b' },
+]
+
+function snapshotWriter(prisma: PrismaService) {
+  const forbidden = new Proxy({}, { get: () => { throw new Error('Unexpected dependency in snapshot writer') } })
+  return new TenantSyncService(
+    prisma, forbidden as never, forbidden as never,
+    { resolveIncident: async () => {}, publishIncident: async () => {} } as never,
+    new ChangeEvidenceService(prisma), forbidden as never,
+  ) as unknown as {
+    saveSnapshot: (
+      tenant: { id: string; organizationId: string }, resourceType: string, result: unknown,
+      persistWithSnapshot?: (tx: unknown) => Promise<void>, riskAttestable?: boolean,
+      riskFailureReason?: unknown,
+      mergeWithPrevious?: (previous: readonly unknown[], incoming: readonly unknown[]) => unknown[],
+      visitOwner?: unknown, auditRequestedRevision?: bigint,
+    ) => Promise<void>
+  }
+}
+
+const seedSnapshot = (prisma: PrismaService, workspace: ExportWorkspace, payload: unknown, observedAt: Date) =>
+  prisma.tenantEntraSnapshot.create({
+    data: {
+      organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+      resourceType: 'GROUPS', payload: payload as never, observedAt,
+    },
+    select: { id: true, observedAt: true },
+  })
+
+/** True when PostgreSQL itself considers the stored document equal to `expected`. */
+async function storedJsonbEquals(prisma: PrismaService, id: string, expected: unknown) {
+  const rows = await prisma.$queryRawUnsafe<Array<{ equal: boolean }>>(
+    'SELECT payload = $2::jsonb AS equal FROM tenant_entra_snapshots WHERE id = $1::uuid',
+    id, JSON.stringify(expected),
+  )
+  assert.equal(rows.length, 1, 'the snapshot row must still exist')
+  return rows[0]!.equal
+}
+
+test(
+  'HAW-89: an unchanged supported document keeps its stored jsonb and advances observation time',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-equal', randomUUID(), track)
+    const seededAt = new Date(Date.UTC(2026, 10, 1))
+    const seeded = await seedSnapshot(prisma, workspace, groupDocument(), seededAt)
+
+    await snapshotWriter(prisma).saveSnapshot(
+      { id: workspace.tenantId, organizationId: workspace.organizationId },
+      'GROUPS', authoritativeSnapshot(reorderedGroupDocument()),
+    )
+
+    const after = await prisma.tenantEntraSnapshot.findUniqueOrThrow({
+      where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType: 'GROUPS' } },
+      select: { id: true, payload: true, observedAt: true },
+    })
+    assert.equal(after.id, seeded.id, 'the same row, never replaced')
+    assert.equal(await storedJsonbEquals(prisma, seeded.id, groupDocument()), true,
+      'PostgreSQL must still hold the original document')
+    assert.deepEqual(after.payload, groupDocument())
+    assert.ok(after.observedAt.getTime() > seededAt.getTime(), 'observation time advances')
+  },
+)
+
+test(
+  'HAW-89: the request the driver sends on the unchanged branch contains no document',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-request', randomUUID(), track)
+    await seedSnapshot(prisma, workspace, groupDocument(), new Date(Date.UTC(2026, 10, 1)))
+
+    // Capture at the driver adapter, which is where the real SQL and its bound
+    // parameters exist. Interactive transactions issue their statements through
+    // the Transaction object, so that is wrapped too.
+    type Captured = { sql: string; args: readonly unknown[] }
+    const captured: Captured[] = []
+    const note = (query: { sql: string; args: unknown[] }) => {
+      captured.push({ sql: query.sql, args: query.args })
+    }
+    const wrapQueryable = (inner: {
+      provider: string; adapterName: string
+      queryRaw: (q: never) => Promise<unknown>; executeRaw: (q: never) => Promise<number>
+    }) => ({
+      provider: inner.provider, adapterName: inner.adapterName,
+      queryRaw: async (query: never) => { note(query); return inner.queryRaw(query) },
+      executeRaw: async (query: never) => { note(query); return inner.executeRaw(query) },
+    })
+    const inner = createAdapter()
+    const capturingFactory = {
+      provider: inner.provider, adapterName: inner.adapterName,
+      connect: async () => {
+        const adapter = await inner.connect()
+        return {
+          ...wrapQueryable(adapter as never),
+          executeScript: (script: string) => adapter.executeScript(script),
+          getConnectionInfo: () => adapter.getConnectionInfo(),
+          dispose: () => adapter.dispose(),
+          startTransaction: async (level?: never) => {
+            const transaction = await adapter.startTransaction(level)
+            return {
+              ...wrapQueryable(transaction as never),
+              options: transaction.options,
+              commit: () => transaction.commit(),
+              rollback: () => transaction.rollback(),
+            }
+          },
+        }
+      },
+      connectToShadowDb: () => inner.connectToShadowDb(),
+    }
+    const observed = new PrismaClient({ adapter: capturingFactory as never })
+    context.after(async () => { await observed.$disconnect() })
+
+    await snapshotWriter(observed as unknown as PrismaService).saveSnapshot(
+      { id: workspace.tenantId, organizationId: workspace.organizationId },
+      'GROUPS', authoritativeSnapshot(reorderedGroupDocument()),
+    )
+
+    // Validate the capture before trusting its silence: an empty recording must
+    // fail here rather than read as proof that nothing carried a document.
+    assert.ok(captured.length > 0, 'the adapter capture recorded nothing at all')
+    assert.ok(captured.some((entry) => entry.sql.includes('pg_advisory_xact_lock')),
+      'the capture missed the advisory lock, so it is not observing this transaction')
+    const snapshotStatements = captured.filter((entry) => entry.sql.includes('tenant_entra_snapshots'))
+    assert.ok(snapshotStatements.length >= 2, 'the read and the write must both be visible')
+    const writes = snapshotStatements.filter((entry) => /INSERT|UPDATE/i.test(entry.sql))
+    assert.equal(writes.length, 1, 'exactly one write statement')
+    assert.match(writes[0]!.sql, /UPDATE/i)
+    assert.doesNotMatch(writes[0]!.sql, /INSERT/i, 'no insert may be attempted on the unchanged branch')
+    assert.doesNotMatch(writes[0]!.sql, /payload/i, 'the update must not name the document column')
+    assert.doesNotMatch(writes[0]!.sql, /RETURNING[\s\S]*payload/i, 'and must not return the document')
+    for (const entry of captured) {
+      assert.equal(JSON.stringify(entry.args ?? []).includes(SNAPSHOT_SENTINEL), false,
+        `a bound parameter carried the document: ${entry.sql}`)
+    }
+
+    // The contrast case: a changed document does send one, so the assertions
+    // above are capable of failing.
+    captured.length = 0
+    const changed = groupDocument()
+    ;(changed[0] as Record<string, unknown>).displayName = `${SNAPSHOT_SENTINEL}-changed`
+    await snapshotWriter(observed as unknown as PrismaService).saveSnapshot(
+      { id: workspace.tenantId, organizationId: workspace.organizationId },
+      'GROUPS', authoritativeSnapshot(changed),
+    )
+    assert.ok(
+      captured.some((entry) => JSON.stringify(entry.args ?? []).includes(`${SNAPSHOT_SENTINEL}-changed`)),
+      'a changed document must still be transmitted',
+    )
+  },
+)
+
+test(
+  'HAW-89: a true comparison implies real jsonb equality, and numbers always choose the full write',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-direction', randomUUID(), track)
+
+    // Directional: wherever the comparator answers true, PostgreSQL must agree.
+    // The converse is not claimed -- a false answer only keeps today's write.
+    const pairs: Array<[unknown[], unknown[]]> = [
+      [groupDocument(), reorderedGroupDocument()],
+      [[], []],
+      [[{ a: null }], [{ a: null }]],
+      [[{ a: 'x', b: ['y', 'z'] }], [{ b: ['y', 'z'], a: 'x' }]],
+      [[{ a: 'x' }], [{ a: 'y' }]],
+      [[{ a: null }], [{}]],
+      [['a', 'b'], ['b', 'a']],
+      [[{ count: 1 }], [{ count: 1 }]],
+      // Both of these literals are already the same double before any SQL is
+      // sent, so this pair is NOT a retained high-precision database witness --
+      // it only records that a numeric document is refused either way. The
+      // blanket numeric refusal is what carries that claim, and it is tested
+      // directly below.
+      [[{ n: 9007199254740993 }], [{ n: 9007199254740992 }]],
+    ]
+    let agreements = 0
+    for (const [left, right] of pairs) {
+      const [row] = await prisma.$queryRawUnsafe<Array<{ equal: boolean }>>(
+        'SELECT $1::jsonb = $2::jsonb AS equal', JSON.stringify(left), JSON.stringify(right))
+      if (identicalSnapshotDocument(left, right)) {
+        assert.equal(row!.equal, true, `claimed identical but jsonb disagrees: ${JSON.stringify(left)}`)
+        agreements += 1
+      }
+    }
+    assert.ok(agreements >= 4, 'the directional check must actually exercise some true answers')
+
+    // A numeric document is never omitted, however equal it looks.
+    const numeric = () => [{ id: 'group-a', displayName: SNAPSHOT_SENTINEL, memberCount: 3 }]
+    const seeded = await seedSnapshot(prisma, workspace, numeric(), new Date(Date.UTC(2026, 10, 1)))
+    assert.equal(identicalSnapshotDocument(numeric(), numeric()), false)
+    await snapshotWriter(prisma).saveSnapshot(
+      { id: workspace.tenantId, organizationId: workspace.organizationId },
+      'GROUPS', authoritativeSnapshot(numeric()),
+    )
+    assert.equal(await storedJsonbEquals(prisma, seeded.id, numeric()), true,
+      'the full write stores the same value, so correctness is unaffected by the limit')
+  },
+)
+
+test(
+  'HAW-89: a skip then a change keeps the baseline, the evidence and the audit receipt correct',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-sequence', randomUUID(), track)
+    const seededAt = new Date(Date.UTC(2026, 10, 1))
+    const seeded = await seedSnapshot(prisma, workspace, groupDocument(), seededAt)
+    await prisma.tenantAuditReconciliationWork.create({
+      data: {
+        organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+        resourceType: 'GROUPS', requestedRevision: 3n, completedRevision: 0n,
+      },
+    })
+    const owner = await tryAcquireTenantVisitLease(
+      prisma, { organizationId: workspace.organizationId, customerTenantId: workspace.tenantId }, 120_000)
+    assert.ok(owner, 'the physical lease must be acquired for an owned visit')
+    const writer = snapshotWriter(prisma)
+    const scope = { id: workspace.tenantId, organizationId: workspace.organizationId }
+
+    // 1. The skip: observation time advances and the receipt still commits.
+    await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(reorderedGroupDocument()),
+      undefined, false, undefined, undefined, owner, 3n)
+    const afterSkip = await prisma.tenantEntraSnapshot.findUniqueOrThrow({
+      where: { id: seeded.id }, select: { observedAt: true },
+    })
+    assert.ok(afterSkip.observedAt.getTime() > seededAt.getTime())
+    const receipt = await prisma.tenantAuditReconciliationWork.findUniqueOrThrow({
+      where: {
+        organizationId_customerTenantId_resourceType: {
+          organizationId: workspace.organizationId, customerTenantId: workspace.tenantId, resourceType: 'GROUPS',
+        },
+      },
+    })
+    assert.equal(receipt.completedRevision, 3n, 'the exact revision is acknowledged on the skip')
+    assert.equal(receipt.lastCompletedAt?.getTime(), afterSkip.observedAt.getTime(),
+      'the receipt and the observation share one instant')
+    assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: workspace.tenantId } }), 0,
+      'an unchanged document is not a change')
+
+    // 2. The change, compared against the baseline the skip left behind.
+    const changed = groupDocument()
+    ;(changed[1] as Record<string, unknown>).displayName = 'Renamed group'
+    await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(changed))
+    const evidence = await prisma.changeEvidenceEvent.findMany({
+      where: { customerTenantId: workspace.tenantId }, select: { targetId: true, changedFields: true, eventDateTime: true },
+    })
+    assert.equal(evidence.length, 1, 'exactly the one group that changed')
+    assert.equal(evidence[0]!.targetId, 'group-b')
+    assert.deepEqual(evidence[0]!.changedFields, ['displayName'])
+    const afterChange = await prisma.tenantEntraSnapshot.findUniqueOrThrow({
+      where: { id: seeded.id }, select: { payload: true, observedAt: true },
+    })
+    assert.deepEqual(afterChange.payload, changed)
+    assert.ok(afterChange.observedAt.getTime() >= afterSkip.observedAt.getTime())
+
+    // 3. Repeating the same collection adds no further evidence, so the skip
+    //    did not corrupt the baseline the comparison works from. This observes
+    //    the resulting row count only: it does not establish that a duplicate
+    //    insert was attempted and conflicted, and the second pass is itself an
+    //    unchanged document, so it takes the observation-only branch.
+    await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(changed))
+    assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: workspace.tenantId } }), 1)
+  },
+)
+
+test(
+  'HAW-89: the groups definition and enrichment compare-and-set still behave on both outcomes',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-cas', randomUUID(), track)
+    const seeded = await seedSnapshot(prisma, workspace, groupDocument(), new Date(Date.UTC(2026, 10, 1)))
+    const writer = snapshotWriter(prisma)
+    const scope = { id: workspace.tenantId, organizationId: workspace.organizationId }
+    const enriched = [...groupDocument(), { id: 'relationships', owners: ['user-a'], members: ['user-b'] }]
+    const cas = (expected: unknown, next: unknown) => prisma.tenantEntraSnapshot.updateMany({
+      where: {
+        organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+        resourceType: 'GROUPS', payload: { equals: expected as never },
+      },
+      data: { payload: next as never, observedAt: new Date() },
+    })
+
+    // A skipped definition leaves exactly the document the enrichment matches.
+    await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(reorderedGroupDocument()))
+    assert.deepEqual((await cas(groupDocument(), enriched)).count, 1)
+    assert.equal(await storedJsonbEquals(prisma, seeded.id, enriched), true)
+
+    // The same compare-and-set now genuinely fails, so the model is not a stub.
+    assert.deepEqual((await cas(groupDocument(), enriched)).count, 0)
+
+    // A later definition pass sees an enriched baseline, writes in full, and
+    // leaves no stale relationships behind.
+    await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(groupDocument()))
+    assert.equal(await storedJsonbEquals(prisma, seeded.id, groupDocument()), true)
+    assert.deepEqual((await cas(groupDocument(), enriched)).count, 1)
+  },
+)
+
+test(
+  'HAW-89: a replaced row aborts the observation and no staged side effect survives',
+  { skip: !databaseIntegrationEnabled },
+  async (context) => {
+    assertDisposableTestDatabase()
+    const { prisma, track } = physicalContext(context)
+    await prisma.$connect()
+    const workspace = await seedExportWorkspace(prisma, 'haw89-abort', randomUUID(), track)
+    const seededAt = new Date(Date.UTC(2026, 10, 1))
+    const seeded = await seedSnapshot(prisma, workspace, groupDocument(), seededAt)
+    await prisma.tenantAuditReconciliationWork.create({
+      data: {
+        organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+        resourceType: 'GROUPS', requestedRevision: 3n, completedRevision: 0n,
+      },
+    })
+    const owner = await tryAcquireTenantVisitLease(
+      prisma, { organizationId: workspace.organizationId, customerTenantId: workspace.tenantId }, 120_000)
+    assert.ok(owner)
+
+    // A second connection replaces the row this transaction already read. It
+    // deliberately bypasses the resource advisory lock every real writer takes,
+    // purely to force the defensive count-zero refusal; it is NOT a model of a
+    // legitimate concurrent writer, and nothing here qualifies runtime locking.
+    // It is deterministic: the replacement commits before the observation write,
+    // so there is no timing window to wait on.
+    const concurrent = new PrismaClient({ adapter: createAdapter() as never })
+    context.after(async () => { await concurrent.$disconnect() })
+    const strayGroupId = randomUUID()
+
+    await assert.rejects(
+      () => snapshotWriter(prisma).saveSnapshot(
+        { id: workspace.tenantId, organizationId: workspace.organizationId },
+        'GROUPS', authoritativeSnapshot(reorderedGroupDocument()),
+        async (transaction) => {
+          // A resource inventory write that must not survive the abort.
+          await (transaction as { directoryGroup: { create: (a: unknown) => Promise<unknown> } })
+            .directoryGroup.create({
+              data: {
+                organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+                microsoftGroupId: strayGroupId, displayName: 'Staged and rolled back',
+              },
+            })
+          await concurrent.tenantEntraSnapshot.delete({ where: { id: seeded.id } })
+          await concurrent.tenantEntraSnapshot.create({
+            data: {
+              organizationId: workspace.organizationId, customerTenantId: workspace.tenantId,
+              resourceType: 'GROUPS', payload: groupDocument() as never, observedAt: seededAt,
+            },
+          })
+        },
+        false, undefined, undefined, owner, 3n,
+      ),
+      /SNAPSHOT_UNCHANGED_OBSERVATION_NOT_ONE_ROW:GROUPS:0/,
+    )
+
+    // The successor row is untouched, and every staged effect is gone.
+    const successor = await prisma.tenantEntraSnapshot.findUniqueOrThrow({
+      where: { customerTenantId_resourceType: { customerTenantId: workspace.tenantId, resourceType: 'GROUPS' } },
+      select: { id: true, observedAt: true },
+    })
+    assert.notEqual(successor.id, seeded.id, 'the replacement really did take effect')
+    assert.equal(successor.observedAt.getTime(), seededAt.getTime(), 'and was never observed by the aborted write')
+    assert.equal(await storedJsonbEquals(prisma, successor.id, groupDocument()), true,
+      'the successor keeps its own document, which the aborted write never touched')
+    assert.equal(await prisma.directoryGroup.count({ where: { microsoftGroupId: strayGroupId } }), 0,
+      'the staged inventory write rolled back')
+    const receipt = await prisma.tenantAuditReconciliationWork.findUniqueOrThrow({
+      where: {
+        organizationId_customerTenantId_resourceType: {
+          organizationId: workspace.organizationId, customerTenantId: workspace.tenantId, resourceType: 'GROUPS',
+        },
+      },
+    })
+    assert.equal(receipt.completedRevision, 0n, 'no receipt escaped the rollback')
   },
 )
