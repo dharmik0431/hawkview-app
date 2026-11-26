@@ -180,9 +180,17 @@ function auditFinding(tenantId: string, event: TenantAuditEvent): TenantAttentio
   return null
 }
 
+/** The recorded timestamp when it is a usable finite measurement, else null.
+ *  The single validator: everything that decides from a recorded time, and
+ *  everything that reports one, resolves it through here, so an output and a
+ *  classification cannot disagree about whether a value was usable. */
+function finiteDate(value: Date | null | undefined): Date | null {
+  return value instanceof Date && Number.isFinite(value.getTime()) ? value : null
+}
+
 /** Serialize a recorded timestamp, or null when it is missing or not finite. */
 function isoTime(value: Date | null | undefined): string | null {
-  return value instanceof Date && Number.isFinite(value.getTime()) ? value.toISOString() : null
+  return finiteDate(value)?.toISOString() ?? null
 }
 
 function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth, 'resourceType' | 'required'> {
@@ -192,7 +200,20 @@ function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth,
   // here. Minimal finiteness guard only: a valid date, including a future
   // one, still serializes exactly as before, because this field reports what
   // was recorded and is not the freshness decision.
-  const base = { lastAttemptAt: isoTime(state.lastAttemptAt), lastSuccessfulAt: isoTime(state.lastSuccessfulAt) }
+  //
+  // ONE validated value, used for both the reported field and every decision
+  // taken from it below. Serializing through `isoTime` while the success
+  // checks re-read the raw `state.lastSuccessfulAt` is what let the two
+  // disagree: every Date object is truthy whatever its validity, so the
+  // missing-success branch was skipped, and `NaN > agingMs` is false, so the
+  // stale branch was skipped too. An invalid SUCCEEDED success therefore
+  // reached `SUCCESS` while reporting `lastSuccessfulAt: null` - a row
+  // claiming a completion it could not name, counted among the successful
+  // resources, absent from `data.issues`, and able to carry `data.status` to
+  // COMPLETE. Deriving the field FROM this value makes that divergence
+  // unrepresentable rather than merely fixed in two places.
+  const recordedSuccessAt = finiteDate(state.lastSuccessfulAt)
+  const base = { lastAttemptAt: isoTime(state.lastAttemptAt), lastSuccessfulAt: recordedSuccessAt?.toISOString() ?? null }
   const authFailure = state.lastErrorCode === '401' || state.lastErrorCode === '403' || state.lastErrorCode === 'MICROSOFT_PERMISSION_REQUIRED' || /unauthorized|forbidden|permission|consent/i.test(state.lastErrorMessage ?? '')
   if (state.status === 'FAILED' && retryableSyncState(state) && state.consecutiveFailures < 3) return { ...base, classification: 'PENDING', reasonCode: state.lastErrorCode, message: sanitizeHealthMessage(state.lastErrorMessage) }
   if (state.status === 'FAILED') return { ...base, classification: authFailure ? 'PERMISSION_REQUIRED' : 'FAILED', reasonCode: state.lastErrorCode ?? 'collector-failed', message: sanitizeHealthMessage(state.lastErrorMessage) }
@@ -203,8 +224,14 @@ function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth,
   // being presented as a stale success.
   if (state.status === 'RUNNING' && qualifiedFallbackSuccessAt(state, now) !== null) return { ...base, classification: 'STALE', reasonCode: 'sign-in-fallback-stale', message: 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' }
   if (state.status === 'RUNNING') return { ...base, classification: 'PENDING', reasonCode: 'collector-running', message: 'Collection is in progress.' }
-  if (!state.lastSuccessfulAt) return { ...base, classification: 'NOT_CONFIGURED', reasonCode: 'never-succeeded', message: 'The collector has not completed successfully.' }
-  const age = now.getTime() - state.lastSuccessfulAt.getTime()
+  // An unusable recorded success is treated exactly as an absent one: there is
+  // no successful completion this projection can stand behind. That keeps the
+  // row out of the successful set and inside `pending`, so it is reported
+  // rather than silently dropped, and it needs no new vocabulary - the
+  // classification union has no "unmeasurable" member and inventing one would
+  // be a far larger change than this defect warrants.
+  if (!recordedSuccessAt) return { ...base, classification: 'NOT_CONFIGURED', reasonCode: 'never-succeeded', message: 'The collector has not completed successfully.' }
+  const age = now.getTime() - recordedSuccessAt.getTime()
   if (age > freshnessWindow(state.resourceType).agingMs) return { ...base, classification: 'STALE', reasonCode: 'stale-success', message: 'The last successful collection is outside its scheduled freshness window.' }
   return { ...base, classification: 'SUCCESS', reasonCode: null, message: null }
 }
