@@ -22,6 +22,7 @@ import {
 import { TenantVisitLeaseLostError } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, releaseTenantVisitLease, renewTenantVisitLease, tryAcquireTenantVisitLease } from './tenant-visit-lease-store.js'
 import { M365AuditBudgetError, M365ManagementActivityService } from './m365-management-activity.service.js'
+import { qualifiedBudgetRefusal } from './m365-audit-refusal-observation.js'
 import { createTenantVisitLifecycleStore } from './tenant-visit-lifecycle-store.js'
 import { assertTenantVisitLifecycleActive, runTenantVisitLifecycle } from './tenant-visit-lifecycle.js'
 import { AUDIT_RECONCILIATION_RESOURCES, type AuditReconciliationResource } from './audit-change-reconciliation.js'
@@ -2503,4 +2504,179 @@ test('physical interrupted ordinary GROUPS inventory recovers under a newly acqu
   assert.equal(await isCandidate(true), true,
     'once Exchange read-only is enabled the same row becomes a candidate')
   assert.equal(await isCandidate(false), false, 'and only under the gate')
+})
+
+// ===========================================================================
+// HAW-75 current-attempt budget-refusal observation.
+//
+// PREPARED for the existing registered disposable PostgreSQL phase. These are
+// the behaviours a transaction fake cannot witness: a real token compare-and-set
+// against a concurrent successor, a genuine rollback of the coupled disposition
+// and observation, and the additive nullable column on legacy rows. They are
+// NOT executed locally.
+// ===========================================================================
+
+async function physicalRefusalFixture(context: TestContext, label: string) {
+  assertDisposableTestDatabase()
+  const writer = new PrismaService()
+  const observer = new PrismaService()
+  let organizationId: string | null = null
+  context.after(async () => {
+    try { if (organizationId) await observer.organization.deleteMany({ where: { id: organizationId } }) }
+    finally { await Promise.all([writer.$disconnect(), observer.$disconnect()]) }
+  })
+  await Promise.all([writer.$connect(), observer.$connect()])
+  const organization = await writer.organization.create({
+    data: { name: `HAW-75 ${label} CI`, slug: `haw75-${label}-${randomUUID()}` },
+  })
+  organizationId = organization.id
+  const tenant = await writer.customerTenant.create({
+    data: { organizationId, microsoftTenantId: randomUUID(), status: 'ACTIVE' },
+  })
+  const scope = { organizationId, customerTenantId: tenant.id }
+  return { writer, observer, scope, tenant }
+}
+
+const refusalEnvelope = (token: string, attemptAt: Date, refusal: Record<string, unknown> | null) => ({
+  v: 1, attemptToken: token, attemptAt: attemptAt.toISOString(), refusal,
+})
+
+test('physical HAW-75 legacy null envelope stays valid and reads as unknown', {
+  skip: !registeredCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  const { writer, observer, scope } = await physicalRefusalFixture(context, 'legacy-null')
+  // The additive column must accept an existing row that never carried one.
+  await writer.syncState.create({
+    data: { ...scope, resourceType: 'M365_AUDIT', status: 'RUNNING', lastAttemptAt: new Date() },
+  })
+  const row = await observer.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+  })
+  assert.equal(row.m365AuditAttempt, null, 'legacy rows are null, not an empty object')
+  assert.equal(qualifiedBudgetRefusal(row as never, new Date()), null,
+    'and null is unknown, never a receipt that no budget block exists')
+})
+
+test('physical HAW-75 token compare-and-set refuses a stale attempt and leaves the successor envelope', {
+  skip: !registeredCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  const { writer, observer, scope } = await physicalRefusalFixture(context, 'token-cas')
+  const staleAt = new Date(Date.UTC(2026, 10, 26, 12, 0, 0))
+  const successorAt = new Date(Date.UTC(2026, 10, 26, 12, 5, 0))
+  const staleToken = randomUUID()
+  const successorToken = randomUUID()
+  await writer.syncState.create({
+    data: {
+      ...scope, resourceType: 'M365_AUDIT', status: 'RUNNING', lastAttemptAt: successorAt,
+      m365AuditAttempt: refusalEnvelope(successorToken, successorAt, null) as never,
+    },
+  })
+  // A stale worker's scoped compare-and-set must match nothing.
+  const stale = await writer.syncState.updateMany({
+    where: {
+      ...scope, resourceType: 'M365_AUDIT', lastAttemptAt: staleAt,
+      m365AuditAttempt: { path: ['attemptToken'], equals: staleToken },
+    },
+    data: { m365AuditAttempt: refusalEnvelope(staleToken, staleAt, {
+      attemptToken: staleToken, path: 'content', constraint: 'daily_tenant_bytes',
+      observedAt: staleAt.toISOString(), retryNotBefore: new Date(Date.UTC(2026, 10, 27)).toISOString(),
+    }) as never },
+  })
+  assert.equal(stale.count, 0, 'zero rows: the stale attempt is fenced out')
+  const after = await observer.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+  })
+  assert.equal((after.m365AuditAttempt as never as { attemptToken: string }).attemptToken, successorToken)
+  assert.equal((after.m365AuditAttempt as never as { refusal: unknown }).refusal, null,
+    'the successor envelope is intact and still refusal-free')
+  // The successor's own compare-and-set does match.
+  const current = await writer.syncState.updateMany({
+    where: {
+      ...scope, resourceType: 'M365_AUDIT', lastAttemptAt: successorAt,
+      m365AuditAttempt: { path: ['attemptToken'], equals: successorToken },
+    },
+    data: { m365AuditAttempt: refusalEnvelope(successorToken, successorAt, {
+      attemptToken: successorToken, path: 'discovery', constraint: 'monthly_deployment_records',
+      observedAt: successorAt.toISOString(), retryNotBefore: new Date(Date.UTC(2026, 11, 1)).toISOString(),
+    }) as never },
+  })
+  assert.equal(current.count, 1)
+})
+
+test('physical HAW-75 coupled disposition and observation roll back together', {
+  skip: !registeredCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  const { writer, observer, scope } = await physicalRefusalFixture(context, 'coupled-rollback')
+  const attemptAt = new Date(Date.UTC(2026, 10, 26, 13, 0, 0))
+  const token = randomUUID()
+  await writer.syncState.create({
+    data: {
+      ...scope, resourceType: 'M365_AUDIT', status: 'RUNNING', lastAttemptAt: attemptAt,
+      m365AuditAttempt: refusalEnvelope(token, attemptAt, null) as never,
+    },
+  })
+  const content = await writer.m365ActivityContent.create({
+    data: {
+      ...scope, contentType: 'Audit.Exchange', microsoftContentId: randomUUID(),
+      contentUri: 'https://manage.office.com/synthetic-content', status: 'PROCESSING',
+      ledgerExpiresAt: new Date(Date.now() + 86_400_000),
+    },
+  })
+  // Both writes in one transaction, then an abort: neither may survive.
+  await assert.rejects(() => writer.$transaction(async transaction => {
+    await transaction.m365ActivityContent.updateMany({
+      where: { id: content.id, ...scope }, data: { status: 'RETRY' },
+    })
+    await transaction.syncState.updateMany({
+      where: {
+        ...scope, resourceType: 'M365_AUDIT', lastAttemptAt: attemptAt,
+        m365AuditAttempt: { path: ['attemptToken'], equals: token },
+      },
+      data: { m365AuditAttempt: refusalEnvelope(token, attemptAt, {
+        attemptToken: token, path: 'content', constraint: 'daily_deployment_bytes',
+        observedAt: attemptAt.toISOString(), retryNotBefore: new Date(Date.UTC(2026, 10, 27)).toISOString(),
+      }) as never },
+    })
+    throw new Error('synthetic abort after both writes')
+  }), /synthetic abort/)
+  const [afterContent, afterState] = await Promise.all([
+    observer.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } }),
+    observer.syncState.findUniqueOrThrow({
+      where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+    }),
+  ])
+  assert.equal(afterContent.status, 'PROCESSING', 'the disposition rolled back')
+  assert.equal((afterState.m365AuditAttempt as never as { refusal: unknown }).refusal, null,
+    'and so did the observation')
+})
+
+test('physical HAW-75 a stored monthly boundary survives a UTC day rollover for its own attempt', {
+  skip: !registeredCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  const { writer, observer, scope } = await physicalRefusalFixture(context, 'monthly-rollover')
+  const attemptAt = new Date(Date.UTC(2026, 10, 26, 23, 50, 0))
+  const token = randomUUID()
+  await writer.syncState.create({
+    data: {
+      ...scope, resourceType: 'M365_AUDIT', status: 'RUNNING',
+      lastErrorCode: 'm365-audit-budget-exhausted', lastAttemptAt: attemptAt,
+      m365AuditAttempt: refusalEnvelope(token, attemptAt, {
+        attemptToken: token, path: 'discovery', constraint: 'monthly_tenant_bytes',
+        observedAt: attemptAt.toISOString(), retryNotBefore: new Date(Date.UTC(2026, 11, 1)).toISOString(),
+      }) as never,
+    },
+  })
+  const row = await observer.syncState.findUniqueOrThrow({
+    where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+  })
+  // Read on the following UTC day: the detail is still usable, because nothing
+  // in the reader consults a usage date.
+  const nextDay = qualifiedBudgetRefusal(row as never, new Date(Date.UTC(2026, 10, 27, 9, 0, 0)))
+  assert.equal(nextDay?.constraint, 'monthly_tenant_bytes')
+  assert.equal(nextDay?.retryNotBefore, new Date(Date.UTC(2026, 11, 1)).toISOString())
+  // Once the boundary itself arrives, the detail is withheld -- without
+  // inventing success anywhere.
+  assert.equal(qualifiedBudgetRefusal(row as never, new Date(Date.UTC(2026, 11, 1))), null)
+  assert.equal(row.lastSuccessfulAt, null)
+  assert.equal(row.status, 'RUNNING')
 })

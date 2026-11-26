@@ -895,6 +895,12 @@ model SyncState {
   roleCompleteCheckedAt DateTime? @map("role_complete_checked_at") @db.Timestamptz(6)
   roleCompleteDigest String? @map("role_complete_digest") @db.VarChar(64)
   roleCompleteCount Int? @map("role_complete_count")
+  // HAW-75 bounded current-attempt envelope, read only for M365_AUDIT. Holds a
+  // durable attempt token, the attempt time, and at most ONE closed budget
+  // refusal observation for that same attempt. NULL legacy rows are unknown,
+  // never a receipt that no budget block exists. No prose, provider identifier
+  // or quota value is stored here; see m365-audit-refusal-observation.ts.
+  m365AuditAttempt Json? @map("m365_audit_attempt") @db.JsonB
 
 }
 

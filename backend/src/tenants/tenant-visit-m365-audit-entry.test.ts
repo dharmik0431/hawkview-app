@@ -33,7 +33,7 @@ for (const lostAt of ['initial-running', 'interrupted-recovery'] as const) {
         }
         assert.fail(`Unexpected lease query: ${sql}`)
       },
-      syncState: { upsert: async () => { writes.push('RUNNING') } },
+      syncState: { upsert: async () => { writes.push('RUNNING') }, updateMany: async () => ({ count: 1 }) },
       m365ActivityContent: { updateMany: async () => { writes.push('recovery') } },
     }
     const prisma: any = {
@@ -42,6 +42,8 @@ for (const lostAt of ['initial-running', 'interrupted-recovery'] as const) {
         findUnique: async () => null,
         upsert: async () => { writes.push('RUNNING') },
         update: async () => { writes.push('FAILED') },
+        // A terminal failure clears this attempt observation, token-guarded.
+        updateMany: async () => ({ count: 1 }),
       },
       m365ActivityContent: {
         count: async () => 1,
@@ -84,6 +86,7 @@ for (const loseAtTerminal of [true, false]) {
         assert.fail(`Unexpected lease query: ${sql}`)
       },
       syncState: {
+        updateMany: async () => ({ count: 1 }),
         upsert: async () => { writes.push('tx:RUNNING') },
         update: async () => { writes.push('tx:terminal-state') },
       },

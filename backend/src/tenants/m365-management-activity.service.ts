@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { retryAfterMilliseconds } from '../microsoft/microsoft-request.js'
 import { assertTenantVisitLifecycleActive } from './tenant-visit-lifecycle.js'
 import { deriveAuditReconciliationResources } from './audit-change-reconciliation.js'
@@ -15,6 +15,10 @@ import { classifyEvidenceTrust } from '../changes/evidence-trust-catalog.js'
 import type { Prisma } from '../generated/prisma/client.js'
 import { TenantVisitLeaseLostError, tenantVisitLeaseLoss } from './tenant-visit-lease-error.js'
 import { assertTenantVisitLeaseOwner, type TenantVisitLeaseOwner } from './tenant-visit-lease-store.js'
+import {
+  beginAttemptEnvelope, envelopeWithRefusal, selectBudgetConstraint,
+  type M365AuditBudgetConstraint, type M365AuditRefusalPath,
+} from './m365-audit-refusal-observation.js'
 
 export { classifyManagementActivity, managementActivityRoleFromEvidence } from '../changes/m365-activity-classification.js'
 
@@ -106,9 +110,29 @@ export class M365ActivityDeadlineError extends Error {
 }
 
 export class M365AuditBudgetError extends Error {
-  constructor(message: string, readonly retryAt = nextUtcUsageDate()) {
+  constructor(
+    message: string,
+    readonly retryAt = nextUtcUsageDate(),
+    /** The representative exceeded cap, in the order documented by
+     *  `M365_AUDIT_BUDGET_CONSTRAINTS`. `null` when the caller did not prove
+     *  one: a historical or hand-constructed error must never yield a
+     *  fabricated observation. */
+    readonly constraint: M365AuditBudgetConstraint | null = null,
+  ) {
     super(message)
   }
+}
+
+/** One real attempt's identity. The token, not the clock, is the fence: two
+ *  attempts can share a millisecond. */
+type M365AuditAttempt = { token: string; attemptAt: Date }
+
+/** A newer attempt already owns this resource's envelope, so the worker that
+ *  raised this is stale. Raised INSIDE a transaction so the coupled write rolls
+ *  back with it: a stale attempt must never overwrite a successor's metadata,
+ *  and its own disposition must not be reported as committed. */
+export class M365AuditAttemptSupersededError extends Error {
+  constructor() { super('M365_AUDIT_ATTEMPT_SUPERSEDED') }
 }
 
 export function m365AuditUsageDate(value = new Date()) {
@@ -952,6 +976,50 @@ export class M365ManagementActivityService {
     return duplicates
   }
 
+  /**
+   * Record this attempt's LATEST budget refusal, as a compare-and-set on the
+   * attempt token and the captured attempt time.
+   *
+   * Writes nothing when the error proved no specific cap, so a historical or
+   * hand-constructed error yields no fabricated detail. Reports a zero-row
+   * compare-and-set instead of retrying or upserting, so the caller fails
+   * closed. Takes no budget lock: the refusal was already decided by the
+   * existing accounting, and recording it needs scope, attempt and ownership
+   * coherence rather than a new shared critical section.
+   */
+  private async recordBudgetRefusal(
+    database: Pick<Prisma.TransactionClient, 'syncState'>,
+    tenant: TenantTarget,
+    attempt: M365AuditAttempt,
+    path: M365AuditRefusalPath,
+    error: M365AuditBudgetError,
+    observedAt: Date,
+  ): Promise<'recorded' | 'nothing-to-record' | 'superseded'> {
+    if (error.constraint === null) return 'nothing-to-record'
+    const envelope = envelopeWithRefusal(
+      beginAttemptEnvelope(attempt.token, attempt.attemptAt),
+      {
+        attemptToken: attempt.token,
+        path,
+        constraint: error.constraint,
+        observedAt,
+        retryNotBefore: error.retryAt,
+      },
+    )
+    if (!envelope) return 'nothing-to-record'
+    const updated = await database.syncState.updateMany({
+      where: {
+        organizationId: tenant.organizationId,
+        customerTenantId: tenant.id,
+        resourceType: 'M365_AUDIT',
+        lastAttemptAt: attempt.attemptAt,
+        m365AuditAttempt: { path: ['attemptToken'], equals: attempt.token },
+      },
+      data: { m365AuditAttempt: envelope as never },
+    })
+    return updated.count === 1 ? 'recorded' : 'superseded'
+  }
+
   private async reserveDailyUsage(
     tenant: TenantTarget,
     usage: { bytes?: number; records?: number; blobs?: number },
@@ -1023,20 +1091,36 @@ export class M365ManagementActivityService {
       const tenantMonthlyRecords = tenantMonthlyUsage._sum.recordsStored ?? 0
       const deploymentMonthlyBytes = deploymentMonthlyUsage._sum.downloadedBytes ?? 0n
       const deploymentMonthlyRecords = deploymentMonthlyUsage._sum.recordsStored ?? 0
+      // The same eight comparisons, now also recorded one by one so a single
+      // closed identifier can be reported. The aggregates below are derived
+      // from exactly these booleans, so the admission arithmetic, the thrown
+      // message and the retry boundary -- including monthly-over-daily
+      // precedence -- are unchanged.
+      const exceeded: Record<M365AuditBudgetConstraint, boolean> = {
+        monthly_tenant_bytes: tenantMonthlyBytes + bytes > limits.tenantMonthlyBytes,
+        monthly_deployment_bytes: deploymentMonthlyBytes + bytes > limits.deploymentMonthlyBytes,
+        monthly_tenant_records: tenantMonthlyRecords + records > limits.tenantMonthlyRecords,
+        monthly_deployment_records: deploymentMonthlyRecords + records > limits.deploymentMonthlyRecords,
+        daily_tenant_bytes: tenantBytes + bytes > limits.tenantBytes,
+        daily_deployment_bytes: deploymentBytes + bytes > limits.deploymentBytes,
+        daily_tenant_records: tenantRecords + records > limits.tenantRecords,
+        daily_deployment_records: deploymentRecords + records > limits.deploymentRecords,
+      }
       const dailyExceeded =
-        tenantBytes + bytes > limits.tenantBytes ||
-        deploymentBytes + bytes > limits.deploymentBytes ||
-        tenantRecords + records > limits.tenantRecords ||
-        deploymentRecords + records > limits.deploymentRecords
+        exceeded.daily_tenant_bytes ||
+        exceeded.daily_deployment_bytes ||
+        exceeded.daily_tenant_records ||
+        exceeded.daily_deployment_records
       const monthlyExceeded =
-        tenantMonthlyBytes + bytes > limits.tenantMonthlyBytes ||
-        deploymentMonthlyBytes + bytes > limits.deploymentMonthlyBytes ||
-        tenantMonthlyRecords + records > limits.tenantMonthlyRecords ||
-        deploymentMonthlyRecords + records > limits.deploymentMonthlyRecords
+        exceeded.monthly_tenant_bytes ||
+        exceeded.monthly_deployment_bytes ||
+        exceeded.monthly_tenant_records ||
+        exceeded.monthly_deployment_records
       if (dailyExceeded || monthlyExceeded) {
         throw new M365AuditBudgetError(
           `Microsoft 365 audit ${monthlyExceeded ? 'monthly' : 'daily'} cost budget is exhausted; ingestion will resume after the next UTC ${monthlyExceeded ? 'month' : 'day'} boundary.`,
-          monthlyExceeded ? nextUtcMonthDate(now) : nextUtcUsageDate(now)
+          monthlyExceeded ? nextUtcMonthDate(now) : nextUtcUsageDate(now),
+          selectBudgetConstraint(exceeded),
         )
       }
     await transaction.m365AuditDailyUsage.upsert({
@@ -1087,6 +1171,7 @@ export class M365ManagementActivityService {
     content: any,
     deadlineAt: number,
     visitOwner?: TenantVisitLeaseOwner,
+    attempt?: M365AuditAttempt,
   ) {
     if (visitOwner && (
       visitOwner.organizationId !== tenant.organizationId ||
@@ -1404,16 +1489,37 @@ export class M365ManagementActivityService {
             : {}),
         },
       } satisfies Prisma.M365ActivityContentUpdateManyArgs
+      // HAW-75: a budget refusal's observation commits with the exact content
+      // disposition it belongs to, or neither commits. An ordinary provider
+      // retry takes this same path and records nothing. The ownerless
+      // compatibility path has no lease to fence it, so the attempt token is
+      // its fence and it needs its own transaction for the same atomicity.
+      const coupleObservation = async (
+        transaction: Prisma.TransactionClient,
+        applied: { count: number },
+      ) => {
+        if (applied.count !== 1 || !budgetLimited || !attempt) return
+        const outcome = await this.recordBudgetRefusal(
+          transaction, tenant, attempt, 'content', error, new Date(),
+        )
+        if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+      }
       if (visitOwner) {
         const disposition = await this.prisma.$transaction(async (transaction) => {
           await assertTenantVisitLeaseOwner(transaction, visitOwner)
-          return transaction.m365ActivityContent.updateMany(failureDisposition)
+          const applied = await transaction.m365ActivityContent.updateMany(failureDisposition)
+          await coupleObservation(transaction, applied)
+          return applied
         })
         // A later claim (or completion) must not inherit this attempt's
         // provider failure, even if an ownerless writer changed the row.
         if (disposition.count !== 1) throw new TenantVisitLeaseLostError()
       } else {
-        await this.prisma.m365ActivityContent.updateMany(failureDisposition)
+        await this.prisma.$transaction(async (transaction) => {
+          const applied = await transaction.m365ActivityContent.updateMany(failureDisposition)
+          await coupleObservation(transaction, applied)
+          return applied
+        })
       }
       if (error instanceof ManagementActivityHttpError && [401, 403].includes(error.status)) throw error
       if (permanent) {
@@ -1466,6 +1572,13 @@ export class M365ManagementActivityService {
       now.getTime() - state.lastSuccessfulAt.getTime() < pollMinutes * 60_000
     ) return [] as ManagementActivityChange[]
 
+    // HAW-75: one fresh identity per real attempt, minted here -- after the
+    // early fresh/no-work return, which therefore leaves any prior observation
+    // untouched. `attemptAt` is the very value written to `lastAttemptAt`, so
+    // the reader can bind the two. Installing the envelope here atomically
+    // supersedes the previous attempt's observation.
+    const attempt: M365AuditAttempt = { token: randomUUID(), attemptAt: now }
+    const freshEnvelope = beginAttemptEnvelope(attempt.token, attempt.attemptAt)
     const runningStateWrite = {
       where: {
         customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
@@ -1476,8 +1589,12 @@ export class M365ManagementActivityService {
         resourceType: 'M365_AUDIT',
         status: 'RUNNING',
         lastAttemptAt: now,
+        m365AuditAttempt: freshEnvelope as never,
       },
-      update: { status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null },
+      update: {
+        status: 'RUNNING', lastAttemptAt: now, lastErrorCode: null, lastErrorMessage: null,
+        m365AuditAttempt: freshEnvelope as never,
+      },
     } as const
     if (visitOwner) {
       await this.prisma.$transaction(async (transaction) => {
@@ -1572,6 +1689,7 @@ export class M365ManagementActivityService {
           content,
           processingDeadline,
           visitOwner,
+          attempt,
         )))
       }
       const [pendingBacklog, processingBacklog, retryBacklog, failedBacklog] = await Promise.all([
@@ -1624,6 +1742,22 @@ export class M365ManagementActivityService {
             usageDate: { lt: new Date(m365AuditUsageDate(now).getTime() - 35 * 24 * 60 * 60 * 1000) },
           },
         }),
+        // HAW-75: a terminal success or a non-budget failure clears THIS
+        // attempt's observation, compare-and-set on its own token so a stale
+        // worker can never erase a successor's envelope. The ordinary backlog
+        // outcome deliberately preserves it -- that is the case the reader needs.
+        ...(failedBacklog > 0 || failedSubscriptions.length > 0 || blocked === 0
+          ? [() => database.syncState.updateMany({
+              where: {
+                organizationId: tenant.organizationId,
+                customerTenantId: tenant.id,
+                resourceType: 'M365_AUDIT' as const,
+                lastAttemptAt: attempt.attemptAt,
+                m365AuditAttempt: { path: ['attemptToken'], equals: attempt.token },
+              },
+              data: { m365AuditAttempt: freshEnvelope as never },
+            })]
+          : []),
         () => database.syncState.update({
           where: {
             customerTenantId_resourceType: { customerTenantId: tenant.id, resourceType: 'M365_AUDIT' },
@@ -1657,7 +1791,7 @@ export class M365ManagementActivityService {
                 consecutiveFailures: 0,
               },
         }),
-      ] as const
+      ]
       if (visitOwner) {
         await this.prisma.$transaction(async (transaction) => {
           await assertTenantVisitLeaseOwner(transaction, visitOwner)
@@ -1670,6 +1804,16 @@ export class M365ManagementActivityService {
     } catch (error) {
       const lost = visitOwner && tenantVisitLeaseLoss(error)
       if (lost) throw lost
+      // HAW-75: a newer attempt owns the envelope, so this worker is stale. Its
+      // coupled writes already rolled back; it records nothing and leaves the
+      // successor's status, metadata and success timestamp untouched.
+      if (error instanceof M365AuditAttemptSupersededError) {
+        this.logger.warn(JSON.stringify({
+          event: 'm365_audit_attempt', phase: 'INGESTION', outcome: 'SUPERSEDED',
+          reasonCode: 'ATTEMPT_SUPERSEDED',
+        }))
+        return [] as ManagementActivityChange[]
+      }
       if (error instanceof M365AuditBudgetError) {
         const budgetStateWrite = {
           where: {
@@ -1682,13 +1826,28 @@ export class M365ManagementActivityService {
             consecutiveFailures: 0,
           },
         } as const
-        if (visitOwner) {
-          await this.prisma.$transaction(async (transaction) => {
-            await assertTenantVisitLeaseOwner(transaction, visitOwner)
-            await transaction.syncState.update(budgetStateWrite)
-          })
-        } else {
-          await this.prisma.syncState.update(budgetStateWrite)
+        // HAW-75: the existing RUNNING/budget-exhausted write and this
+        // attempt's observation commit together, or neither does. The ownerless
+        // path becomes transactional for exactly that reason.
+        const writeBudgetState = async (transaction: Prisma.TransactionClient) => {
+          await transaction.syncState.update(budgetStateWrite)
+          const outcome = await this.recordBudgetRefusal(
+            transaction, tenant, attempt, 'discovery', error, new Date(),
+          )
+          if (outcome === 'superseded') throw new M365AuditAttemptSupersededError()
+        }
+        try {
+          if (visitOwner) {
+            await this.prisma.$transaction(async (transaction) => {
+              await assertTenantVisitLeaseOwner(transaction, visitOwner)
+              await writeBudgetState(transaction)
+            })
+          } else {
+            await this.prisma.$transaction(writeBudgetState)
+          }
+        } catch (writeError) {
+          // A stale attempt writes nothing at all, status included.
+          if (!(writeError instanceof M365AuditAttemptSupersededError)) throw writeError
         }
         return [] as ManagementActivityChange[]
       }

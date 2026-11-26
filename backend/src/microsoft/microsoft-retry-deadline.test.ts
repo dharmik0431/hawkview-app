@@ -187,6 +187,8 @@ function ledger() {
       findUnique: async () => state,
       upsert: async ({ update }: any) => Object.assign(state, update),
       update: async ({ data }: any) => Object.assign(state, data),
+      // A terminal state clears this attempt observation, token-guarded.
+      updateMany: async () => ({ count: 1 }),
     },
     m365ActivityContent: {
       count: async ({ where }: any) => rows.filter(row => matches(row, where)).length,
@@ -206,7 +208,9 @@ function ledger() {
     m365ActivitySubscription: { findMany: async () => [] },
     m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
-    $transaction: async (operations: any[]) => Promise.all(operations),
+    // The ownerless failure disposition now uses the interactive form, so this
+    // fake accepts both shapes.
+    $transaction: async (work: any) => Array.isArray(work) ? Promise.all(work) : work(prisma),
   }
   const { service } = management(prisma)
   service.microsoftConsent = { getTenantManagementActivityContext: async () => ({ accessToken: 'synthetic-token', publisherIdentifier: publisher }) }
