@@ -4,6 +4,7 @@ import { classifyEvidence, isKnownMicrosoftSystemEvent, PRIMARY_CHANGE_CLASSIFIC
 import type { PilotEvidenceProjection } from './collection-readiness.js'
 import type { MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { LEGACY_SYNC_FRESHNESS_WINDOWS, resourceFreshnessWindow as freshnessWindow } from './sync-freshness-policy.js'
+import { isLimitedSignInFallbackCode, recordedTimeAtOrBefore } from './sync-outcome-projection.js'
 import type { AuditEvidenceReason, AuditEvidenceStatus } from './tenant-health-audit-evidence.js'
 
 /**
@@ -121,17 +122,37 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
 export const TENANT_HEALTH_FRESHNESS = LEGACY_SYNC_FRESHNESS_WINDOWS
 
 function mfaCoverage(payload: unknown) { if (!Array.isArray(payload)) return null; const rows = payload.filter((row): row is { isMfaRegistered: boolean } => typeof row === 'object' && row !== null && typeof (row as { isMfaRegistered?: unknown }).isMfaRegistered === 'boolean'); return rows.length ? Math.round((rows.filter((row) => row.isMfaRegistered).length / rows.length) * 100) : null }
-function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => Boolean(d)).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
+/** Latest of the supplied timestamps, ignoring missing and non-finite ones.
+ *  Truthiness alone admitted an invalid Date, whose `getTime()` is NaN, so it
+ *  neither sorted nor compared and could end up first — and `toISOString()`
+ *  then threw RangeError, aborting the whole projection. One lone invalid row,
+ *  or an invalid row ordered first, was enough. */
+function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => d instanceof Date && Number.isFinite(d.getTime())).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
 function securityUrl(tenantId: string, view: string) { return `/tenants/${encodeURIComponent(tenantId)}?entraTab=security&securityView=${view}` }
 function retryableSyncState(state: SyncState | undefined) { return Boolean(state && ['MICROSOFT_TRANSIENT', 'MICROSOFT_THROTTLED', 'MICROSOFT_NETWORK_TIMEOUT', 'MICROSOFT_DELTA_RESET_REQUIRED', 'MICROSOFT_PARTIAL_RESPONSE'].includes(state.lastErrorCode ?? '')) }
-function isSignInFallback(state: SyncState | undefined) { return Boolean(state?.resourceType === 'SIGN_INS' && /sign-ins-.*fallback-active/.test(state.lastErrorCode ?? '')) }
+/** ATTRIBUTION only: the collector reported one of the six recognized limited
+ *  sign-in return paths. Says nothing about whether that evidence is current,
+ *  which is why it stays separate from the qualification below. */
+function isSignInFallback(state: SyncState | undefined) { return Boolean(state?.resourceType === 'SIGN_INS' && isLimitedSignInFallbackCode(state.lastErrorCode)) }
+/**
+ * QUALIFIED fallback evidence: a recognized code AND a recorded success that is
+ * finite and at or before `now`, in epoch milliseconds. Null when the evidence
+ * cannot be measured.
+ *
+ * The previous code accepted `state.lastSuccessfulAt` on truthiness, so an
+ * invalid Date passed, and compared `now - success <= aging`, which is true for
+ * any FUTURE success. Both produced qualified-looking fallback evidence from a
+ * timestamp that measures nothing.
+ */
+function qualifiedFallbackSuccessAt(state: SyncState | undefined, now: Date): number | null {
+  return isSignInFallback(state) ? recordedTimeAtOrBefore(state?.lastSuccessfulAt, now) : null
+}
 function currentLimitedFallback(state: SyncState | undefined, now: Date) {
-  return Boolean(
-    state?.status === 'RUNNING' &&
-    state.lastSuccessfulAt &&
-    isSignInFallback(state) &&
-    now.getTime() - state.lastSuccessfulAt.getTime() <= freshnessWindow('SIGN_INS').agingMs,
-  )
+  const successAt = qualifiedFallbackSuccessAt(state, now)
+  // Inclusive [now - aging, now]: exactly 0 and exactly the aging bound are
+  // current; invalid, missing or future success is not current.
+  return successAt !== null && state?.status === 'RUNNING' &&
+    now.getTime() - successAt <= freshnessWindow('SIGN_INS').agingMs
 }
 function syncAction(tenantId: string, resourceType: string, state?: SyncState) { const id = encodeURIComponent(tenantId); if (retryableSyncState(state)) return { label: 'View synchronization', url: `/tenants/${id}/settings?section=sync&resource=${encodeURIComponent(resourceType)}` }; const actions: Record<string, { label: string; url: string }> = { AUTH_REGISTRATIONS: { label: 'Review authentication', url: securityUrl(tenantId, 'auth') }, CONDITIONAL_ACCESS: { label: 'Review policies', url: securityUrl(tenantId, 'policies') }, SIGN_INS: { label: 'Review sign-ins', url: securityUrl(tenantId, 'sign-ins') }, GROUPS: { label: 'Review groups', url: `/tenants/${id}?entraTab=groups` }, M365_AUDIT: { label: 'Review audit synchronization', url: `/tenants/${id}/settings?section=sync&resource=M365_AUDIT` } }; return actions[resourceType] ?? { label: 'Investigate', url: `/tenants/${id}/settings` } }
 function objectValueRaw(value: unknown, key: string): unknown { return typeof value === 'object' && value !== null ? (value as Record<string, unknown>)[key] : null }
@@ -159,17 +180,58 @@ function auditFinding(tenantId: string, event: TenantAuditEvent): TenantAttentio
   return null
 }
 
+/** The recorded timestamp when it is a usable finite measurement, else null.
+ *  The single validator: everything that decides from a recorded time, and
+ *  everything that reports one, resolves it through here, so an output and a
+ *  classification cannot disagree about whether a value was usable. */
+function finiteDate(value: Date | null | undefined): Date | null {
+  return value instanceof Date && Number.isFinite(value.getTime()) ? value : null
+}
+
+/** Serialize a recorded timestamp, or null when it is missing or not finite. */
+function isoTime(value: Date | null | undefined): string | null {
+  return finiteDate(value)?.toISOString() ?? null
+}
+
 function classify(state: SyncState | undefined, now: Date): Omit<ResourceHealth, 'resourceType' | 'required'> {
   if (!state) return { classification: 'NOT_CONFIGURED', reasonCode: 'collector-not-configured', message: 'No collector state has been recorded.', lastAttemptAt: null, lastSuccessfulAt: null }
-  const base = { lastAttemptAt: state.lastAttemptAt?.toISOString() ?? null, lastSuccessfulAt: state.lastSuccessfulAt?.toISOString() ?? null }
+  // `Date.prototype.toISOString` THROWS on an invalid Date, so a single
+  // malformed stored timestamp used to abort the whole health projection
+  // here. Minimal finiteness guard only: a valid date, including a future
+  // one, still serializes exactly as before, because this field reports what
+  // was recorded and is not the freshness decision.
+  //
+  // ONE validated value, used for both the reported field and every decision
+  // taken from it below. Serializing through `isoTime` while the success
+  // checks re-read the raw `state.lastSuccessfulAt` is what let the two
+  // disagree: every Date object is truthy whatever its validity, so the
+  // missing-success branch was skipped, and `NaN > agingMs` is false, so the
+  // stale branch was skipped too. An invalid SUCCEEDED success therefore
+  // reached `SUCCESS` while reporting `lastSuccessfulAt: null` - a row
+  // claiming a completion it could not name, counted among the successful
+  // resources, absent from `data.issues`, and able to carry `data.status` to
+  // COMPLETE. Deriving the field FROM this value makes that divergence
+  // unrepresentable rather than merely fixed in two places.
+  const recordedSuccessAt = finiteDate(state.lastSuccessfulAt)
+  const base = { lastAttemptAt: isoTime(state.lastAttemptAt), lastSuccessfulAt: recordedSuccessAt?.toISOString() ?? null }
   const authFailure = state.lastErrorCode === '401' || state.lastErrorCode === '403' || state.lastErrorCode === 'MICROSOFT_PERMISSION_REQUIRED' || /unauthorized|forbidden|permission|consent/i.test(state.lastErrorMessage ?? '')
   if (state.status === 'FAILED' && retryableSyncState(state) && state.consecutiveFailures < 3) return { ...base, classification: 'PENDING', reasonCode: state.lastErrorCode, message: sanitizeHealthMessage(state.lastErrorMessage) }
   if (state.status === 'FAILED') return { ...base, classification: authFailure ? 'PERMISSION_REQUIRED' : 'FAILED', reasonCode: state.lastErrorCode ?? 'collector-failed', message: sanitizeHealthMessage(state.lastErrorMessage) }
   if (currentLimitedFallback(state, now)) return { ...base, classification: 'PARTIAL', reasonCode: state.lastErrorCode, message: sanitizeHealthMessage(state.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' }
-  if (state.status === 'RUNNING' && isSignInFallback(state) && state.lastSuccessfulAt) return { ...base, classification: 'STALE', reasonCode: 'sign-in-fallback-stale', message: 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' }
+  // STALE is a MEASURED claim: the fallback succeeded, and that success is now
+  // older than its window. An invalid or future success measures nothing, so it
+  // falls through to the RUNNING branch below and stays PENDING rather than
+  // being presented as a stale success.
+  if (state.status === 'RUNNING' && qualifiedFallbackSuccessAt(state, now) !== null) return { ...base, classification: 'STALE', reasonCode: 'sign-in-fallback-stale', message: 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' }
   if (state.status === 'RUNNING') return { ...base, classification: 'PENDING', reasonCode: 'collector-running', message: 'Collection is in progress.' }
-  if (!state.lastSuccessfulAt) return { ...base, classification: 'NOT_CONFIGURED', reasonCode: 'never-succeeded', message: 'The collector has not completed successfully.' }
-  const age = now.getTime() - state.lastSuccessfulAt.getTime()
+  // An unusable recorded success is treated exactly as an absent one: there is
+  // no successful completion this projection can stand behind. That keeps the
+  // row out of the successful set and inside `pending`, so it is reported
+  // rather than silently dropped, and it needs no new vocabulary - the
+  // classification union has no "unmeasurable" member and inventing one would
+  // be a far larger change than this defect warrants.
+  if (!recordedSuccessAt) return { ...base, classification: 'NOT_CONFIGURED', reasonCode: 'never-succeeded', message: 'The collector has not completed successfully.' }
+  const age = now.getTime() - recordedSuccessAt.getTime()
   if (age > freshnessWindow(state.resourceType).agingMs) return { ...base, classification: 'STALE', reasonCode: 'stale-success', message: 'The last successful collection is outside its scheduled freshness window.' }
   return { ...base, classification: 'SUCCESS', reasonCode: null, message: null }
 }
@@ -180,7 +242,11 @@ function classifySelectedSignInEvidence(
 ): Omit<ResourceHealth, 'resourceType' | 'required'> | null {
   if (!evidence?.selectedSource) return null
   const base = {
-    lastAttemptAt: state?.lastAttemptAt?.toISOString() ?? evidence.observedAt,
+    // Same RangeError as `classify()`: an invalid recorded ATTEMPT timestamp
+    // threw here and aborted the whole composed projection, which is the one
+    // path a selected source actually takes. Guarded identically — a valid
+    // date, future included, serializes exactly as before.
+    lastAttemptAt: isoTime(state?.lastAttemptAt) ?? evidence.observedAt,
     lastSuccessfulAt: evidence.observedAt,
     reasonCode: evidence.reasonCode,
     message: sanitizeHealthMessage(evidence.reason),
@@ -198,7 +264,11 @@ function classifySelectedSignInEvidence(
   if (evidence.availability === 'FAILED_TRANSIENT') return { ...base, classification: 'FAILED' }
   if (evidence.availability === 'NOT_LICENSED') return { ...base, classification: 'NOT_LICENSED' }
   if (evidence.availability === 'UNSUPPORTED') return { ...base, classification: 'UNSUPPORTED' }
-  if (evidence.availability === 'BACKLOGGED' || evidence.availability === 'INITIALIZING') return { ...base, classification: 'PENDING' }
+  // PARTIAL means a RUNNING collector with some prior success. It had no branch
+  // here, so it fell to NOT_CONFIGURED and was then excluded from the
+  // operational states by its own truthy selectedSource, hiding running work.
+  if (evidence.availability === 'BACKLOGGED' || evidence.availability === 'INITIALIZING' ||
+    evidence.availability === 'PARTIAL') return { ...base, classification: 'PENDING' }
   return { ...base, classification: 'NOT_CONFIGURED' }
 }
 
@@ -359,10 +429,43 @@ export function deriveTenantHealth(input: HealthInput & { microsoftRiskSummary?:
     !(retryableSyncState(state) && state.consecutiveFailures < 3),
   )
   const signInFailed = authoritativeSignInEvidence && ['FAILED', 'PERMISSION_REQUIRED'].includes(signInHealth?.classification ?? '') ? 1 : 0
-  const signInPending = authoritativeSignInEvidence && signInHealth?.classification === 'PENDING' ? 1 : 0
+  // An UNVERIFIED verdict says HawkView has not established this source. That is
+  // not completion, and it is not a reason to stop counting work that is
+  // actually running. The selected-evidence mapper has no UNVERIFIED branch, so
+  // the resource stays NOT_CONFIGURED; and a truthy selected source excludes
+  // SIGN_INS from `operationalStates` above, so the row's own RUNNING status
+  // reached no count at all. Operations therefore read HEALTHY with zero pending
+  // jobs while the collector was running.
+  //
+  // Written as one more disjunct inside the SAME `? 1 : 0`, never as a second
+  // additive term, so a source that is already PENDING cannot be counted twice.
+  // Scoped three ways: the readiness verdict must be UNVERIFIED, the resource
+  // must be NOT_CONFIGURED - so a blocked or failed source, already counted in
+  // `signInFailed`, is not counted here as well - and the raw collector row must
+  // say RUNNING, so non-running and unconfigured input is untouched.
+  const signInPending = authoritativeSignInEvidence &&
+    (signInHealth?.classification === 'PENDING' ||
+      (input.signInEvidence?.availability === 'UNVERIFIED' &&
+        signInHealth?.classification === 'NOT_CONFIGURED' &&
+        states.get('SIGN_INS')?.status === 'RUNNING'))
+    ? 1 : 0
   const signInPartial = authoritativeSignInEvidence && signInHealth?.classification === 'PARTIAL' ? 1 : 0
   const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length + signInFailed
-  const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && !isSignInFallback(s)).length + signInPending
+  // A RUNNING collector leaves `pendingJobs` only when its fallback evidence is
+  // QUALIFIED. Recognizing the code alone used to remove it from pending, so an
+  // invalid or future success hid a genuinely in-progress collection.
+  //
+  // Written as two partitioned terms rather than one combined predicate: the
+  // first is the long-standing rule that a QUALIFIED fallback is not pending
+  // work, which `lib/tenants/pilot-readiness-truth.test.ts` guards by source
+  // text, and the second adds back the unqualified ones. The counted set is
+  // exactly the same as a single `qualifiedFallbackSuccessAt(s, now) === null`
+  // filter. In the COMPOSED path SIGN_INS is excluded from these states by its
+  // truthy selected source, so its pending count arrives through
+  // `signInPending` from the PENDING classification above.
+  const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && !isSignInFallback(s)).length +
+    operationalStates.filter((s) => s.status === 'RUNNING' && isSignInFallback(s) && qualifiedFallbackSuccessAt(s, now) === null).length +
+    signInPending
   const partialJobs = operationalStates.filter((s) => (s.status === 'FAILED' && s.lastSuccessfulAt !== null) || currentLimitedFallback(s, now)).length + signInPartial
   const requiredStaleJobs = requiredProblems.filter((resource) => resource.classification === 'STALE').length
   const selectedFallbackStaleJobs = signInHealth?.classification === 'STALE' &&

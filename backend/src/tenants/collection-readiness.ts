@@ -1,5 +1,6 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { syncFreshnessWindow } from './sync-freshness-policy.js'
+import { isLimitedSignInFallbackCode, recordedTimeAtOrBefore } from './sync-outcome-projection.js'
 import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
@@ -32,6 +33,67 @@ export const COLLECTION_READINESS_STATES = [
 
 export type CollectionReadinessState = (typeof COLLECTION_READINESS_STATES)[number]
 export type PermissionGrantStatus = 'CONFIRMED' | 'MISSING' | 'UNVERIFIED' | 'NOT_APPLICABLE'
+
+/**
+ * Which selected-dataset states the limited sign-in "unmeasured running"
+ * relabel is allowed to REPLACE.
+ *
+ * The relabel exists because an unqualified RUNNING fallback used to fall
+ * through to an ordinary in-progress dataset state that the health mapper had
+ * no PENDING branch for, so a genuinely running collector was reported as not
+ * configured with zero pending work. But it was written without consulting the
+ * dataset state at all, so it also replaced an AUTHORITATIVE verdict: a revoked
+ * or unconsented connection, or a dataset whose required permission is
+ * verified missing, reads as merely initializing. A customer cannot act on
+ * that, and the remediation the row carries is thrown away.
+ *
+ * An exhaustive `Record` rather than a set, and a declared type rather than an
+ * inferred one, so a thirteenth member of `COLLECTION_READINESS_STATES` cannot
+ * COMPILE until somebody classifies it. The polarity matters as much as the
+ * membership: this is an allowlist, so the unknown case is the one where the
+ * relabel does NOT fire and the dataset's own verdict survives. A denylist
+ * would relabel a new state by default, which is this defect re-created by
+ * construction, with no test failing.
+ *
+ * Measured reachability under the predicate this gates (a recognized fallback
+ * code, RUNNING, and a recorded success that is not finite-and-at-or-before
+ * the assessment clock): the selected sign-in dataset reaches exactly four
+ * states - PARTIAL, BACKLOGGED, UNVERIFIED and BLOCKED_PERMISSION - across six
+ * (state, reasonCode) pairs. `PARTIAL` is the one ordinary in-progress state
+ * among them and the only one the relabel may take.
+ *
+ * KNOWN LIMIT, deliberately not closed here. The gate reads the
+ * ENTITLEMENT-chosen dataset - the Graph one unless the tenant is NON_PREMIUM -
+ * which is the same dataset every other field in this projection falls through
+ * to. It is NOT always the dataset backing the `selectedSource` the projection
+ * publishes: `selectedSource` says the activity feed whenever a fallback code
+ * is recognized. So a premium tenant with `ActivityFeed.Read` verified missing
+ * has an ordinary PARTIAL Graph dataset and a BLOCKED_PERMISSION feed dataset,
+ * and the relabel still fires over the attributed source's own blocker.
+ * Measured, and pinned in `fallback-access-precedence.test.ts`. Keying this on
+ * the attributed dataset would change which dataset the whole evidence block
+ * reads, which is a source-attribution redesign rather than a precedence fix.
+ */
+export const UNMEASURED_RUNNING_RELABEL: Readonly<Record<CollectionReadinessState, boolean>> = Object.freeze({
+  /** Ordinary in-progress with a prior recorded success: the case the relabel exists for. */
+  PARTIAL: true,
+  /** A more specific in-progress reason the collector itself reported; it is already PENDING downstream. */
+  BACKLOGGED: false,
+  /** Unreachable here - the gated predicate requires a recorded Date, and this state needs a falsy one. */
+  INITIALIZING: false,
+  /** Measured outcomes: replacing them would discard a measurement, not a non-measurement. */
+  READY: false,
+  STALE: false,
+  /** Authoritative access, entitlement and applicability verdicts. Never replaced. */
+  UNVERIFIED: false,
+  NOT_LICENSED: false,
+  BLOCKED_PERMISSION: false,
+  BLOCKED_TENANT_CONFIGURATION: false,
+  UNSUPPORTED: false,
+  /** Collector outcomes that carry their own reason; in progress does not describe them. */
+  FAILED_TRANSIENT: false,
+  NEVER_SUCCEEDED: false,
+})
 
 export type ReadinessSyncState = {
   resourceType: string
@@ -840,11 +902,52 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     rows.find((row) => row.key === workloadKey)?.datasets?.find((candidate) => candidate.key === datasetKey)
   const signInDataset = dataset('sign_ins', signInEntitlement === 'NON_PREMIUM' ? 'entra_sign_ins_activity_feed' : 'entra_sign_ins_graph')
   const signInSync = states.get('SIGN_INS')
-  const fallbackSelected = /sign-ins-.*fallback-active/.test(signInSync?.lastErrorCode ?? '') && Boolean(signInSync?.lastSuccessfulAt)
-  const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING'
-  const fallbackCurrent = fallbackRunning && signInSync?.lastSuccessfulAt
-    ? now.getTime() - signInSync.lastSuccessfulAt.getTime() <= 2 * 60 * 60 * 1000
-    : false
+  // Source attribution and freshness are separate questions, and the previous
+  // unanchored `/sign-ins-.*fallback-active/` answered both from one loose
+  // match: it accepted any string CONTAINING a fallback-looking fragment, and
+  // then treated any present timestamp as a measurement — including an invalid
+  // Date (truthy) and a FUTURE success, because `now - future <= 2h` is true.
+  //
+  // The code now has to be one of the six recognized return paths, and a
+  // measurement has to be finite and at or before `now`.
+  const signInFallbackCode = isLimitedSignInFallbackCode(signInSync?.lastErrorCode)
+  // ATTRIBUTION: a recognized code names the selected source even when its
+  // timestamp is unusable. Freshness is rejected below; attribution is not
+  // erased merely because of that, which also stops an unusable timestamp from
+  // falling through to a FULL Microsoft Graph claim.
+  const fallbackSelected = signInFallbackCode && signInSync?.lastSuccessfulAt instanceof Date
+  // MEASUREMENT: finite, not in the future. Null means unmeasured, not stale.
+  const fallbackSuccessAt = signInFallbackCode
+    ? recordedTimeAtOrBefore(signInSync?.lastSuccessfulAt, now)
+    : null
+  const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING' && fallbackSuccessAt !== null
+  // A recognized RUNNING fallback with NO finite, non-future measurement is
+  // work in progress whose evidence is unmeasured. It must say so HERE, because
+  // the composed path feeds this projection into health: falling through to the
+  // dataset state produced PARTIAL, which the selected-source mapper had no
+  // branch for, so health called it NOT_CONFIGURED and — with a truthy
+  // selectedSource excluding SIGN_INS from the operational states — reported
+  // zero pending work for a collector that was actually running.
+  //
+  // PRECEDENCE: only an ordinary in-progress dataset state may be relabelled.
+  // Written without this conjunct, the relabel replaced an authoritative
+  // blocked, unverified or backlogged verdict as well, which is a stronger and
+  // actionable claim than "in progress".
+  //
+  // `=== true` rather than a bare lookup: the record is a plain object, so a
+  // state string that somehow bypassed the type system and collided with an
+  // Object.prototype member would otherwise read truthy. The undefined check is
+  // defensive, not reachable - both sign-in datasets are always assigned - and
+  // it is here so a missing dataset would keep its own fall-through.
+  const fallbackUnmeasuredRunning = fallbackSelected && signInSync?.status === 'RUNNING' &&
+    fallbackSuccessAt === null &&
+    signInDataset !== undefined && UNMEASURED_RUNNING_RELABEL[signInDataset.state] === true
+  // Inclusive [now - aging, now]: age exactly 0 and exactly the aging bound are
+  // current; one millisecond into the future is not a measurement at all. The
+  // existing SIGN_INS window replaces the hardcoded two hours; it is the same
+  // value, so no cadence changes.
+  const fallbackCurrent = fallbackRunning && fallbackSuccessAt !== null &&
+    now.getTime() - fallbackSuccessAt <= syncFreshnessWindow('incremental').agingMs
   const riskyDataset = dataset('entra_identity_protection', 'entra_identity_protection_risky_users')
   const conditionalAccessDataset = dataset('entra_security_configuration', 'entra_conditional_access')
   const securityDefaultsDataset = dataset('entra_security_configuration', 'entra_security_defaults')
@@ -875,12 +978,19 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const evidence: PilotEvidenceProjection = {
     version: 1,
     signIns: {
-      availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : signInDataset?.state ?? 'UNVERIFIED',
+      availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : fallbackUnmeasuredRunning ? 'INITIALIZING' : signInDataset?.state ?? 'UNVERIFIED',
       coverage: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'LIMITED' : signInDataset?.state === 'READY' ? 'FULL' : 'NONE',
       selectedSource: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'OFFICE_365_ACTIVITY_FEED' : signInEntitlement === 'PREMIUM' ? 'MICROSOFT_GRAPH' : null,
-      observedAt: fallbackSelected ? iso(signInSync?.lastSuccessfulAt) : signInDataset?.lastSuccessfulAt ?? null,
-      reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : signInDataset?.reasonCode ?? null,
-      reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
+      // Only a measured success is published here. When a fallback IS the
+      // selected source but has no finite, non-future measurement, this field
+      // stays null rather than falling through to the dataset timestamp, which
+      // would publish the invalid or future value as THIS evidence's own
+      // observation. Other resources' dataset timestamps are untouched.
+      observedAt: fallbackSuccessAt !== null
+        ? iso(signInSync?.lastSuccessfulAt)
+        : fallbackSelected ? null : signInDataset?.lastSuccessfulAt ?? null,
+      reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : fallbackUnmeasuredRunning ? signInSync?.lastErrorCode ?? 'COLLECTION_IN_PROGRESS' : signInDataset?.reasonCode ?? null,
+      reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : fallbackUnmeasuredRunning ? 'Limited sign-in collection is in progress and its last success cannot be measured.' : signInDataset?.reason ?? null,
     },
     riskyIdentities: {
       microsoftRiskSummary,

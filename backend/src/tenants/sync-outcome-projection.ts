@@ -21,7 +21,19 @@ type OutcomeState = {
   lastErrorCode?: string | null
 }
 
-const limitedSignInCodes = new Set([
+/**
+ * The CLOSED set of recognized limited sign-in fallback return codes.
+ *
+ * Exported so the readiness and health readers match on exactly these strings
+ * instead of each keeping their own pattern. Membership is exact: no trimming,
+ * no case folding and no substring acceptance, because a prefix or suffix of a
+ * recognized code is a DIFFERENT return path and must not inherit its meaning.
+ *
+ * This module stays dependency-free on purpose — several frontend and script
+ * tests load this single file directly — so it exports the policy and imports
+ * nothing.
+ */
+export const LIMITED_SIGN_IN_FALLBACK_CODES: readonly string[] = Object.freeze([
   'sign-ins-premium-graph-fallback-active',
   'sign-ins-non-premium-fallback-active',
   'sign-ins-entitlement-unverified-fallback-active',
@@ -29,12 +41,32 @@ const limitedSignInCodes = new Set([
   'sign-ins-non-premium-fallback-active-geolocation-partial',
   'sign-ins-entitlement-unverified-fallback-active-geolocation-partial',
 ])
+const limitedSignInCodes = new Set(LIMITED_SIGN_IN_FALLBACK_CODES)
+
+/** Exact membership of the closed set above. Anything else is unrecognized. */
+export function isLimitedSignInFallbackCode(code: unknown): boolean {
+  return typeof code === 'string' && limitedSignInCodes.has(code)
+}
 const initializingCode = 'sign-ins-audit-subscription-initializing'
 const deferredCodes = new Set(['m365-audit-backlog', 'm365-audit-budget-exhausted'])
 
 function validClock(value: Date | null | undefined, now: Date): number | null {
   const time = value instanceof Date ? value.getTime() : NaN
   return Number.isFinite(time) && Number.isFinite(now.getTime()) && time <= now.getTime() ? time : null
+}
+
+/**
+ * A RECORDED time: a real Date, finite, and at or before `now`.
+ *
+ * Returns its epoch milliseconds, or null when the value cannot be measured.
+ * This is the same rule `projectSyncOutcome` already applies to stored clocks,
+ * exported unchanged so the readiness and health readers cannot drift from it.
+ * A missing, invalid or FUTURE timestamp is not a measurement, and must not be
+ * presented as one — neither as current evidence nor as a measured stale
+ * success.
+ */
+export function recordedTimeAtOrBefore(value: Date | null | undefined, now: Date): number | null {
+  return validClock(value, now)
 }
 
 export function projectSyncOutcome(
