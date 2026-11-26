@@ -860,6 +860,14 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     ? recordedTimeAtOrBefore(signInSync?.lastSuccessfulAt, now)
     : null
   const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING' && fallbackSuccessAt !== null
+  // A recognized RUNNING fallback with NO finite, non-future measurement is
+  // work in progress whose evidence is unmeasured. It must say so HERE, because
+  // the composed path feeds this projection into health: falling through to the
+  // dataset state produced PARTIAL, which the selected-source mapper had no
+  // branch for, so health called it NOT_CONFIGURED and — with a truthy
+  // selectedSource excluding SIGN_INS from the operational states — reported
+  // zero pending work for a collector that was actually running.
+  const fallbackUnmeasuredRunning = fallbackSelected && signInSync?.status === 'RUNNING' && fallbackSuccessAt === null
   // Inclusive [now - aging, now]: age exactly 0 and exactly the aging bound are
   // current; one millisecond into the future is not a measurement at all. The
   // existing SIGN_INS window replaces the hardcoded two hours; it is the same
@@ -896,14 +904,19 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   const evidence: PilotEvidenceProjection = {
     version: 1,
     signIns: {
-      availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : signInDataset?.state ?? 'UNVERIFIED',
+      availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : fallbackUnmeasuredRunning ? 'INITIALIZING' : signInDataset?.state ?? 'UNVERIFIED',
       coverage: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'LIMITED' : signInDataset?.state === 'READY' ? 'FULL' : 'NONE',
       selectedSource: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'OFFICE_365_ACTIVITY_FEED' : signInEntitlement === 'PREMIUM' ? 'MICROSOFT_GRAPH' : null,
-      // Only a measured success is published here; `iso` already refuses an
-      // invalid Date, and a future one must not be reported as observed.
-      observedAt: fallbackSuccessAt !== null ? iso(signInSync?.lastSuccessfulAt) : signInDataset?.lastSuccessfulAt ?? null,
-      reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : signInDataset?.reasonCode ?? null,
-      reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
+      // Only a measured success is published here. When a fallback IS the
+      // selected source but has no finite, non-future measurement, this field
+      // stays null rather than falling through to the dataset timestamp, which
+      // would publish the invalid or future value as THIS evidence's own
+      // observation. Other resources' dataset timestamps are untouched.
+      observedAt: fallbackSuccessAt !== null
+        ? iso(signInSync?.lastSuccessfulAt)
+        : fallbackSelected ? null : signInDataset?.lastSuccessfulAt ?? null,
+      reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : fallbackUnmeasuredRunning ? signInSync?.lastErrorCode ?? 'COLLECTION_IN_PROGRESS' : signInDataset?.reasonCode ?? null,
+      reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : fallbackUnmeasuredRunning ? 'Limited sign-in collection is in progress and its last success cannot be measured.' : signInDataset?.reason ?? null,
     },
     riskyIdentities: {
       microsoftRiskSummary,

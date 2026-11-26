@@ -122,7 +122,12 @@ export const TENANT_HEALTH_RESOURCE_REGISTRY: ReadonlyArray<{ resourceType: stri
 export const TENANT_HEALTH_FRESHNESS = LEGACY_SYNC_FRESHNESS_WINDOWS
 
 function mfaCoverage(payload: unknown) { if (!Array.isArray(payload)) return null; const rows = payload.filter((row): row is { isMfaRegistered: boolean } => typeof row === 'object' && row !== null && typeof (row as { isMfaRegistered?: unknown }).isMfaRegistered === 'boolean'); return rows.length ? Math.round((rows.filter((row) => row.isMfaRegistered).length / rows.length) * 100) : null }
-function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => Boolean(d)).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
+/** Latest of the supplied timestamps, ignoring missing and non-finite ones.
+ *  Truthiness alone admitted an invalid Date, whose `getTime()` is NaN, so it
+ *  neither sorted nor compared and could end up first — and `toISOString()`
+ *  then threw RangeError, aborting the whole projection. One lone invalid row,
+ *  or an invalid row ordered first, was enough. */
+function latestDate(dates: Array<Date | null>) { return dates.filter((d): d is Date => d instanceof Date && Number.isFinite(d.getTime())).sort((a, b) => b.getTime() - a.getTime())[0]?.toISOString() ?? null }
 function securityUrl(tenantId: string, view: string) { return `/tenants/${encodeURIComponent(tenantId)}?entraTab=security&securityView=${view}` }
 function retryableSyncState(state: SyncState | undefined) { return Boolean(state && ['MICROSOFT_TRANSIENT', 'MICROSOFT_THROTTLED', 'MICROSOFT_NETWORK_TIMEOUT', 'MICROSOFT_DELTA_RESET_REQUIRED', 'MICROSOFT_PARTIAL_RESPONSE'].includes(state.lastErrorCode ?? '')) }
 /** ATTRIBUTION only: the collector reported one of the six recognized limited
@@ -210,7 +215,11 @@ function classifySelectedSignInEvidence(
 ): Omit<ResourceHealth, 'resourceType' | 'required'> | null {
   if (!evidence?.selectedSource) return null
   const base = {
-    lastAttemptAt: state?.lastAttemptAt?.toISOString() ?? evidence.observedAt,
+    // Same RangeError as `classify()`: an invalid recorded ATTEMPT timestamp
+    // threw here and aborted the whole composed projection, which is the one
+    // path a selected source actually takes. Guarded identically — a valid
+    // date, future included, serializes exactly as before.
+    lastAttemptAt: isoTime(state?.lastAttemptAt) ?? evidence.observedAt,
     lastSuccessfulAt: evidence.observedAt,
     reasonCode: evidence.reasonCode,
     message: sanitizeHealthMessage(evidence.reason),
@@ -228,7 +237,11 @@ function classifySelectedSignInEvidence(
   if (evidence.availability === 'FAILED_TRANSIENT') return { ...base, classification: 'FAILED' }
   if (evidence.availability === 'NOT_LICENSED') return { ...base, classification: 'NOT_LICENSED' }
   if (evidence.availability === 'UNSUPPORTED') return { ...base, classification: 'UNSUPPORTED' }
-  if (evidence.availability === 'BACKLOGGED' || evidence.availability === 'INITIALIZING') return { ...base, classification: 'PENDING' }
+  // PARTIAL means a RUNNING collector with some prior success. It had no branch
+  // here, so it fell to NOT_CONFIGURED and was then excluded from the
+  // operational states by its own truthy selectedSource, hiding running work.
+  if (evidence.availability === 'BACKLOGGED' || evidence.availability === 'INITIALIZING' ||
+    evidence.availability === 'PARTIAL') return { ...base, classification: 'PENDING' }
   return { ...base, classification: 'NOT_CONFIGURED' }
 }
 
@@ -395,7 +408,18 @@ export function deriveTenantHealth(input: HealthInput & { microsoftRiskSummary?:
   // A RUNNING collector leaves `pendingJobs` only when its fallback evidence is
   // QUALIFIED. Recognizing the code alone used to remove it from pending, so an
   // invalid or future success hid a genuinely in-progress collection.
-  const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && qualifiedFallbackSuccessAt(s, now) === null).length + signInPending
+  //
+  // Written as two partitioned terms rather than one combined predicate: the
+  // first is the long-standing rule that a QUALIFIED fallback is not pending
+  // work, which `lib/tenants/pilot-readiness-truth.test.ts` guards by source
+  // text, and the second adds back the unqualified ones. The counted set is
+  // exactly the same as a single `qualifiedFallbackSuccessAt(s, now) === null`
+  // filter. In the COMPOSED path SIGN_INS is excluded from these states by its
+  // truthy selected source, so its pending count arrives through
+  // `signInPending` from the PENDING classification above.
+  const pendingJobs = operationalStates.filter((s) => s.status === 'RUNNING' && !isSignInFallback(s)).length +
+    operationalStates.filter((s) => s.status === 'RUNNING' && isSignInFallback(s) && qualifiedFallbackSuccessAt(s, now) === null).length +
+    signInPending
   const partialJobs = operationalStates.filter((s) => (s.status === 'FAILED' && s.lastSuccessfulAt !== null) || currentLimitedFallback(s, now)).length + signInPartial
   const requiredStaleJobs = requiredProblems.filter((resource) => resource.classification === 'STALE').length
   const selectedFallbackStaleJobs = signInHealth?.classification === 'STALE' &&
