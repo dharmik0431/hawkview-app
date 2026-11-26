@@ -114,7 +114,11 @@ function harness(context: TestContext, options: {
   // One frozen clock per test, however many harnesses that test builds.
   if (!frozen.has(context)) { context.mock.timers.enable({ apis: ['Date'], now: CLOCK }); frozen.add(context) }
   const calls: Call[] = []
-  const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }) }
+  const issued: Call[] = []
+  const record = (method: string, ...args: unknown[]) => {
+    calls.push({ method, args })
+    issued.push({ method, args })
+  }
   const warnings: string[] = []
   let row: Row | null = options.storedRow === undefined ? baseRow() : options.storedRow
   const successorToken = 'successor-token-9999'
@@ -334,6 +338,10 @@ function harness(context: TestContext, options: {
     committedTokens: () => [...committedTokens],
     /** Only the commits that carried a content disposition. */
     dispositionCommits: () => commits.filter((commit) => commit.sawDisposition),
+    /** Everything the service ASKED for, including calls later rolled back.
+     *  `of` is the committed view; this one distinguishes "never attempted"
+     *  from "attempted and discarded". */
+    issuedOf: (method: string) => issued.filter((call) => call.method === method),
     envelope: () => parseAttemptEnvelope((row ?? {}).m365AuditAttempt),
     of: (method: string) => calls.filter((call) => call.method === method),
     attemptTokenFromUpsert: () => {
@@ -684,8 +692,10 @@ test('ownerless: a zero-row budget disposition fails closed instead of reaching 
   await fake.run()
   assert.equal(fake.of('content.disposition').length, 1,
     'the attempt did reach its failure disposition, so this is a fail-closed path')
-  assert.deepEqual(fake.of('syncState.updateMany'), [],
-    'an unattributable disposition reaches neither the observation nor terminal state')
+  assert.deepEqual(fake.issuedOf('syncState.updateMany'), [],
+    'and never ASKED for an observation or a terminal write -- asserted on the '
+    + 'issued log, because a terminal write that is itself fenced would roll '
+    + 'back and vanish from the committed log, hiding the fall-through')
   assert.ok(fake.reasonCodes().includes('ATTEMPT_SUPERSEDED'))
   assert.ok(fake.envelope(), 'the successor envelope still parses')
   assert.equal(fake.envelope()?.refusal, null, 'and no refusal was recorded')
