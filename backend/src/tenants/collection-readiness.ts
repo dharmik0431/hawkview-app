@@ -1,5 +1,6 @@
 import { sanitizeHealthMessage } from './sanitize-health-message.js'
 import { syncFreshnessWindow } from './sync-freshness-policy.js'
+import { isLimitedSignInFallbackCode, recordedTimeAtOrBefore } from './sync-outcome-projection.js'
 import { summarizeMicrosoftRisk, type MicrosoftRiskSummary } from '../identity-risk/microsoft-risk-summary.js'
 import { deriveSignInEntitlement } from './sign-in-entitlement.js'
 import {
@@ -840,11 +841,31 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
     rows.find((row) => row.key === workloadKey)?.datasets?.find((candidate) => candidate.key === datasetKey)
   const signInDataset = dataset('sign_ins', signInEntitlement === 'NON_PREMIUM' ? 'entra_sign_ins_activity_feed' : 'entra_sign_ins_graph')
   const signInSync = states.get('SIGN_INS')
-  const fallbackSelected = /sign-ins-.*fallback-active/.test(signInSync?.lastErrorCode ?? '') && Boolean(signInSync?.lastSuccessfulAt)
-  const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING'
-  const fallbackCurrent = fallbackRunning && signInSync?.lastSuccessfulAt
-    ? now.getTime() - signInSync.lastSuccessfulAt.getTime() <= 2 * 60 * 60 * 1000
-    : false
+  // Source attribution and freshness are separate questions, and the previous
+  // unanchored `/sign-ins-.*fallback-active/` answered both from one loose
+  // match: it accepted any string CONTAINING a fallback-looking fragment, and
+  // then treated any present timestamp as a measurement — including an invalid
+  // Date (truthy) and a FUTURE success, because `now - future <= 2h` is true.
+  //
+  // The code now has to be one of the six recognized return paths, and a
+  // measurement has to be finite and at or before `now`.
+  const signInFallbackCode = isLimitedSignInFallbackCode(signInSync?.lastErrorCode)
+  // ATTRIBUTION: a recognized code names the selected source even when its
+  // timestamp is unusable. Freshness is rejected below; attribution is not
+  // erased merely because of that, which also stops an unusable timestamp from
+  // falling through to a FULL Microsoft Graph claim.
+  const fallbackSelected = signInFallbackCode && signInSync?.lastSuccessfulAt instanceof Date
+  // MEASUREMENT: finite, not in the future. Null means unmeasured, not stale.
+  const fallbackSuccessAt = signInFallbackCode
+    ? recordedTimeAtOrBefore(signInSync?.lastSuccessfulAt, now)
+    : null
+  const fallbackRunning = fallbackSelected && signInSync?.status === 'RUNNING' && fallbackSuccessAt !== null
+  // Inclusive [now - aging, now]: age exactly 0 and exactly the aging bound are
+  // current; one millisecond into the future is not a measurement at all. The
+  // existing SIGN_INS window replaces the hardcoded two hours; it is the same
+  // value, so no cadence changes.
+  const fallbackCurrent = fallbackRunning && fallbackSuccessAt !== null &&
+    now.getTime() - fallbackSuccessAt <= syncFreshnessWindow('incremental').agingMs
   const riskyDataset = dataset('entra_identity_protection', 'entra_identity_protection_risky_users')
   const conditionalAccessDataset = dataset('entra_security_configuration', 'entra_conditional_access')
   const securityDefaultsDataset = dataset('entra_security_configuration', 'entra_security_defaults')
@@ -878,7 +899,9 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
       availability: fallbackCurrent ? 'CURRENT_LIMITED' : fallbackRunning ? 'STALE' : signInDataset?.state ?? 'UNVERIFIED',
       coverage: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'LIMITED' : signInDataset?.state === 'READY' ? 'FULL' : 'NONE',
       selectedSource: fallbackSelected || signInEntitlement === 'NON_PREMIUM' ? 'OFFICE_365_ACTIVITY_FEED' : signInEntitlement === 'PREMIUM' ? 'MICROSOFT_GRAPH' : null,
-      observedAt: fallbackSelected ? iso(signInSync?.lastSuccessfulAt) : signInDataset?.lastSuccessfulAt ?? null,
+      // Only a measured success is published here; `iso` already refuses an
+      // invalid Date, and a future one must not be reported as observed.
+      observedAt: fallbackSuccessAt !== null ? iso(signInSync?.lastSuccessfulAt) : signInDataset?.lastSuccessfulAt ?? null,
       reasonCode: fallbackCurrent ? signInSync?.lastErrorCode ?? 'SIGN_IN_FALLBACK_ACTIVE' : fallbackRunning ? 'SIGN_IN_FALLBACK_STALE' : signInDataset?.reasonCode ?? null,
       reason: fallbackCurrent ? safeReason(signInSync?.lastErrorMessage) ?? 'Current limited sign-in evidence is available from the Microsoft 365 audit feed.' : fallbackRunning ? 'Limited sign-in evidence from the Microsoft 365 audit feed is no longer current.' : signInDataset?.reason ?? null,
     },
