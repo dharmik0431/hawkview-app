@@ -30,8 +30,18 @@ import { NotificationsService } from '../notifications/notifications.service.js'
 import { PrismaService } from '../prisma/prisma.service.js'
 import {
   deriveTenantHealth,
+  unreadTenantAuditEvidence,
   type TenantAuditEvent,
+  type TenantAuditEvidenceSummary,
 } from './tenant-health.js'
+import {
+  AuditEvidenceRequestError,
+  newAuditEvidenceReadMetrics,
+  readTenantAuditEvidencePages,
+  type AuditEvidenceForTenant,
+  type AuditEvidenceScope,
+  type AuditEvidenceStore,
+} from './tenant-health-audit-evidence.js'
 import { deriveCollectionReadiness, collectedLicenseServicePlans, effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 export { effectiveMicrosoftConnectionStatus } from './collection-readiness.js'
 import {
@@ -91,6 +101,99 @@ export const preserveOptionalExchangeConsent = (
     ),
   ]),
 ]
+
+/** How long an unchanged evaluation suppresses a new history row. */
+const HEALTH_HISTORY_DEDUPE_WINDOW_MS = 15 * 60 * 1000
+
+/** Per-service freshness identity, unchanged from the previous contract. */
+function freshnessSignature(syncFreshness: TenantSyncFreshness) {
+  return Object.values(syncFreshness.services).map((service) => ({
+    service: service.service,
+    status: service.status,
+    freshness: service.freshnessStatus,
+    failures: service.partialFailures.map((failure) => failure.collector),
+  }))
+}
+
+/**
+ * Audit-coverage identity. A row saved before this model carries no audit
+ * metadata at all, and absence is NOT a complete read: it is given its own
+ * marker so it differs from every present summary, and the first evaluation
+ * under the new model is therefore always retained rather than suppressed.
+ *
+ * Counts are deliberately excluded. An extra quiet event changes a count
+ * without changing what the window MEANS, and including it would approach one
+ * row per poll on a busy tenant. A withheld payload already shows up as a
+ * status and reason change.
+ */
+function auditEvidenceSignature(summary: TenantAuditEvidenceSummary | undefined) {
+  if (!summary || typeof summary !== 'object') return 'LEGACY_ABSENT'
+  return { status: summary.status, reason: summary.reason, complete: summary.windowComplete }
+}
+
+/**
+ * Observed-finding identity: the stable key and the classification of each
+ * finding, sorted, with no timestamp and no raw payload. This is what makes a
+ * changed set of findings — or the same label at a different severity —
+ * survive deduplication even when the overall status and freshness match.
+ * Bounded: audit findings are capped at three and the remainder are one per
+ * registry collector plus a fixed few.
+ */
+function findingSignature(attention: unknown) {
+  if (!Array.isArray(attention)) return 'LEGACY_ABSENT'
+  return attention
+    .map((item) => {
+      const finding = item as { key?: unknown; severity?: unknown }
+      return `${String(finding?.key)}\u0000${String(finding?.severity)}`
+    })
+    .sort()
+}
+
+/**
+ * The semantic identity of one evaluation, for history deduplication only.
+ *
+ * It EXCLUDES the assessment clock, so a poll that changed nothing writes no
+ * row. It INCLUDES the health model version, audit-window completeness and
+ * every observed finding's identity and classification, so a changed meaning
+ * behind an unchanged status is not swallowed.
+ */
+function healthHistorySignature(input: {
+  healthModelVersion: number
+  auditEvidence: TenantAuditEvidenceSummary | undefined
+  attention: unknown
+  syncFreshness: TenantSyncFreshness
+}) {
+  return JSON.stringify({
+    version: input.healthModelVersion,
+    audit: auditEvidenceSignature(input.auditEvidence),
+    findings: findingSignature(input.attention),
+    services: freshnessSignature(input.syncFreshness),
+  })
+}
+
+/** The same identity, recovered from a previously saved snapshot row. Returns
+ *  null when the saved payload cannot supply one, which never compares equal to
+ *  a current signature and therefore never suppresses a write. */
+function savedHealthHistorySignature(previous: {
+  payload: unknown
+  healthModelVersion?: number | null
+} | null): string | null {
+  const payload = previous?.payload as {
+    syncFreshness?: TenantSyncFreshness
+    auditEvidence?: TenantAuditEvidenceSummary
+    attention?: unknown
+    healthModelVersion?: number
+  } | null | undefined
+  if (!payload?.syncFreshness) return null
+  const version = previous?.healthModelVersion ?? payload.healthModelVersion
+  if (typeof version !== 'number') return null
+  return healthHistorySignature({
+    healthModelVersion: version,
+    auditEvidence: payload.auditEvidence,
+    attention: payload.attention,
+    syncFreshness: payload.syncFreshness,
+  })
+}
 
 @Injectable()
 export class TenantsService {
@@ -326,7 +429,42 @@ export class TenantsService {
       lastSuccessfulPollAt: Date | null
       lastError: string | null
     }>
-  }, auditEvents: TenantAuditEvent[] = []) {
+  },
+  /**
+   * The audit read backing this evaluation, or `null` when this path performed
+   * no read. Required, not defaulted: every one of the seven call sites has to
+   * say which it is, so a path that reads nothing cannot drift into looking
+   * like a complete empty window.
+   */
+  auditEvidence: AuditEvidenceForTenant | null,
+  /** The ONE captured assessment time for this request. */
+  now: Date) {
+    // Observations carry a `payloadWithheld` flag the finding derivation has no
+    // field for; a withheld payload yields null `initiatedBy`/`targetResources`
+    // there, and the summary below records that the window is not complete, so
+    // what was seen still surfaces while the evaluation cannot read clean.
+    const auditEvents: TenantAuditEvent[] = (auditEvidence?.observations ?? []).map((observation) => ({
+      microsoftAuditId: observation.microsoftAuditId,
+      eventDateTime: observation.eventDateTime,
+      activityDisplayName: observation.activityDisplayName,
+      category: observation.category,
+      operationType: observation.operationType,
+      result: observation.result,
+      initiatedBy: observation.initiatedBy,
+      targetResources: observation.targetResources,
+    }))
+    const auditEvidenceSummary: TenantAuditEvidenceSummary = auditEvidence
+      ? {
+          status: auditEvidence.status,
+          reason: auditEvidence.reason,
+          // Recomputed by `deriveTenantHealth` from the status, reason and
+          // withheld count; supplied here only so the shape is complete.
+          windowComplete: false,
+          observedCount: auditEvidence.observations.length,
+          withheldPayloads: auditEvidence.withheldPayloads,
+          assessedAt: now.toISOString(),
+        }
+      : unreadTenantAuditEvidence(now)
     const secureScoreDetails = getMicrosoftSecureScoreDetails(
       tenant.entraSnapshots.find((snapshot) => snapshot.resourceType === SyncResourceType.SECURE_SCORES),
       tenant.syncStates.find((state) => state.resourceType === SyncResourceType.SECURE_SCORES)?.lastSuccessfulAt,
@@ -376,6 +514,8 @@ export class TenantsService {
       return { state: 'REJECTED', reasonCode: 'USAGE_PROJECTION_EVIDENCE_INVALID' }
     }
     const collectionReadiness = deriveCollectionReadiness({
+      // The same captured time the audit window, freshness and health use.
+      now,
       connectionStatus: effectiveConnectionStatus,
       connectionVerifiedAt: tenant.connection?.lastVerifiedAt,
       consentedPermissions,
@@ -398,7 +538,7 @@ export class TenantsService {
     const notApplicableResourceTypes = readinessResourceTypes('NOT_LICENSED')
     const unsupportedResourceTypes = readinessResourceTypes('UNSUPPORTED')
     const syncFreshness = deriveTenantSyncFreshness(
-      tenant.syncStates, new Date(),
+      tenant.syncStates, now,
       [...notApplicableResourceTypes, ...unsupportedResourceTypes],
       { notLicensed: notApplicableResourceTypes, unsupported: unsupportedResourceTypes },
     )
@@ -414,8 +554,10 @@ export class TenantsService {
       microsoftRiskSummary: collectionReadiness.evidence.riskyIdentities.microsoftRiskSummary,
       signInEvidence: collectionReadiness.evidence.signIns,
       auditEvents,
+      auditEvidence: auditEvidenceSummary,
       notApplicableResourceTypes,
       unsupportedResourceTypes,
+      now,
     })
 
     return {
@@ -578,7 +720,12 @@ export class TenantsService {
         where: { id: captured.tenant.id },
         select: this.tenantSelect(),
       })
-      return { tenant: this.mapTenant(refreshed), connected: published.connected }
+      // VERIFICATION-1 of 7 mapper calls. No audit read happens on this path, so
+      // the mapper is told so explicitly: the evaluation reports an UNREAD window
+      // rather than inferring a complete one from an empty event list. Adding a
+      // second database read here is deliberately out of scope, and no provider,
+      // verification or reconnect semantics change.
+      return { tenant: this.mapTenant(refreshed, null, new Date()), connected: published.connected }
     }
 
     const capture = await captureConnectionVerification(this.prisma, {
@@ -615,7 +762,12 @@ export class TenantsService {
       where: { id: tenant.id },
       select: this.tenantSelect(),
     })
-    return { tenant: this.mapTenant(refreshed), connected: published.connected }
+    // VERIFICATION-2 of 7 mapper calls. No audit read happens on this path, so
+    // the mapper is told so explicitly: the evaluation reports an UNREAD window
+    // rather than inferring a complete one from an empty event list. Adding a
+    // second database read here is deliberately out of scope, and no provider,
+    // verification or reconnect semantics change.
+    return { tenant: this.mapTenant(refreshed, null, new Date()), connected: published.connected }
   }
 
   private tenantSelect() {
@@ -684,6 +836,56 @@ export class TenantsService {
     } as const satisfies Prisma.CustomerTenantSelect
   }
 
+  /**
+   * The storage boundary for the qualified audit-evidence reader: the installed
+   * Prisma raw path, which is exactly what the registered physical witness
+   * executes. The statement and its bound values come from the reader
+   * unchanged — nothing is interpolated here, no extra limit or ordering is
+   * added, and no tenant is looked up on this path.
+   */
+  private auditEvidenceStore(): AuditEvidenceStore {
+    return {
+      query: (sql, params) => this.prisma.$queryRawUnsafe<unknown[]>(sql, ...params),
+    }
+  }
+
+  /**
+   * Map one already-read audit page onto its exact tenants and persist each
+   * resulting snapshot, then return so the generator may acquire the next page.
+   *
+   * History work is bounded by the page, never by the fleet: at most one
+   * page-worth of snapshot read/write pairs is ever in flight, which replaces
+   * the previous unbounded `Promise.all` over every authorized tenant. Results
+   * are written into `mapped` by ABSOLUTE index, so the response keeps the
+   * tenant query's order whatever order these settle in.
+   */
+  private async mapAuditEvidencePage(
+    tenants: readonly Parameters<typeof this.mapTenant>[0][],
+    mapped: Array<ReturnType<typeof this.mapTenant> | undefined>,
+    page: readonly AuditEvidenceForTenant[],
+    offset: number,
+    assessmentAt: Date,
+  ) {
+    await Promise.all(page.map(async (evidence, index) => {
+      const position = offset + index
+      const tenant = tenants[position]
+      if (!tenant) return
+      // The reader returns one entry per requested scope, in request order.
+      // Check the pair anyway: a mismatch must make THIS tenant unread, and
+      // must never hand it another tenant's evidence.
+      const matched =
+        evidence.scope.organizationId === tenant.organization.id &&
+        evidence.scope.customerTenantId === tenant.id
+      const row = this.mapTenant(tenant, matched ? evidence : {
+        scope: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
+        status: 'UNREAD', reason: 'SCOPE_MISMATCH',
+        observations: [], capReached: false, withheldPayloads: 0,
+      }, assessmentAt)
+      mapped[position] = row
+      await this.persistTenantHealthSnapshot(tenant, row.tenantHealth, row.syncFreshness)
+    }))
+  }
+
   async listForIdentity(identity: AuthenticatedIdentity, internals: { now?: () => Date } = {}) {
     const organizationIds = await this.getAccessibleOrganizationIds(identity)
     if (organizationIds.length === 0) return { tenants: [] }
@@ -694,58 +896,59 @@ export class TenantsService {
       select: this.tenantSelect(),
     })
 
-    const tenantIds = tenants.map((tenant) => tenant.id)
-    // Event recency and saved retention are independent eligibility rules.
-    // Capture once for this query; HTTP callers never supply the clock.
-    const auditReadAt = internals.now?.() ?? new Date()
-    const auditEvents = await this.prisma.directoryAuditLog.findMany({
-        where: {
-          organizationId: { in: organizationIds },
-          customerTenantId: { in: tenantIds },
-          eventDateTime: {
-            gte: new Date(auditReadAt.getTime() - 24 * 60 * 60 * 1000),
-          },
-          expiresAt: { gt: auditReadAt },
-        },
-        orderBy: { eventDateTime: 'desc' },
-        take: 500,
-        select: {
-          customerTenantId: true,
-          microsoftAuditId: true,
-          eventDateTime: true,
-          activityDisplayName: true,
-          category: true,
-          operationType: true,
-          result: true,
-          initiatedBy: true,
-          targetResources: true,
-        },
-      })
+    // ONE trusted internal assessment time for the whole request. Event
+    // recency, saved retention, collection readiness, sync freshness and health
+    // evaluation are independent rules evaluated against this single value, and
+    // HTTP callers never supply the clock.
+    const assessmentAt = internals.now?.() ?? new Date()
 
-    const auditEventsByTenant = new Map<string, TenantAuditEvent[]>()
-    for (const event of auditEvents) {
-      const events = auditEventsByTenant.get(event.customerTenantId) ?? []
-      events.push(event)
-      auditEventsByTenant.set(event.customerTenantId, events)
-    }
-
-    const mappedTenants = tenants.map((tenant) =>
-        this.mapTenant(
-          tenant,
-          auditEventsByTenant.get(tenant.id) ?? []
-        )
-      )
-
-    // Retain auditable health history. A persistence failure must never make a
-    // tenant list unavailable, and every row is scoped to the same workspace
-    // used to load the tenant above.
-    await Promise.all(mappedTenants.map(async (mapped, index) => {
-      const tenant = tenants[index]
-      if (!tenant) return
-      await this.persistTenantHealthSnapshot(tenant, mapped.tenantHealth, mapped.syncFreshness)
+    // Exact pairs, built only from the tenants the authorized query actually
+    // returned and each paired with its OWN selected organization id. This is
+    // deliberately not the cross-product of the accessible organizations and
+    // the tenant ids, which is what the previous workspace-wide read used.
+    const scopes: AuditEvidenceScope[] = tenants.map((tenant) => ({
+      organizationId: tenant.organization.id,
+      customerTenantId: tenant.id,
     }))
 
-    return { tenants: mappedTenants }
+    const mapped: Array<ReturnType<typeof this.mapTenant> | undefined> = new Array(tenants.length)
+    // No authorized tenants means no audit query at all.
+    if (scopes.length > 0) {
+      const metrics = newAuditEvidenceReadMetrics()
+      let offset = 0
+      try {
+        // One bounded page in flight at a time. Each page is consumed — mapped
+        // and persisted — before the generator issues the next read, and no
+        // reference to its raw observations is kept afterwards, so the fleet's
+        // events are never accumulated.
+        for await (const page of readTenantAuditEvidencePages(
+          this.auditEvidenceStore(), scopes, assessmentAt, metrics,
+        )) {
+          await this.mapAuditEvidencePage(tenants, mapped, page.tenants, offset, assessmentAt)
+          offset += page.tenants.length
+        }
+      } catch (error) {
+        // A rejected request (not a rejected query: the reader already turns a
+        // storage failure into UNREAD per scope) must not make the tenant list
+        // unavailable. Only the fixed code is logged; no source error text,
+        // statement or payload is recorded or returned.
+        this.logger.warn(`Tenant audit evidence read was unusable: ${
+          error instanceof AuditEvidenceRequestError ? error.code : 'READ_UNAVAILABLE'}`)
+      }
+    }
+
+    // Every authorized tenant is preserved in the response in query order. A
+    // tenant the traversal did not cover is mapped with NO audit read rather
+    // than dropped or left as a hole; coverage is never inferred.
+    for (let index = 0; index < tenants.length; index += 1) {
+      if (mapped[index]) continue
+      const tenant = tenants[index]!
+      const row = this.mapTenant(tenant, null, assessmentAt)
+      mapped[index] = row
+      await this.persistTenantHealthSnapshot(tenant, row.tenantHealth, row.syncFreshness)
+    }
+
+    return { tenants: mapped as Array<ReturnType<typeof this.mapTenant>> }
   }
 
   private async persistTenantHealthSnapshot(
@@ -757,16 +960,23 @@ export class TenantsService {
       const previous = await this.prisma.tenantHealthSnapshot.findFirst({
         where: { organizationId: tenant.organization.id, customerTenantId: tenant.id },
         orderBy: { evaluatedAt: 'desc' },
-        select: { overallStatus: true, evaluatedAt: true, payload: true },
+        select: { overallStatus: true, evaluatedAt: true, payload: true, healthModelVersion: true },
       })
       const evaluatedAt = new Date(health.evaluatedAt)
-      const currentSignature = JSON.stringify(Object.values(syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-      const previousPayload = previous?.payload as { syncFreshness?: TenantSyncFreshness } | null
-      const previousSignature = previousPayload?.syncFreshness
-        ? JSON.stringify(Object.values(previousPayload.syncFreshness.services).map((service) => ({ service: service.service, status: service.status, freshness: service.freshnessStatus, failures: service.partialFailures.map((failure) => failure.collector) })))
-        : null
-      // Keep evidence history without producing a row on every tenant-list poll.
-      if (previous?.overallStatus === health.overallStatus && previousSignature === currentSignature && evaluatedAt.getTime() - previous.evaluatedAt.getTime() < 15 * 60 * 1000) return
+      const currentSignature = healthHistorySignature({
+        healthModelVersion: health.healthModelVersion,
+        auditEvidence: health.auditEvidence,
+        attention: health.attention,
+        syncFreshness,
+      })
+      const previousSignature = savedHealthHistorySignature(previous)
+      // Keep evidence history without producing a row on every tenant-list
+      // poll. A changed model version, a changed audit-window completeness or
+      // a changed observed finding is a changed evaluation even when the
+      // overall status and the per-service freshness are identical.
+      if (previous?.overallStatus === health.overallStatus &&
+        previousSignature !== null && previousSignature === currentSignature &&
+        evaluatedAt.getTime() - previous.evaluatedAt.getTime() < HEALTH_HISTORY_DEDUPE_WINDOW_MS) return
       await this.prisma.tenantHealthSnapshot.create({
         // Preserve the existing health fields for snapshot consumers; freshness
         // is additive rather than wrapping the prior payload shape.
@@ -785,6 +995,8 @@ export class TenantsService {
           data: health.data.status,
           security: health.security.status,
           operations: health.operations.status,
+          auditWindow: health.auditEvidence.status,
+          auditReason: health.auditEvidence.reason,
         },
         serviceSyncTransitions: Object.values(syncFreshness.services).map((service) => ({
           service: service.service,
@@ -896,14 +1108,24 @@ export class TenantsService {
           })
         })
         await this.markInitialSyncDue(tenant.id, organizationIds[0])
-        return { tenant: this.mapTenant(tenant), requiresConsent: false }
+        // RECONNECT-1 of 7 mapper calls. No audit read happens on this path, so the
+        // mapper is told so explicitly: the evaluation reports an UNREAD window
+        // rather than inferring a complete one from an empty event list. Adding a
+        // second database read here is deliberately out of scope, and no provider,
+        // verification or reconnect semantics change.
+        return { tenant: this.mapTenant(tenant, null, new Date()), requiresConsent: false }
       }
 
       const tenant = await this.prisma.customerTenant.findUniqueOrThrow({
         where: { id: existing.id },
         select: this.tenantSelect(),
       })
-      return { tenant: this.mapTenant(tenant), requiresConsent: true }
+      // RECONNECT-2 of 7 mapper calls. No audit read happens on this path, so the
+      // mapper is told so explicitly: the evaluation reports an UNREAD window
+      // rather than inferring a complete one from an empty event list. Adding a
+      // second database read here is deliberately out of scope, and no provider,
+      // verification or reconnect semantics change.
+      return { tenant: this.mapTenant(tenant, null, new Date()), requiresConsent: true }
     }
 
     if (input.connectionMode === 'CUSTOMER_MANAGED') {
@@ -941,7 +1163,12 @@ export class TenantsService {
         select: this.tenantSelect(),
       })
       await this.markInitialSyncDue(tenant.id, organizationIds[0])
-      return { tenant: this.mapTenant(tenant), requiresConsent: false }
+      // RECONNECT-3 of 7 mapper calls. No audit read happens on this path, so the
+      // mapper is told so explicitly: the evaluation reports an UNREAD window
+      // rather than inferring a complete one from an empty event list. Adding a
+      // second database read here is deliberately out of scope, and no provider,
+      // verification or reconnect semantics change.
+      return { tenant: this.mapTenant(tenant, null, new Date()), requiresConsent: false }
     }
 
     const tenant = await this.prisma.customerTenant.create({
@@ -956,7 +1183,12 @@ export class TenantsService {
       select: this.tenantSelect(),
     })
 
-    return { tenant: this.mapTenant(tenant), requiresConsent: true }
+    // RECONNECT-4 of 7 mapper calls. No audit read happens on this path, so the
+    // mapper is told so explicitly: the evaluation reports an UNREAD window
+    // rather than inferring a complete one from an empty event list. Adding a
+    // second database read here is deliberately out of scope, and no provider,
+    // verification or reconnect semantics change.
+    return { tenant: this.mapTenant(tenant, null, new Date()), requiresConsent: true }
   }
 
   async removeTenantForIdentity(

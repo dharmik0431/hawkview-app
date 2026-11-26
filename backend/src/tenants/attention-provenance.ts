@@ -10,11 +10,17 @@ export type AttentionCollectorResource = typeof ATTENTION_COLLECTOR_RESOURCES[nu
 type Owner = 'CUSTOMER_ADMIN' | 'HAWKVIEW_OPERATIONS' | 'UNDETERMINED'
 export type TenantFindingKind = 'MICROSOFT_ACTIVE_RISK' | 'MFA_REGISTRATION_COVERAGE' |
   'CONDITIONAL_ACCESS_CHANGE' | 'AUTHENTICATION_CHANGE' | 'APPLICATION_ACCESS_CHANGE' | 'ADMINISTRATIVE_ROLE_CHANGE'
+/** Each kind names WHICH evidence is missing. `LIMITED_SIGN_IN_EVIDENCE` is
+ *  specifically the sign-in source fallback and keeps its exact meaning;
+ *  `INCOMPLETE_AUDIT_EVIDENCE` is the tenant audit window. They are deliberately
+ *  separate: tagging an unread audit window as a sign-in limitation would
+ *  misreport the gap to every consumer that routes or attributes by kind. */
+export type EvidenceLimitationKind = 'LIMITED_SIGN_IN_EVIDENCE' | 'INCOMPLETE_AUDIT_EVIDENCE'
 export type AttentionProvenance = { version: 1 } & (
   | { origin: 'TENANT_FINDING'; kind: TenantFindingKind; remediationOwner: 'CUSTOMER_ADMIN' }
   | { origin: 'ACCESS_CONFIGURATION'; kind: 'CONNECTION_UNAVAILABLE' | 'AUTHORIZATION_REQUIRED'; remediationOwner: 'CUSTOMER_ADMIN' | 'UNDETERMINED' }
   | { origin: 'COLLECTION_OPERATION'; kind: 'COLLECTOR_ATTENTION'; resourceType: AttentionCollectorResource; remediationOwner: 'HAWKVIEW_OPERATIONS' | 'UNDETERMINED' }
-  | { origin: 'EVIDENCE_LIMITATION'; kind: 'LIMITED_SIGN_IN_EVIDENCE'; remediationOwner: 'UNDETERMINED' }
+  | { origin: 'EVIDENCE_LIMITATION'; kind: EvidenceLimitationKind; remediationOwner: 'UNDETERMINED' }
   | { origin: 'UNKNOWN'; kind: 'UNKNOWN'; remediationOwner: 'UNDETERMINED' }
 )
 export const unknownAttentionProvenance = (): AttentionProvenance => ({ version: 1, origin: 'UNKNOWN', kind: 'UNKNOWN', remediationOwner: 'UNDETERMINED' })
@@ -35,6 +41,9 @@ export function collectorAttentionProvenance(resource: string, reasonCode: strin
     remediationOwner: knownOperatorIssue ? 'HAWKVIEW_OPERATIONS' : 'UNDETERMINED' }
 }
 export const limitedEvidenceProvenance = (): AttentionProvenance => ({ version: 1, origin: 'EVIDENCE_LIMITATION', kind: 'LIMITED_SIGN_IN_EVIDENCE', remediationOwner: 'UNDETERMINED' })
+/** The tenant audit window was not read completely. Missing evidence, never an
+ *  observed tenant finding and never a customer permission request. */
+export const auditEvidenceLimitationProvenance = (): AttentionProvenance => ({ version: 1, origin: 'EVIDENCE_LIMITATION', kind: 'INCOMPLETE_AUDIT_EVIDENCE', remediationOwner: 'UNDETERMINED' })
 
 /** Historical/malformed/future tags are unclassified, not permission to drop an item. */
 export function readAttentionProvenance(value: unknown): AttentionProvenance {
@@ -51,6 +60,12 @@ export function readAttentionProvenance(value: unknown): AttentionProvenance {
   if (keys === 'kind,origin,remediationOwner,resourceType,version' && v.origin === 'COLLECTION_OPERATION' && v.kind === 'COLLECTOR_ATTENTION' &&
     typeof v.resourceType === 'string' && (ATTENTION_COLLECTOR_RESOURCES as readonly string[]).includes(v.resourceType) &&
     ['HAWKVIEW_OPERATIONS', 'UNDETERMINED'].includes(owner)) return { version: 1, origin: 'COLLECTION_OPERATION', kind: 'COLLECTOR_ATTENTION', resourceType: v.resourceType as AttentionCollectorResource, remediationOwner: owner as 'HAWKVIEW_OPERATIONS' | 'UNDETERMINED' }
-  if (keys === basicKeys && v.origin === 'EVIDENCE_LIMITATION' && v.kind === 'LIMITED_SIGN_IN_EVIDENCE' && owner === 'UNDETERMINED') return limitedEvidenceProvenance()
+  if (keys === basicKeys && v.origin === 'EVIDENCE_LIMITATION' && owner === 'UNDETERMINED') {
+    // Each recognized kind round-trips to its OWN constructor. An unrecognized
+    // or future kind falls through to unclassified rather than collapsing onto
+    // whichever limitation happens to be listed first.
+    if (v.kind === 'LIMITED_SIGN_IN_EVIDENCE') return limitedEvidenceProvenance()
+    if (v.kind === 'INCOMPLETE_AUDIT_EVIDENCE') return auditEvidenceLimitationProvenance()
+  }
   return unknownAttentionProvenance()
 }
