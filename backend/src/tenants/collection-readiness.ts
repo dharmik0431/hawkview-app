@@ -34,6 +34,67 @@ export const COLLECTION_READINESS_STATES = [
 export type CollectionReadinessState = (typeof COLLECTION_READINESS_STATES)[number]
 export type PermissionGrantStatus = 'CONFIRMED' | 'MISSING' | 'UNVERIFIED' | 'NOT_APPLICABLE'
 
+/**
+ * Which selected-dataset states the limited sign-in "unmeasured running"
+ * relabel is allowed to REPLACE.
+ *
+ * The relabel exists because an unqualified RUNNING fallback used to fall
+ * through to an ordinary in-progress dataset state that the health mapper had
+ * no PENDING branch for, so a genuinely running collector was reported as not
+ * configured with zero pending work. But it was written without consulting the
+ * dataset state at all, so it also replaced an AUTHORITATIVE verdict: a revoked
+ * or unconsented connection, or a dataset whose required permission is
+ * verified missing, reads as merely initializing. A customer cannot act on
+ * that, and the remediation the row carries is thrown away.
+ *
+ * An exhaustive `Record` rather than a set, and a declared type rather than an
+ * inferred one, so a thirteenth member of `COLLECTION_READINESS_STATES` cannot
+ * COMPILE until somebody classifies it. The polarity matters as much as the
+ * membership: this is an allowlist, so the unknown case is the one where the
+ * relabel does NOT fire and the dataset's own verdict survives. A denylist
+ * would relabel a new state by default, which is this defect re-created by
+ * construction, with no test failing.
+ *
+ * Measured reachability under the predicate this gates (a recognized fallback
+ * code, RUNNING, and a recorded success that is not finite-and-at-or-before
+ * the assessment clock): the selected sign-in dataset reaches exactly four
+ * states - PARTIAL, BACKLOGGED, UNVERIFIED and BLOCKED_PERMISSION - across six
+ * (state, reasonCode) pairs. `PARTIAL` is the one ordinary in-progress state
+ * among them and the only one the relabel may take.
+ *
+ * KNOWN LIMIT, deliberately not closed here. The gate reads the
+ * ENTITLEMENT-chosen dataset - the Graph one unless the tenant is NON_PREMIUM -
+ * which is the same dataset every other field in this projection falls through
+ * to. It is NOT always the dataset backing the `selectedSource` the projection
+ * publishes: `selectedSource` says the activity feed whenever a fallback code
+ * is recognized. So a premium tenant with `ActivityFeed.Read` verified missing
+ * has an ordinary PARTIAL Graph dataset and a BLOCKED_PERMISSION feed dataset,
+ * and the relabel still fires over the attributed source's own blocker.
+ * Measured, and pinned in `fallback-access-precedence.test.ts`. Keying this on
+ * the attributed dataset would change which dataset the whole evidence block
+ * reads, which is a source-attribution redesign rather than a precedence fix.
+ */
+export const UNMEASURED_RUNNING_RELABEL: Readonly<Record<CollectionReadinessState, boolean>> = Object.freeze({
+  /** Ordinary in-progress with a prior recorded success: the case the relabel exists for. */
+  PARTIAL: true,
+  /** A more specific in-progress reason the collector itself reported; it is already PENDING downstream. */
+  BACKLOGGED: false,
+  /** Unreachable here - the gated predicate requires a recorded Date, and this state needs a falsy one. */
+  INITIALIZING: false,
+  /** Measured outcomes: replacing them would discard a measurement, not a non-measurement. */
+  READY: false,
+  STALE: false,
+  /** Authoritative access, entitlement and applicability verdicts. Never replaced. */
+  UNVERIFIED: false,
+  NOT_LICENSED: false,
+  BLOCKED_PERMISSION: false,
+  BLOCKED_TENANT_CONFIGURATION: false,
+  UNSUPPORTED: false,
+  /** Collector outcomes that carry their own reason; in progress does not describe them. */
+  FAILED_TRANSIENT: false,
+  NEVER_SUCCEEDED: false,
+})
+
 export type ReadinessSyncState = {
   resourceType: string
   status: string
@@ -867,7 +928,20 @@ export function deriveCollectionReadiness(input: ReadinessInput): CollectionRead
   // branch for, so health called it NOT_CONFIGURED and — with a truthy
   // selectedSource excluding SIGN_INS from the operational states — reported
   // zero pending work for a collector that was actually running.
-  const fallbackUnmeasuredRunning = fallbackSelected && signInSync?.status === 'RUNNING' && fallbackSuccessAt === null
+  //
+  // PRECEDENCE: only an ordinary in-progress dataset state may be relabelled.
+  // Written without this conjunct, the relabel replaced an authoritative
+  // blocked, unverified or backlogged verdict as well, which is a stronger and
+  // actionable claim than "in progress".
+  //
+  // `=== true` rather than a bare lookup: the record is a plain object, so a
+  // state string that somehow bypassed the type system and collided with an
+  // Object.prototype member would otherwise read truthy. The undefined check is
+  // defensive, not reachable - both sign-in datasets are always assigned - and
+  // it is here so a missing dataset would keep its own fall-through.
+  const fallbackUnmeasuredRunning = fallbackSelected && signInSync?.status === 'RUNNING' &&
+    fallbackSuccessAt === null &&
+    signInDataset !== undefined && UNMEASURED_RUNNING_RELABEL[signInDataset.state] === true
   // Inclusive [now - aging, now]: age exactly 0 and exactly the aging bound are
   // current; one millisecond into the future is not a measurement at all. The
   // existing SIGN_INS window replaces the hardcoded two hours; it is the same
