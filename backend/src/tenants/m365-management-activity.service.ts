@@ -1022,16 +1022,38 @@ export class M365ManagementActivityService {
   }
 
   /**
-   * Confirm this attempt is still current WITHOUT writing anything. Used where
-   * there is no structured detail to record but a coupled change still must not
-   * commit for a stale attempt.
+   * HOLD this attempt's state row until the caller's transaction commits, while
+   * changing nothing the row records. Used where there is no structured detail
+   * to record but a coupled change still must not commit for a stale attempt.
+   *
+   * This must be a write, not a read. PostgreSQL takes no row lock for a plain
+   * SELECT, so a count can only report that the attempt was current at the
+   * instant it answered: a successor could install its own token on this row
+   * -- a DIFFERENT row from the content row this transaction has locked --
+   * after the count and before the coupled disposition committed. An UPDATE
+   * takes the row lock and holds it to commit, and the successor's own
+   * token-installing UPDATE then waits and re-evaluates its predicate against
+   * the committed row, so it cannot interleave.
+   *
+   * The payload writes lastAttemptAt back to the value currentAttemptWhere
+   * already requires it to equal, so every row this can match is written its
+   * own current value. Status, reason, success clock, failure counter and any
+   * earlier legitimate refusal recorded by THIS SAME attempt are all preserved,
+   * and no detail is fabricated to acquire the guard. The row's updated_at does
+   * advance, as it does for every other write in this file.
+   *
+   * It takes no budget lock and introduces no new lock mode or raw statement,
+   * and it locks sync_states AFTER the content row -- the same direction
+   * commitTerminalState already commits in.
    */
-  private async currentAttemptHolds(
+  private async holdCurrentAttempt(
     database: Pick<Prisma.TransactionClient, 'syncState'>,
     tenant: TenantTarget,
     attempt: M365AuditAttempt,
-  ): Promise<boolean> {
-    return await database.syncState.count({ where: this.currentAttemptWhere(tenant, attempt) }) === 1
+  ): Promise<'applied' | 'superseded'> {
+    return await this.applyCurrentAttemptState(
+      database, tenant, attempt, { lastAttemptAt: attempt.attemptAt },
+    )
   }
 
   /** This attempt's envelope carrying its latest refusal, or null when the error
@@ -1543,8 +1565,10 @@ export class M365ManagementActivityService {
           return
         }
         // Nothing to record, but the attempt fence is unconditional: a stale
-        // worker's content disposition must not commit either.
-        if (!(await this.currentAttemptHolds(transaction, tenant, attempt))) {
+        // worker's content disposition must not commit either. The guard is a
+        // conditional write, so this attempt's row stays locked until the
+        // coupled disposition commits -- a successor cannot slip in between.
+        if (await this.holdCurrentAttempt(transaction, tenant, attempt) === 'superseded') {
           throw new M365AuditAttemptSupersededError()
         }
       }
@@ -1559,11 +1583,21 @@ export class M365ManagementActivityService {
         // provider failure, even if an ownerless writer changed the row.
         if (disposition.count !== 1) throw new TenantVisitLeaseLostError()
       } else {
-        await this.prisma.$transaction(async (transaction) => {
+        const disposition = await this.prisma.$transaction(async (transaction) => {
           const applied = await transaction.m365ActivityContent.updateMany(failureDisposition)
           await coupleObservation(transaction, applied)
           return applied
         })
+        // A budget refusal whose own disposition matched no row never reached
+        // the fence at all: coupleObservation returns before the guard. The
+        // owned path catches that case through its lease; this path has no
+        // lease, so it fails closed here instead of falling through into
+        // terminal handling as though the disposition had committed. Ordinary
+        // provider retries, and standalone callers with no attempt context,
+        // keep their released behaviour.
+        if (budgetLimited && attempt && disposition.count !== 1) {
+          throw new M365AuditAttemptSupersededError()
+        }
       }
       if (error instanceof ManagementActivityHttpError && [401, 403].includes(error.status)) throw error
       if (permanent) {

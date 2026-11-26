@@ -2514,11 +2514,18 @@ test('physical interrupted ordinary GROUPS inventory recovers under a newly acqu
 // against a concurrent successor, a genuine rollback of the coupled disposition
 // and observation, and the additive nullable column on legacy rows.
 //
-// SCOPE, stated plainly: these are HAND-WRITTEN Prisma statements that exercise
-// the storage and compare-and-set semantics the production writer relies on.
-// They do NOT drive syncTenant/processContent against PostgreSQL, so they do not
-// prove the production writer's own branches. That still requires exact-head
-// registered CI after review. They are NOT executed locally.
+// SCOPE, stated plainly: four of these are HAND-WRITTEN Prisma statements that
+// exercise the storage and compare-and-set semantics the production writer
+// relies on. They do NOT drive syncTenant/processContent against PostgreSQL, so
+// they do not prove the production writer's own branches.
+//
+// The fifth, the guard row-lock case, differs in one respect: it calls the
+// ACTUAL production guard (holdCurrentAttempt) on a real connection while a
+// second connection contends for the same row. It still does not drive
+// syncTenant or processContent end to end.
+//
+// All five require exact-head registered CI after review. They are NOT executed
+// locally.
 // ===========================================================================
 
 async function physicalRefusalFixture(context: TestContext, label: string) {
@@ -2660,6 +2667,83 @@ test('physical HAW-75 coupled disposition and observation roll back together', {
   assert.equal(afterContent.status, 'PROCESSING', 'the disposition rolled back')
   assert.equal((afterState.m365AuditAttempt as never as { refusal: unknown }).refusal, null,
     'and so did the observation')
+})
+
+test('physical HAW-75 the absent-detail guard holds the attempt row until commit', {
+  skip: !registeredCi, concurrency: false, timeout: 60_000,
+}, async context => {
+  // The one behaviour no fake can establish: that the guard really takes a
+  // PostgreSQL row lock and holds it to commit. This drives the ACTUAL
+  // production guard (M365ManagementActivityService#holdCurrentAttempt) on one
+  // connection and a successor's token install on a second, so the two
+  // genuinely contend. A bounded lock_timeout on the successor turns the block
+  // into a deterministic failure instead of an indefinite wait; it is SET LOCAL
+  // inside that one test transaction and changes nothing globally.
+  const { writer, observer, scope } = await physicalRefusalFixture(context, 'guard-row-lock')
+  const attemptAt = new Date(Date.UTC(2026, 10, 26, 14, 0, 0))
+  const token = randomUUID()
+  const successorToken = randomUUID()
+  await writer.syncState.create({
+    data: {
+      ...scope, resourceType: 'M365_AUDIT', status: 'RUNNING', lastAttemptAt: attemptAt,
+      m365AuditAttempt: refusalEnvelope(token, attemptAt, null) as never,
+    },
+  })
+  const content = await writer.m365ActivityContent.create({
+    data: {
+      ...scope, contentType: 'Audit.Exchange', microsoftContentId: randomUUID(),
+      contentUri: 'https://manage.office.com/synthetic-guard-content', status: 'PROCESSING',
+      ledgerExpiresAt: new Date(Date.now() + 86_400_000),
+    },
+  })
+  const service = new M365ManagementActivityService(writer as never, {} as never) as unknown as {
+    holdCurrentAttempt: (
+      database: unknown,
+      tenant: { id: string; organizationId: string },
+      attempt: { token: string; attemptAt: Date },
+    ) => Promise<'applied' | 'superseded'>
+  }
+  const target = { id: scope.customerTenantId, organizationId: scope.organizationId }
+  const attempt = { token, attemptAt }
+  const successorInstall = {
+    where: { ...scope, resourceType: 'M365_AUDIT' as const },
+    data: { m365AuditAttempt: refusalEnvelope(successorToken, attemptAt, null) as never },
+  }
+
+  await assert.rejects(() => writer.$transaction(async transaction => {
+    const disposition = await transaction.m365ActivityContent.updateMany({
+      where: { id: content.id, ...scope }, data: { status: 'RETRY' },
+    })
+    assert.equal(disposition.count, 1, 'the disposition matched its claimed row')
+    const held = await service.holdCurrentAttempt(transaction, target, attempt)
+    assert.equal(held, 'applied', 'the production guard matched this attempt exactly once')
+    // Held: the successor's own token-installing UPDATE must wait on this row.
+    await assert.rejects(() => observer.$transaction(async other => {
+      await other.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
+      await other.syncState.updateMany(successorInstall)
+    }), /lock timeout|55P03|canceling statement/i,
+      'the successor blocked on the row this attempt holds, instead of overtaking it')
+    throw new Error('synthetic abort after the guard')
+  }, { timeout: 30_000 }), /synthetic abort/)
+
+  const [afterContent, afterState] = await Promise.all([
+    observer.m365ActivityContent.findUniqueOrThrow({ where: { id: content.id } }),
+    observer.syncState.findUniqueOrThrow({
+      where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+    }),
+  ])
+  assert.equal(afterContent.status, 'PROCESSING', 'the disposition rolled back with the abort')
+  assert.equal((afterState.m365AuditAttempt as never as { attemptToken: string }).attemptToken, token,
+    'and the guard changed no recorded field, so the attempt still owns the row')
+  assert.equal((afterState.m365AuditAttempt as never as { refusal: unknown }).refusal, null,
+    'with no detail fabricated to acquire it')
+
+  // The lock lived with the transaction, not beyond it.
+  const installed = await observer.syncState.updateMany(successorInstall)
+  assert.equal(installed.count, 1, 'the successor installs once nothing holds the row')
+  // And the production guard now fails closed for the superseded attempt.
+  assert.equal(await service.holdCurrentAttempt(writer, target, attempt), 'superseded',
+    'the same guard refuses the attempt whose token was replaced')
 })
 
 test('physical HAW-75 a stored monthly boundary survives a UTC day rollover for its own attempt', {

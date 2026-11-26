@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import { TenantSyncService } from './tenant-sync.service.js'
 
 /**
@@ -11,6 +11,16 @@ import { TenantSyncService } from './tenant-sync.service.js'
  * Every model is answered empty except the one scoped `syncState.findMany` the
  * bundle already performs, so anything the bundle had to look up separately
  * would come back empty and the detail could not appear.
+ *
+ * CLOCK: `options.now` governs only the bundle's expiry clock. The M365 audit
+ * projection is evaluated against a separate, uninjectable `new Date()`, and
+ * buildBundle reads the real clock in several other places too. So every test
+ * here freezes Date at EVALUATED_AT before building, and the fixtures below are
+ * fixed instants around it. Without that freeze these assertions would depend
+ * on the real calendar: the qualifying refusal's boundary is 2026-11-27T00:00Z,
+ * and a run after it would see the detail as expired and fail while production
+ * behaviour was correct. `options.now` is still passed, because it is the only
+ * clock a caller can inject and it covers that seam.
  */
 const tenant = {
   id: '11111111-1111-1111-1111-111111111111',
@@ -67,7 +77,22 @@ const signInRow = () => ({
   m365AuditAttempt: null,
 })
 
-function bundleService(syncStates: unknown[]) {
+/**
+ * One frozen clock per test, however many services that test builds. Enabling
+ * the same context's timers twice is treated as a hazard in this repository, so
+ * the guard is a WeakSet keyed on the context, as in the sibling service suite.
+ */
+const frozen = new WeakSet<object>()
+function freezeClock(context: TestContext) {
+  if (frozen.has(context)) return
+  context.mock.timers.enable({ apis: ['Date'], now: EVALUATED_AT.getTime() })
+  frozen.add(context)
+}
+
+function bundleService(context: TestContext, syncStates: unknown[]) {
+  // Frozen BEFORE the bundle is built, so every actual Date consumer on the
+  // composed path -- not only the injected expiry clock -- sees EVALUATED_AT.
+  freezeClock(context)
   const modelQueries: string[] = []
   const emptyModel = (name: string) => new Proxy({}, {
     get(_target, operation: string) {
@@ -107,8 +132,8 @@ function bundleService(syncStates: unknown[]) {
   }
 }
 
-test('composed: the real buildBundle surfaces the M365 detail with no extra query', async () => {
-  const fake = bundleService([auditRow(), signInRow()])
+test('composed: the real buildBundle surfaces the M365 detail with no extra query', async (context) => {
+  const fake = bundleService(context, [auditRow(), signInRow()])
   const bundle = await fake.build()
 
   const audit = bundle?.bundle?.sync?.m365Audit
@@ -130,8 +155,8 @@ test('composed: the real buildBundle surfaces the M365 detail with no extra quer
     'and no new model or table was consulted')
 })
 
-test('composed: another resource projection is unaffected and carries no detail', async () => {
-  const fake = bundleService([auditRow(), signInRow()])
+test('composed: another resource projection is unaffected and carries no detail', async (context) => {
+  const fake = bundleService(context, [auditRow(), signInRow()])
   const bundle = await fake.build()
   const text = JSON.stringify(bundle)
   // Exactly one observedBudgetRefusal anywhere in the response.
@@ -140,9 +165,9 @@ test('composed: another resource projection is unaffected and carries no detail'
   assert.match(text, /"m365-audit-backlog"/)
 })
 
-test('composed: a non-qualifying row yields the released response shape', async () => {
+test('composed: a non-qualifying row yields the released response shape', async (context) => {
   // A later success: the same envelope must not be surfaced.
-  const fake = bundleService([
+  const fake = bundleService(context, [
     auditRow({ status: 'SUCCEEDED', lastSuccessfulAt: EVALUATED_AT, lastErrorCode: null }),
     signInRow(),
   ])
@@ -154,8 +179,8 @@ test('composed: a non-qualifying row yields the released response shape', async 
   assert.equal(audit.outcomeProjection.recordedOutcome.kind, 'SUCCEEDED')
 })
 
-test('composed: a legacy null envelope yields the released response shape', async () => {
-  const fake = bundleService([auditRow({ m365AuditAttempt: null }), signInRow()])
+test('composed: a legacy null envelope yields the released response shape', async (context) => {
+  const fake = bundleService(context, [auditRow({ m365AuditAttempt: null }), signInRow()])
   const bundle = await fake.build()
   assert.equal(JSON.stringify(bundle).includes('observedBudgetRefusal'), false)
   const audit = bundle?.bundle?.sync?.m365Audit
