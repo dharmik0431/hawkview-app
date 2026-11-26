@@ -37,7 +37,21 @@ function fixture() {
       upsert: async ({ create, update }: any) => {
         assert.ok(pending); assert.equal(create.organizationId, tenant.organizationId)
         assert.equal(create.customerTenantId, tenant.id)
-        pending.snapshot = state.snapshot ? { ...state.snapshot, ...update } : create
+        pending.snapshot = state.snapshot
+          ? { ...state.snapshot, ...update }
+          : { id: 'synthetic-snapshot-row', ...create }
+      },
+      // An unchanged document records observation time alone: the request
+      // carries no payload and the stored document is retained.
+      updateMany: async ({ where, data }: any) => {
+        assert.ok(pending)
+        assert.deepEqual(Object.keys(data), ['observedAt'])
+        assert.equal(where.organizationId, tenant.organizationId)
+        assert.equal(where.customerTenantId, tenant.id)
+        assert.equal(where.resourceType, 'EXCHANGE_MAILBOX_RULES')
+        if (!pending.snapshot || where.id !== pending.snapshot.id) return { count: 0 }
+        pending.snapshot = { ...pending.snapshot, observedAt: data.observedAt }
+        return { count: 1 }
       },
     },
     tenantCollectionFieldState: { upsert: async ({ where, create, update }: any) => {
