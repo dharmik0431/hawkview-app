@@ -177,6 +177,16 @@ function matches(row: any, where: any): boolean {
     })
   })
 }
+function applyStateData(state: any, data: any): void {
+  for (const [key, value] of Object.entries(data ?? {})) {
+    if (value !== null && typeof value === 'object' && 'increment' in (value as Record<string, unknown>)) {
+      state[key] = (state[key] ?? 0) + Number((value as { increment: number }).increment)
+    } else {
+      state[key] = value
+    }
+  }
+}
+
 function ledger() {
   const rows: any[] = [{ ...content, ...{ organizationId: tenant.organizationId, customerTenantId: tenant.id }, status: 'PENDING', nextRetryAt: null, updatedAt: new Date(NOW) }]
   const state: any = { lastSuccessfulAt: new Date(NOW - 3600000) }
@@ -187,8 +197,12 @@ function ledger() {
       findUnique: async () => state,
       upsert: async ({ update }: any) => Object.assign(state, update),
       update: async ({ data }: any) => Object.assign(state, data),
-      // A terminal state clears this attempt observation, token-guarded.
-      updateMany: async () => ({ count: 1 }),
+      // Every current-attempt status transition is a token-fenced updateMany
+      // (m365-management-activity.service.ts). This fake does NOT evaluate that
+      // where predicate -- m365-audit-refusal-observation.service.test.ts owns
+      // the scope/time/token fence controls. Here it applies the data to the one
+      // state row it holds and reports exactly one affected row.
+      updateMany: async ({ data }: any) => { applyStateData(state, data); return { count: 1 } },
     },
     m365ActivityContent: {
       count: async ({ where }: any) => rows.filter(row => matches(row, where)).length,
