@@ -1045,6 +1045,14 @@ export class M365ManagementActivityService {
    * It takes no budget lock and introduces no new lock mode or raw statement,
    * and it locks sync_states AFTER the content row -- the same direction
    * commitTerminalState already commits in.
+   *
+   * REACHABILITY, stated plainly so the comment above is not read as a live
+   * production race: this branch runs only for a budget error that proved no
+   * closed cap, and the sole production construction of M365AuditBudgetError
+   * always passes selectBudgetConstraint(exceeded) from inside a check that one
+   * of those eight caps is exceeded, so it never yields a null constraint. The
+   * branch therefore exists for a historical or hand-constructed error, and the
+   * guard is defensive. It was equally unreachable while it was a plain count.
    */
   private async holdCurrentAttempt(
     database: Pick<Prisma.TransactionClient, 'syncState'>,
@@ -1595,6 +1603,17 @@ export class M365ManagementActivityService {
         // terminal handling as though the disposition had committed. Ordinary
         // provider retries, and standalone callers with no attempt context,
         // keep their released behaviour.
+        //
+        // Why SUPERSEDED is the accurate reason here: this where clause is
+        // keyed on the content row's primary key, so a zero count can only mean
+        // that row was deleted. Its only deleter is the retention sweep in
+        // commitTerminalState, which commits in the same transaction as that
+        // run's own token-fenced terminal write -- so a committed delete proves
+        // a newer attempt owns the state row. (A tenant or organization cascade
+        // also removes the state row itself, so the label is loose only for a
+        // case where nothing of this tenant survives either way.) A STRUCTURAL
+        // test pins that single-deleter invariant, because this attribution
+        // depends on it.
         if (budgetLimited && attempt && disposition.count !== 1) {
           throw new M365AuditAttemptSupersededError()
         }

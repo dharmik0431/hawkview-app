@@ -2717,12 +2717,28 @@ test('physical HAW-75 the absent-detail guard holds the attempt row until commit
     assert.equal(disposition.count, 1, 'the disposition matched its claimed row')
     const held = await service.holdCurrentAttempt(transaction, target, attempt)
     assert.equal(held, 'applied', 'the production guard matched this attempt exactly once')
+    // Value preservation has to be read HERE, on the writer's own connection,
+    // while the guard's write is still uncommitted. A read after the abort sees
+    // the fixture again and would pass for any payload at all.
+    const guarded = await transaction.syncState.findUniqueOrThrow({
+      where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
+    })
+    assert.equal(guarded.status, 'RUNNING', 'the guard changed no status')
+    assert.equal(guarded.lastErrorCode, null, 'no reason code')
+    assert.equal(guarded.lastSuccessfulAt, null, 'no success clock')
+    assert.equal(guarded.consecutiveFailures, 0, 'no failure counter')
+    assert.equal(guarded.lastAttemptAt?.getTime(), attemptAt.getTime(),
+      'and the captured attempt time it wrote back is the same instant')
+    assert.deepEqual(guarded.m365AuditAttempt, refusalEnvelope(token, attemptAt, null) as never,
+      'the envelope is byte-identical: nothing fabricated to acquire the row')
     // Held: the successor's own token-installing UPDATE must wait on this row.
     await assert.rejects(() => observer.$transaction(async other => {
       await other.$executeRawUnsafe("SET LOCAL lock_timeout = '2s'")
       await other.syncState.updateMany(successorInstall)
-    }), /lock timeout|55P03|canceling statement/i,
-      'the successor blocked on the row this attempt holds, instead of overtaking it')
+    }), /55P03/,
+      'the successor blocked on the row this attempt holds: SQLSTATE 55P03 lock_timeout, '
+      + 'asserted by code rather than by message text, so a statement timeout or a '
+      + 'cancelled backend cannot satisfy it')
     throw new Error('synthetic abort after the guard')
   }, { timeout: 30_000 }), /synthetic abort/)
 
@@ -2732,11 +2748,13 @@ test('physical HAW-75 the absent-detail guard holds the attempt row until commit
       where: { customerTenantId_resourceType: { customerTenantId: scope.customerTenantId, resourceType: 'M365_AUDIT' } },
     }),
   ])
+  // These measure the ROLLBACK and the blocked successor -- not the guard's
+  // payload, which the in-transaction read above covers.
   assert.equal(afterContent.status, 'PROCESSING', 'the disposition rolled back with the abort')
   assert.equal((afterState.m365AuditAttempt as never as { attemptToken: string }).attemptToken, token,
-    'and the guard changed no recorded field, so the attempt still owns the row')
+    'the cancelled successor installed nothing, so the attempt still owns the row')
   assert.equal((afterState.m365AuditAttempt as never as { refusal: unknown }).refusal, null,
-    'with no detail fabricated to acquire it')
+    'and the aborted guard left no trace')
 
   // The lock lived with the transaction, not beyond it.
   const installed = await observer.syncState.updateMany(successorInstall)

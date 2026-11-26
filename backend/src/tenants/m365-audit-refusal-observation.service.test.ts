@@ -121,17 +121,34 @@ function harness(context: TestContext, options: {
   let successorInstalled: Row | null = null
   /**
    * PostgreSQL row-lock semantics, modelled only as far as this correction
-   * needs: a matching UPDATE inside a transaction holds the state row until
-   * that transaction ends, and another writer's token-installing UPDATE must
-   * wait for it and then act on the committed row. A plain SELECT takes no such
-   * lock. Those two facts are the entire difference between the old read-only
-   * check and the new guard, so the fake has to represent them or no witness
-   * here could tell the implementations apart.
+   * needs, and modelled by ISSUER because that is the distinction the whole
+   * correction turns on:
+   *
+   *  - a matching UPDATE issued on the enclosing TRANSACTION holds the state
+   *    row until that transaction ends;
+   *  - the same UPDATE issued on the base client is its own autocommit
+   *    transaction, so it releases the row at the end of its own statement;
+   *  - a plain SELECT takes no row lock at all.
+   *
+   * A waiting token install therefore lands after the holder's transaction
+   * commits in the first case, and immediately in the other two. Without the
+   * issuer distinction, passing the base client instead of the transaction --
+   * which type-checks, and re-opens the exact interleaving this guard exists to
+   * close -- would be invisible here.
    */
-  let stateRowLocked = false
+  let lockHolder: 'transaction' | null = null
   const deferredWriters: (() => void)[] = []
-  /** The attempt token the row carried at each successful commit. */
+  const releaseAndFlush = () => {
+    lockHolder = null
+    while (deferredWriters.length) deferredWriters.shift()!()
+  }
+  /** One entry per successful transaction: who owned the state row at its
+   *  commit, and whether that transaction ISSUED the failure disposition. A
+   *  disposition that matched zero rows still counts as issued, so this answers
+   *  "which attempt owned the row when that transaction committed", not
+   *  "whether a content row changed". */
   const committedTokens: (string | undefined)[] = []
+  const commits: { token: string | undefined; sawDisposition: boolean }[] = []
   const applyInstall = () => {
     // A real concurrent attempt: it rewrites the envelope and (unless we are
     // isolating the token) the captured attempt time too.
@@ -150,13 +167,13 @@ function harness(context: TestContext, options: {
     record('successor.install')
   }
   const installSuccessor = () => {
-    if (stateRowLocked) { deferredWriters.push(applyInstall); return }
+    if (lockHolder === 'transaction') { deferredWriters.push(applyInstall); return }
     applyInstall()
   }
   /** Did the guard just answer positively for the current attempt? */
   const guardAnswered = (where: any) => options.successorDuring === 'content-guard' &&
     matches(row, where) && where?.m365AuditAttempt?.equals !== successorToken
-  const syncState = {
+  const syncStateFor = (issuer: 'transaction' | 'autocommit') => ({
     findUnique: async () => row,
     /**
      * UNLOCKED on purpose. Production no longer reads the row to fence an
@@ -176,16 +193,20 @@ function harness(context: TestContext, options: {
       return row
     },
     updateMany: async ({ where, data }: any) => {
-      record('syncState.updateMany', { where, data })
+      record('syncState.updateMany', { where, data, issuer })
       if (!matches(row, where)) return { count: 0 }
-      // A matching UPDATE locks the row for the rest of this transaction.
       const answered = guardAnswered(where)
-      stateRowLocked = true
+      // Held to commit only when the ENCLOSING transaction issued it.
+      if (issuer === 'transaction') lockHolder = 'transaction'
       row = applyData(row!, data)
       if (answered) installSuccessor()
+      // An autocommit statement releases the row as it ends, so anything that
+      // was waiting proceeds now rather than after the caller's transaction.
+      if (issuer === 'autocommit') releaseAndFlush()
       return { count: 1 }
     },
-  }
+  })
+  const syncState = syncStateFor('autocommit')
   const contents = Array.from({ length: options.blobs ?? 1 }, (_blob, index) => ({
     id: `7777777${index}-7777-7777-7777-777777777777`,
     contentUri: `https://manage.office.com/api/v1.0/x/activity/feed/audit/blob-${index}`,
@@ -201,8 +222,13 @@ function harness(context: TestContext, options: {
     },
     findMany: async () => (options.pendingContent === false ? [] : contents),
     updateMany: async (args: any) => {
-      record('content.updateMany', args)
       const claiming = args?.data?.status === 'PROCESSING'
+      const scoped = args?.where?.id !== undefined
+      record(
+        claiming ? 'content.claim' : scoped ? 'content.disposition' : 'content.recovery',
+        args,
+      )
+      record('content.updateMany', args)
       return { count: claiming ? (options.claimCount ?? 1) : (options.dispositionCount ?? 1) }
     },
     update: async () => undefined,
@@ -218,7 +244,7 @@ function harness(context: TestContext, options: {
       }
       return []
     },
-    syncState,
+    syncState: syncStateFor('transaction'),
     m365ActivityContent: contentClient,
     m365AuditRecord: { createMany: async () => ({ count: 0 }), deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
@@ -236,8 +262,17 @@ function harness(context: TestContext, options: {
         const result = await work(transactionClient)
         // Which attempt owned the row at the instant this transaction
         // committed. A disposition that commits while a SUCCESSOR owns it is
-        // exactly the stale commit the guard has to make impossible.
-        committedTokens.push((row as any)?.m365AuditAttempt?.attemptToken)
+        // exactly the stale commit the guard has to make impossible. The
+        // disposition flag matters because a run commits several transactions
+        // (attempt mint, interrupted recovery, blob claim) before this one, and
+        // those would otherwise satisfy an assertion about the disposition.
+        const token = (row as any)?.m365AuditAttempt?.attemptToken
+        committedTokens.push(token)
+        commits.push({
+          token,
+          sawDisposition: calls.slice(committedCalls)
+            .some((call) => call.method === 'content.disposition'),
+        })
         return result
       } catch (error) {
         row = committedRow
@@ -246,8 +281,7 @@ function harness(context: TestContext, options: {
       } finally {
         // This transaction ended, so its row lock is released and any writer
         // that was waiting on it now acts on the committed row.
-        stateRowLocked = false
-        while (deferredWriters.length) deferredWriters.shift()!()
+        releaseAndFlush()
       }
     },
     syncState,
@@ -298,6 +332,8 @@ function harness(context: TestContext, options: {
     }),
     /** The owning attempt token at each successful commit, in order. */
     committedTokens: () => [...committedTokens],
+    /** Only the commits that carried a content disposition. */
+    dispositionCommits: () => commits.filter((commit) => commit.sawDisposition),
     envelope: () => parseAttemptEnvelope((row ?? {}).m365AuditAttempt),
     of: (method: string) => calls.filter((call) => call.method === method),
     attemptTokenFromUpsert: () => {
@@ -552,13 +588,22 @@ test('a stale inner refusal rolls back both the disposition and the observation'
   assert.equal(fake.envelope()?.refusal, null)
 })
 
-test('a stale inner refusal with NO proven cap is fenced by the held guard', async (context) => {
+test('a stale inner refusal with NO proven cap matches zero rows and rolls back', async (context) => {
+  // The successor is installed before the guard runs, so the guard's first
+  // evaluation already matches zero rows. This measures the fail-closed OUTCOME,
+  // not the holding property -- holding is witnessed by the content-guard pair
+  // below, where the successor arrives after a positive guard.
   const fake = harness(context, {
     visitOwner: owner, reservation: 'budget', constraint: null,
     successorDuring: 'content', successorSameTime: true,
   })
   await fake.run()
   assert.deepEqual(fake.row()!.m365AuditAttempt, fake.successor()!.m365AuditAttempt)
+  // Pinning the 'superseded' RESULT, not merely the guard call: if the result
+  // were ignored, the coupled transaction would commit a stale RETRY
+  // disposition onto the content row while the successor owns the state row.
+  assert.deepEqual(fake.dispositionCommits(), [],
+    'no disposition committed once the guard reported the attempt superseded')
 })
 
 test('a lost lease refuses before any observation', async (context) => {
@@ -593,8 +638,13 @@ for (const [label, visitOwner] of [['owned', owner], ['ownerless', undefined]] a
     // this list then contains its token.
     assert.equal(fake.committedTokens().includes(fake.successorToken), false,
       'no transaction committed under the successor token')
-    assert.ok(fake.committedTokens().includes(fake.attemptTokenFromUpsert()!),
-      'the disposition committed under its own attempt, which still held the row')
+    // Attributed to the DISPOSITION's own transaction. A run commits the
+    // attempt mint, interrupted recovery and the blob claim first, and in the
+    // owned lane those are transactions too, so a whole-run token list would
+    // satisfy this assertion no matter what the disposition committed under.
+    assert.deepEqual(fake.dispositionCommits(), [
+      { token: fake.attemptTokenFromUpsert(), sawDisposition: true },
+    ], 'the disposition committed exactly once, under its own attempt')
 
     // And the row was acquired by WRITING it, with nothing but the attempt time
     // its own fence already required.
@@ -611,7 +661,8 @@ for (const [label, visitOwner] of [['owned', owner], ['ownerless', undefined]] a
 
     // The successor is intact afterwards, with no detail invented for it.
     assert.deepEqual(fake.row()!.m365AuditAttempt, fake.successor()!.m365AuditAttempt)
-    assert.equal(fake.envelope()?.refusal ?? null, null)
+    assert.ok(fake.envelope(), 'the successor envelope still parses')
+    assert.equal(fake.envelope()?.refusal, null)
     assert.ok(fake.reasonCodes().includes('ATTEMPT_SUPERSEDED'),
       'and the stale attempt recorded itself as superseded rather than writing state')
   })
@@ -619,12 +670,25 @@ for (const [label, visitOwner] of [['owned', owner], ['ownerless', undefined]] a
 
 test('ownerless: a zero-row budget disposition fails closed instead of reaching terminal state', async (context) => {
   // No lease exists to catch this, so the attempt itself must refuse to go on.
-  const fake = harness(context, { reservation: 'budget', dispositionCount: 0 })
+  //
+  // A successor is installed as well, because that is the state production can
+  // actually produce: the only deleter of a content row is the retention sweep
+  // inside commitTerminalState, which commits in the same transaction as that
+  // run's own token-fenced terminal write -- so a committed delete proves a
+  // newer attempt owns the state row. A zero-row disposition here therefore
+  // really is supersession, which is what makes the reason code accurate.
+  const fake = harness(context, {
+    reservation: 'budget', dispositionCount: 0,
+    successorDuring: 'content', successorSameTime: true,
+  })
   await fake.run()
+  assert.equal(fake.of('content.disposition').length, 1,
+    'the attempt did reach its failure disposition, so this is a fail-closed path')
   assert.deepEqual(fake.of('syncState.updateMany'), [],
     'an unattributable disposition reaches neither the observation nor terminal state')
   assert.ok(fake.reasonCodes().includes('ATTEMPT_SUPERSEDED'))
-  assert.equal(fake.envelope()?.refusal ?? null, null, 'and records no refusal')
+  assert.ok(fake.envelope(), 'the successor envelope still parses')
+  assert.equal(fake.envelope()?.refusal, null, 'and no refusal was recorded')
 })
 
 test('an earlier refusal from the SAME attempt survives acquiring the guard', async (context) => {
@@ -642,6 +706,16 @@ test('an earlier refusal from the SAME attempt survives acquiring the guard', as
   assert.equal(envelope?.refusal?.path, 'content')
   assert.equal(envelope?.attemptToken, fake.attemptTokenFromUpsert(),
     'and it still belongs to this attempt')
+  // Witness that the guard was actually ACQUIRED for the second blob. Without
+  // this, the test passes with the guard deleted outright, because blob 0's
+  // envelope survives on its own.
+  const guardWrites = fake.of('syncState.updateMany').filter((call) => {
+    const data = (call.args[0] as { data: Record<string, unknown> }).data
+    return Object.keys(data).length === 1 && 'lastAttemptAt' in data
+  })
+  assert.equal(guardWrites.length, 1, 'the unrecordable blob acquired the guard')
+  assert.equal((guardWrites[0].args[0] as any).issuer, 'transaction',
+    'on the coupled transaction, not as an autocommit statement')
 })
 
 // ==========================================================================
@@ -666,13 +740,43 @@ test('STRUCTURAL: every sync-state transition goes through the fenced writer', (
   assert.match(SOURCE, /private async holdCurrentAttempt\(/)
   // The guard acquires the row by writing back the value its own fence already
   // requires, so it cannot fabricate or clear anything to take the lock.
-  const guard = SOURCE.slice(
-    SOURCE.indexOf('private async holdCurrentAttempt('),
-    SOURCE.indexOf('private refusalEnvelope('),
-  )
+  // Ends at the guard's own closing brace, so a neighbouring method's doc
+  // comment cannot drift into the window and fail this for the wrong reason.
+  const guardStart = SOURCE.indexOf('private async holdCurrentAttempt(')
+  const guard = SOURCE.slice(guardStart, SOURCE.indexOf('\n  }\n', guardStart) + 5)
   assert.match(guard, /\{ lastAttemptAt: attempt\.attemptAt \}/)
   assert.equal(/m365AuditAttempt|status:|lastSuccessfulAt|lastErrorCode|consecutiveFailures/.test(guard), false,
     'the guard payload touches no recorded field')
+})
+
+test('STRUCTURAL: the absent-detail branch is defensive, not a live production race', () => {
+  // The guard's own comment claims this. Measure it, so the claim cannot rot:
+  // every production budget error proves a cap, so refusalEnvelope never
+  // returns null and the guard branch is unreachable from this file's own
+  // throw. The hardening is still required -- the branch is reachable through
+  // the constructor's default -- but it closes no live race.
+  const constructions = [...SOURCE.matchAll(/new M365AuditBudgetError\(/g)]
+  assert.equal(constructions.length, 1, 'exactly one construction in this collector')
+  const call = SOURCE.slice(constructions[0].index!, constructions[0].index! + 400)
+  assert.match(call, /selectBudgetConstraint\(exceeded\)/,
+    'and it always passes a selected constraint, never a null one')
+  const before = SOURCE.slice(Math.max(0, constructions[0].index! - 200), constructions[0].index!)
+  assert.match(before, /if \(dailyExceeded \|\| monthlyExceeded\) \{/,
+    'guarded by one of the eight caps actually being exceeded')
+})
+
+test('STRUCTURAL: exactly one deleter of content rows, inside the fenced terminal transition', () => {
+  // The ownerless fail-closed attribution ("a zero-row disposition means this
+  // attempt was superseded") rests on there being a single deleter, committing
+  // with the token fence. If a second deleter appears, that attribution is no
+  // longer sound and this test is where it must be reconsidered.
+  const deleters = [...SOURCE.matchAll(/m365ActivityContent\.deleteMany\(/g)]
+  assert.equal(deleters.length, 1, 'one content deleter')
+  const terminalStart = SOURCE.indexOf('const commitTerminalState =')
+  assert.ok(terminalStart > 0, 'the terminal transition is still a named closure')
+  const fencedWrite = SOURCE.indexOf('applyCurrentAttemptState', terminalStart)
+  assert.ok(deleters[0].index! > terminalStart && deleters[0].index! < fencedWrite,
+    'the sweep sits inside commitTerminalState, ahead of its fenced state write')
 })
 
 test('STRUCTURAL: no budget lock is taken to record', () => {
