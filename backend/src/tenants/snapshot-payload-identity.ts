@@ -1,3 +1,5 @@
+import { types } from 'node:util'
+
 /**
  * Conservative structural identity for stored Entra snapshot documents.
  *
@@ -28,10 +30,18 @@
  * limits how often the omission applies, in exchange for an argument that holds
  * without trusting the decoder.
  *
- * The bounds below are the ones `mailbox-source-attestation.ts` already
- * enforces on these same documents, so this traversal is bounded by an
- * established contract rather than a fresh guess. Exceeding any of them returns
- * `false` rather than raising.
+ * The serialization contract this enforces. Comparing the values a traversal
+ * reads is only equivalent to comparing what would be written if serialization
+ * reads the same things. `JSON.stringify` consults exactly one hook, `toJSON`,
+ * and it does not care whether that property is enumerable or inherited, so a
+ * container carrying one is refused outright -- never invoked -- as is an array
+ * that is not an ordinary array and an object whose prototype is neither
+ * `Object.prototype` nor null. A Proxy is refused before anything is read
+ * through it, because nothing a trap reports during this comparison is bound to
+ * what a trap will report during serialization. An ordinary hidden property is
+ * a deliberate exception: a non-enumerable data property other than `toJSON`
+ * cannot reach the serialized document, so it does not make two otherwise equal
+ * documents unequal.
  */
 
 /** Deepest nesting inspected, counting the root document as depth 0: the
@@ -43,14 +53,35 @@ const MAX_DEPTH = 12
 const MAX_NODES = 1_000_000
 /** Own keys and property descriptors inspected across the whole pair. */
 const MAX_INSPECTED_KEYS = 1_000_000
-/** String characters compared across the whole pair. */
+/** Characters compared across the whole pair, counting both string values and
+ *  the key names inspected on either side. */
 const MAX_INSPECTED_CHARACTERS = 16 * 1024 * 1024
 /** Own keys allowed on one object. */
 const MAX_OBJECT_KEYS = 100
 /** Elements allowed in one array. */
 const MAX_ARRAY_LENGTH = 50_000
 
-/** Exported so a test can sit exactly on a boundary instead of guessing it. */
+/**
+ * What the counters do and do not bound.
+ *
+ * These are internal limits on this comparison alone. They are not a
+ * collection, provider or quota limit, nothing upstream is required to have
+ * satisfied them, and exhausting any of them returns `false` -- keeping the
+ * existing full write -- rather than failing a collection. Their values are
+ * chosen to match the bounds `mailbox-source-attestation.ts` already applies to
+ * documents of this kind; that is a precedent for the sizes, not a claim that
+ * every snapshot document has already passed through those checks, because only
+ * the two Exchange resources reach that function.
+ *
+ * An array's `length` is read before its keys are enumerated, so
+ * `MAX_ARRAY_LENGTH` does bound that enumeration. An object's key count cannot
+ * be known without enumerating it, so `Object.keys` allocates first and
+ * `MAX_OBJECT_KEYS` is enforced immediately afterwards: it bounds every
+ * subsequent step for that object rather than the one allocation that revealed
+ * its size, and the node budget bounds how many objects are enumerated at all.
+ * Auxiliary allocation is therefore bounded per container and across the
+ * traversal, but it is not zero.
+ */
 export const SNAPSHOT_IDENTITY_LIMITS = Object.freeze({
   maxDepth: MAX_DEPTH,
   maxNodes: MAX_NODES,
@@ -63,12 +94,38 @@ export const SNAPSHOT_IDENTITY_LIMITS = Object.freeze({
 /** The single mutable allocation of a comparison: three descending counters. */
 type InspectionBudget = { nodes: number; keys: number; characters: number }
 
-/** Only an ordinary JSON object. A class instance, Date, Map, or anything
- *  carrying an inherited `toJSON` serialises differently and is refused. */
+/**
+ * A value refused before anything at all is read from it.
+ *
+ * `types.isProxy` answers without invoking a single trap and answers for a
+ * revoked Proxy too, which is why it has to come before every other test: even
+ * `Array.isArray` throws on a revoked Proxy.
+ */
+function refusedObject(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && types.isProxy(value)
+}
+
+/** True when serialization would call a hook instead of reading the value as
+ *  data. `in` covers an own property whether or not it is enumerable, and an
+ *  inherited one, without invoking it. */
+function serializationHook(value: object): boolean {
+  return 'toJSON' in value
+}
+
+/** Exactly an ordinary array: not a subclass, and carrying no serialization
+ *  hook of its own or inherited. `Array.isArray` is true for subclasses, so the
+ *  prototype test is what excludes them. */
+function ordinaryArray(value: readonly unknown[]): boolean {
+  return Object.getPrototypeOf(value) === Array.prototype && !serializationHook(value)
+}
+
+/** Only an ordinary JSON object. A class instance, Date or Map serialises
+ *  differently, and anything carrying `toJSON` is refused without calling it. */
 function plainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
   const prototype: unknown = Object.getPrototypeOf(value)
-  return prototype === Object.prototype || prototype === null
+  if (prototype !== Object.prototype && prototype !== null) return false
+  return !serializationHook(value)
 }
 
 /** An own, enumerable, plain data property: what serialisation would read
@@ -83,6 +140,7 @@ function sameArray(
   left: readonly unknown[], right: readonly unknown[], depth: number, budget: InspectionBudget,
 ): boolean {
   const length = left.length
+  // Length is read before either enumeration, so the cap bounds both of them.
   if (length !== right.length || length > MAX_ARRAY_LENGTH) return false
   // Density and own-key exactness, deliberately stricter than serialisation
   // requires: a hole, or any extra own enumerable property, makes this a
@@ -114,8 +172,10 @@ function samePlainObject(
   // Equal counts plus "every left key is an own enumerable data property of
   // right" gives set equality without sorting or copying either key list.
   for (const key of leftKeys) {
+    // Key names are compared characters too, so they are charged like values.
+    budget.characters -= key.length
     budget.keys -= 2
-    if (budget.keys < 0) return false
+    if (budget.characters < 0 || budget.keys < 0) return false
     if (!plainDataProperty(left, key) || !plainDataProperty(right, key)) return false
     if (!sameValue(left[key], right[key], depth + 1, budget)) return false
   }
@@ -126,6 +186,8 @@ function sameValue(left: unknown, right: unknown, depth: number, budget: Inspect
   if (depth > MAX_DEPTH) return false
   budget.nodes -= 1
   if (budget.nodes < 0) return false
+  // Refuse a Proxy before reading anything, including its shape.
+  if (refusedObject(left) || refusedObject(right)) return false
   // No same-reference shortcut. `mergeWithPrevious` may hand back the very
   // array decoded from the stored row, and that still proves nothing about a
   // number inside it, so every value is inspected on its own terms.
@@ -136,7 +198,10 @@ function sameValue(left: unknown, right: unknown, depth: number, budget: Inspect
     return left === right
   }
   if (typeof left === 'boolean' || left === null) return left === right
-  if (Array.isArray(left)) return Array.isArray(right) && sameArray(left, right, depth, budget)
+  if (Array.isArray(left)) {
+    return Array.isArray(right) && ordinaryArray(left) && ordinaryArray(right) &&
+      sameArray(left, right, depth, budget)
+  }
   if (plainObject(left)) return plainObject(right) && samePlainObject(left, right, depth, budget)
   // undefined, symbol, bigint, function, and every exotic object.
   return false
@@ -144,14 +209,19 @@ function sameValue(left: unknown, right: unknown, depth: number, budget: Inspect
 
 /**
  * True only when `candidate` would store exactly the `jsonb` value that
- * `stored` already holds. Both sides must be array documents, which is the only
- * shape the snapshot writer stores. Never throws and never mutates either
- * input; a proxy trap, a throwing accessor, a stack bound or an exhausted
- * budget all answer false, which keeps the existing full write.
+ * `stored` already holds. Both sides must be ordinary array documents, which is
+ * the only shape the snapshot writer stores. Never throws and never mutates
+ * either input; a Proxy, a serialization hook, a throwing accessor, a stack
+ * bound or an exhausted budget all answer false, which keeps the existing full
+ * write.
  */
 export function identicalSnapshotDocument(stored: unknown, candidate: unknown): boolean {
-  if (!Array.isArray(stored) || !Array.isArray(candidate)) return false
   try {
+    // Every check sits inside this boundary. `Array.isArray` throws on a
+    // revoked Proxy, so even the root shape test has to be guarded, and the
+    // Proxy refusal has to precede it.
+    if (refusedObject(stored) || refusedObject(candidate)) return false
+    if (!Array.isArray(stored) || !Array.isArray(candidate)) return false
     return sameValue(stored, candidate, 0, {
       nodes: MAX_NODES, keys: MAX_INSPECTED_KEYS, characters: MAX_INSPECTED_CHARACTERS,
     })

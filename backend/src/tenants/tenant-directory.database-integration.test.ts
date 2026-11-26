@@ -1497,6 +1497,11 @@ test(
       [[{ a: null }], [{}]],
       [['a', 'b'], ['b', 'a']],
       [[{ count: 1 }], [{ count: 1 }]],
+      // Both of these literals are already the same double before any SQL is
+      // sent, so this pair is NOT a retained high-precision database witness --
+      // it only records that a numeric document is refused either way. The
+      // blanket numeric refusal is what carries that claim, and it is tested
+      // directly below.
       [[{ n: 9007199254740993 }], [{ n: 9007199254740992 }]],
     ]
     let agreements = 0
@@ -1581,8 +1586,11 @@ test(
     assert.deepEqual(afterChange.payload, changed)
     assert.ok(afterChange.observedAt.getTime() >= afterSkip.observedAt.getTime())
 
-    // 3. Repeating the identical change deduplicates against the same baseline
-    //    version, so the skip did not corrupt the evidence fingerprint.
+    // 3. Repeating the same collection adds no further evidence, so the skip
+    //    did not corrupt the baseline the comparison works from. This observes
+    //    the resulting row count only: it does not establish that a duplicate
+    //    insert was attempted and conflicted, and the second pass is itself an
+    //    unchanged document, so it takes the observation-only branch.
     await writer.saveSnapshot(scope, 'GROUPS', authoritativeSnapshot(changed))
     assert.equal(await prisma.changeEvidenceEvent.count({ where: { customerTenantId: workspace.tenantId } }), 1)
   },
@@ -1644,9 +1652,12 @@ test(
       prisma, { organizationId: workspace.organizationId, customerTenantId: workspace.tenantId }, 120_000)
     assert.ok(owner)
 
-    // A second connection replaces the row this transaction already read. This
-    // is deterministic: the replacement commits before the observation write,
-    // with no timing window to wait on.
+    // A second connection replaces the row this transaction already read. It
+    // deliberately bypasses the resource advisory lock every real writer takes,
+    // purely to force the defensive count-zero refusal; it is NOT a model of a
+    // legitimate concurrent writer, and nothing here qualifies runtime locking.
+    // It is deterministic: the replacement commits before the observation write,
+    // so there is no timing window to wait on.
     const concurrent = new PrismaClient({ adapter: createAdapter() as never })
     context.after(async () => { await concurrent.$disconnect() })
     const strayGroupId = randomUUID()
@@ -1684,6 +1695,8 @@ test(
     })
     assert.notEqual(successor.id, seeded.id, 'the replacement really did take effect')
     assert.equal(successor.observedAt.getTime(), seededAt.getTime(), 'and was never observed by the aborted write')
+    assert.equal(await storedJsonbEquals(prisma, successor.id, groupDocument()), true,
+      'the successor keeps its own document, which the aborted write never touched')
     assert.equal(await prisma.directoryGroup.count({ where: { microsoftGroupId: strayGroupId } }), 0,
       'the staged inventory write rolled back')
     const receipt = await prisma.tenantAuditReconciliationWork.findUniqueOrThrow({

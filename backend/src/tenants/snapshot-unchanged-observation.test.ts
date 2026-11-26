@@ -498,3 +498,106 @@ test('a row replaced mid-transaction matches nothing, so the id scope is load be
   assert.equal(fake.storedObservedAt()?.getTime(), STORED_AT.getTime(), 'and its own observation time')
   assert.equal(fake.committed(), false)
 })
+
+// ---------------------------------------------------------------------------
+// Serialization-boundary regressions on the real saveSnapshot path. Before the
+// comparator correction each of these took the observation-only branch while
+// the document that would have been stored differed, so a real change was
+// silently skipped.
+// ---------------------------------------------------------------------------
+
+test('a candidate with a hidden toJSON is written in full, not observed', async () => {
+  let invoked = 0
+  const candidate = document()
+  Object.defineProperty(candidate[0]!, 'toJSON', {
+    value: () => { invoked += 1; return { id: 'group-1', displayName: 'rewritten' } },
+    enumerable: false, configurable: true,
+  })
+  const fake = harness({ stored: storedRow(document()) })
+  await fake.save(tenant, 'GROUPS', supported(candidate))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [],
+    'a hidden serialization hook must not be omitted')
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+  assert.equal(invoked, 0, 'the writer must not invoke the hook either')
+})
+
+test('a stored document carrying a hidden toJSON is written in full', async () => {
+  const stored = document()
+  Object.defineProperty(stored, 'toJSON', {
+    value: () => [{ id: 'elsewhere' }], enumerable: false, configurable: true,
+  })
+  const fake = harness({ stored: storedRow(stored) })
+  await fake.save(tenant, 'GROUPS', supported(document()))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [])
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+})
+
+test('an array subclass candidate is written in full despite passing Array.isArray', async () => {
+  class Rows extends Array { toJSON() { return [{ id: 'subclass' }] } }
+  const candidate = new Rows()
+  for (const row of document()) candidate.push(row)
+  const fake = harness({ stored: storedRow(document()) })
+  await fake.save(tenant, 'GROUPS', supported(candidate as unknown[]))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [])
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+})
+
+test('a proxied candidate is written in full and consults no trap', async () => {
+  const traps: string[] = []
+  const candidate = new Proxy(document(), {
+    get(target, key, receiver) { traps.push(String(key)); return Reflect.get(target, key, receiver) },
+    ownKeys(target) { traps.push('ownKeys'); return Reflect.ownKeys(target) },
+  })
+  const fake = harness({ stored: storedRow(document()) })
+  await fake.save(tenant, 'GROUPS', supported(candidate))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [])
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+  assert.deepEqual(traps, [], 'the comparison must not read through the proxy')
+})
+
+test('a proxied stored document is written in full and the collection completes', async () => {
+  // A live Proxy passes `Array.isArray`, so it reaches the comparator, which
+  // refuses it. The collection still completes: refusing to decide may never
+  // turn into a failed sync.
+  const fake = harness({ stored: storedRow(new Proxy(document(), {})) })
+  await fake.save(tenant, 'GROUPS', supported(document()))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [])
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+  assert.equal(fake.committed(), true)
+})
+
+test('a revoked proxied stored document raises upstream of the comparator, not inside it', async () => {
+  // This pins a boundary rather than hiding it. `saveSnapshot` reads
+  // `Array.isArray(existing?.payload)` at tenant-sync.service.ts:5961 -- a line
+  // byte-identical in released main835 and untouched by this candidate -- and
+  // that call throws on a revoked Proxy before the comparator is ever reached.
+  // The comparator's own never-throws contract is proved directly in
+  // snapshot-payload-identity.test.ts; it cannot extend to a value the caller
+  // has already inspected. Prisma's JSON decode does not produce proxies, so
+  // this is a contract statement, not a reachable production path.
+  const revocable = Proxy.revocable(document(), {})
+  revocable.revoke()
+  const fake = harness({ stored: storedRow(revocable.proxy) })
+  await assert.rejects(
+    () => fake.save(tenant, 'GROUPS', supported(document())),
+    /Cannot perform 'IsArray' on a proxy that has been revoked/,
+  )
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [])
+  assert.deepEqual(fake.of('tenantEntraSnapshot.upsert'), [])
+  assert.equal(fake.committed(), false)
+})
+
+test('a document whose key characters exceed the comparison budget is written in full', async () => {
+  const keyName = 'k'.repeat(8000)
+  const wide = () => Array.from({ length: 60 }, () => {
+    const row: Record<string, unknown> = {}
+    for (let index = 0; index < 100; index += 1) row[`${keyName}${index}`] = 'v'
+    return row
+  })
+  const fake = harness({ stored: storedRow(wide()) })
+  await fake.save(tenant, 'GROUPS', supported(wide()))
+  assert.deepEqual(fake.of('tenantEntraSnapshot.updateMany'), [],
+    'budget exhaustion keeps the existing write')
+  assert.equal(fake.of('tenantEntraSnapshot.upsert').length, 1)
+  assert.equal(fake.committed(), true, 'and never fails the collection')
+})

@@ -206,3 +206,132 @@ test('the published bounds are the ones the module enforces', () => {
   })
   assert.equal(Object.isFrozen(limits), true)
 })
+
+// ---------------------------------------------------------------------------
+// Serialization-boundary regressions. Each of these returned true before the
+// correction while `JSON.stringify` would have produced a different document,
+// so the omission branch would have skipped a real change.
+// ---------------------------------------------------------------------------
+
+test('a hidden own toJSON on a nested object is refused, and never invoked', () => {
+  let invoked = 0
+  const stored = [{ value: 'old' }]
+  const candidate: Record<string, unknown>[] = [{ value: 'old' }]
+  Object.defineProperty(candidate[0]!, 'toJSON', {
+    value: () => { invoked += 1; return { value: 'new' } }, enumerable: false, configurable: true,
+  })
+  assert.equal(identicalSnapshotDocument(stored, candidate), false)
+  assert.equal(identicalSnapshotDocument(candidate, stored), false)
+  assert.equal(invoked, 0, 'the hook must be detected without being called')
+  // The hook really would have changed the document, which is why this matters.
+  assert.notEqual(JSON.stringify(candidate), JSON.stringify(stored))
+})
+
+test('a hidden own toJSON on the document array itself is refused', () => {
+  let invoked = 0
+  const stored = [{ value: 'old' }]
+  const candidate: unknown[] = [{ value: 'old' }]
+  Object.defineProperty(candidate, 'toJSON', {
+    value: () => { invoked += 1; return [{ value: 'different' }] }, enumerable: false, configurable: true,
+  })
+  assert.equal(identicalSnapshotDocument(stored, candidate), false)
+  assert.equal(invoked, 0)
+  assert.notEqual(JSON.stringify(candidate), JSON.stringify(stored))
+})
+
+test('an array subclass with an inherited toJSON is refused despite Array.isArray', () => {
+  let invoked = 0
+  class Rows extends Array { toJSON() { invoked += 1; return [{ value: 'subclass' }] } }
+  const candidate = new Rows()
+  candidate.push({ value: 'old' })
+  assert.equal(Array.isArray(candidate), true, 'the subclass really does pass Array.isArray')
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], candidate), false)
+  assert.equal(invoked, 0)
+  assert.notEqual(JSON.stringify(candidate), JSON.stringify([{ value: 'old' }]))
+})
+
+test('an inherited toJSON on Object.prototype is refused, and the fixture is restored', () => {
+  const original = Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON')
+  assert.equal(original, undefined, 'the fixture only applies to an unpolluted prototype')
+  let invoked = 0
+  try {
+    Object.defineProperty(Object.prototype, 'toJSON', {
+      value: () => { invoked += 1; return { value: 'polluted' } },
+      enumerable: false, configurable: true, writable: true,
+    })
+    assert.equal(identicalSnapshotDocument([{ value: 'old' }], [{ value: 'old' }]), false)
+    assert.equal(invoked, 0)
+  } finally {
+    delete (Object.prototype as unknown as Record<string, unknown>).toJSON
+  }
+  assert.equal(Object.getOwnPropertyDescriptor(Object.prototype, 'toJSON'), undefined,
+    'the prototype must be restored deterministically')
+  // And the ordinary answer is back.
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], [{ value: 'old' }]), true)
+})
+
+test('a revoked Proxy is refused without throwing, at the root and nested', () => {
+  const rootRevocable = Proxy.revocable([{ value: 'old' }], {})
+  rootRevocable.revoke()
+  // Array.isArray alone throws on this value, which is why the guard has to
+  // sit inside the boundary.
+  assert.throws(() => Array.isArray(rootRevocable.proxy), TypeError)
+  assert.equal(identicalSnapshotDocument(rootRevocable.proxy, [{ value: 'old' }]), false)
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], rootRevocable.proxy), false)
+  const nestedRevocable = Proxy.revocable({ value: 'old' }, {})
+  nestedRevocable.revoke()
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], [nestedRevocable.proxy]), false)
+})
+
+test('a live Proxy is refused before any trap runs, at the root and nested', () => {
+  const traps: string[] = []
+  const watcher: ProxyHandler<object> = {
+    get(target, key, receiver) { traps.push(`get:${String(key)}`); return Reflect.get(target, key, receiver) },
+    ownKeys(target) { traps.push('ownKeys'); return Reflect.ownKeys(target) },
+    has(target, key) { traps.push(`has:${String(key)}`); return Reflect.has(target, key) },
+    getOwnPropertyDescriptor(target, key) {
+      traps.push(`descriptor:${String(key)}`); return Reflect.getOwnPropertyDescriptor(target, key)
+    },
+  }
+  const rootProxy = new Proxy([{ value: 'old' }], watcher)
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], rootProxy), false)
+  const nestedProxy = new Proxy({ value: 'old' }, watcher)
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], [nestedProxy]), false)
+  assert.deepEqual(traps, [], 'no trap may be consulted for a value that is refused')
+})
+
+test('an ordinary hidden data property remains equal, which is the stated exception', () => {
+  const hidden: Record<string, unknown> = { id: 'a' }
+  Object.defineProperty(hidden, 'shadow', { value: 'x', enumerable: false })
+  assert.equal(identicalSnapshotDocument([hidden], [{ id: 'a' }]), true)
+  assert.equal(JSON.stringify([hidden]), JSON.stringify([{ id: 'a' }]),
+    'because it cannot reach the serialized document')
+})
+
+test('key characters are charged against the same budget as string values', () => {
+  // One key whose name alone exceeds the character budget.
+  const oversizedKey = 'k'.repeat(limits.maxInspectedCharacters + 1)
+  assert.equal(identicalSnapshotDocument([{ [oversizedKey]: 'v' }], [{ [oversizedKey]: 'v' }]), false)
+  // Many ordinary rows whose key names together exceed it, where every value is
+  // short: before the correction only values were counted, so this was true.
+  const keyName = 'k'.repeat(8000)
+  const wide = () => Array.from({ length: 60 }, () => {
+    const row: Record<string, unknown> = {}
+    for (let index = 0; index < limits.maxObjectKeys; index += 1) row[`${keyName}${index}`] = 'v'
+    return row
+  })
+  assert.equal(identicalSnapshotDocument(wide(), wide()), false)
+  // A document whose key characters stay inside the budget still compares.
+  const modest = () => [{ [`${'k'.repeat(64)}a`]: 'v', [`${'k'.repeat(64)}b`]: 'v' }]
+  assert.equal(identicalSnapshotDocument(modest(), modest()), true)
+})
+
+test('a throwing toJSON is refused by detection, not by catching its throw', () => {
+  const hostile: Record<string, unknown> = { value: 'old' }
+  Object.defineProperty(hostile, 'toJSON', {
+    value: () => { throw new Error('hostile toJSON') }, enumerable: false, configurable: true,
+  })
+  assert.equal(identicalSnapshotDocument([{ value: 'old' }], [hostile]), false)
+  // Proof the hook would have thrown had anything invoked it.
+  assert.throws(() => JSON.stringify(hostile), /hostile toJSON/)
+})
