@@ -36,7 +36,16 @@ for(const [activity,type,kind] of [
  ['Update directory role','Role','ADMINISTRATIVE_ROLE_CHANGE'],
 ]) test(`audit producer ${kind}`,()=>{
  const result=deriveTenantHealth({...base,auditEvents:[{microsoftAuditId:'synthetic-event',eventDateTime:now,activityDisplayName:activity,category:'UserManagement',operationType:'Update',result:'success',initiatedBy:{user:{userPrincipalName:'admin@example.invalid'}},targetResources:[{displayName:'Synthetic target',type}]}]})
- assert.equal(result.attention.length,1);assert.equal(result.attention[0]!.provenance.kind,kind);assert.equal(result.attention[0]!.provenance.origin,'TENANT_FINDING')
+ // `base` supplies no audit completeness, so the window is unread and the
+ // bounded audit-coverage limitation accompanies the finding. The finding keeps
+ // its position, kind and origin; the limitation is a limitation, not a second
+ // finding, and it does not take an `audit-` budget slot.
+ assert.equal(result.attention.length,2)
+ assert.equal(result.attention[0]!.provenance.kind,kind);assert.equal(result.attention[0]!.provenance.origin,'TENANT_FINDING')
+ const limitation=result.attention[1]!
+ assert.deepEqual(limitation.provenance,{version:1,origin:'EVIDENCE_LIMITATION',kind:'INCOMPLETE_AUDIT_EVIDENCE',remediationOwner:'UNDETERMINED'})
+ assert.equal(limitation.key.startsWith('audit-'),false)
+ assert.deepEqual(readAttentionProvenance(JSON.parse(JSON.stringify(limitation.provenance))),limitation.provenance)
 })
 test('partial Microsoft positives and MFA findings coexist with operations without an exact zero',()=>{
  const microsoftRiskSummary=summarizeMicrosoftRisk({payload:[{id:'synthetic',riskState:'atRisk',riskLevel:'high'},{}],snapshotObservedAt:now,collectionSucceededAt:now,collectionStatus:'SUCCEEDED',now})
@@ -50,6 +59,22 @@ test('limited evidence remains a limitation, not a finding or completed executio
  const result=deriveTenantHealth({...base,syncStates:[{...failed('SIGN_INS','sign-ins-non-premium-fallback-active'),status:'RUNNING',consecutiveFailures:0}]})
  assert.deepEqual(result.attention.find(x=>x.key==='sign-ins-limited-evidence')!.provenance,{version:1,origin:'EVIDENCE_LIMITATION',kind:'LIMITED_SIGN_IN_EVIDENCE',remediationOwner:'UNDETERMINED'})
 })
+test('the two evidence-limitation kinds stay distinct and any other kind is unclassified',()=>{
+ const signIn={version:1,origin:'EVIDENCE_LIMITATION',kind:'LIMITED_SIGN_IN_EVIDENCE',remediationOwner:'UNDETERMINED'}
+ const audit={version:1,origin:'EVIDENCE_LIMITATION',kind:'INCOMPLETE_AUDIT_EVIDENCE',remediationOwner:'UNDETERMINED'}
+ assert.deepEqual(readAttentionProvenance(signIn),signIn)
+ assert.deepEqual(readAttentionProvenance(audit),audit)
+ assert.notDeepEqual(readAttentionProvenance(signIn),readAttentionProvenance(audit))
+ // A future or misspelled limitation kind must not collapse onto either one.
+ for(const kind of ['INCOMPLETE_SIGN_IN_EVIDENCE','INCOMPLETE_AUDIT','LIMITED_AUDIT_EVIDENCE','']) {
+  assert.equal(readAttentionProvenance({version:1,origin:'EVIDENCE_LIMITATION',kind,remediationOwner:'UNDETERMINED'}).origin,'UNKNOWN',kind)
+ }
+ // The shape check still applies to the new kind.
+ assert.equal(readAttentionProvenance({...audit,remediationOwner:'CUSTOMER_ADMIN'}).origin,'UNKNOWN')
+ assert.equal(readAttentionProvenance({...audit,extra:'untrusted'}).origin,'UNKNOWN')
+ assert.equal(readAttentionProvenance({...audit,version:2}).origin,'UNKNOWN')
+})
+
 test('missing, future, malformed and unknown tags remain unclassified without dropping records',()=>{
  const tags=[undefined,null,[],{}, {version:2,origin:'TENANT_FINDING'}, {version:1,origin:'TENANT_FINDING',kind:'COLLECTOR_ATTENTION',remediationOwner:'CUSTOMER_ADMIN'}, {version:1,origin:'COLLECTION_OPERATION',kind:'COLLECTOR_ATTENTION',resourceType:'NEW',remediationOwner:'HAWKVIEW_OPERATIONS'}, {version:1,origin:'TENANT_FINDING',kind:'MICROSOFT_ACTIVE_RISK',remediationOwner:'CUSTOMER_ADMIN',extra:'untrusted'}]
  const items=tags.map((tag,id)=>({id,tag,classification:readAttentionProvenance(tag)}))

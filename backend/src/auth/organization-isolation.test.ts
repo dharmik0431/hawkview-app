@@ -370,6 +370,7 @@ test('notifications cannot fall back to email or query data without a subject-li
 
 test('tenant list scopes authoritative snapshots and audit queries by organization and tenant', async () => {
   const observed: Record<string, unknown> = {}
+  const auditReads: Array<{ sql: string; params: unknown[] }> = []
   const prisma = {
     user: {
       findUnique: async ({ where }: { where: unknown }) => {
@@ -392,6 +393,12 @@ test('tenant list scopes authoritative snapshots and audit queries by organizati
         observed.auditWhere = where
         return []
       },
+    },
+    // The tenant-scoped audit reader issues ONE parameterized raw read per
+    // bounded page of exact organization/tenant pairs.
+    $queryRawUnsafe: async (sql: string, ...params: unknown[]) => {
+      auditReads.push({ sql, params })
+      return []
     },
   } as unknown as PrismaService
 
@@ -427,14 +434,11 @@ test('tenant list scopes authoritative snapshots and audit queries by organizati
     (observed.tenantSelect as any).connection.select.onboardingCompletedAt,
     true,
   )
-  assert.deepEqual(
-    (observed.auditWhere as Record<string, unknown>).organizationId,
-    { in: ['organization-a'] },
-  )
-  assert.deepEqual(
-    (observed.auditWhere as Record<string, unknown>).customerTenantId,
-    { in: [] },
-  )
+  // No authorized tenant was returned, so no audit evidence is read at all.
+  // The previous workspace-wide read still issued a query carrying an empty
+  // tenant list; a read that cannot be scoped to an exact pair is not issued.
+  assert.equal(observed.auditWhere, undefined, 'the workspace-wide audit read is gone')
+  assert.deepEqual(auditReads, [], 'zero authorized tenants must issue zero audit reads')
 })
 
 test('tenant bundle scopes sync state and daily usage by the readable tenant organization', async () => {
