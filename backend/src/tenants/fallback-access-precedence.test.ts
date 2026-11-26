@@ -322,64 +322,122 @@ test('composed: entitlement-unverified outranks a verified-missing permission', 
 // 3. An unverified dataset keeps its unverified verdict, and the carried gap
 // ---------------------------------------------------------------------------
 
-test('composed: an unverified permission verdict survives, and its carried pending gap is pinned', () => {
+test('composed: a RUNNING collector under an unverified verdict is counted as pending work', () => {
+  // THE REGRESSION THIS SUITE USED TO PIN. v3 withheld the relabel here, which
+  // is right - an unverified verdict is authoritative about what HawkView has
+  // NOT established - but the selected-evidence mapper has no UNVERIFIED branch,
+  // so the resource became NOT_CONFIGURED, and a truthy selected source excludes
+  // SIGN_INS from the operational states, so the row's own RUNNING status
+  // reached no count. Operations read HEALTHY with pendingJobs 0 while the
+  // collector was running. An unverified verdict is not completion.
+  //
+  // The operational counts are asserted FIRST, deliberately: `assert` throws at
+  // the first failure, so with the availability assertion leading, a control run
+  // against the uncorrected parent would never reach these lines and would prove
+  // only the published string.
   const { dataset, evidence, health, resource } = compose({ connectionVerifiedAt: null, signIn: RUNNING(FUTURE) })
+  assert.equal(health.operations.pendingJobs, 1,
+    'a genuinely RUNNING collector must be counted even when its source is unverified')
+  assert.equal(health.operations.status, 'SYNCING', 'so operations must not read healthy')
+  assert.equal(health.operations.failedJobs, 0, 'and an unverified source is not a failed one')
+  assert.equal(health.operations.partialJobs, 0)
+  assert.equal(health.operations.activeIssues, 0)
+  assert.equal(health.data.pendingResources, 1)
+  assert.equal(health.data.status, 'PARTIAL')
+  assert.equal(health.data.completenessPercent, 95)
+  assert.equal(health.overallStatus, 'ATTENTION')
+
+  // The readiness verdict, its reason and its refusal to publish an observation
+  // are unchanged. The correction is a count, not a relabel.
   assert.equal(dataset?.state, 'UNVERIFIED')
   assert.equal(dataset?.reasonCode, 'MICROSOFT_PERMISSION_UNVERIFIED')
   assert.equal(evidence.availability, 'UNVERIFIED',
-    'an unverified verdict is authoritative about what HawkView has NOT established')
+    'the authoritative verdict stays; the old INITIALIZING override is NOT restored')
   assert.equal(evidence.reasonCode, 'MICROSOFT_PERMISSION_UNVERIFIED')
-  assert.equal(evidence.observedAt, null)
-  assert.equal(evidence.coverage, 'LIMITED')
-
-  // THE COST OF THIS CORRECTION, stated exactly rather than waved at.
-  //
-  // The selected-evidence mapper has no branch for UNVERIFIED, so the resource
-  // lands on NOT_CONFIGURED and the OPERATIONS section reports no pending work
-  // for a collector that is running. That missing branch is pre-existing and is
-  // reachable on released main and on both earlier candidates - the sibling
-  // assertion below reaches it with an unrecognized error code on every base.
-  //
-  // But for THIS input the previous candidate relabelled the dataset, so it
-  // reported operations SYNCING with pendingJobs 1. Withholding the relabel
-  // therefore moves this input class from SYNCING/1 to HEALTHY/0. It is NOT the
-  // behaviour of released main either, which published CURRENT_LIMITED with a
-  // future observedAt and partialJobs 1. The trade is deliberate: an accurate
-  // but quieter operations figure instead of an inaccurate "initializing" over
-  // an authoritative unverified verdict, and the DATA section and overall status
-  // still carry the collector, which the last four assertions prove.
-  //
-  // Closing it needs an UNVERIFIED branch in the health mapper, which is
-  // outside "only the precedence of the new override may change".
+  assert.equal(evidence.reason,
+    'HawkView has not completed resource-specific permission verification for this dataset.')
+  assert.equal(evidence.observedAt, null, 'an unmeasurable success is still not an observation')
+  assert.equal(evidence.coverage, 'LIMITED', 'and source attribution is still preserved')
+  assert.equal(evidence.selectedSource, 'OFFICE_365_ACTIVITY_FEED')
+  // The resource itself is still not confirmed configured: the permission has
+  // not been verified. The JOB is running; the RESOURCE is unverified. Both are
+  // reported, and neither is dressed up as the other.
   assert.equal(resource.classification, 'NOT_CONFIGURED')
-  assert.equal(health.operations.pendingJobs, 0, 'the cost: the operations count misses it')
-  assert.equal(health.operations.status, 'HEALTHY', 'the cost: operations reads healthy')
-  assert.equal(health.data.pendingResources, 1, 'but the data section still counts the resource')
-  assert.equal(health.data.status, 'PARTIAL', 'and still refuses to call the data complete')
-  assert.equal(health.data.completenessPercent, 95)
-  assert.equal(health.overallStatus, 'ATTENTION', 'and the tenant is not reported healthy overall')
+  assert.equal(resource.reasonCode, 'MICROSOFT_PERMISSION_UNVERIFIED')
+  assert.equal(resource.lastSuccessfulAt, null)
 })
 
-test('composed: the missing UNVERIFIED mapper branch is reachable without any fallback code', () => {
-  // The same shape with an UNRECOGNIZED error code, so no fallback is selected
-  // and the relabel is never consulted on any base. This is what makes the
-  // missing mapper branch a pre-existing gap rather than a cost of this slice.
+test('composed: an invalid recorded success under an unverified verdict counts the same', () => {
+  const { evidence, health } = compose({ connectionVerifiedAt: null, signIn: RUNNING(INVALID) })
+  assert.equal(health.operations.pendingJobs, 1)
+  assert.equal(health.operations.status, 'SYNCING')
+  assert.equal(evidence.availability, 'UNVERIFIED')
+  assert.equal(evidence.reasonCode, 'MICROSOFT_PERMISSION_UNVERIFIED')
+  assert.equal(evidence.observedAt, null)
+})
+
+test('composed: an entitlement-unverified RUNNING collector is counted as pending work', () => {
+  // The second reachable cause of an unverified sign-in verdict. The running
+  // LICENSES collector that makes the entitlement unverified is itself pending
+  // work, so the expected count here is two, not one.
+  const { dataset, evidence, health, resource } = compose({
+    licenses: { status: 'RUNNING', lastSuccessfulAt: null }, signIn: RUNNING(FUTURE),
+  })
+  assert.equal(health.operations.pendingJobs, 2,
+    'the sign-in collector plus the running LICENSES collector')
+  assert.equal(health.operations.status, 'SYNCING')
+  assert.equal(health.operations.failedJobs, 0)
+  assert.equal(health.data.pendingResources, 2)
+  assert.equal(dataset?.state, 'UNVERIFIED')
+  assert.equal(evidence.availability, 'UNVERIFIED')
+  assert.equal(evidence.reasonCode, 'SIGN_IN_ENTITLEMENT_UNVERIFIED')
+  assert.equal(evidence.reason, 'HawkView does not yet have current service-plan evidence to '
+    + 'select the licensed Graph source or limited audit-feed fallback.')
+  assert.equal(evidence.observedAt, null)
+  assert.equal(evidence.coverage, 'LIMITED')
+  assert.equal(resource.classification, 'NOT_CONFIGURED')
+})
+
+test('composed: an unverified verdict without a recognized code is counted too', () => {
+  // Same principle, reached without any fallback code at all: the verdict is
+  // unverified and the collector is running, so the work is pending. This input
+  // read HEALTHY / 0 on every earlier candidate; the correction is deliberately
+  // not narrowed to the recognized-code case, because the untruth is the same.
   const { evidence, health, resource } = compose({
     connectionVerifiedAt: null,
     signIn: { status: 'RUNNING', consecutiveFailures: 0, lastErrorCode: 'SOMETHING_ELSE', lastSuccessfulAt: FUTURE },
   })
+  assert.equal(health.operations.pendingJobs, 1)
+  assert.equal(health.operations.status, 'SYNCING')
   assert.equal(evidence.availability, 'UNVERIFIED')
   assert.equal(evidence.selectedSource, 'MICROSOFT_GRAPH', 'no fallback was selected')
   assert.equal(resource.classification, 'NOT_CONFIGURED')
-  assert.equal(health.operations.pendingJobs, 0)
-  assert.equal(health.operations.status, 'HEALTHY')
-  assert.equal(health.data.pendingResources, 1)
-  assert.equal(health.overallStatus, 'ATTENTION')
-  // And the dataset-timestamp echo this slice also leaves alone: with no
-  // fallback selected, `observedAt` falls through to the dataset value, which
-  // is the future success itself.
+  // The dataset-timestamp echo this correction does not touch: with no fallback
+  // selected, `observedAt` still falls through to the dataset value.
   assert.equal(evidence.observedAt, FUTURE.toISOString())
 })
+
+const NON_RUNNING: Array<[string, Record<string, unknown>]> = [
+  ['SUCCEEDED', { status: 'SUCCEEDED', consecutiveFailures: 0, lastErrorCode: CODE, lastSuccessfulAt: FUTURE }],
+  ['QUEUED', { status: 'QUEUED', consecutiveFailures: 0, lastErrorCode: CODE, lastSuccessfulAt: FUTURE }],
+  ['IDLE', { status: 'IDLE', consecutiveFailures: 0, lastErrorCode: CODE, lastSuccessfulAt: FUTURE }],
+  ['FAILED', { status: 'FAILED', consecutiveFailures: 4, lastErrorCode: CODE, lastSuccessfulAt: FUTURE }],
+]
+
+for (const [status, signIn] of NON_RUNNING) {
+  test(`composed: a ${status} collector under an unverified verdict is NOT counted as pending`, () => {
+    // The scope boundary. Only a genuinely RUNNING row earns the count; an
+    // unverified verdict on its own must not manufacture pending work.
+    const { evidence, health, resource } = compose({ connectionVerifiedAt: null, signIn })
+    assert.equal(health.operations.pendingJobs, 0, `${status} is not running work`)
+    assert.equal(health.operations.status, 'HEALTHY')
+    assert.equal(health.operations.failedJobs, 0, 'and it is not double counted as failed either')
+    assert.equal(evidence.availability, 'UNVERIFIED')
+    assert.equal(resource.classification, 'NOT_CONFIGURED')
+    assert.equal(health.data.pendingResources, 1, 'the data section is unchanged by this correction')
+    assert.equal(health.overallStatus, 'ATTENTION')
+  })
+}
 
 // ---------------------------------------------------------------------------
 // 4. A backlogged collector keeps its own more specific in-progress reason

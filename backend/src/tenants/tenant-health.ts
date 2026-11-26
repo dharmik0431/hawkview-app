@@ -402,7 +402,26 @@ export function deriveTenantHealth(input: HealthInput & { microsoftRiskSummary?:
     !(retryableSyncState(state) && state.consecutiveFailures < 3),
   )
   const signInFailed = authoritativeSignInEvidence && ['FAILED', 'PERMISSION_REQUIRED'].includes(signInHealth?.classification ?? '') ? 1 : 0
-  const signInPending = authoritativeSignInEvidence && signInHealth?.classification === 'PENDING' ? 1 : 0
+  // An UNVERIFIED verdict says HawkView has not established this source. That is
+  // not completion, and it is not a reason to stop counting work that is
+  // actually running. The selected-evidence mapper has no UNVERIFIED branch, so
+  // the resource stays NOT_CONFIGURED; and a truthy selected source excludes
+  // SIGN_INS from `operationalStates` above, so the row's own RUNNING status
+  // reached no count at all. Operations therefore read HEALTHY with zero pending
+  // jobs while the collector was running.
+  //
+  // Written as one more disjunct inside the SAME `? 1 : 0`, never as a second
+  // additive term, so a source that is already PENDING cannot be counted twice.
+  // Scoped three ways: the readiness verdict must be UNVERIFIED, the resource
+  // must be NOT_CONFIGURED - so a blocked or failed source, already counted in
+  // `signInFailed`, is not counted here as well - and the raw collector row must
+  // say RUNNING, so non-running and unconfigured input is untouched.
+  const signInPending = authoritativeSignInEvidence &&
+    (signInHealth?.classification === 'PENDING' ||
+      (input.signInEvidence?.availability === 'UNVERIFIED' &&
+        signInHealth?.classification === 'NOT_CONFIGURED' &&
+        states.get('SIGN_INS')?.status === 'RUNNING'))
+    ? 1 : 0
   const signInPartial = authoritativeSignInEvidence && signInHealth?.classification === 'PARTIAL' ? 1 : 0
   const failedJobs = operationalStates.filter((s) => s.status === 'FAILED').length + signInFailed
   // A RUNNING collector leaves `pendingJobs` only when its fallback evidence is
