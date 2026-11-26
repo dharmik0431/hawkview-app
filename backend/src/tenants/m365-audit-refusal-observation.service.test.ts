@@ -586,8 +586,18 @@ for (const [label, visitOwner] of [['owned', owner], ['ownerless', undefined]] a
     })
     await fake.run()
 
-    // The guard acquired the row by WRITING it, and wrote nothing but the
-    // attempt time its own fence already required.
+    // THE POINT, asserted FIRST so a control that reverts the guard fails on
+    // this claim and not on some earlier shape check: nothing may commit while
+    // the successor owns the row. A plain count answers true and releases
+    // immediately, so the successor lands between the check and the commit and
+    // this list then contains its token.
+    assert.equal(fake.committedTokens().includes(fake.successorToken), false,
+      'no transaction committed under the successor token')
+    assert.ok(fake.committedTokens().includes(fake.attemptTokenFromUpsert()!),
+      'the disposition committed under its own attempt, which still held the row')
+
+    // And the row was acquired by WRITING it, with nothing but the attempt time
+    // its own fence already required.
     const guardWrites = fake.of('syncState.updateMany').filter((call) => {
       const data = (call.args[0] as { data: Record<string, unknown> }).data
       return Object.keys(data).length === 1 && 'lastAttemptAt' in data
@@ -598,14 +608,6 @@ for (const [label, visitOwner] of [['owned', owner], ['ownerless', undefined]] a
       fake.attemptTokenFromUpsert(),
       'and it was fenced on this attempt token, not the successor',
     )
-
-    // THE POINT: nothing may commit while the successor owns the row. A plain
-    // count answers true and releases immediately, so the successor could land
-    // between the check and the commit and this list would contain its token.
-    assert.equal(fake.committedTokens().includes(fake.successorToken), false,
-      'no transaction committed under the successor token')
-    assert.ok(fake.committedTokens().includes(fake.attemptTokenFromUpsert()!),
-      'the disposition committed under its own attempt, which still held the row')
 
     // The successor is intact afterwards, with no detail invented for it.
     assert.deepEqual(fake.row()!.m365AuditAttempt, fake.successor()!.m365AuditAttempt)
