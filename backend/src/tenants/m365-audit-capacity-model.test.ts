@@ -102,18 +102,22 @@ const bytesOnly = (increment: bigint) => ({ daily_bytes: increment, monthly_byte
 // ==========================================================================
 
 test('shares and remainders at n=3 match the reviewed figures', () => {
-  assert.deepEqual(m365CapacityShare(DEFAULTS.daily_bytes, 3), { share: 34_952_533n, remainder: 1n })
-  assert.deepEqual(m365CapacityShare(DEFAULTS.daily_records, 3), { share: 666n, remainder: 2n })
-  assert.deepEqual(m365CapacityShare(DEFAULTS.monthly_bytes, 3), { share: 699_050_666n, remainder: 2n })
-  assert.deepEqual(m365CapacityShare(DEFAULTS.monthly_records, 3), { share: 13_333n, remainder: 1n })
+  assert.deepEqual(m365CapacityShare(DEFAULTS.daily_bytes, 3),
+    { share: 34_952_533n, remainder: 1n, beyondDecisionDomain: false })
+  assert.deepEqual(m365CapacityShare(DEFAULTS.daily_records, 3),
+    { share: 666n, remainder: 2n, beyondDecisionDomain: false })
+  assert.deepEqual(m365CapacityShare(DEFAULTS.monthly_bytes, 3),
+    { share: 699_050_666n, remainder: 2n, beyondDecisionDomain: false })
+  assert.deepEqual(m365CapacityShare(DEFAULTS.monthly_records, 3),
+    { share: 13_333n, remainder: 1n, beyondDecisionDomain: false })
 })
 
 test('the share clamps to the tenant ceiling for small cohorts', () => {
   // At n<=2 the equal split exceeds the tenant ceiling, so the tenant ceiling wins.
   assert.deepEqual(m365CapacityShare(DEFAULTS.daily_bytes, 1),
-    { share: 52_428_800n, remainder: 52_428_800n })
+    { share: 52_428_800n, remainder: 52_428_800n, beyondDecisionDomain: false })
   assert.deepEqual(m365CapacityShare(DEFAULTS.daily_bytes, 2),
-    { share: 52_428_800n, remainder: 0n })
+    { share: 52_428_800n, remainder: 0n, beyondDecisionDomain: false })
   assert.equal(m365CapacityShare(DEFAULTS.daily_bytes, 0), null)
   assert.equal(m365CapacityShare(DEFAULTS.daily_bytes, 1.5), null)
 })
@@ -508,7 +512,7 @@ test('effective non-default ceilings drive the share and the boundary exactly', 
     monthly_bytes: { tenantCeiling: 300n * MiB, deploymentCeiling: 700n * MiB },
   } as const
   assert.deepEqual(m365CapacityShare(ceilings.daily_bytes, 3),
-    { share: 24_466_773n, remainder: 1n })
+    { share: 24_466_773n, remainder: 1n, beyondDecisionDomain: false })
 
   const day = decided(build({
     eligible: THREE, actor: 'Q', dailyBytes: { N1: 0n, N2: 0n, Q: 0n },
@@ -656,6 +660,135 @@ test('a day larger than its own month is rejected as unreachable', () => {
   const result = decideM365Capacity(inverted)
   assert.equal(result.kind === 'INVALID' && result.reason, 'PERIOD_USAGE_INVERTED')
   assert.match(result.kind === 'INVALID' ? result.detail : '', /daily_bytes usage for Q/)
+})
+
+// ==========================================================================
+// Public input boundary: malformed top-level input returns a closed result
+// ==========================================================================
+
+test('null, undefined and non-objects return INVALID instead of throwing', () => {
+  for (const [label, input] of [
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'not a snapshot'],
+    ['a number', 42],
+    ['a boolean', true],
+    ['an array', [] as unknown],
+  ] as const) {
+    const result = decideM365Capacity(input as never)
+    assert.equal(result.kind, 'INVALID', `${label} must not be decided`)
+    assert.equal(result.kind === 'INVALID' && result.reason, 'MALFORMED_SNAPSHOT', label)
+    assert.ok(result.kind === 'INVALID' && result.detail.length > 0, `${label} explains itself`)
+  }
+})
+
+test('a non-array eligible cohort is malformed, while an empty one stays EMPTY_COHORT', () => {
+  const base = build({ eligible: ['A'], actor: 'A', dailyBytes: { A: 0n }, increment: bytesOnly(0n) })
+  for (const bad of [null, undefined, 'N1', 7, {}] as const) {
+    const result = decideM365Capacity({ ...base, eligible: bad as never })
+    assert.equal(result.kind === 'INVALID' && result.reason, 'MALFORMED_SNAPSHOT',
+      `eligible=${String(bad)}`)
+  }
+  // The pre-existing reason for an ordinary object snapshot is unchanged.
+  const empty = decideM365Capacity({ ...base, eligible: [] })
+  assert.equal(empty.kind === 'INVALID' && empty.reason, 'EMPTY_COHORT')
+})
+
+test('malformed numeric values are rejected with a numeric reason, not a throw', () => {
+  const base = build({ eligible: ['A'], actor: 'A', dailyBytes: { A: 0n }, increment: bytesOnly(0n) })
+  // A plain number where a bigint is required -- the common caller mistake.
+  const numberUsage = {
+    ...base,
+    eligibleUsage: { ...base.eligibleUsage, daily_bytes: { A: 5 as never } },
+  }
+  assert.equal(decideM365Capacity(numberUsage).kind === 'INVALID'
+    && (decideM365Capacity(numberUsage) as { reason: string }).reason, 'NON_INTEGER_VALUE')
+
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 1.5] as const) {
+    const badIncrement = {
+      ...base,
+      increment: { ...base.increment, daily_bytes: bad as never },
+    }
+    const result = decideM365Capacity(badIncrement)
+    assert.equal(result.kind === 'INVALID' && result.reason, 'NON_INTEGER_VALUE', `increment=${bad}`)
+  }
+  const nullCeiling = {
+    ...base,
+    ceilings: { ...base.ceilings, daily_bytes: { tenantCeiling: null as never, deploymentCeiling: 1n } },
+  }
+  assert.equal(decideM365Capacity(nullCeiling).kind === 'INVALID'
+    && (decideM365Capacity(nullCeiling) as { reason: string }).reason, 'NON_INTEGER_VALUE')
+})
+
+// ==========================================================================
+// Public input boundary: the share helper's documented arithmetic-only domain
+// ==========================================================================
+
+test('the share helper returns null outside its domain rather than throwing', () => {
+  for (const bad of [null, undefined, 'x', 7] as const) {
+    assert.equal(m365CapacityShare(bad as never, 3), null, `ceilings=${String(bad)}`)
+  }
+  assert.equal(m365CapacityShare({ tenantCeiling: 1, deploymentCeiling: 2n } as never, 3), null,
+    'a number ceiling is not a bigint')
+  assert.equal(m365CapacityShare({ tenantCeiling: 1n, deploymentCeiling: null } as never, 3), null)
+  assert.equal(m365CapacityShare({ tenantCeiling: 0n, deploymentCeiling: 2n }, 3), null)
+  assert.equal(m365CapacityShare({ tenantCeiling: 1n, deploymentCeiling: -1n }, 3), null)
+  for (const bad of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(m365CapacityShare(DEFAULTS.daily_bytes, bad), null, `cohortSize=${bad}`)
+  }
+})
+
+test('a cohort size past the safe-integer range is outside the helper domain', () => {
+  assert.equal(m365CapacityShare(DEFAULTS.daily_bytes, Number.MAX_SAFE_INTEGER + 1), null,
+    '2^53 is not a safe integer, so the helper refuses it rather than converting it')
+  const safeEdge = m365CapacityShare(DEFAULTS.daily_bytes, Number.MAX_SAFE_INTEGER)
+  assert.ok(safeEdge, 'the safe-integer edge itself is in the domain')
+  assert.equal(safeEdge.share, 0n, 'a cohort that large floors every share to zero')
+  assert.equal(safeEdge.beyondDecisionDomain, true)
+})
+
+test('the helper answers above ten, flagged, while the decision API refuses', () => {
+  // The reviewed design quotes this exact figure as evidence that the scheme
+  // cannot carry a maximum-size blob past ten members.
+  const eleven = m365CapacityShare(DEFAULTS.daily_bytes, 11)
+  assert.deepEqual(eleven, { share: 9_532_509n, remainder: 1n, beyondDecisionDomain: true })
+  assert.ok(eleven.share < BLOB, 'below one maximum-size blob')
+
+  // Arithmetic only: the decision API still refuses to decide for that cohort,
+  // so the flagged answer implies no admission or fleet support.
+  const ids = Array.from({ length: 11 }, (_unused, i) => `T${i}`)
+  const refused = decideM365Capacity(build({
+    eligible: ids, actor: 'T0',
+    dailyBytes: Object.fromEntries(ids.map((id) => [id, 0n])), increment: bytesOnly(BLOB),
+  }))
+  assert.equal(refused.kind, 'UNSUPPORTED')
+  assert.equal(refused.kind === 'UNSUPPORTED' && refused.reason, 'COHORT_TOO_LARGE')
+
+  // At the supported edge the flag is false and the arithmetic is exact.
+  const ten = m365CapacityShare(DEFAULTS.daily_bytes, M365_CAPACITY_MAX_COHORT)
+  assert.deepEqual(ten, { share: 10_485_760n, remainder: 0n, beyondDecisionDomain: false })
+})
+
+test('at the supported edge a maximum blob is admitted with no slack -- arithmetic, not a guarantee', () => {
+  // Stated explicitly because the previous edge test asserted only that a
+  // decision was reached. This says what is actually established: the fairness
+  // remainder leaves exactly one blob and nothing more. It is not a scheduling,
+  // provider-availability or fairness guarantee.
+  const ids = Array.from({ length: M365_CAPACITY_MAX_COHORT }, (_unused, i) => `T${i}`)
+  const zeros = Object.fromEntries(ids.map((id) => [id, 0n]))
+  const result = decided(build({
+    eligible: ids, actor: 'T0', dailyBytes: zeros, increment: bytesOnly(BLOB),
+  }))
+  const day = result.axes.daily_bytes
+  assert.equal(day.share, 10_485_760n)
+  assert.equal(day.fairnessAdmissible, 10_485_760n, 'exactly one blob of room')
+  assert.equal(day.mode, 'PROTECTED')
+  assert.equal(result.admitted, true)
+
+  const oneMore = decided(build({
+    eligible: ids, actor: 'T0', dailyBytes: zeros, increment: bytesOnly(BLOB + 1n),
+  }))
+  assert.equal(oneMore.admitted, false, 'and one byte more is refused')
 })
 
 test('the exported constraint and axis lists are frozen and in released order', () => {

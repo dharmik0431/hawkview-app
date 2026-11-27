@@ -149,6 +149,7 @@ export type M365CapacityRefusal =
   | { readonly kind: 'FAIRNESS'; readonly axis: M365CapacityAxis }
 
 export type M365CapacityRejection =
+  | 'MALFORMED_SNAPSHOT'
   | 'EMPTY_COHORT'
   | 'COHORT_TOO_LARGE'
   | 'DUPLICATE_MEMBER'
@@ -185,8 +186,23 @@ function isNonNegativeBigInt(value: unknown): value is bigint {
 
 /** Every rejection the snapshot can earn, or null when it is in the domain. */
 function rejectSnapshot(snapshot: M365CapacitySnapshot): M365CapacityResult | null {
+  // The top-level shape is checked BEFORE anything is destructured. A future
+  // caller handing over null, undefined or a non-object must get this API's
+  // closed result, not an undocumented TypeError from a property access.
+  // Arrays are rejected here too: an array is an object, but it is not a
+  // snapshot, and its axis lookups would all read as missing.
+  if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    return invalid('MALFORMED_SNAPSHOT',
+      `the snapshot must be an object; received ${snapshot === null ? 'null' : Array.isArray(snapshot) ? 'an array' : typeof snapshot}`)
+  }
   const { eligible, actor } = snapshot
-  if (!Array.isArray(eligible) || eligible.length === 0) {
+  // A non-array `eligible` is malformed rather than empty, so an ordinary
+  // object snapshot still earns the precise reason it had before.
+  if (!Array.isArray(eligible)) {
+    return invalid('MALFORMED_SNAPSHOT',
+      `the eligible cohort must be an array; received ${eligible === null ? 'null' : typeof eligible}`)
+  }
+  if (eligible.length === 0) {
     return invalid('EMPTY_COHORT', 'the eligible cohort must name at least one tenant')
   }
   if (eligible.length > M365_CAPACITY_MAX_COHORT) {
@@ -357,8 +373,10 @@ function axisOutcome(
  * Decide one hypothetical increment against one caller-supplied snapshot.
  *
  * Returns INVALID or UNSUPPORTED instead of a decision when the snapshot is
- * outside the supported domain. It never throws for in-domain input, never
- * defaults to admission, and never synthesizes a cohort from spend.
+ * outside the supported domain. It never throws -- for any input at all,
+ * including null, undefined and non-objects, which return
+ * INVALID/MALFORMED_SNAPSHOT -- never defaults to admission, and never
+ * synthesizes a cohort from spend.
  */
 export function decideM365Capacity(snapshot: M365CapacitySnapshot): M365CapacityResult {
   const rejected = rejectSnapshot(snapshot)
@@ -398,18 +416,55 @@ export function decideM365Capacity(snapshot: M365CapacitySnapshot): M365Capacity
   return { kind: 'DECIDED', admitted, refusal: admitted ? null : refusal, axes }
 }
 
+export type M365CapacityShareResult = {
+  readonly share: bigint
+  readonly remainder: bigint
+  /**
+   * True when `cohortSize` exceeds the decision API's supported maximum. The
+   * arithmetic is still exact, but `decideM365Capacity` answers UNSUPPORTED for
+   * such a cohort. This flag is NOT a statement that the cohort is supported,
+   * admitted, schedulable or fair -- it exists so a caller cannot mistake an
+   * arithmetic answer for one.
+   */
+  readonly beyondDecisionDomain: boolean
+}
+
 /**
  * The equal share and its integer remainder for one axis, exposed because the
- * reviewed design quotes both. `cohortSize` must be positive.
+ * reviewed design quotes both.
+ *
+ * RUNTIME DOMAIN -- deliberately ARITHMETIC-ONLY, and wider than the decision
+ * API's. It answers for any safe positive integer cohort size, including sizes
+ * above M365_CAPACITY_MAX_COHORT, because the reviewed design quotes exactly
+ * such a figure as evidence (an eleven-member daily byte share of 9,532,509 is
+ * below one maximum-size blob). Returns `beyondDecisionDomain: true` there so
+ * the answer cannot be read as fleet support: it implies no admission, no
+ * scheduling progress and no fairness guarantee, and `decideM365Capacity`
+ * still refuses to decide for such a cohort.
+ *
+ * Returns null -- never throws -- outside the domain:
+ *   - `ceilings` null, undefined or not an object;
+ *   - either ceiling not a bigint, or not strictly positive;
+ *   - `cohortSize` not a safe positive integer, which excludes 0, negatives,
+ *     fractions, NaN, Infinity and values past Number.MAX_SAFE_INTEGER.
+ * Ceilings themselves are arbitrary-size bigints; only the cohort size is
+ * bounded by safe-integer representability.
  */
 export function m365CapacityShare(
   ceilings: M365CapacityCeilings,
   cohortSize: number,
-): { readonly share: bigint; readonly remainder: bigint } | null {
-  if (!Number.isInteger(cohortSize) || cohortSize <= 0) return null
-  if (ceilings.tenantCeiling <= 0n || ceilings.deploymentCeiling <= 0n) return null
+): M365CapacityShareResult | null {
+  if (!Number.isSafeInteger(cohortSize) || cohortSize <= 0) return null
+  if (ceilings === null || typeof ceilings !== 'object') return null
+  const { tenantCeiling, deploymentCeiling } = ceilings
+  if (typeof tenantCeiling !== 'bigint' || typeof deploymentCeiling !== 'bigint') return null
+  if (tenantCeiling <= 0n || deploymentCeiling <= 0n) return null
   const n = BigInt(cohortSize)
-  const equalShare = ceilings.deploymentCeiling / n
-  const share = ceilings.tenantCeiling < equalShare ? ceilings.tenantCeiling : equalShare
-  return { share, remainder: ceilings.deploymentCeiling - n * share }
+  const equalShare = deploymentCeiling / n
+  const share = tenantCeiling < equalShare ? tenantCeiling : equalShare
+  return {
+    share,
+    remainder: deploymentCeiling - n * share,
+    beyondDecisionDomain: cohortSize > M365_CAPACITY_MAX_COHORT,
+  }
 }
