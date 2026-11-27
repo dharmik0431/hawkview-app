@@ -42,6 +42,8 @@ for (const lostAt of ['initial-running', 'interrupted-recovery'] as const) {
         findUnique: async () => null,
         upsert: async () => { writes.push('RUNNING') },
         update: async () => { writes.push('FAILED') },
+        // One fenced updateMany replaces the status update; same recorded label.
+        updateMany: async () => { writes.push('FAILED'); return { count: 1 } },
       },
       m365ActivityContent: {
         count: async () => 1,
@@ -86,6 +88,8 @@ for (const loseAtTerminal of [true, false]) {
       syncState: {
         upsert: async () => { writes.push('tx:RUNNING') },
         update: async () => { writes.push('tx:terminal-state') },
+        // One fenced updateMany replaces the status update; same recorded label.
+        updateMany: async () => { writes.push('tx:terminal-state'); return { count: 1 } },
       },
       m365ActivityContent: {
         updateMany: async () => { writes.push('tx:recovery') },
@@ -104,6 +108,8 @@ for (const loseAtTerminal of [true, false]) {
         findUnique: async () => null,
         upsert: async () => { writes.push('root:RUNNING') },
         update: async () => { writes.push('root:terminal-state') },
+        // One fenced updateMany replaces the status update; same recorded label.
+        updateMany: async () => { writes.push('root:terminal-state'); return { count: 1 } },
       },
       m365ActivityContent: {
         count: async ({ where }: any) => where.OR ? 1 : 0,
@@ -159,6 +165,8 @@ for (const failure of ['budget', 'provider'] as const) {
         syncState: {
           upsert: async () => { writes.push('tx:RUNNING') },
           update: async () => { writes.push('tx:failure') },
+          // One fenced updateMany replaces the status update; same recorded label.
+          updateMany: async () => { writes.push('tx:failure'); return { count: 1 } },
         },
         m365ActivityContent: { updateMany: async () => { writes.push('tx:recovery') } },
       }
@@ -171,6 +179,8 @@ for (const failure of ['budget', 'provider'] as const) {
           findUnique: async () => null,
           upsert: async () => { writes.push('root:RUNNING') },
           update: async () => { writes.push('root:failure') },
+          // One fenced updateMany replaces the status update; same recorded label.
+          updateMany: async () => { writes.push('root:failure'); return { count: 1 } },
         },
         m365ActivityContent: {
           count: async () => 1,

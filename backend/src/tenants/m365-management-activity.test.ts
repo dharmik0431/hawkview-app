@@ -419,7 +419,7 @@ test('writes raw and normalized evidence and completes a content ledger in one t
       },
       m365AuditRecord: { createMany: async ({ data }: any) => { rawWrites.push(...data); return { count: data.length } } },
       changeEvidenceEvent: { createMany: async ({ data }: any) => evidenceWrites.push(...data) },
-      m365ActivityContent: { update: async ({ data }: any) => ledgerWrites.push(data) },
+      m365ActivityContent: { update: async ({ data }: any) => ledgerWrites.push(data), updateMany: (...args: any[]) => (prisma as any).m365ActivityContent.updateMany(...args) },
     }),
   }
   const service = new M365ManagementActivityService(prisma, {} as never)
@@ -485,7 +485,7 @@ test('rejects a cross-tenant content blob before evidence writes', async () => {
       },
       m365AuditRecord: { createMany: async () => ({ count: 1 }) },
       changeEvidenceEvent: { createMany: async ({ data }: any) => evidenceWrites.push(...data) },
-      m365ActivityContent: { update: async () => undefined },
+      m365ActivityContent: { update: async () => undefined, updateMany: (...args: any[]) => (prisma as any).m365ActivityContent.updateMany(...args) },
     }),
   }
   const service = new M365ManagementActivityService(prisma, {} as never)
@@ -524,7 +524,7 @@ test('does not mark a blob complete when the evidence transaction fails', async 
       },
       m365AuditRecord: { createMany: async () => ({ count: 1 }) },
       changeEvidenceEvent: { createMany: async () => { throw new Error('database unavailable') } },
-      m365ActivityContent: { update: async ({ data }: any) => states.push(data.status) },
+      m365ActivityContent: { update: async ({ data }: any) => states.push(data.status), updateMany: (...args: any[]) => (prisma as any).m365ActivityContent.updateMany(...args) },
     }),
   }
   const service = new M365ManagementActivityService(prisma, {} as never)
@@ -552,6 +552,12 @@ test('content ingestion operational logs never include provider identifiers or h
           ? { count: 1 }
           : { count: 1 },
       },
+      // The ownerless failure disposition now commits inside a transaction.
+      $transaction: async (work: any) => work({
+        m365ActivityContent: {
+          updateMany: (...args: any[]) => prisma.m365ActivityContent.updateMany(...args),
+        },
+      }),
     }
     const service = new M365ManagementActivityService(prisma, {} as never)
     ;(service as any).request = async () => { throw failure }
@@ -608,7 +614,7 @@ test('rolls record quota reservation back with failed evidence storage so retrie
         },
         m365AuditRecord: { createMany: async () => ({ count: 1 }) },
         changeEvidenceEvent: { createMany: async () => { throw new Error('evidence write failed') } },
-        m365ActivityContent: { update: async () => undefined },
+        m365ActivityContent: { update: async () => undefined, updateMany: (...args: any[]) => (prisma as any).m365ActivityContent.updateMany(...args) },
       }
       try {
         const result = await callback(transaction)
@@ -1001,6 +1007,7 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
           findUnique: async () => null,
           upsert: async () => undefined,
           update: async ({ data }: any) => { syncUpdates.push(data); return data },
+          updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
         },
         m365ActivityContent: {
           count: async ({ where }: any) => {
@@ -1018,7 +1025,7 @@ test('reports a backlog after blob-count, byte-budget, and runtime bounds instea
         m365ActivitySubscription: { findMany: async () => [] },
         m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
         m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
-        $transaction: async (operations: any) => Promise.all(operations),
+        $transaction: async (work: any) => Array.isArray(work) ? Promise.all(work) : work((prisma as any).__tx ?? prisma),
       }
       const consent: any = {
         getTenantManagementActivityContext: async () => ({
@@ -1070,6 +1077,9 @@ test('reports incomplete subscription coverage as a collector failure while poll
       findUnique: async () => null,
       upsert: async () => undefined,
       update: async ({ data }: any) => { syncUpdates.push(data); return data },
+      // The terminal/outer transitions are now one fenced updateMany; record it
+      // in the same place the old status update was recorded.
+      updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
     },
     m365ActivityContent: {
       count: async () => 0,
@@ -1086,7 +1096,7 @@ test('reports incomplete subscription coverage as a collector failure while poll
     },
     m365AuditRecord: { deleteMany: async () => ({ count: 0 }) },
     m365AuditDailyUsage: { deleteMany: async () => ({ count: 0 }) },
-    $transaction: async (operations: any) => Promise.all(operations),
+    $transaction: async (work: any) => Array.isArray(work) ? Promise.all(work) : work(prisma),
   }
   const consent: any = {
     getTenantManagementActivityContext: async () => ({
@@ -1123,11 +1133,22 @@ test('treats a daily/monthly budget stop as recoverable backpressure, not a coll
       findUnique: async () => null,
       upsert: async () => undefined,
       update: async ({ data }: any) => { syncUpdates.push(data); return data },
+        updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
     },
     m365ActivityContent: {
       count: async () => 1,
       updateMany: async () => ({ count: 0 }),
     },
+    // The ownerless outer budget write is now transactional so the existing
+    // status write and this attempt observation commit together or not at all.
+    $transaction: async (work: any) => work({
+      syncState: {
+        update: async ({ data }: any) => { syncUpdates.push(data); return data },
+      // The terminal/outer transitions are now one fenced updateMany; record it
+      // in the same place the old status update was recorded.
+      updateMany: async ({ data }: any) => { syncUpdates.push(data); return { count: 1 } },
+      },
+    }),
   }
   const consent: any = {
     getTenantManagementActivityContext: async () => ({ accessToken: 'token', publisherIdentifier }),
