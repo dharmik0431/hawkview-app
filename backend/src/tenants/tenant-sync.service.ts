@@ -115,6 +115,7 @@ import {
   buildSharePointDataContract,
   inspectMicrosoftUsageProjectionEvidence,
   MICROSOFT_USAGE_REPORT_DATASET,
+  sumKnownReportBytes,
   type MicrosoftUsageSourceProjectionEvidence,
 } from './sharepoint-data-contract.js'
 import {
@@ -2923,7 +2924,13 @@ export class TenantSyncService {
       { key: 'sharepoint.sites.inventory', resource: 'SHAREPOINT_SITES', source: 'Microsoft Graph', endpoint: '/sites?search=*' },
       { key: 'sharepoint.sites.access', resource: 'SHAREPOINT_SITES', source: 'HawkView standard least-privilege mode', endpoint: 'not-collected-in-standard-mode', capability: 'NOT_COLLECTED_LEAST_PRIVILEGE' },
       { key: 'sharepoint.tenant.settings', resource: 'SHAREPOINT_SETTINGS', source: 'Microsoft Graph', endpoint: '/admin/sharepoint/settings' },
-      { key: 'sharepoint.usage', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
+      // The usage bytes come from the validated report projection, so this key
+      // carries the same projection evidence the two *-usage-projection keys
+      // do. Without it the durable row stays AVAILABLE with a null reasonCode
+      // while the published value is unknown, which reads to a legacy consumer
+      // as "available, and zero". The existing PENDING/FAILED override supplies
+      // a truthful existing state and reason; no new state is introduced.
+      { key: 'sharepoint.usage', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail', projectionEvidence: usageProjection.sharePoint },
       { key: 'sharepoint.usage-projection', resource: 'SHAREPOINT_USAGE', source: 'HawkView validated Microsoft Graph report projection', endpoint: '/reports/getSharePointSiteUsageDetail', projectionEvidence: usageProjection.sharePoint },
       { key: 'onedrive.usage-projection', resource: 'SHAREPOINT_USAGE', source: 'HawkView validated Microsoft Graph report projection', endpoint: '/reports/getOneDriveUsageAccountDetail', projectionEvidence: usageProjection.oneDrive },
       { key: 'sharepoint.activity', resource: 'SHAREPOINT_USAGE', source: 'Microsoft Graph Reports', endpoint: '/reports/getSharePointSiteUsageDetail' },
@@ -7141,21 +7148,29 @@ export class TenantSyncService {
           row,
         ])
     )
+    // Retained unchanged for the PER-SITE values below, whose semantics this
+    // slice does not touch. Only the two tenant-wide totals change.
     const parseReportBytes = (value: unknown) => {
       if (typeof value !== 'string' || !value.trim()) return null
       const parsed = Number(value)
       return Number.isFinite(parsed) ? parsed : null
     }
-    const reportedSharePointAllocationBytes = sharePointUsage.reduce(
-      (total: number, row: Record<string, string>) =>
-        total + (parseReportBytes(row?.['Storage Allocated (Byte)']) ?? 0),
-      0
-    )
-    const reportedSharePointUsedBytes = sharePointUsage.reduce(
-      (total: number, row: Record<string, string>) =>
-        total + (parseReportBytes(row?.['Storage Used (Byte)']) ?? 0),
-      0
-    )
+    // A complete projection establishes period, refresh-date and identity
+    // coherence; it does NOT establish that every storage cell is a usable
+    // number. The previous reduction substituted 0 for a missing or non-numeric
+    // cell and accepted a negative one, so an authoritative projection could
+    // still publish an invented or understated total.
+    //
+    // These use the contract's own `sumKnown` rule over the LEGACY row set,
+    // which is the row set a legacy total describes — the contract's own totals
+    // deliberately exclude Microsoft-reported deleted sites, so reusing its
+    // numbers would silently change what these fields mean. Used and allocated
+    // are summed INDEPENDENTLY: a tenant whose allocation is unusable must not
+    // lose a perfectly good used figure.
+    const reportedSharePointAllocationBytes =
+      sumKnownReportBytes(sharePointUsage, 'Storage Allocated (Byte)')
+    const reportedSharePointUsedBytes =
+      sumKnownReportBytes(sharePointUsage, 'Storage Used (Byte)')
     const getSharePointUsage = (site: any) => {
       const byUrl = sharePointUsageByUrl.get(
         normalizeSharePointUrl(site?.webUrl)
@@ -7429,6 +7444,41 @@ export class TenantSyncService {
       Boolean(sharePointSettings)
     const sharePointUsageSynchronized =
       sharePointUsageSyncState?.status === 'SUCCEEDED'
+    // The row gate above discards usage rows whose stored projection evidence
+    // is not authoritative-complete. Anything SUMMED or LISTED from those rows
+    // must then be published as unknown rather than as a value: a sum over the
+    // discarded rows is 0, and a collector-status boolean is still true, so
+    // together they would publish a fabricated zero as available evidence for a
+    // tenant whose storage HawkView declined to verify.
+    //
+    // This is deliberately the same condition as the row gate, so published
+    // values track the rows actually used. It is NOT substituted for
+    // `usageSynchronized` into the data contract, which re-derives coherence
+    // itself and correctly reports the source as partial, nor for
+    // `collection.activity`, which counts sites rather than usage rows.
+    // Three cases, not two.
+    //
+    //  - A v2 projection stamped AUTHORITATIVE_COMPLETE: usable, including the
+    //    legitimate measured zero of a tenant with no reported sites.
+    //  - A v2 projection that is anything else: the gate above emptied the
+    //    rows, so nothing is usable.
+    //  - No v2 projection at all — an absent snapshot, a legacy v1 dataset, or
+    //    an unrecognized shape. Here the rows were NOT gated, so coherent
+    //    legacy rows must keep working; compatibility is preserved by treating
+    //    a non-empty row set as usable. But an EMPTY row set carries no
+    //    evidence whatsoever, and every total over it is zero by vacuity, so it
+    //    is reported unknown.
+    //
+    // Intended contract behaviour, stated because it is a deliberate change: a
+    // legacy or absent snapshot with no rows now publishes unknown rather than
+    // zero. Without projection evidence there is no way to tell a tenant with
+    // genuinely no reported sites from a tenant whose report never arrived, and
+    // of the two readings only "unknown" is true of both.
+    const sharePointUsageRowsUsable =
+      sharePointUsageSynchronized &&
+      (combinedUsageProjection
+        ? combinedUsageProjection.sharePoint.state === 'AUTHORITATIVE_COMPLETE'
+        : sharePointUsage.length > 0)
     const latestSharePointReportRefreshDate = sharePointUsage
       .map((row: Record<string, string>) => row?.['Report Refresh Date']?.trim())
       .filter((value: string | undefined): value is string => Boolean(value))
@@ -8130,7 +8180,7 @@ export class TenantSyncService {
             ),
             usage: collectionState(
               'sharepoint.usage',
-              sharePointUsageSynchronized ? reportedSharePointUsedBytes : null
+              sharePointUsageRowsUsable ? reportedSharePointUsedBytes : null
             ),
             activity: collectionState(
               'sharepoint.activity',
@@ -8170,19 +8220,19 @@ export class TenantSyncService {
           },
           capabilities: {
             tenantSettings: sharePointSettingsSynchronized,
-            usageReport: sharePointUsageSynchronized,
+            usageReport: sharePointUsageRowsUsable,
             // The usage report provides one reported owner, not a complete
             // owners collection. It can still identify sites for which
             // Microsoft reports no owner at all.
-            siteOwnerPresence: sharePointUsageSynchronized,
-            deletedSites: sharePointUsageSynchronized,
+            siteOwnerPresence: sharePointUsageRowsUsable,
+            deletedSites: sharePointUsageRowsUsable,
           },
           overview: {
             totalSites: sharePointSites.length,
-            summedSiteStorageUsedBytes: sharePointUsageSynchronized
+            summedSiteStorageUsedBytes: sharePointUsageRowsUsable
               ? reportedSharePointUsedBytes
               : null,
-            summedSiteQuotaBytes: sharePointUsageSynchronized
+            summedSiteQuotaBytes: sharePointUsageRowsUsable
               ? reportedSharePointAllocationBytes
               : null,
             // Microsoft Graph does not expose the licensed tenant storage
@@ -8190,12 +8240,14 @@ export class TenantSyncService {
             // allocation, so expose that useful aggregate with an explicit
             // capability label instead of presenting it as licensed quota.
             totalStorageQuotaGB:
-              sharePointUsageSynchronized &&
+              sharePointUsageRowsUsable &&
+              reportedSharePointAllocationBytes !== null &&
               reportedSharePointAllocationBytes > 0
                 ? bytesToGb(reportedSharePointAllocationBytes)
                 : null,
             storageQuotaSource:
-              sharePointUsageSynchronized &&
+              sharePointUsageRowsUsable &&
+              reportedSharePointAllocationBytes !== null &&
               reportedSharePointAllocationBytes > 0
                 ? 'reported-site-allocation'
                 : 'unavailable',
@@ -8325,7 +8377,7 @@ export class TenantSyncService {
           // It is not the SharePoint recycle bin and must not be presented as
           // a complete list of recoverable sites.
           deletedSites: sharePointDataContract.reportedDeletedSites,
-          deletedSitesSynchronized: sharePointUsageSynchronized,
+          deletedSitesSynchronized: sharePointUsageRowsUsable,
           unsupported: {
             siteOwnerCount:
               'Microsoft Graph site inventory and usage reports do not provide a reliable owner count.',

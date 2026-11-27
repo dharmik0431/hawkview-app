@@ -524,6 +524,27 @@ function projectTenantSettings(settings: unknown, synchronized: boolean) {
   }
 }
 
+/**
+ * Sum a byte column with the canonical authority's semantics, over a row set
+ * the CALLER chooses.
+ *
+ * `sumKnown` is the contract's own rule: no rows is unknown, a cell that is not
+ * an unsigned integer within the byte limit is unknown — which rejects a
+ * negative, a non-numeric and an over-long value — and an overflowing total is
+ * unknown. A legacy consumer needs exactly those cell semantics while keeping
+ * its OWN row set, because the contract's totals deliberately exclude
+ * Microsoft-reported deleted sites and a legacy total describes every reported
+ * row. Reusing the authority therefore means reusing this rule, not the
+ * contract's numbers.
+ *
+ * Fails closed on a row that is not a plain record, rather than skipping it,
+ * so a malformed row makes the total unknown instead of silently shrinking it.
+ */
+export function sumKnownReportBytes(rows: readonly unknown[], key: string): number | null {
+  if (!rows.every(isPlainRecord)) return null
+  return sumKnown(rows as JsonRecord[], key)
+}
+
 function sumKnown(rows: JsonRecord[], key: string) {
   if (rows.length === 0) return null
   let total = 0
