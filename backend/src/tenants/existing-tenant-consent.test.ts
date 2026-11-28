@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { randomUUID, createHash } from 'node:crypto'
 import { SignJWT } from 'jose'
+import { NotFoundException } from '@nestjs/common'
 import { MicrosoftConsentService } from '../microsoft/microsoft-consent.service.js'
 import { TenantsService } from './tenants.service.js'
 
@@ -42,9 +43,40 @@ test('legacy existing callback never reaches old consumption or provider',async(
 })
 test('unauthorized issuance stops before operation or URL creation',async()=>{
   const service=new TenantsService({customerTenant:{findFirst:async()=>null}} as any,{} as any,{} as any)
-  ;(service as any).getAccessibleOrganizationIds=async()=>[]
+  ;(service as any).getTenantOnboardingOrganizationIds=async()=>[]
   await assert.rejects(service.createConsentUrlForIdentity({subject:'synthetic'} as any,randomUUID()),/not found/)
 })
+for (const role of ['MSP_VIEWER','MSP_OWNER','MSP_ADMIN','MSP_TECHNICIAN']) {
+  test(`${role} consent authorization stops viewers before preparation and admits onboarding roles`,async()=>{
+    const organizationId=randomUUID(),customerTenantId=randomUUID(),microsoftTenantId=randomUUID()
+    const enteredPreparation=new Error('authorized preparation reached')
+    let tenantReads=0,preparations=0,transactions=0
+    const service=new TenantsService({
+      user:{findUnique:async(args:any)=>{
+        assert.deepEqual(args.select.memberships.where,{
+          status:'ACTIVE',role:{in:['MSP_OWNER','MSP_ADMIN','MSP_TECHNICIAN']},organization:{status:'ACTIVE'},
+        })
+        return {disabledAt:null,memberships:role==='MSP_VIEWER'?[]:[{organizationId,organization:{onboardingCompletedAt:new Date()}}]}
+      }},
+      customerTenant:{findFirst:async(args:any)=>{
+        tenantReads++
+        return args.where.organizationId.in.includes(organizationId)
+          ? {id:customerTenantId,organizationId,microsoftTenantId,
+            connection:{connectionMode:'HAWKVIEW_MANAGED',collectionIncarnation:randomUUID()}}
+          : null
+      }},
+      $transaction:async()=>{transactions++;throw new Error('unexpected consent write')},
+    } as any,{
+      prepareExistingConsent:async()=>{preparations++;throw enteredPreparation},
+    } as any,{} as any)
+    const run=()=>service.createConsentUrlForIdentity({subject:'synthetic'} as any,customerTenantId)
+    if(role==='MSP_VIEWER') await assert.rejects(run(),NotFoundException)
+    else await assert.rejects(run(),error=>error===enteredPreparation)
+    assert.equal(tenantReads,1)
+    assert.equal(preparations,role==='MSP_VIEWER'?0:1)
+    assert.equal(transactions,0)
+  })
+}
 test('verification retries keep one captured credential and deadline',async()=>{
   const refs:string[]=[],calls:any[]=[]
   const service=new MicrosoftConsentService({} as any,{access:async(ref:string)=>{refs.push(ref);return 'synthetic-secret'}} as any)
