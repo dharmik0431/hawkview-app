@@ -656,7 +656,7 @@ export class TenantsService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    const organizationIds = await this.getAccessibleOrganizationIds(identity)
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
         id: customerTenantId,
@@ -1287,7 +1287,7 @@ export class TenantsService {
     identity: AuthenticatedIdentity,
     customerTenantId: string
   ) {
-    const organizationIds = await this.getAccessibleOrganizationIds(identity)
+    const organizationIds = await this.getTenantOnboardingOrganizationIds(identity)
     const tenant = await this.prisma.customerTenant.findFirst({
       where: {
         id: customerTenantId,
